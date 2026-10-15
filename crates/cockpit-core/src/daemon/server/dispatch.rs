@@ -3882,7 +3882,7 @@ async fn handle_message_ingress(
         .await
         .map_err(internal)?
     {
-        let origin_principal = state.principal.tag();
+        let origin_principal = state.principal.authorship_tag();
         if !durable_canonical_replay
             && terminal.origin_principal.as_deref() != origin_principal.as_deref()
         {
@@ -4470,7 +4470,7 @@ async fn handle_send_user_message(
     }
     let session_id = require_attached(state)?.handle.session_id();
     let handle = require_attached(state)?.handle.clone();
-    let origin_principal = state.principal.tag();
+    let origin_principal = state.principal.authorship_tag();
     // A text-only oversized source switches to FCM2 before any receipt or
     // queue side effect. In particular the codec rejects 8MiB+1 before the
     // worker can create a receipt triple or reservation.
@@ -7200,7 +7200,12 @@ async fn handle_serialized_request_impl(
                 }
             };
             if let Some(attached) = state.attached.as_ref() {
-                scrub_code_root_read(&mut root, &attached.handle.redaction_table());
+                scrub_code_root_read_current(
+                    &mut root,
+                    &attached.handle,
+                    &mut state.pending_replay,
+                )
+                .await;
             }
             if let Some(attached) = state.attached.as_ref() {
                 if let Err(error) = attached.handle.persist_if_needed() {
@@ -7381,7 +7386,12 @@ async fn handle_serialized_request_impl(
                 }
             };
             if let Some(attached) = state.attached.as_ref() {
-                scrub_code_root_read(&mut root, &attached.handle.redaction_table());
+                scrub_code_root_read_current(
+                    &mut root,
+                    &attached.handle,
+                    &mut state.pending_replay,
+                )
+                .await;
             }
             let writer =
                 crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());

@@ -34,9 +34,10 @@ pub(crate) const COVERAGE_RESIDENT_GENERATIONS: usize = 64;
 /// admits a realistic developer `~/.ssh`: 10 RSA-4096 + 2 ed25519 keys + 40
 /// env values measure about 12.5 MiB with ContiguousNFA (#527).
 pub(crate) const COVERAGE_ARTIFACT_BYTES_PER_GENERATION: usize = 16 * 1024 * 1024;
-/// All resident generations together. Installed tables do not pin their
-/// generation (#542), so the total must hold the daemon-global table plus
-/// several sessions at the per-generation size: 64 MiB keeps 4 at the cap.
+/// All resident generations together. Installed tables pin their generation
+/// (#542), so the total bounds how many sessions can hold coverage at once:
+/// 64 MiB keeps the daemon-global table plus 3 sessions at the cap; a further
+/// admission is refused with [`CoverageError::ResidentBudgetExhausted`].
 pub(crate) const COVERAGE_ARTIFACT_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +131,9 @@ pub(crate) enum CoverageScope {
     ApprovalPreview,
     DebugContext,
     RedactionOverride,
+    /// A client-bound projection of a session (attach history) whose
+    /// installed table went stale before the next turn refreshed it.
+    AttachProjection,
 }
 
 /// All members are opaque daemon-derived revisions/identities.  A key cannot
@@ -343,6 +347,11 @@ pub(crate) enum CoverageError {
     ArtifactOverBudget {
         ssh_key_material: bool,
     },
+    /// The resident budget (generation count or total artifact bytes) is
+    /// fully held by generations that live installed tables or active
+    /// admissions pin. Eviction never drops a pinned generation, so this
+    /// admission is refused instead (#542).
+    ResidentBudgetExhausted,
 }
 
 impl CoverageError {
@@ -352,6 +361,17 @@ impl CoverageError {
     fn unavailable(category: &str) -> Self {
         tracing::warn!(category, "redaction coverage unavailable (fail closed)");
         Self::Unavailable
+    }
+
+    fn resident_budget_exhausted(residents: usize, resident_bytes: usize, needed: usize) -> Self {
+        tracing::warn!(
+            category = "resident_budget_exhausted",
+            residents,
+            resident_bytes,
+            needed,
+            "redaction coverage unavailable (fail closed): every resident generation is pinned by open sessions"
+        );
+        Self::ResidentBudgetExhausted
     }
 
     /// The per-generation artifact cap refused a capture. Logged like every
@@ -387,11 +407,49 @@ impl fmt::Display for CoverageError {
             Self::ArtifactOverBudget {
                 ssh_key_material: false,
             } => "redaction sources exceed the redaction coverage memory budget",
+            Self::ResidentBudgetExhausted => {
+                "redaction coverage memory is fully held by open sessions; close idle sessions and retry"
+            }
         })
     }
 }
 
 impl std::error::Error for CoverageError {}
+
+impl CoverageError {
+    /// The typed, content-free reason a client is told.
+    pub(crate) fn failure_reason(self) -> cockpit_proto::RedactionCoverageFailure {
+        use cockpit_proto::RedactionCoverageFailure as F;
+        match self {
+            Self::Unavailable => F::CaptureFailed,
+            Self::Saturated => F::Busy,
+            Self::Invalidated => F::SourcesChanged,
+            Self::SourceFileOverLimit => F::SourceFileOverLimit,
+            Self::ArtifactOverBudget {
+                ssh_key_material: true,
+            } => F::SshKeysOverBudget,
+            Self::ArtifactOverBudget {
+                ssh_key_material: false,
+            } => F::SourcesOverBudget,
+            Self::ResidentBudgetExhausted => F::HeldByOpenSessions,
+        }
+    }
+}
+
+/// The typed reason behind an acquisition error chain: the first
+/// [`CoverageError`] in it, or [`cockpit_proto::RedactionCoverageFailure::CaptureFailed`]
+/// for any other failure (a source the acquisition could not open).
+pub(crate) fn coverage_failure_reason(
+    error: &anyhow::Error,
+) -> cockpit_proto::RedactionCoverageFailure {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CoverageError>())
+        .map_or(
+            cockpit_proto::RedactionCoverageFailure::CaptureFailed,
+            |coverage| coverage.failure_reason(),
+        )
+}
 
 struct LiveCurrentBindingGuard {
     generation: Arc<RedactionCoverageGeneration>,
@@ -1013,7 +1071,14 @@ impl RedactionCoverageAuthority {
             || state.artifact_bytes.saturating_add(build.artifact_bytes)
                 > COVERAGE_ARTIFACT_BYTES_TOTAL
         {
-            return Err(CoverageError::Saturated);
+            // Every remaining resident is pinned by a live installed table
+            // or an active admission. Refuse this admission rather than
+            // evict coverage another session is still using (#542).
+            return Err(CoverageError::resident_budget_exhausted(
+                state.residents.len(),
+                state.artifact_bytes,
+                build.artifact_bytes,
+            ));
         }
         let generation_order = state.next_generation_order;
         state.next_generation_order = state
@@ -1331,7 +1396,15 @@ impl CoverageAdmission {
         }
     }
 
+    /// Every bound table pins its generation: while any clone of the table
+    /// (an installed daemon-global or session table, or a one-operation sink
+    /// table) is alive, eviction never drops that generation (#542). Only an
+    /// explicit invalidation retires it, and an invalidated table is stale by
+    /// design.
     fn coverage_binding_for_sink(&self) -> CoverageTableBinding {
+        self.generation
+            .live_current_bindings
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         CoverageTableBinding {
             authority: self.inner.clone(),
             generation_id: self.generation.id,
@@ -1339,7 +1412,9 @@ impl CoverageAdmission {
             generation_order: self.generation.generation_order,
             key_revision: self.generation.key_revision,
             key: self.generation.key.clone(),
-            live_binding: None,
+            live_binding: Some(LiveCurrentBindingGuard {
+                generation: self.generation.clone(),
+            }),
         }
     }
 

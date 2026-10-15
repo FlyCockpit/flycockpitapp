@@ -9621,14 +9621,16 @@ async fn revoked_owner_connection_refusals_explain_the_recovery() {
     state.owner_credential_revoked =
         Some(crate::daemon::peer_authority::PeerCredentialRevocation::PeerChanged);
     let shared = state.shared_snapshot();
-    let envelope = response_envelope_for_shared(
+    let (notice, envelope) = response_envelope_for_shared(
         Uuid::new_v4(),
         Err(authorization_error(
             "remote principal cannot access this session",
         )),
         &shared,
         &ctx,
-    );
+    )
+    .await;
+    assert!(notice.is_none());
     let Body::Error { error, .. } = envelope.body else {
         panic!("expected an error envelope");
     };
@@ -9643,7 +9645,7 @@ async fn revoked_owner_connection_refusals_explain_the_recovery() {
         error.message
     );
 
-    let envelope = response_envelope_for_shared(
+    let (notice, envelope) = response_envelope_for_shared(
         Uuid::new_v4(),
         Err(ErrorPayload {
             code: ErrorCode::NotFound,
@@ -9651,19 +9653,23 @@ async fn revoked_owner_connection_refusals_explain_the_recovery() {
         }),
         &shared,
         &ctx,
-    );
+    )
+    .await;
+    assert!(notice.is_none());
     let Body::Error { error, .. } = envelope.body else {
         panic!("expected an error envelope");
     };
     assert_eq!(error.message, "no such session");
 
     state.owner_credential_revoked = None;
-    let envelope = response_envelope_for_shared(
+    let (notice, envelope) = response_envelope_for_shared(
         Uuid::new_v4(),
         Err(authorization_error("request requires the local owner")),
         &state.shared_snapshot(),
         &ctx,
-    );
+    )
+    .await;
+    assert!(notice.is_none());
     let Body::Error { error, .. } = envelope.body else {
         panic!("expected an error envelope");
     };
@@ -29417,6 +29423,16 @@ async fn dispatch_attach_delivers_config_snapshot_event() {
         )),
         "attach must deliver a ConfigSnapshot event over dispatch, got {events:?}"
     );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            proto::Event::RedactionCoverageStatus {
+                session_id: None,
+                unavailable: None
+            }
+        )),
+        "attach must snapshot healthy global coverage, even if recovery was missed"
+    );
 }
 
 /// Criterion 6 (`engine-config-snapshot-adoption`): after a re-resolution
@@ -39671,6 +39687,15 @@ async fn attach_replays_drain_state_after_attached_response() {
         }
         other => panic!("expected Attached response, got {other:?}"),
     }
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "attachment coverage snapshot").await,
+        Body::Event {
+            event: proto::Event::RedactionCoverageStatus {
+                session_id: None,
+                unavailable: None,
+            },
+        }
+    ));
     let mut saw_drain = false;
     for _ in 0..8 {
         match recv_writer_body(&mut writer_rx, "drain state replay").await {
@@ -45519,4 +45544,345 @@ async fn aborted_handler_cannot_mint_after_lease_release() {
         recreated.is_empty(),
         "cancelled executor minted a credential after lease release; sensitive authority retained={retained_sensitive_authority}"
     );
+}
+
+fn docs_answer_of(envelope: &Envelope) -> String {
+    let Body::Response { response, .. } = &envelope.body else {
+        panic!("expected a response envelope, got {envelope:?}");
+    };
+    let Response::DocsAnswer { answer } = response.as_ref() else {
+        panic!("expected DocsAnswer, got {response:?}");
+    };
+    answer.clone()
+}
+
+/// #547 (B3/B5): every authority invalidation (a config-file edit seen by
+/// the watcher, a resolved command secret, a vault commit) revokes the
+/// published daemon-global generation. The owner response backstop used that
+/// published table without a currency check, so every string in every owner
+/// response — branch, history, titles — became the placeholder. It must
+/// scrub with a *current* table instead: ordinary text intact, secrets still
+/// scrubbed, and no withheld notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_backstop_uses_current_coverage_after_authority_invalidation() {
+    const GLOBAL_SECRET: &str = "owner-backstop-denylisted-canary-5b1f";
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_ssh_keys = false;
+    extended.redact.denylist = vec![GLOBAL_SECRET.to_string()];
+    let source =
+        crate::daemon::config_source::ConfigSource::fixed(stub_providers_config(), extended);
+    let ctx = test_ctx_with_config_source(source);
+    ctx.global_coverage
+        .republish(crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh)
+        .await
+        .expect("admitted daemon-global table");
+    // What the config watcher does on any config.json / providers/*.json
+    // write (onboarding writes config.json after the daemon is up).
+    ctx.registry.coverage_authority().invalidate();
+    assert!(
+        current_redaction(&ctx.global_redaction)
+            .ensure_binding_current()
+            .is_err(),
+        "precondition: the published table is stale"
+    );
+
+    let shared = owner_state().shared_snapshot();
+    let (notice, envelope) = response_envelope_for_shared(
+        Uuid::new_v4(),
+        Ok(Response::DocsAnswer {
+            answer: format!("on branch main, token {GLOBAL_SECRET}"),
+        }),
+        &shared,
+        &ctx,
+    )
+    .await;
+    let answer = docs_answer_of(&envelope);
+    assert!(answer.starts_with("on branch main, token "), "{answer}");
+    assert!(!answer.contains(GLOBAL_SECRET), "{answer}");
+    assert!(
+        notice.is_none(),
+        "current coverage needs no transition notice"
+    );
+}
+
+/// When no current daemon-global table can be established, the owner
+/// backstop still delivers the response, withholds every free-text string
+/// behind an explicit marker (never the secret placeholder, never the stale
+/// or merely published table), and tells this client why with a typed,
+/// content-free notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_backstop_withholds_and_explains_when_coverage_is_unavailable() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let available = Arc::new(AtomicBool::new(false));
+    let capture_available = available.clone();
+    let source = crate::daemon::config_source::ConfigSource::new(
+        move |_cwd| {
+            if !capture_available.load(Ordering::Acquire) {
+                anyhow::bail!("installation policy unavailable");
+            }
+            let mut extended = crate::config::extended::ExtendedConfig::default();
+            extended.redact.scan_ssh_keys = false;
+            Ok((stub_providers_config(), extended))
+        },
+        |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
+    );
+    let ctx = test_ctx();
+    let mut ctx = Arc::try_unwrap(ctx).unwrap_or_else(|_| panic!("unique test context"));
+    ctx.global_coverage = crate::daemon::global_coverage::GlobalCoverage::new(
+        current_redaction(&ctx.global_redaction),
+        None,
+        ctx.registry.coverage_authority().clone(),
+        source.clone(),
+        &ctx.secret_vault,
+        ctx.registry.downgrade(),
+    );
+    ctx.global_redaction = ctx.global_coverage.shared_table();
+    ctx.config_source = source;
+    let ctx = Arc::new(ctx);
+    ctx.registry.coverage_authority().invalidate();
+
+    let shared = owner_state().shared_snapshot();
+    let (notice, envelope) = response_envelope_for_shared(
+        Uuid::new_v4(),
+        Ok(Response::DocsAnswer {
+            answer: "ordinary text".to_string(),
+        }),
+        &shared,
+        &ctx,
+    )
+    .await;
+    assert_eq!(
+        docs_answer_of(&envelope),
+        crate::redact::COVERAGE_WITHHELD_PLACEHOLDER
+    );
+    let notice = notice.expect("the client is told why its text is withheld");
+    assert!(
+        matches!(
+            &notice.body,
+            Body::Event { event } if matches!(
+                event,
+                proto::Event::RedactionCoverageStatus {
+                    session_id: None,
+                    unavailable: Some(proto::RedactionCoverageFailure::CaptureFailed)
+                }
+            )
+        ),
+        "{notice:?}"
+    );
+    let mut recovery = ctx.global_events.subscribe();
+    available.store(true, Ordering::Release);
+    let (notice, envelope) = response_envelope_for_shared(
+        Uuid::new_v4(),
+        Ok(Response::DocsAnswer {
+            answer: "ordinary text restored".into(),
+        }),
+        &shared,
+        &ctx,
+    )
+    .await;
+    assert!(matches!(
+        notice.expect("healthy coverage snapshot").body,
+        Body::Event {
+            event: proto::Event::RedactionCoverageStatus {
+                session_id: None,
+                unavailable: None,
+            }
+        }
+    ));
+    assert_eq!(docs_answer_of(&envelope), "ordinary text restored");
+    assert!(matches!(
+        recovery.try_recv().expect("recovery announced").event,
+        proto::Event::RedactionCoverageStatus {
+            session_id: None,
+            unavailable: None
+        }
+    ));
+}
+
+/// An attachment must capture current session sources even when its installed
+/// table looks current in memory. File changes can precede watcher invalidation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_root_projection_reacquires_coverage_and_keeps_public_history() {
+    const OLD_SECRET: &str = "projection-old-secret-547";
+    const NEW_SECRET: &str = "projection-new-secret-547";
+    const HISTORICAL_SECRET: &str = "projection-historical-secret-547";
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let project = tempfile::tempdir().unwrap();
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_ssh_keys = false;
+    extended.redact.scan_dotenv = true;
+    extended.redact.denylist = vec![OLD_SECRET.into()];
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+        stub_providers_config(),
+        extended,
+    ));
+    let (state, session_id) = attached_state(&ctx, project.path()).await;
+    let handle = &state.attached.as_ref().unwrap().handle;
+    let previous = handle.current_projection_redaction_table().await.unwrap();
+    assert_eq!(previous.scrub("public text"), "public text");
+    assert!(!previous.scrub(OLD_SECRET).contains(OLD_SECRET));
+    handle.set_redaction_table_for_test(Arc::new(
+        previous
+            .with_forced_literal(HISTORICAL_SECRET.into(), "$test:historical".into())
+            .unwrap(),
+    ));
+    std::fs::write(
+        project.path().join(".env"),
+        format!("API_TOKEN={NEW_SECRET}\n"),
+    )
+    .unwrap();
+    // The installed generation is current in memory: binding-only checks
+    // would return it without ever looking at this new dotenv secret.
+    assert!(handle.redaction_table().ensure_binding_current().is_ok());
+    let mut root = proto::CodeRootReadV1 {
+        root_id: proto::CodeRootIdV1(session_id),
+        workspace_path: project.path().to_string_lossy().into_owned(),
+        title: Some("Resume real work".into()),
+        short_id: "res547".into(),
+        project_id: "project547".into(),
+        active_agent: "Build".into(),
+        active_agent_path: vec!["Build".into()],
+        foreground_target: None,
+        active_subagent: None,
+        active_model_state: None,
+        history: vec![proto::HistoryEntry::User {
+            text: format!("public history {OLD_SECRET} {NEW_SECRET} {HISTORICAL_SECRET}"),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            client_submission_ids: Vec::new(),
+            ts_ms: 0,
+            seq: 1,
+            origin_principal: None,
+        }],
+        paused_work: Vec::new(),
+        repair_required: None,
+        daemon_version: proto::DAEMON_VERSION.into(),
+        env_baseline: None,
+        env_session: None,
+        env_drift: None,
+        env_policy_applied: Default::default(),
+        btw_fork: None,
+        attention: Vec::new(),
+    };
+    let mut replay = Vec::new();
+    scrub_code_root_read_current(&mut root, handle, &mut replay).await;
+    assert_eq!(root.title.as_deref(), Some("Resume real work"));
+    let proto::HistoryEntry::User { text, .. } = &root.history[0] else {
+        panic!("user history")
+    };
+    assert!(text.starts_with("public history "), "{text}");
+    assert!(!text.contains(OLD_SECRET), "{text}");
+    assert!(!text.contains(NEW_SECRET), "{text}");
+    assert!(!text.contains(HISTORICAL_SECRET), "{text}");
+    assert!(
+        matches!(replay.as_slice(), [proto::Event::RedactionCoverageStatus {
+        session_id: Some(id), unavailable: None,
+    }] if *id == session_id)
+    );
+    ctx.registry.coverage_authority().invalidate();
+    assert!(previous.ensure_binding_current().is_err());
+    let refreshed = handle.current_projection_redaction_table().await.unwrap();
+    assert_eq!(
+        refreshed.scrub("real transcript on branch main"),
+        "real transcript on branch main"
+    );
+    assert!(!refreshed.scrub(NEW_SECRET).contains(NEW_SECRET));
+    ctx.registry.coverage_authority().shutdown();
+    replay.clear();
+    scrub_code_root_read_current(&mut root, handle, &mut replay).await;
+    assert_eq!(
+        root.title.as_deref(),
+        Some(crate::redact::COVERAGE_WITHHELD_PLACEHOLDER)
+    );
+    let proto::HistoryEntry::User { text, .. } = &root.history[0] else {
+        panic!("user history")
+    };
+    assert_eq!(text, crate::redact::COVERAGE_WITHHELD_PLACEHOLDER);
+    assert!(
+        matches!(replay.as_slice(), [proto::Event::RedactionCoverageStatus {
+        session_id: Some(id), unavailable: Some(proto::RedactionCoverageFailure::CaptureFailed),
+    }] if *id == session_id)
+    );
+    let _ = ctx.registry.drain_all(Duration::ZERO).await;
+}
+
+/// #527 follow-up: a ready construction that failed on boot redaction
+/// coverage reports the typed cause on the locked hello, so onboarding can
+/// name the remedy instead of only pointing at daemon.log.
+#[test]
+fn ready_construction_failure_names_the_typed_coverage_cause() {
+    let over_budget = anyhow::Error::new(
+        crate::redact::coverage_authority::CoverageError::ArtifactOverBudget {
+            ssh_key_material: true,
+        },
+    )
+    .context("admitting daemon boot redaction coverage")
+    .context("constructing ready services");
+    let failure = ready_construction_failure_of(&over_budget);
+    assert_eq!(
+        failure,
+        cockpit_proto::ReadyConstructionFailure::RedactionCoverage(
+            cockpit_proto::RedactionCoverageFailure::SshKeysOverBudget
+        )
+    );
+    assert!(
+        failure.message().contains("redact.ssh_key_dir"),
+        "{}",
+        failure.message()
+    );
+    assert_eq!(
+        ready_construction_failure_of(&anyhow::anyhow!("unrelated")),
+        cockpit_proto::ReadyConstructionFailure::Unclassified
+    );
+}
+
+/// A real authority invalidation between scrubbing and publication must
+/// produce typed withholding, rather than an unexplained stale placeholder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projection_scrub_invalidation_is_explained_and_healthy_scrub_runs_once() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let project = tempfile::tempdir().unwrap();
+    let ctx = test_ctx();
+    let (state, _) = attached_state(&ctx, project.path()).await;
+    let handle = &state.attached.as_ref().unwrap().handle;
+    let table = handle.current_projection_redaction_table().await.unwrap();
+    let mut response = Response::DocsAnswer {
+        answer: "public transcript".into(),
+    };
+    let mut passes = 0;
+    let result = scrub_with_current_coverage(&mut response, &table, |value, table| {
+        passes += 1;
+        scrub_response_free_text(value, table);
+        if passes == 1 {
+            ctx.registry.coverage_authority().invalidate();
+        }
+    });
+    assert_eq!(result, Err(proto::RedactionCoverageFailure::SourcesChanged));
+    assert_eq!(
+        passes, 2,
+        "one ordinary scrub, one fail-closed withholding pass"
+    );
+    let Response::DocsAnswer { answer } = response else {
+        panic!("docs answer")
+    };
+    assert_eq!(answer, crate::redact::COVERAGE_WITHHELD_PLACEHOLDER);
+
+    let table = handle.current_projection_redaction_table().await.unwrap();
+    let mut response = Response::DocsAnswer {
+        answer: "public transcript".into(),
+    };
+    let mut passes = 0;
+    let result = scrub_with_current_coverage(&mut response, &table, |value, table| {
+        passes += 1;
+        scrub_response_free_text(value, table);
+    });
+    assert_eq!(result, Ok(()));
+    assert_eq!(passes, 1, "healthy projections must not be scrubbed twice");
+    let Response::DocsAnswer { answer } = response else {
+        panic!("docs answer")
+    };
+    assert_eq!(answer, "public transcript");
+    let _ = ctx.registry.drain_all(Duration::ZERO).await;
 }

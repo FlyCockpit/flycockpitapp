@@ -729,6 +729,13 @@ pub enum TurnEvent {
         message: Option<String>,
     },
 
+    /// Coverage for the attachment projection (`Some(session_id)`) or the
+    /// daemon-global owner-response backstop (`None`).
+    RedactionCoverageStatus {
+        session_id: Option<uuid::Uuid>,
+        unavailable: Option<cockpit_proto::RedactionCoverageFailure>,
+    },
+
     /// Remote relay connector state changed — daemon-global and UI-only.
     #[cfg(feature = "remote")]
     ConnectorStatus {

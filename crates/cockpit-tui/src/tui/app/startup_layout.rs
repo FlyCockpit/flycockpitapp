@@ -420,7 +420,10 @@ enum OnboardingReadyWait {
     Ready(cockpit_client::DaemonClient),
     /// A locked owner reports that construction failed; the client is a
     /// connection to that locked owner (the only place a retry is valid).
-    ConstructionFailed(cockpit_client::DaemonClient),
+    ConstructionFailed(
+        cockpit_client::DaemonClient,
+        cockpit_proto::ReadyConstructionFailure,
+    ),
 }
 
 /// Wait on the daemon's explicit readiness signal: a locked owner answers
@@ -484,10 +487,10 @@ async fn wait_for_ready_onboarding_daemon(
                     progress.set(OnboardingHandoffPhase::PreparingServices);
                 }
                 Ok(cockpit_client::OwnerPhase::Bootstrap(
-                    cockpit_proto::LockedReadyConstruction::Failed,
+                    cockpit_proto::LockedReadyConstruction::Failed { reason },
                 )) => {
                     let client = held.take().expect("held locked client");
-                    return Ok(OnboardingReadyWait::ConstructionFailed(client));
+                    return Ok(OnboardingReadyWait::ConstructionFailed(client, reason));
                 }
                 Ok(cockpit_client::OwnerPhase::Bootstrap(
                     cockpit_proto::LockedReadyConstruction::AwaitingSecureStore,
@@ -510,6 +513,38 @@ async fn wait_for_ready_onboarding_daemon(
     }
 }
 
+/// What the onboarding screen says when ready construction failed twice:
+/// the daemon's typed cause, never only a pointer at daemon.log (#527).
+fn onboarding_construction_failed_message(
+    reason: cockpit_proto::ReadyConstructionFailure,
+) -> String {
+    format!(
+        "Cockpit could not finish preparing its services: {}",
+        reason.message()
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn onboarding_construction_failure_explains_coverage_budget() {
+    let message = onboarding_construction_failed_message(
+        cockpit_proto::ReadyConstructionFailure::RedactionCoverage(
+            cockpit_proto::RedactionCoverageFailure::SshKeysOverBudget,
+        ),
+    );
+    assert!(
+        message.contains("redaction coverage memory budget"),
+        "{message}"
+    );
+    assert!(message.contains("redact.ssh_key_dir"), "{message}");
+    assert!(message.contains("redact.scan_ssh_keys"), "{message}");
+    let unknown = onboarding_construction_failed_message(
+        cockpit_proto::ReadyConstructionFailure::Unclassified,
+    );
+    assert!(unknown.contains("daemon.log"));
+    assert!(!unknown.contains("SSH"));
+}
+
 /// Wait until the daemon serves ready services and return a retained ready
 /// connection. A construction the locked owner reports as failed is retried
 /// at most once, and only through that locked owner: a ready daemon never
@@ -527,12 +562,10 @@ async fn await_onboarding_ready_services(
             .await?
         {
             OnboardingReadyWait::Ready(client) => return Ok(client),
-            OnboardingReadyWait::ConstructionFailed(_) if retried => {
-                return Err(
-                    "Cockpit could not finish preparing its services; see daemon.log".into(),
-                );
+            OnboardingReadyWait::ConstructionFailed(_, reason) if retried => {
+                return Err(onboarding_construction_failed_message(reason));
             }
-            OnboardingReadyWait::ConstructionFailed(locked) => {
+            OnboardingReadyWait::ConstructionFailed(locked, _) => {
                 retried = true;
                 progress.set(OnboardingHandoffPhase::PreparingServices);
                 match within_deadline(

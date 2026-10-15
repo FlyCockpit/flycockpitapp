@@ -178,8 +178,11 @@ pub enum LockedReadyConstruction {
     /// once construction completes.
     Constructing,
     /// The vault committed but ready construction failed. The owner stays
-    /// locked and accepts `retry_onboarding_ready_construction`.
-    Failed,
+    /// locked and accepts `retry_onboarding_ready_construction`. `reason` is
+    /// the typed, content-free cause a client shows the user.
+    Failed {
+        reason: crate::ReadyConstructionFailure,
+    },
 }
 
 /// Redacted metadata sent after local peer authentication while normal daemon

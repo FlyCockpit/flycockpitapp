@@ -105,6 +105,11 @@ impl std::error::Error for RedactionTableUnavailable {}
 mod command_output;
 pub(crate) mod coverage_authority;
 pub(crate) mod coverage_bindings;
+
+/// What a [`RedactionTable::withholding_all`] table substitutes for every
+/// non-empty string: text withheld because coverage was unavailable, not a
+/// matched secret.
+pub const COVERAGE_WITHHELD_PLACEHOLDER: &str = "[withheld: redaction coverage unavailable]";
 mod dotenv;
 pub(crate) use dotenv::{
     UnanchoredRedactionSourcePath, matched_dotenv_sources, resolve_explicit_dotenv_path,
@@ -1107,6 +1112,10 @@ pub struct RedactionTable {
     /// tell whether the table still covers them. `None` for a table that is
     /// not (derived from) a capture.
     source_freshness: Option<std::sync::Arc<MachineSourceFreshness>>,
+    /// `true` only for [`Self::withholding_all`]: every non-empty string is
+    /// replaced with [`COVERAGE_WITHHELD_PLACEHOLDER`]. Used where a
+    /// response must still be delivered but no current coverage exists.
+    withhold_all: bool,
     /// Test-only fault injection: when set, [`Self::enforced_checked`] returns
     /// an error, so a caller's fail-closed-before-side-effect path (e.g. the
     /// external-harness runner constructing its scrub view before spawning a
@@ -1602,6 +1611,7 @@ impl RedactionTable {
                 protected_path_conflicts,
                 coverage_binding: None,
                 source_freshness: None,
+                withhold_all: false,
                 #[cfg(test)]
                 fail_enforced_view: false,
             });
@@ -1648,6 +1658,7 @@ impl RedactionTable {
             protected_path_conflicts,
             coverage_binding: None,
             source_freshness: None,
+            withhold_all: false,
             #[cfg(test)]
             fail_enforced_view: false,
         })
@@ -1859,6 +1870,7 @@ impl RedactionTable {
             protected_path_conflicts: self.protected_path_conflicts.clone(),
             coverage_binding: self.coverage_binding.clone(),
             source_freshness: self.source_freshness.clone(),
+            withhold_all: self.withhold_all,
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
         }
@@ -2011,6 +2023,12 @@ impl RedactionTable {
     /// no-table-or-disabled path returns a borrowed input, and a configured
     /// table with no match also avoids allocating.
     pub fn scrub_cow<'a>(&self, body: &'a str) -> Cow<'a, str> {
+        if self.withhold_all {
+            if body.is_empty() {
+                return Cow::Borrowed(body);
+            }
+            return Cow::Borrowed(COVERAGE_WITHHELD_PLACEHOLDER);
+        }
         if self.coverage_binding_stale() {
             if body.is_empty() {
                 return Cow::Borrowed(body);
@@ -2206,6 +2224,7 @@ impl RedactionTable {
             protected_path_conflicts: self.protected_path_conflicts.clone(),
             coverage_binding: self.coverage_binding.clone(),
             source_freshness: self.source_freshness.clone(),
+            withhold_all: self.withhold_all,
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
         }
@@ -2452,6 +2471,20 @@ impl RedactionTable {
         }
     }
 
+    /// A table that withholds every non-empty string, replacing it with
+    /// [`COVERAGE_WITHHELD_PLACEHOLDER`]. It carries no entries and no
+    /// binding. The owner response backstop uses it when current
+    /// daemon-global coverage cannot be established, so the response is
+    /// still delivered fail-closed and the client is told why
+    /// (`Event::RedactionCoverageStatus`) instead of seeing secrets'
+    /// placeholders in place of ordinary text.
+    pub(crate) fn withholding_all() -> Self {
+        Self {
+            withhold_all: true,
+            ..Self::empty()
+        }
+    }
+
     /// A no-op table that scrubs nothing, because it has no entries. Used as a
     /// fallback when a redaction chokepoint object is needed but the table couldn't be built
     /// (the chokepoint still *runs* — it just has an empty table), and as the
@@ -2474,6 +2507,7 @@ impl RedactionTable {
             protected_path_conflicts: Vec::new(),
             coverage_binding: None,
             source_freshness: None,
+            withhold_all: false,
             #[cfg(test)]
             fail_enforced_view: false,
         }

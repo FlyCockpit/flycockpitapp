@@ -11,7 +11,7 @@
 //! source of truth. Every pill draws only from daemon/launch-provided
 //! state; setup retains its explicit loading state until the mode arrives.
 //! Lower-priority pills collapse into a counted `more` chip in the priority
-//! order [`HeaderPillKind`] declares (attention, tool, agent, task, timer,
+//! order [`HeaderPillKind`] declares (attention, coverage, update, tool, agent, task, timer,
 //! skill, pins, longcache, setup, lock, side, caffeinate), so narrow widths
 //! deterministically retain the highest-priority active indicator.
 
@@ -45,6 +45,8 @@ pub const HEADER_COLLAPSE_PROBE_WIDTHS: [u16; 3] = [80, 56, 40];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum HeaderPillKind {
     Attention,
+    /// Redaction coverage is unavailable, so response text is withheld.
+    Coverage,
     Update,
     Tool,
     Agent,
@@ -67,8 +69,9 @@ impl HeaderPillKind {
     /// Every kind, in priority order. The button inventory derives its
     /// header coverage from this list.
     #[cfg(not(feature = "remote"))]
-    pub(crate) const ALL: [HeaderPillKind; 13] = [
+    pub(crate) const ALL: [HeaderPillKind; 14] = [
         HeaderPillKind::Attention,
+        HeaderPillKind::Coverage,
         HeaderPillKind::Update,
         HeaderPillKind::Tool,
         HeaderPillKind::Agent,
@@ -83,8 +86,9 @@ impl HeaderPillKind {
         HeaderPillKind::Caffeinate,
     ];
     #[cfg(feature = "remote")]
-    pub(crate) const ALL: [HeaderPillKind; 15] = [
+    pub(crate) const ALL: [HeaderPillKind; 16] = [
         HeaderPillKind::Attention,
+        HeaderPillKind::Coverage,
         HeaderPillKind::Update,
         HeaderPillKind::Tool,
         HeaderPillKind::Agent,
@@ -202,7 +206,7 @@ pub(crate) struct ChatHeaderLayout {
     pub more_button: Option<(usize, Rect)>,
     /// Pills collapsed behind `more`, in priority order, with full labels.
     pub collapsed: Vec<HeaderPill>,
-    /// Full labels collapse to terse labels before the path is elided.
+    /// Full labels collapse to terse labels when the pill cluster needs it.
     pub compact_pills: bool,
 }
 
@@ -271,15 +275,13 @@ pub(crate) fn plan_chat_header(state: &ChatHeaderState, area: Rect) -> ChatHeade
     if area.height < 3 {
         return layout;
     }
-    let full_left_w: u16 = launch_path_spans(&state.path, state.git.as_ref(), u16::MAX)
-        .iter()
-        .map(|span| display_width(span.content.as_ref()))
-        .sum();
+    // A long cwd must not erase activity details (update version, counts,
+    // coverage reason) when the pills themselves fit. The path already has
+    // its own width-aware elision at paint time. Reserve a short path slot,
+    // independent of the actual cwd length, before compacting the cluster.
+    let budget = area.width.saturating_sub(CLUSTER_GAP);
     let full_labels: Vec<&str> = state.pills.iter().map(|pill| pill.label.as_str()).collect();
-    let compact = cluster_width(&full_labels)
-        .saturating_add(3)
-        .saturating_add(full_left_w)
-        > area.width;
+    let compact = cluster_width(&full_labels) > budget.saturating_sub(12.min(budget / 3));
     layout.compact_pills = compact;
     let planned_pills: Vec<HeaderPill> = state
         .pills
@@ -293,7 +295,6 @@ pub(crate) fn plan_chat_header(state: &ChatHeaderState, area: Rect) -> ChatHeade
             },
         })
         .collect();
-    let budget = area.width.saturating_sub(CLUSTER_GAP);
     let (visible, more) = plan_pill_cluster(&planned_pills, budget);
 
     // Right-align: walk from the right edge leftward, placing the `more`
@@ -348,6 +349,7 @@ pub(crate) fn plan_chat_header(state: &ChatHeaderState, area: Rect) -> ChatHeade
 fn compact_pill_label(pill: &HeaderPill) -> String {
     match pill.kind {
         HeaderPillKind::Attention => pill.label.replace("attention", "attn"),
+        HeaderPillKind::Coverage => "⚠ withheld".to_string(),
         HeaderPillKind::Update => "update".to_string(),
         HeaderPillKind::Tool => pill.label.clone(),
         HeaderPillKind::Agent => pill
@@ -838,6 +840,36 @@ mod tests {
         assert!(rects.last().expect("pills painted").right() <= 120);
         assert!(layout.more_button.is_none());
         assert!(layout.collapsed.is_empty());
+    }
+
+    #[test]
+    fn long_paths_do_not_compact_pills_that_fit() {
+        let mut state = ChatHeaderState {
+            pills: vec![
+                pill(HeaderPillKind::Update, "update 9.9.9"),
+                pill(HeaderPillKind::Task, "task 2"),
+                pill(HeaderPillKind::Timer, "timer 1"),
+                pill(HeaderPillKind::Setup, "Setup: Code"),
+            ],
+            ..full_state()
+        };
+        for path in ["/repo".to_string(), format!("/{}/repo", "long/".repeat(40))] {
+            state.path = path;
+            let layout = plan_chat_header(&state, area(100));
+            assert!(!layout.compact_pills);
+            assert!(layout.collapsed.is_empty());
+            assert_eq!(layout.pill_buttons.len(), state.pills.len());
+        }
+        // The same real state must still fit and remain reachable when narrow.
+        let narrow = plan_chat_header(&state, area(40));
+        assert!(narrow.compact_pills);
+        assert_eq!(narrow.active_kinds().len(), state.pills.len());
+        assert!(
+            narrow
+                .pill_buttons
+                .iter()
+                .all(|(_, rect)| rect.right() <= 40)
+        );
     }
 
     #[test]

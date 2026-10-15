@@ -71,6 +71,23 @@ fn apply_list(rail: &mut SessionRail, sessions: Vec<SessionSummary>) {
     rail.apply_sessions_result(generation, attachment, Ok(sessions));
 }
 
+#[test]
+fn session_title_survives_rail_search_and_discards_on_attachment_change() {
+    let id = Uuid::new_v4();
+    let mut row = summary(id, 1);
+    row.title = Some("Resume real work".into());
+    let mut rail = test_rail(Vec::new());
+    apply_list(&mut rail, vec![row]);
+    rail.focus_search();
+    rail.paste("no matching title");
+    assert!(rail.visible_cards().is_empty());
+    let loaded = rail.session_summary(id).expect("loaded attached summary");
+    assert_eq!(loaded.title.as_deref(), Some("Resume real work"));
+    assert_eq!(card_description(loaded), "Resume real work");
+    rail.discard_for_attachment_change();
+    assert!(rail.session_summary(id).is_none());
+}
+
 fn start_archive(rail: &mut SessionRail) -> SessionsMutationEffect {
     rail.handle_key(press(KeyCode::Char('d')));
     rail.handle_key(press(KeyCode::Right));

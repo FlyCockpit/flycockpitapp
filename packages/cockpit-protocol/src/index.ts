@@ -15,6 +15,7 @@ import {
   onboardingReceiptQuerySchema,
   onboardingTransitionReceiptSchema,
   onboardingTransitionResultSchema,
+  redactionCoverageStatusSchema,
 } from "./onboarding";
 import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./remote-protocol-id";
 
@@ -2873,6 +2874,7 @@ export const knownEventKindSchema = z.enum([
   "context_projection",
   "daemon_draining",
   "daemon_lifetime_changed",
+  "redaction_coverage_status",
   "default_model_update_result",
   "delegation_recursion_state",
   "env_drift_warning",
@@ -3241,6 +3243,7 @@ const structuredEventDataSchemas = {
   agent_tree_changed: agentTreeChangedDataSchema,
   default_model_update_result: defaultModelUpdateResultDataSchema,
   daemon_lifetime_changed: daemonLifetimeChangedDataSchema,
+  redaction_coverage_status: redactionCoverageStatusSchema,
   event_stream_lagged: eventStreamLaggedDataSchema,
   history_replay: historyReplayDataSchema,
   host_capabilities_changed: hostCapabilitiesChangedDataSchema,

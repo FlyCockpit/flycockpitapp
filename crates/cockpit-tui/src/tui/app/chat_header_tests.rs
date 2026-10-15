@@ -9,6 +9,7 @@ use super::{
 use crate::tui::chat_header::{HEADER_COLLAPSE_PROBE_WIDTHS, HeaderPillKind};
 use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
 use crate::tui::rules_overlay::RulesReview;
+use cockpit_client::presentation::TurnEvent;
 use cockpit_config::config::update_channel::UpdateChannel;
 use cockpit_core::updater::{
     ManualUpdateOutcome, UpdateCheckResult, UpdateStatusSnapshot, Updater, UpdaterError,
@@ -1276,4 +1277,106 @@ fn question_dialog() -> crate::tui::dialog::question::QuestionDialog {
         },
         std::time::Duration::ZERO,
     )
+}
+
+/// #547: when the daemon withholds response text because redaction coverage
+/// is unavailable, the TUI says so — a header warning pill and one
+/// transcript line naming the typed cause — instead of silently showing
+/// placeholders; the pill clears when coverage is back.
+#[test]
+fn redaction_coverage_unavailable_is_a_visible_explained_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut app = App::new(Some(tmp.path()), false);
+    let has_pill = |app: &App| {
+        app.chat_header_state()
+            .pills
+            .iter()
+            .any(|pill| pill.kind == HeaderPillKind::Coverage)
+    };
+    assert!(!has_pill(&app));
+    let before = app.history.len();
+    app.apply_event(TurnEvent::RedactionCoverageStatus {
+        session_id: None,
+        unavailable: Some(cockpit_proto::RedactionCoverageFailure::SshKeysOverBudget),
+    });
+    assert!(has_pill(&app));
+    // A repeated notice (every withheld response sends one) adds no line.
+    app.apply_event(TurnEvent::RedactionCoverageStatus {
+        session_id: None,
+        unavailable: Some(cockpit_proto::RedactionCoverageFailure::SshKeysOverBudget),
+    });
+    let lines: Vec<String> = (before..app.history.len())
+        .filter_map(|index| match app.history.get(index) {
+            Some(HistoryEntry::Plain { line }) => Some(line.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("redact.ssh_key_dir"), "{lines:?}");
+    assert!(
+        lines[0].contains(cockpit_core::redact::COVERAGE_WITHHELD_PLACEHOLDER),
+        "{lines:?}"
+    );
+    app.apply_event(TurnEvent::RedactionCoverageStatus {
+        session_id: None,
+        unavailable: None,
+    });
+    assert!(!has_pill(&app));
+}
+
+#[test]
+fn coverage_header_keeps_global_and_attachment_state_separate() {
+    use cockpit_proto::RedactionCoverageFailure as F;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    let session_id = Uuid::new_v4();
+    app.launch.session_id = Some(session_id);
+    app.apply_event(TurnEvent::RedactionCoverageStatus {
+        session_id: Some(session_id),
+        unavailable: Some(F::SshKeysOverBudget),
+    });
+    // A healthy global backstop cannot clear withheld session history.
+    app.apply_event(TurnEvent::RedactionCoverageStatus {
+        session_id: None,
+        unavailable: None,
+    });
+    assert_eq!(
+        app.header_coverage_unavailable(),
+        Some(F::SshKeysOverBudget)
+    );
+    app.activate_header_pill(HeaderPillKind::Coverage);
+    assert!(
+        app.toast
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("redact.ssh_key_dir")
+    );
+    app.apply_event(TurnEvent::RedactionCoverageStatus {
+        session_id: None,
+        unavailable: Some(F::Busy),
+    });
+    // Nor can a recovered session hide a daemon-global failure.
+    app.apply_event(TurnEvent::RedactionCoverageStatus {
+        session_id: Some(session_id),
+        unavailable: None,
+    });
+    assert_eq!(app.header_coverage_unavailable(), Some(F::Busy));
+    // Late status from an abandoned session cannot poison the current one.
+    app.apply_event(TurnEvent::RedactionCoverageStatus {
+        session_id: Some(Uuid::new_v4()),
+        unavailable: Some(F::SourcesOverBudget),
+    });
+    assert_eq!(app.header_coverage_unavailable(), Some(F::Busy));
+    app.apply_event(TurnEvent::RedactionCoverageStatus {
+        session_id: None,
+        unavailable: None,
+    });
+    assert_eq!(app.header_coverage_unavailable(), None);
+    assert!(
+        !app.chat_header_state()
+            .pills
+            .iter()
+            .any(|p| p.kind == HeaderPillKind::Coverage)
+    );
 }

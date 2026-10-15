@@ -42,10 +42,9 @@ use crate::daemon::registry::SessionRegistry;
 use crate::daemon::scheduler::DaemonSchedulerHandle;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
-use crate::daemon::{
-    EventEnvelope, EventReceiver, EventSender, SharedRedactionTable, current_redaction, send_event,
-    set_current_redaction,
-};
+use crate::daemon::{EventEnvelope, EventReceiver, EventSender, send_event, set_current_redaction};
+#[cfg(test)]
+use crate::daemon::{SharedRedactionTable, current_redaction};
 use crate::db::Db;
 use crate::env_snapshot::{
     EnvDiffSummary, EnvDriftPolicy, EnvSnapshot, EnvSnapshotMeta, EnvSnapshotSource,
@@ -274,11 +273,9 @@ async fn acquire_daemon_global_coverage(
             Ok(build.with_publish_fence(publish_fence))
         })
         .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        .map_err(anyhow::Error::new)?;
     let (key, epoch) = admission.acquisition_stamp();
-    let table = admission
-        .install_table()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let table = admission.install_table().map_err(anyhow::Error::new)?;
     Ok(crate::daemon::global_coverage::AdmittedGlobalCoverage {
         table: Arc::new(table),
         stamp: crate::daemon::global_coverage::CoverageStamp::new(key, epoch),
@@ -1264,6 +1261,44 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
     }
 }
 
+/// Scrub a code-root attach projection with the session's *current* coverage
+/// (#547). When none can be established every free-text field is withheld
+/// and the client is told why through the attach replay.
+pub(super) async fn scrub_code_root_read_current(
+    root: &mut proto::CodeRootReadV1,
+    handle: &SessionWorkerHandle,
+    pending_replay: &mut Vec<proto::Event>,
+) {
+    let unavailable = match handle.current_projection_redaction_table().await {
+        Ok(table) => scrub_with_current_coverage(root, &table, scrub_code_root_read).err(),
+        Err(reason) => {
+            scrub_code_root_read(root, &RedactionTable::withholding_all());
+            Some(reason)
+        }
+    };
+    pending_replay.push(proto::Event::RedactionCoverageStatus {
+        session_id: Some(handle.session_id()),
+        unavailable,
+    });
+}
+
+/// A projection may span several strings. Revalidate after the whole scrub:
+/// an invalidation during it must not leave a mixture of real text and the
+/// stale-table secret placeholder with no explanation. No result escapes
+/// this boundary until it is current or explicitly withheld.
+fn scrub_with_current_coverage<T>(
+    value: &mut T,
+    table: &RedactionTable,
+    mut scrub: impl FnMut(&mut T, &RedactionTable),
+) -> std::result::Result<(), proto::RedactionCoverageFailure> {
+    scrub(value, table);
+    if let Err(error) = table.ensure_binding_current() {
+        scrub(value, &RedactionTable::withholding_all());
+        return Err(error.failure_reason());
+    }
+    Ok(())
+}
+
 pub(super) fn scrub_code_root_read(root: &mut proto::CodeRootReadV1, redact: &RedactionTable) {
     scrub_string(&mut root.workspace_path, redact);
     scrub_option_string(&mut root.title, redact);
@@ -1405,6 +1440,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             dropped: _,
         }
         | proto::Event::DaemonDraining { forced: _ }
+        | proto::Event::RedactionCoverageStatus { .. }
         | proto::Event::DaemonLifetimeChanged { ephemeral_owner: _ } => {}
         #[cfg(feature = "extended")]
         proto::Event::ImageControlConfigChanged { event: _ } => {}
@@ -2891,7 +2927,9 @@ pub struct DaemonContext {
     /// [`proto::Event::CaffeinateState`] reaches *all* connected clients.
     global_events: EventSender,
     /// Read side of the published daemon-global table (the same cell
-    /// `global_coverage` publishes into).
+    /// `global_coverage` publishes into). Test-only: production reads go
+    /// through `global_coverage`, which never hands out a stale table.
+    #[cfg(test)]
     global_redaction: SharedRedactionTable,
     /// Publication state of the daemon-global table: the one place the table
     /// and its freshness stamps are published together, monotonically, by
@@ -3066,8 +3104,16 @@ pub(crate) fn test_context_for_daemon_modules() -> Arc<DaemonContext> {
 }
 
 impl DaemonContext {
-    pub(crate) fn current_global_redaction(&self) -> Arc<RedactionTable> {
-        current_redaction(&self.global_redaction)
+    /// A current daemon-global table (republished when stale), or the typed
+    /// reason none can be established. Never the merely published table:
+    /// that one may be stale and scrub every string to the placeholder.
+    pub(crate) async fn current_global_redaction(
+        &self,
+    ) -> std::result::Result<Arc<RedactionTable>, proto::RedactionCoverageFailure> {
+        self.global_coverage
+            .current_or_republish()
+            .await
+            .map_err(|error| crate::redact::coverage_authority::coverage_failure_reason(&error))
     }
 
     /// Whether this owner still follows last-client ephemeral teardown.
@@ -3564,6 +3610,7 @@ impl DaemonContext {
             &secret_vault,
             registry.downgrade(),
         );
+        #[cfg(test)]
         let global_redaction = global_coverage.shared_table();
         // MCP connections retain only the vault handle, not the full daemon
         // context. Install the owner publication seam here so an in-band
@@ -3743,6 +3790,7 @@ impl DaemonContext {
             started_at,
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,
+            #[cfg(test)]
             global_redaction,
             global_coverage,
             terminal_host,
@@ -5004,8 +5052,9 @@ async fn dispatch_locked_bootstrap_request(
             cockpit_proto::LockedReadyConstruction::Constructing => {
                 Err(anyhow::Error::new(ReadyConstructionInProgress))
             }
-            cockpit_proto::LockedReadyConstruction::Failed => Err(anyhow::anyhow!(
-                "ready services failed to start (see daemon.log); reopen cockpit or restart the daemon to retry"
+            cockpit_proto::LockedReadyConstruction::Failed { reason } => Err(anyhow::anyhow!(
+                "ready services failed to start ({}); reopen cockpit or restart the daemon to retry",
+                reason.message()
             )),
             cockpit_proto::LockedReadyConstruction::AwaitingSecureStore => {
                 Err(anyhow::anyhow!("bootstrap is locked"))
@@ -5375,6 +5424,10 @@ pub(crate) struct LockedServices {
     /// together with `vault_committed` (see
     /// [`LockedServices::ready_construction_phase`]).
     ready_construction_phase: std::sync::atomic::AtomicU8,
+    /// The typed cause of the latest failed construction, reported with the
+    /// `failed` phase so the onboarding client can explain it (#527).
+    /// `Unclassified` until a construction fails with a known cause.
+    ready_construction_failure: StdMutex<cockpit_proto::ReadyConstructionFailure>,
     /// Whether the durable vault authority exists: read at boot, set by
     /// secure-store materialization the moment the vault commits, and
     /// re-read from the durable authority after a materializer error. It
@@ -5625,6 +5678,23 @@ impl Drop for CommitStepGuard<'_> {
     }
 }
 
+/// The typed cause a failed ready construction reports: a redaction coverage
+/// refusal anywhere in the chain (boot coverage is the one construction step
+/// with user-actionable causes), otherwise `Unclassified`.
+fn ready_construction_failure_of(error: &anyhow::Error) -> cockpit_proto::ReadyConstructionFailure {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::redact::coverage_authority::CoverageError>())
+        .map_or(
+            cockpit_proto::ReadyConstructionFailure::Unclassified,
+            |coverage| {
+                cockpit_proto::ReadyConstructionFailure::RedactionCoverage(
+                    coverage.failure_reason(),
+                )
+            },
+        )
+}
+
 /// Outcome of [`LockedServices::start_ready_construction`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadyConstructionStart {
@@ -5784,6 +5854,9 @@ impl LockedServices {
             inflight_drained: tokio::sync::Notify::new(),
             ready_transition_inflight: AtomicBool::new(false),
             ready_construction_phase: std::sync::atomic::AtomicU8::new(READY_CONSTRUCTION_IDLE),
+            ready_construction_failure: StdMutex::new(
+                cockpit_proto::ReadyConstructionFailure::Unclassified,
+            ),
             vault_committed: Arc::new(AtomicBool::new(false)),
             opened_vault: StdMutex::new(None),
             onboarding_exclusion: tokio::sync::RwLock::new(()),
@@ -5841,12 +5914,28 @@ impl LockedServices {
     pub(crate) fn ready_construction_phase(&self) -> cockpit_proto::LockedReadyConstruction {
         match self.ready_construction_phase.load(Ordering::Acquire) {
             READY_CONSTRUCTION_RUNNING => cockpit_proto::LockedReadyConstruction::Constructing,
-            READY_CONSTRUCTION_FAILED => cockpit_proto::LockedReadyConstruction::Failed,
+            READY_CONSTRUCTION_FAILED => cockpit_proto::LockedReadyConstruction::Failed {
+                reason: *self
+                    .ready_construction_failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            },
             _ if self.vault_committed.load(Ordering::Acquire) => {
-                cockpit_proto::LockedReadyConstruction::Failed
+                cockpit_proto::LockedReadyConstruction::Failed {
+                    reason: cockpit_proto::ReadyConstructionFailure::Unclassified,
+                }
             }
             _ => cockpit_proto::LockedReadyConstruction::AwaitingSecureStore,
         }
+    }
+
+    /// Record the typed cause of a failed construction before the failed
+    /// phase is published.
+    fn record_ready_construction_failure(&self, failure: cockpit_proto::ReadyConstructionFailure) {
+        *self
+            .ready_construction_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = failure;
     }
 
     /// Record durable evidence that the vault authority exists. With
@@ -6067,6 +6156,11 @@ impl LockedServices {
             anyhow::bail!(reason);
         }
         self.closing.store(true, Ordering::Release);
+        // A retry owns a new attempt. Cancellation/drop before a typed
+        // failure is recorded must not resurrect the previous attempt's cause.
+        self.record_ready_construction_failure(
+            cockpit_proto::ReadyConstructionFailure::Unclassified,
+        );
         self.set_ready_construction_phase(READY_CONSTRUCTION_RUNNING);
         Ok(ReadyTransitionPermit::new(self.clone()))
     }
@@ -6169,15 +6263,19 @@ impl LockedServices {
             Ok::<_, anyhow::Error>(ctx)
         };
         let outcome = match tokio::time::timeout(READY_CONSTRUCTION_TIMEOUT, construction).await {
-            Ok(outcome) => outcome,
-            Err(_) => Err(anyhow::anyhow!(
-                "onboarding ready construction exceeded its {}s deadline",
-                READY_CONSTRUCTION_TIMEOUT.as_secs()
+            Ok(outcome) => outcome.map_err(|error| (ready_construction_failure_of(&error), error)),
+            Err(_) => Err((
+                cockpit_proto::ReadyConstructionFailure::TimedOut,
+                anyhow::anyhow!(
+                    "onboarding ready construction exceeded its {}s deadline",
+                    READY_CONSTRUCTION_TIMEOUT.as_secs()
+                ),
             )),
         };
         match outcome {
             Ok(ctx) => Ok(ConstructedReady::new(self.clone(), ctx, permit)),
-            Err(error) => {
+            Err((failure, error)) => {
+                self.record_ready_construction_failure(failure);
                 permit.rollback();
                 Err(error)
             }
@@ -6581,10 +6679,10 @@ pub(crate) async fn in_process_boot_services(locked: LockedServices) -> Result<B
             if let Some(constructed) = locked.take_achieved_ready() {
                 return Ok(BootServices::Ready(constructed.publish_returned()));
             }
-        } else if locked.ready_construction_phase()
-            == cockpit_proto::LockedReadyConstruction::Failed
+        } else if let cockpit_proto::LockedReadyConstruction::Failed { reason } =
+            locked.ready_construction_phase()
         {
-            anyhow::bail!("in-process ready construction failed; see the daemon log");
+            anyhow::bail!("in-process ready construction failed: {}", reason.message());
         }
     }
 }
@@ -10180,8 +10278,12 @@ async fn handle_envelope(
                     #[cfg(not(feature = "remote"))]
                     let result =
                         run_concurrent_request_catching_panic(request, request_shared, ctx).await;
-                    let envelope =
-                        response_envelope_for_shared(id, result, &response_shared, &response_ctx);
+                    let (notice, envelope) =
+                        response_envelope_for_shared(id, result, &response_shared, &response_ctx)
+                            .await;
+                    if let Some(notice) = notice {
+                        let _ = send_writer_envelope(&writer_tx, notice).await;
+                    }
                     let _ = send_writer_envelope(&writer_tx, envelope).await;
                 });
                 return Ok(());
@@ -10234,7 +10336,14 @@ async fn handle_envelope(
                 *shared = state.shared_snapshot();
                 let _ = principal_tx.send(ClientEventAuthority::from_state(state));
             }
-            let envelope = response_envelope_for_shared(id, result, shared, ctx);
+            let (mut notice, envelope) =
+                response_envelope_for_shared(id, result, shared, ctx).await;
+            // Attachment adoption starts with its response. Deliver its
+            // coverage snapshot before replay, after the client can bind
+            // that replay to the replacement attachment.
+            if !attached && let Some(notice) = notice.take() {
+                let _ = send_writer_envelope(writer_tx, notice).await;
+            }
             let envelope_kind = envelope_kind(&envelope);
             let sent = if effects.shutdown_after_response {
                 send_writer_envelope_with_ack(writer_tx, envelope).await
@@ -10251,6 +10360,9 @@ async fn handle_envelope(
                     request_shutdown(ctx);
                 }
                 return Ok(());
+            }
+            if let Some(notice) = notice {
+                let _ = send_writer_envelope(writer_tx, notice).await;
             }
             if effects.shutdown_after_response {
                 request_shutdown(ctx);
@@ -10569,13 +10681,19 @@ async fn apply_concurrent_request_test_hook(request: &Request) {
     }
 }
 
-fn response_envelope_for_shared(
+/// The response envelope for one request, paired with a per-connection
+/// [`proto::Event::RedactionCoverageStatus`] snapshot when withholding,
+/// recovering, or adopting an attachment. Attachment snapshots include healthy
+/// state: a reconnect may have missed the daemon-global recovery edge.
+/// Socket attachment snapshots follow the response and precede replay.
+async fn response_envelope_for_shared(
     id: Uuid,
     result: std::result::Result<Response, ErrorPayload>,
     shared: &SharedClientState,
     ctx: &DaemonContext,
-) -> Envelope {
-    match result {
+) -> (Option<Envelope>, Envelope) {
+    let mut notice = None;
+    let envelope = match result {
         Ok(response) => {
             let response = if shared.principal.has_owner_level_authority() {
                 // Owner responses are trusted, but still pass through the
@@ -10585,8 +10703,49 @@ fn response_envelope_for_shared(
                 // is neutralized before it crosses the socket. This is a
                 // backstop; secret-bearing payloads must be sanitized
                 // structurally at their source (see `policy::export`).
+                //
+                // The table must be *current*: the published table goes stale
+                // on every authority invalidation (a config edit, a resolved
+                // command secret, a vault commit) and a stale table replaces
+                // every string with the placeholder (#547). When no current
+                // table can be established the free text is withheld with an
+                // explicit marker and the client is told why.
+                let mut coverage = ctx.global_coverage.owner_backstop().await;
                 let mut response = response;
-                scrub_response_free_text(&mut response, &current_redaction(&ctx.global_redaction));
+                if let Err(reason) = scrub_with_current_coverage(
+                    &mut response,
+                    &coverage.table,
+                    scrub_response_free_text,
+                ) {
+                    coverage.withheld = Some(reason);
+                    coverage.recovered = false;
+                    ctx.global_coverage.mark_owner_withheld();
+                }
+                if coverage.withheld.is_some()
+                    || coverage.recovered
+                    || matches!(
+                        &response,
+                        Response::Attached { .. }
+                            | Response::CodeRootCreated(_)
+                            | Response::CodeRootAttached(_)
+                            | Response::CodeRootWithAcpIngressCreated(_)
+                            | Response::CodeRootWithAcpIngressAttached(_)
+                    )
+                {
+                    notice = Some(Envelope::event(proto::Event::RedactionCoverageStatus {
+                        session_id: None,
+                        unavailable: coverage.withheld,
+                    }));
+                }
+                if coverage.recovered {
+                    let _ = ctx.global_events.send(crate::daemon::EventEnvelope {
+                        event: proto::Event::RedactionCoverageStatus {
+                            session_id: None,
+                            unavailable: None,
+                        },
+                        redact: crate::daemon::EventScrub::content_free(),
+                    });
+                }
                 Some(response)
             } else if let Some(attached) = shared.attached.as_ref() {
                 scrub_proto_response(response, &attached.redaction_table())
@@ -10615,7 +10774,8 @@ fn response_envelope_for_shared(
             Some(id),
             explain_revoked_owner_authority(normalize_database_storage_error(err), shared),
         ),
-    }
+    };
+    (notice, envelope)
 }
 
 /// A connection that lost its owner credential is downgraded to an

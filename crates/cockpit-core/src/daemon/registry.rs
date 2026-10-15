@@ -2628,12 +2628,8 @@ impl SessionRegistry {
                 },
             )
             .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let redact = std::sync::Arc::new(
-            admission
-                .install_table()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-        );
+            .map_err(anyhow::Error::new)?;
+        let redact = std::sync::Arc::new(admission.install_table().map_err(anyhow::Error::new)?);
         session.set_redaction_coverage(
             self.coverage_authority().clone(),
             coverage_key,

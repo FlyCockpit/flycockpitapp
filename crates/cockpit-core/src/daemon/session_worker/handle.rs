@@ -1924,6 +1924,49 @@ impl SessionWorkerHandle {
         current_redaction(&self.redaction)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_redaction_table_for_test(&self, table: Arc<RedactionTable>) {
+        crate::daemon::set_current_redaction(&self.redaction, table);
+    }
+
+    /// A *current* table for scrubbing a projection of this session sent to a
+    /// client (the code-root attach history). The installed table goes stale
+    /// on every coverage invalidation (a config edit, a resolved command
+    /// secret, a vault commit) until the next turn refreshes it, and a stale
+    /// table replaces every string with the placeholder (#547). When stale,
+    /// this acquires the session's current coverage and unions it with the
+    /// installed table, so entries the session accumulated are kept. Always
+    /// acquire at this boundary: an installed binding alone cannot detect a
+    /// file-backed source change that has not invalidated the authority. Never
+    /// installs the result: the worker's turn refresh owns that.
+    pub(crate) async fn current_projection_redaction_table(
+        &self,
+    ) -> std::result::Result<Arc<RedactionTable>, cockpit_proto::RedactionCoverageFailure> {
+        let installed = self.redaction_table();
+        let fresh = self
+            .acquire_redaction_coverage(
+                crate::redact::coverage_authority::CoverageScope::AttachProjection,
+            )
+            .await
+            .and_then(|admission| admission.install_table().map_err(anyhow::Error::new))
+            .map_err(|error| {
+                let reason = crate::redact::coverage_authority::coverage_failure_reason(&error);
+                tracing::warn!(
+                    reason = ?reason,
+                    error = %format!("{error:#}"),
+                    "session coverage unavailable for an attach projection; free text withheld"
+                );
+                reason
+            })?;
+        installed.union(&fresh).map(Arc::new).map_err(|error| {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "session coverage could not be combined with the installed table; free text withheld"
+            );
+            cockpit_proto::RedactionCoverageFailure::CaptureFailed
+        })
+    }
+
     pub(crate) fn coverage_publish_owners(
         &self,
         vault: std::sync::Arc<crate::secure_key::SecretVault>,
@@ -2069,7 +2112,7 @@ impl SessionWorkerHandle {
                 Ok(build.with_publish_fence(publish_fence))
             })
             .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            .map_err(anyhow::Error::new)?;
         // The operation boundary has awaited a complete, fenced publication;
         // advertise that generation before serving the sink so later
         // mutations revoke the current key rather than a stale startup key.

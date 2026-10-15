@@ -43,10 +43,9 @@ impl App {
     /// id. `None` until either is known — never a placeholder.
     fn chat_header_title(&self) -> Option<String> {
         if let Some(summary) = self
-            .session_rail
-            .visible_cards()
-            .into_iter()
-            .find(|summary| Some(summary.session_id) == self.launch.session_id)
+            .launch
+            .session_id
+            .and_then(|id| self.session_rail.session_summary(id))
         {
             let title = summary
                 .title
@@ -147,6 +146,13 @@ impl App {
             pills.push(HeaderPill {
                 kind: HeaderPillKind::Attention,
                 label: counted_label("attention", attention),
+            });
+        }
+
+        if self.header_coverage_unavailable().is_some() {
+            pills.push(HeaderPill {
+                kind: HeaderPillKind::Coverage,
+                label: "⚠ text withheld: redaction coverage unavailable".to_string(),
             });
         }
 
@@ -305,6 +311,13 @@ impl App {
             }
         }
         None
+    }
+
+    pub(super) fn header_coverage_unavailable(
+        &self,
+    ) -> Option<cockpit_proto::RedactionCoverageFailure> {
+        self.session_redaction_coverage_unavailable
+            .or(self.redaction_coverage_unavailable)
     }
 
     /// The skill auto-injected onto the current turn: the newest injection
@@ -520,6 +533,15 @@ impl App {
         self.chat_header_more_open = false;
         match kind {
             HeaderPillKind::Attention | HeaderPillKind::Agent => self.open_agent_tree(),
+            HeaderPillKind::Coverage => {
+                self.header_pill_selection = None;
+                if let Some(reason) = self.header_coverage_unavailable() {
+                    self.show_toast(
+                        super::redaction_coverage_withheld_text(reason),
+                        super::ToastKind::Warning,
+                    );
+                }
+            }
             HeaderPillKind::Update => self.header_pill_selection = None,
             HeaderPillKind::Tool => self.open_tools_pane(),
             HeaderPillKind::Task | HeaderPillKind::Timer => self.handle_schedule_command(""),

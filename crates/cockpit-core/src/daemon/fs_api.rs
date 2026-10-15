@@ -356,7 +356,12 @@ pub async fn get_extended_config_snapshot(
     snapshot_session_id: String,
 ) -> Result<Response, ErrorPayload> {
     let root = settings_snapshot_root(ctx, &project_root).await?;
-    let redaction = ctx.current_global_redaction();
+    let redaction = ctx.current_global_redaction().await.map_err(|reason| {
+        internal(format!(
+            "settings are unavailable because redaction coverage could not be established: {}",
+            reason.message()
+        ))
+    })?;
     // Runtime lifetime, not the boot-time path marker: in-place promotion
     // never rewrites `ctx.paths.ephemeral`.
     let ephemeral = ctx.is_ephemeral_lifetime();

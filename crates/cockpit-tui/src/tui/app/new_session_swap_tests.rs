@@ -2576,3 +2576,234 @@ async fn provisional_new_suppresses_model_selection_cancel_notice() {
         app.history
     );
 }
+
+/// #547: a resume attach advances the runner epoch and its events (the
+/// attach-time config snapshot among them) arrive before App adopts the
+/// switch outcome. Adopting the outcome must make that epoch visible and
+/// replay the held events; dropping them left the resumed session with no
+/// provider ("No provider is configured yet") and no live rendering.
+#[tokio::test]
+async fn resume_outcome_adopts_its_epoch_and_replays_held_events() {
+    use crate::tui::agent_runner::QueuedTurnEvent;
+    use cockpit_client::presentation::TurnEvent;
+
+    for preserve_history in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
+        seed_outgoing_model_and_config_chrome(&mut app);
+        app.visible_attachment_epoch = 1;
+        let outgoing = uuid::Uuid::new_v4();
+        let resumed = uuid::Uuid::new_v4();
+        app.launch.session_id = Some(outgoing);
+        app.session_redaction_coverage_unavailable =
+            Some(cockpit_proto::RedactionCoverageFailure::Busy);
+        let mut providers = app.config_snapshot.provider_view.clone();
+        let provider = providers.providers.remove("outgoing").unwrap();
+        providers.providers.insert("resumed".into(), provider);
+        providers.active_model.as_mut().unwrap().provider = "resumed".into();
+        let mut extended = app.config_snapshot.extended.clone();
+        extended.dialog.lockout_ms = 17;
+        let replacement_events = [
+            TurnEvent::ConfigSnapshot {
+                snapshot: Box::new(cockpit_proto::ConfigSnapshot {
+                    session_id: resumed,
+                    generation: 0,
+                    extended,
+                    providers,
+                }),
+            },
+            TurnEvent::RedactionCoverageStatus {
+                session_id: Some(resumed),
+                unavailable: Some(cockpit_proto::RedactionCoverageFailure::SshKeysOverBudget),
+            },
+            TurnEvent::Notice {
+                text: "held-before-outcome".into(),
+            },
+        ];
+        {
+            let runner = app.agent_runner.as_ref().unwrap().as_ref().unwrap();
+            runner.attachment_epoch.store(2, Ordering::Release);
+            let mut events = runner.events.lock().unwrap();
+            events.extend(replacement_events.into_iter().map(|event| QueuedTurnEvent {
+                attachment_epoch: 2,
+                event,
+            }));
+        }
+        // An abandoned buffered epoch must not be replayed into this session.
+        app.same_session_resync_event_buffer
+            .push_back(QueuedTurnEvent {
+                attachment_epoch: 0,
+                event: TurnEvent::Notice {
+                    text: "abandoned-epoch".into(),
+                },
+            });
+        assert!(app.drain_agent_events());
+        assert_eq!(app.same_session_resync_event_buffer.len(), 4);
+        let AsyncActionPayload::SessionSwitched(outcome) =
+            switch_outcome_with_epoch(resumed, "res001", 2)
+        else {
+            unreachable!()
+        };
+        let mut outcome = *outcome;
+        outcome.target = SessionTarget::Resume {
+            session_id: resumed,
+            since_seq: None,
+        };
+        if preserve_history {
+            app.apply_session_switch_outcome_preserving_history(outcome, true);
+        } else {
+            app.apply_session_switch_outcome(outcome);
+        }
+        assert_eq!(app.visible_attachment_epoch, 2);
+        assert!(app.same_session_resync_event_buffer.is_empty());
+        assert!(app.config_snapshot.from_daemon);
+        assert_eq!(
+            app.config_snapshot.generation, 0,
+            "new worker generations restart at zero"
+        );
+        assert_eq!(app.config_snapshot.extended.dialog.lockout_ms, 17);
+        assert!(
+            app.config_snapshot
+                .providers
+                .providers
+                .contains_key("resumed")
+        );
+        assert!(
+            !app.config_snapshot
+                .providers
+                .providers
+                .contains_key("outgoing")
+        );
+        assert_eq!(
+            app.header_coverage_unavailable(),
+            Some(cockpit_proto::RedactionCoverageFailure::SshKeysOverBudget)
+        );
+        assert!(
+            app.history.iter().any(|entry| matches!(entry,
+                HistoryEntry::Plain { line } if line.contains("held-before-outcome")
+            )),
+            "events delivered before adoption must render"
+        );
+        assert!(!app.history.iter().any(|entry| matches!(entry,
+            HistoryEntry::Plain { line } if line.contains("abandoned-epoch")
+        )));
+        {
+            let runner = app.agent_runner.as_ref().unwrap().as_ref().unwrap();
+            let mut events = runner.events.lock().unwrap();
+            events.push(QueuedTurnEvent {
+                attachment_epoch: 1,
+                event: TurnEvent::RedactionCoverageStatus {
+                    session_id: Some(outgoing),
+                    unavailable: None,
+                },
+            });
+            events.push(QueuedTurnEvent {
+                attachment_epoch: 2,
+                event: TurnEvent::Notice {
+                    text: "live-after-outcome".into(),
+                },
+            });
+        }
+        assert!(app.drain_agent_events());
+        assert_eq!(
+            app.header_coverage_unavailable(),
+            Some(cockpit_proto::RedactionCoverageFailure::SshKeysOverBudget)
+        );
+        assert!(app.history.iter().any(|entry| matches!(entry,
+            HistoryEntry::Plain { line } if line.contains("live-after-outcome")
+        )));
+    }
+}
+
+#[tokio::test]
+async fn resume_header_adopts_identity_and_rehomes_outgoing_activity() {
+    use crate::tui::chat_header::HeaderPillKind as K;
+    use cockpit_client::presentation::TurnEvent;
+    for preserve_history in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
+        let old = uuid::Uuid::new_v4();
+        let resumed = uuid::Uuid::new_v4();
+        let interrupt = uuid::Uuid::new_v4();
+        app.launch.session_id = Some(old);
+        app.agent_path = vec!["outgoing".into(), "old-child".into()];
+        app.waiting_for_lock = Some(("old/path".into(), "old-holder".into()));
+        app.longcache_enabled = true;
+        app.longcache_supported = true;
+        app.update_available_version = Some("9.9.9".into());
+        app.caffeinate_active = true;
+        app.attention_interrupt = Some(super::AttentionInterruptState {
+            interrupt_id: interrupt,
+            kind: super::AttentionInterruptKind::Question,
+            pending: true,
+            pending_count: 1,
+            next_renudge_at: Instant::now(),
+        });
+        let AsyncActionPayload::SessionSwitched(outcome) =
+            switch_outcome_with_epoch(resumed, "res002", 2)
+        else {
+            unreachable!()
+        };
+        let mut outcome = *outcome;
+        outcome.target = SessionTarget::Resume {
+            session_id: resumed,
+            since_seq: None,
+        };
+        outcome.active_agent = "ResumeAgent".into();
+        outcome.active_agent_path = vec!["ResumeAgent".into()];
+        if preserve_history {
+            app.apply_session_switch_outcome_preserving_history(outcome, true);
+        } else {
+            app.apply_session_switch_outcome(outcome);
+        }
+        assert_eq!(app.agent_path, vec!["ResumeAgent"]);
+        assert_eq!(app.launch.agent_name, "ResumeAgent");
+        assert!(app.waiting_for_lock.is_none());
+        assert!(!app.longcache_enabled);
+        assert!(app.attention_interrupt.is_none());
+        assert_eq!(
+            app.background_attention_interrupts[&old].interrupt_id,
+            interrupt
+        );
+        let active = app
+            .chat_header_state()
+            .pills
+            .into_iter()
+            .map(|p| p.kind)
+            .collect::<Vec<_>>();
+        assert!(!active.contains(&K::Lock));
+        assert!(!active.contains(&K::Longcache));
+        assert!(!active.contains(&K::Agent));
+        assert!(active.contains(&K::Update));
+        assert!(active.contains(&K::Caffeinate));
+        assert!(
+            active.contains(&K::Attention),
+            "outgoing background attention is still real"
+        );
+        app.resolve_attention_interrupt_for(old, interrupt);
+        assert!(
+            !app.chat_header_state()
+                .pills
+                .iter()
+                .any(|p| p.kind == K::Attention)
+        );
+        app.apply_event(TurnEvent::LongcacheState {
+            enabled: true,
+            supported: true,
+        });
+        app.apply_event(TurnEvent::WaitingForLock {
+            path: "resumed/path".into(),
+            holder_agent: "new-holder".into(),
+            waiting: true,
+        });
+        let active = app.chat_header_state().pills;
+        assert!(active.iter().any(|p| p.kind == K::Longcache));
+        assert!(
+            active
+                .iter()
+                .any(|p| p.kind == K::Lock && p.label.contains("new-holder"))
+        );
+    }
+}

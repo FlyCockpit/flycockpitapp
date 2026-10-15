@@ -724,10 +724,20 @@ impl App {
         let attachment_epoch = runner.attachment_epoch();
         self.next_control_request_seq = self.next_control_request_seq.saturating_add(1);
         let request_id = ControlRequestId(self.next_control_request_seq);
-        self.pending_control_requests.insert(
-            request_id,
-            PendingControlRequest::new(label.to_string(), applied),
-        );
+        let binding = super::ExitCheckBinding {
+            session_id,
+            attachment_epoch,
+        };
+        let mut pending = PendingControlRequest::new(label.to_string(), applied);
+        pending.binding = Some(binding);
+        if let cockpit_proto::Request::SetDefaultModel {
+            default_update_id, ..
+        } = &req
+        {
+            pending.default_model_update_id = Some(*default_update_id);
+            self.pending_default_model_update_id = Some(*default_update_id);
+        }
+        self.pending_control_requests.insert(request_id, pending);
         self.bind_composer_control_request(request_id);
         let result = agent_runner::send_control_request(
             &control_tx,
@@ -740,14 +750,25 @@ impl App {
         );
         if let Err(reason) = result {
             let removed = self.pending_control_requests.remove(&request_id);
+            if let Some(pending) = &removed {
+                self.clear_pending_default_model_update(pending.default_model_update_id);
+            }
             let tool_surface_override = removed.as_ref().is_some_and(|pending| {
                 matches!(pending.applied, ControlApplied::ToolSurfaceOverride { .. })
             });
+            let exit_check = removed
+                .as_ref()
+                .is_some_and(|pending| matches!(pending.applied, ControlApplied::ExitGuardStatus));
             let selection_id = removed.and_then(|pending| match pending.applied {
                 ControlApplied::ModelSelection { selection_id } => Some(selection_id),
                 _ => None,
             });
-            let message = Self::control_not_delivered_message(label, reason);
+            let mut message = Self::control_not_delivered_message(label, reason);
+            if exit_check {
+                // Nothing was sent, so no outcome will ever arrive: an
+                // undelivered exit check must never strand quit (C2).
+                message = self.arm_exit_check_escape(Some(binding), message);
+            }
             if tool_surface_override {
                 self.refuse_tool_surface_override(message.clone());
             }
@@ -780,6 +801,10 @@ impl App {
         &mut self,
         reason: super::ControlEpochAbandonment,
     ) {
+        // Ack can retire the control correlation before the separately
+        // stamped DefaultModelUpdateResult arrives. Retire that owner even
+        // when its control entry has already completed.
+        self.pending_default_model_update_id = None;
         let pending = std::mem::take(&mut self.pending_control_requests);
         let mut refresh_snapshot = false;
         let interruption = match reason {
@@ -787,16 +812,36 @@ impl App {
             super::ControlEpochAbandonment::SessionTransition => "session change",
             super::ControlEpochAbandonment::TerminalDisconnect => "the daemon connection ending",
         };
-        for (id, request) in pending {
-            // Fenced correlations still swallow late receipts without
-            // confirming; dropping them would lose that settlement path.
-            if request.fenced {
-                self.pending_control_requests.insert(id, request);
+        for request in pending.into_values() {
+            let action = request.applied.epoch_abandon_action(reason);
+            // A fence suppresses presentation, not retirement. The old
+            // epoch's receipt can no longer settle this correlation. Only
+            // owned-slot cleanup survives the fence; never replay a fenced
+            // follow-on, confirm it, or turn it into exit authority.
+            if request.fenced
+                && !matches!(
+                    action,
+                    super::ControlEpochAbandonAction::ModelSelection
+                        | super::ControlEpochAbandonAction::FailTokenizer
+                )
+            {
                 continue;
             }
-            match request.applied.epoch_abandon_action(reason) {
-                super::ControlEpochAbandonAction::Silent
-                | super::ControlEpochAbandonAction::ModelSelection => {}
+            match action {
+                super::ControlEpochAbandonAction::Silent => {}
+                super::ControlEpochAbandonAction::ModelSelection => {
+                    if request.fenced
+                        && let ControlApplied::ModelSelection { selection_id } = request.applied
+                        && self
+                            .pending_model_selection
+                            .as_ref()
+                            .is_some_and(|pending| pending.selection_id == selection_id)
+                    {
+                        // Preserve held submissions through the same epoch
+                        // cancellation path as an unfenced model selection.
+                        let _ = self.cancel_model_controls_for_runner_epoch();
+                    }
+                }
                 super::ControlEpochAbandonAction::RefreshSnapshot => {
                     refresh_snapshot = true;
                 }
@@ -804,7 +849,11 @@ impl App {
                     if let ControlApplied::ResponseMetricsTokenizer { confirm_id } = request.applied
                         && let Some(tok) = self.pending_tokenizer_confirm.take()
                     {
-                        let outcome = tok.on_response(confirm_id, 0, false, Some("refresh_failed"));
+                        let outcome = if request.fenced && tok.request_id == confirm_id {
+                            tok.supersede()
+                        } else {
+                            tok.on_response(confirm_id, 0, false, Some("refresh_failed"))
+                        };
                         self.apply_tokenizer_confirm_outcome(outcome);
                     }
                 }
@@ -928,6 +977,15 @@ impl App {
         let Some(pending) = self.pending_control_requests.remove(&request_id) else {
             return;
         };
+        if matches!(
+            outcome,
+            ControlRequestOutcome::Unauthorized(_)
+                | ControlRequestOutcome::Rejected(_)
+                | ControlRequestOutcome::TransportFailed(_)
+                | ControlRequestOutcome::NotDelivered(_)
+        ) {
+            self.clear_pending_default_model_update(pending.default_model_update_id);
+        }
         let skip_confirmation =
             pending.fenced || self.discard_stale_composer_control_receipt(request_id);
         let selection_id = match pending.applied {
@@ -940,6 +998,8 @@ impl App {
         };
         let refresh_tool_surface_on_failure =
             matches!(pending.applied, ControlApplied::ToolSurfaceOverride { .. });
+        let unauthorized = matches!(outcome, ControlRequestOutcome::Unauthorized(_));
+        let transport_failed = matches!(outcome, ControlRequestOutcome::TransportFailed(_));
         match outcome {
             ControlRequestOutcome::ConfigRefreshed {
                 applied_generation,
@@ -984,7 +1044,9 @@ impl App {
                     ));
                 }
             }
-            ControlRequestOutcome::Rejected(error) => {
+            ControlRequestOutcome::Rejected(error)
+            | ControlRequestOutcome::Unauthorized(error)
+            | ControlRequestOutcome::TransportFailed(error) => {
                 if refresh_tool_surface_on_failure {
                     self.refuse_tool_surface_override(format!(
                         "Tool surface update was refused: {error}"
@@ -1005,14 +1067,27 @@ impl App {
                     let outcome = tok.on_response(confirm_id, 0, false, code);
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
-                    let message = format!("{}: daemon rejected request: {error}", pending.label);
+                    let mut message = if transport_failed {
+                        format!("{}: daemon response unavailable: {error}", pending.label)
+                    } else {
+                        format!("{}: daemon rejected request: {error}", pending.label)
+                    };
+                    // Only the exit check itself, only for a typed
+                    // authorization refusal or an unavailable response, and
+                    // never from a fenced or stale receipt (C4).
+                    if (unauthorized || transport_failed)
+                        && !skip_confirmation
+                        && matches!(pending.applied, ControlApplied::ExitGuardStatus)
+                    {
+                        message = self.arm_exit_check_escape(pending.binding, message);
+                    }
                     self.finish_control_failure(
                         skip_confirmation,
                         selection_id,
                         request_id,
                         message,
                         &error,
-                        false,
+                        transport_failed,
                     );
                 }
             }
@@ -1028,7 +1103,12 @@ impl App {
                     let outcome = tok.on_response(confirm_id, 0, false, Some("refresh_failed"));
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
-                    let message = Self::control_not_delivered_message(&pending.label, reason);
+                    let mut message = Self::control_not_delivered_message(&pending.label, reason);
+                    if !skip_confirmation
+                        && matches!(pending.applied, ControlApplied::ExitGuardStatus)
+                    {
+                        message = self.arm_exit_check_escape(pending.binding, message);
+                    }
                     self.finish_control_failure(
                         skip_confirmation,
                         selection_id,
@@ -1039,6 +1119,12 @@ impl App {
                     );
                 }
             }
+        }
+    }
+
+    fn clear_pending_default_model_update(&mut self, id: Option<uuid::Uuid>) {
+        if id.is_some() && self.pending_default_model_update_id == id {
+            self.pending_default_model_update_id = None;
         }
     }
 
@@ -1369,8 +1455,6 @@ impl super::App {
             clear: false,
         };
         self.send_daemon_request("/settings default model", req, ControlApplied::None);
-        // Stash id for terminal handling.
-        self.pending_default_model_update_id = Some(default_update_id);
     }
 }
 

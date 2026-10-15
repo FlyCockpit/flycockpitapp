@@ -257,8 +257,14 @@ pub(crate) struct PendingControlRequest {
     applied: ControlApplied,
     /// Fenced requests keep correlation so Rejected/NotDelivered can still
     /// release uniquely-owned slots (`pending_model_selection`, tokenizer
-    /// confirm) without driving picker confirmation side-effects.
+    /// confirm) without driving picker confirmation side-effects. Epoch
+    /// retirement releases them when that receipt route is no longer live.
     fenced: bool,
+    /// The attachment the request was sent for.
+    binding: Option<ExitCheckBinding>,
+    /// A separate daemon event confirms this default-model write after Ack.
+    /// A failed control receipt can release only this exact owned slot.
+    default_model_update_id: Option<uuid::Uuid>,
 }
 
 impl PendingControlRequest {
@@ -267,8 +273,17 @@ impl PendingControlRequest {
             label: label.into(),
             applied,
             fenced: false,
+            binding: None,
+            default_model_update_id: None,
         }
     }
+}
+
+/// The session attachment a daemon exit check was issued against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExitCheckBinding {
+    pub(crate) session_id: uuid::Uuid,
+    pub(crate) attachment_epoch: u64,
 }
 
 pub(crate) struct PendingModelSelection {
@@ -2166,6 +2181,12 @@ pub struct App {
     pub(super) daemon_restart_prompt: Option<DaemonRestartPrompt>,
     exit_requested: bool,
     exit_notice: Option<String>,
+    /// One-shot permission for the *next* exit attempt to leave without the
+    /// daemon's exit check. Armed only when that check itself was refused
+    /// with a typed authorization error or could not be delivered, and bound
+    /// to the attachment it was issued against: a successful check, a
+    /// session reset, or any other attachment voids it (issue #546).
+    exit_check_escape: Option<ExitCheckBinding>,
     pub(super) active_model_state_generation: u64,
     /// Security disclosures must be fetched from the daemon before a session
     /// attachment can be created. Failures leave this false and user actions
@@ -4203,6 +4224,7 @@ impl App {
             daemon_restart_prompt: None,
             exit_requested: false,
             exit_notice: None,
+            exit_check_escape: None,
             active_model_state_generation: 0,
             // Existing unit harnesses construct App without an event loop or
             // daemon fake; gate-focused tests explicitly set this false.

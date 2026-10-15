@@ -514,3 +514,485 @@ fn note_without_session_shows_send_first_error() {
         "no note row is added without a session"
     );
 }
+
+/// Issue #546: quitting never depends on daemon authority. When the daemon
+/// refuses the exit check with a typed authorization error (this connection
+/// lost owner authority), the user is told how to leave and the next exit
+/// request quits without asking the daemon again.
+#[test]
+fn unauthorized_exit_check_lets_the_next_exit_quit_without_the_daemon() {
+    use super::App;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+
+    assert!(!app.request_guarded_exit(), "first exit asks the daemon");
+    let sent = control_rx.try_recv().expect("exit check is sent");
+    assert!(matches!(
+        sent.request,
+        cockpit_proto::Request::ExitGuardStatus
+    ));
+    let request_id = *app
+        .pending_control_requests
+        .keys()
+        .next()
+        .expect("exit check is pending");
+    app.apply_control_request_outcome(
+        request_id,
+        cockpit_client::presentation::ControlRequestOutcome::Unauthorized(
+            "daemon request: daemon error: authorization: request requires the local owner"
+                .to_string(),
+        ),
+    );
+    assert!(
+        !app.exit_requested,
+        "a refused check does not exit by itself"
+    );
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("quit without the daemon check")),
+        "the refusal tells the user how to quit"
+    );
+
+    assert!(
+        app.request_guarded_exit(),
+        "the next exit request quits without daemon authority"
+    );
+    assert!(
+        control_rx.try_recv().is_err(),
+        "no second exit check is sent"
+    );
+}
+
+/// Run one exit attempt that the daemon answers with `outcome`.
+fn exit_check_answered(
+    app: &mut super::App,
+    control_rx: &mut tokio::sync::mpsc::Receiver<crate::tui::agent_runner::ControlRequest>,
+    outcome: cockpit_client::presentation::ControlRequestOutcome,
+) {
+    assert!(!app.request_guarded_exit(), "exit asks the daemon");
+    let _sent = control_rx.try_recv().expect("exit check is sent");
+    let request_id = *app
+        .pending_control_requests
+        .keys()
+        .next()
+        .expect("exit check is pending");
+    app.apply_control_request_outcome(request_id, outcome);
+}
+
+/// C4 (issue #546 r2): a delivered non-authorization refusal (for example a
+/// concurrent detach decision) never disables the daemon's exit check.
+#[test]
+fn unrelated_exit_check_refusal_keeps_the_guard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+    exit_check_answered(
+        &mut app,
+        &mut control_rx,
+        cockpit_client::presentation::ControlRequestOutcome::Rejected(
+            "daemon request: daemon error: internal: another client is deciding how to detach live ephemeral work"
+                .to_string(),
+        ),
+    );
+    assert!(app.exit_check_escape.is_none());
+    assert!(
+        !app.request_guarded_exit(),
+        "the next exit still asks the daemon"
+    );
+    assert!(control_rx.try_recv().is_ok(), "a fresh exit check is sent");
+}
+
+/// C4: a fenced (stale) receipt never arms the escape.
+#[test]
+fn fenced_exit_check_refusal_does_not_arm_the_escape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+    assert!(!app.request_guarded_exit());
+    let _request = control_rx.try_recv().unwrap();
+    let id = *app.pending_control_requests.keys().next().unwrap();
+    app.fence_pending_control_request(id);
+    app.apply_control_request_outcome(
+        id,
+        cockpit_client::presentation::ControlRequestOutcome::Unauthorized(
+            "authorization: request requires the local owner".into(),
+        ),
+    );
+    assert!(app.exit_check_escape.is_none());
+}
+
+/// C4: the escape is one-shot and bound to its attachment: a session reset
+/// voids it, and a successful exit check clears it.
+#[test]
+fn exit_check_escape_is_one_shot_and_bound_to_its_attachment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+    let unauthorized = || {
+        cockpit_client::presentation::ControlRequestOutcome::Unauthorized(
+            "authorization: request requires the local owner".into(),
+        )
+    };
+    exit_check_answered(&mut app, &mut control_rx, unauthorized());
+    assert!(app.exit_check_escape.is_some());
+    app.reset_session_live_state();
+    assert!(
+        app.exit_check_escape.is_none(),
+        "exit recovery from an old session must not bypass a new session's work check"
+    );
+
+    // The reset session's successor attaches a new runner.
+    control_rx = install_ephemeral_runner(&mut app);
+    exit_check_answered(&mut app, &mut control_rx, unauthorized());
+    assert!(app.exit_check_escape.is_some());
+    // The very next exit attempt uses it ...
+    assert!(
+        app.request_guarded_exit(),
+        "the armed attempt quits locally"
+    );
+    assert!(control_rx.try_recv().is_err(), "without asking the daemon");
+    // ... and only that one: it is not sticky.
+    app.exit_requested = false;
+    assert!(app.exit_check_escape.is_none());
+    assert!(
+        !app.request_guarded_exit(),
+        "a later exit asks the daemon again"
+    );
+    assert!(control_rx.try_recv().is_ok());
+    // A successful daemon answer to that check voids an escape armed
+    // meanwhile (for example by a parallel undelivered check).
+    let id = *app.pending_control_requests.keys().next().unwrap();
+    app.exit_check_escape = app.current_exit_check_binding();
+    assert!(app.exit_check_escape.is_some());
+    app.apply_control_request_outcome(
+        id,
+        cockpit_client::presentation::ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        },
+    );
+    assert!(app.exit_check_escape.is_none());
+
+    // An escape armed for another attachment is consumed without effect.
+    app.exit_check_escape = Some(super::ExitCheckBinding {
+        session_id: uuid::Uuid::new_v4(),
+        attachment_epoch: 99,
+    });
+    app.question_dialog = None;
+    app.pending_local_choice = None;
+    assert!(
+        !app.request_guarded_exit(),
+        "a foreign binding never skips the check"
+    );
+    assert!(
+        app.exit_check_escape.is_none(),
+        "the escape is consumed by one attempt"
+    );
+}
+
+/// C2 (issue #546 r2): an exit check that cannot even be queued (the
+/// runner's control receiver is gone) never strands quit: the next exit
+/// leaves without the daemon.
+#[test]
+fn immediately_undelivered_exit_check_can_quit_on_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let control_rx = install_ephemeral_runner(&mut app);
+    drop(control_rx);
+    assert!(!app.request_guarded_exit());
+    assert!(app.pending_control_requests.is_empty());
+    assert!(
+        app.request_guarded_exit(),
+        "an immediately undelivered check must allow the local exit on retry"
+    );
+}
+
+/// C2: the same when the control channel is full.
+#[test]
+fn exit_check_rejected_by_a_full_control_channel_can_quit_on_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let _control_rx = install_ephemeral_runner(&mut app);
+    let control_tx = app
+        .agent_runner
+        .as_ref()
+        .and_then(|runner| runner.as_ref().ok())
+        .map(|runner| runner.control_tx.clone())
+        .expect("runner");
+    // Fill the one-slot channel with an unrelated request.
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    control_tx
+        .try_send(crate::tui::agent_runner::ControlRequest {
+            request: cockpit_proto::Request::Prune,
+            intended_session_id: uuid::Uuid::new_v4(),
+            intended_attachment_epoch: 0,
+            response_tx,
+        })
+        .expect("fill the control channel");
+    assert!(!app.request_guarded_exit());
+    assert!(app.pending_control_requests.is_empty());
+    assert!(
+        app.request_guarded_exit(),
+        "a full control channel never strands quit"
+    );
+}
+
+/// Reviewer C2 sibling: transport failure after the runner accepts a control
+/// is not a delivered policy refusal. It must permit the bound local retry.
+#[test]
+fn transport_failed_exit_check_can_quit_on_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+    let outcome = crate::tui::agent_runner::control_response_outcome(Err(
+        "daemon request: daemon client task has stopped"
+            .to_string()
+            .into(),
+    ));
+    exit_check_answered(&mut app, &mut control_rx, outcome);
+    assert!(app.pending_control_requests.is_empty());
+    assert!(
+        app.request_guarded_exit(),
+        "a transport-failed exit check must permit a local retry, like a closed control channel"
+    );
+}
+
+async fn drain_exit_control_receipt(app: &mut super::App) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !app.pending_control_requests.is_empty() {
+            app.drain_agent_events();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the accepted control settles through the runner event queue");
+}
+
+/// Exercise real DaemonClient failures through the accepted response channel,
+/// production conversion, runner event queue, App settlement and local retry.
+#[tokio::test]
+async fn transport_failed_exit_guard_settles_closed_task_dropped_reply_and_timeout() {
+    for failure in ["closed task", "dropped reply", "timeout"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::App::new(Some(tmp.path()), false);
+        app.dialog = crate::tui::settings::Dialog::None;
+        let mut control_rx = install_ephemeral_runner(&mut app);
+        let (requests, mut request_rx) =
+            tokio::sync::mpsc::channel::<cockpit_client::InProcessRequest>(1);
+        let (_events, event_rx) = tokio::sync::mpsc::channel(1);
+        let client =
+            cockpit_client::DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+                requests,
+                events: event_rx,
+            });
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let daemon = if failure == "closed task" {
+            drop(request_rx);
+            None
+        } else {
+            Some(tokio::spawn(async move {
+                let request = request_rx
+                    .recv()
+                    .await
+                    .expect("control reaches the daemon client");
+                assert!(matches!(
+                    request.request,
+                    cockpit_proto::Request::ExitGuardStatus
+                ));
+                if failure == "timeout" {
+                    release_rx.await.unwrap();
+                }
+                drop(request.reply);
+            }))
+        };
+        assert!(!app.request_guarded_exit());
+        let control = control_rx.try_recv().expect("control accepted by runner");
+        let result = client
+            .request_with_timeout(control.request, Duration::from_millis(25))
+            .await;
+        let error = result
+            .as_ref()
+            .expect_err("transport must fail")
+            .to_string();
+        match failure {
+            "closed task" => assert!(error.contains("task has stopped")),
+            "dropped reply" => assert!(error.contains("dropped reply channel")),
+            "timeout" => assert!(error.contains("request timed out")),
+            _ => unreachable!(),
+        }
+        control
+            .response_tx
+            .send(crate::tui::agent_runner::control_request_result(result))
+            .unwrap();
+        drain_exit_control_receipt(&mut app).await;
+        assert!(!app.exit_requested, "failure alone never exits");
+        assert!(
+            app.request_guarded_exit(),
+            "{failure} permits the bound local retry"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "retry requires no daemon response"
+        );
+        if failure == "timeout" {
+            release_tx.send(()).unwrap();
+        }
+        if let Some(daemon) = daemon {
+            daemon.await.unwrap();
+        }
+    }
+}
+
+/// A mutation already accepted by the transport can still complete after
+/// timeout. Its receipt must retain uncertainty through the real conversion.
+#[tokio::test]
+async fn timed_out_mutation_stays_transport_unknown_after_delivery() {
+    let (requests, mut request_rx) = tokio::sync::mpsc::channel(1);
+    let (_events, events) = tokio::sync::mpsc::channel(1);
+    let client =
+        cockpit_client::DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+            requests,
+            events,
+        });
+    let mutation = tokio::spawn(async move {
+        client
+            .request_with_timeout(cockpit_proto::Request::Prune, Duration::from_millis(25))
+            .await
+    });
+    let delivered = request_rx.recv().await.unwrap();
+    assert!(matches!(delivered.request, cockpit_proto::Request::Prune));
+    let result = mutation.await.unwrap();
+    assert!(
+        result.is_err(),
+        "timeout cannot manufacture a daemon refusal"
+    );
+    let outcome = crate::tui::agent_runner::control_response_outcome(
+        crate::tui::agent_runner::control_request_result(result),
+    );
+    assert!(
+        matches!(
+            outcome,
+            cockpit_client::presentation::ControlRequestOutcome::TransportFailed(_)
+        ),
+        "an admitted mutation stays delivery/effect-unknown, never NotDelivered"
+    );
+    assert!(
+        delivered
+            .reply
+            .send(Ok(cockpit_proto::Response::Ack))
+            .is_err(),
+        "late mutation completion has no expired reply receiver"
+    );
+}
+
+/// Inverse: actual delivered Internal/policy refusals do not masquerade as
+/// transport loss. Typed Authorization still permits local recovery.
+#[tokio::test]
+async fn control_request_delivered_refusal_preserves_the_exit_guard_contract() {
+    for code in [
+        cockpit_proto::ErrorCode::Internal,
+        cockpit_proto::ErrorCode::Conflict,
+        cockpit_proto::ErrorCode::Authorization,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::App::new(Some(tmp.path()), false);
+        app.dialog = crate::tui::settings::Dialog::None;
+        let mut control_rx = install_ephemeral_runner(&mut app);
+        let (requests, mut request_rx) =
+            tokio::sync::mpsc::channel::<cockpit_client::InProcessRequest>(1);
+        let (_events, events) = tokio::sync::mpsc::channel(1);
+        let client =
+            cockpit_client::DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+                requests,
+                events,
+            });
+        let authorization = code == cockpit_proto::ErrorCode::Authorization;
+        let daemon = tokio::spawn(async move {
+            let request = request_rx.recv().await.unwrap();
+            request
+                .reply
+                .send(Err(cockpit_proto::ErrorPayload {
+                    code,
+                    message: "another client is deciding how to detach live work".into(),
+                }))
+                .unwrap();
+        });
+        assert!(!app.request_guarded_exit());
+        let control = control_rx.try_recv().unwrap();
+        let result = client.request(control.request).await;
+        assert!(result.as_ref().expect("response delivered").is_err());
+        control
+            .response_tx
+            .send(crate::tui::agent_runner::control_request_result(result))
+            .unwrap();
+        drain_exit_control_receipt(&mut app).await;
+        assert_eq!(app.exit_check_escape.is_some(), authorization);
+        assert_eq!(
+            app.request_guarded_exit(),
+            authorization,
+            "only delivered Authorization permits the local retry"
+        );
+        if authorization {
+            assert!(control_rx.try_recv().is_err());
+        } else {
+            assert!(matches!(
+                control_rx.try_recv().unwrap().request,
+                cockpit_proto::Request::ExitGuardStatus
+            ));
+        }
+        daemon.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn runner_teardown_after_accepting_exit_guard_allows_the_local_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+    assert!(!app.request_guarded_exit());
+    drop(
+        control_rx
+            .try_recv()
+            .expect("runner accepted the exit check"),
+    );
+    drain_exit_control_receipt(&mut app).await;
+    assert!(app.request_guarded_exit());
+    assert!(control_rx.try_recv().is_err());
+}
+
+#[test]
+fn fenced_transport_failed_exit_check_does_not_arm_the_escape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+    assert!(!app.request_guarded_exit());
+    let _control = control_rx.try_recv().unwrap();
+    let id = *app.pending_control_requests.keys().next().unwrap();
+    app.fence_pending_control_request(id);
+    app.apply_control_request_outcome(
+        id,
+        crate::tui::agent_runner::control_response_outcome(
+            crate::tui::agent_runner::control_request_result(Err(anyhow::anyhow!(
+                "request timed out"
+            ))),
+        ),
+    );
+    assert!(app.pending_control_requests.is_empty());
+    assert!(app.exit_check_escape.is_none());
+    assert!(
+        !app.request_guarded_exit(),
+        "a fenced transport failure preserves the guard"
+    );
+    assert!(control_rx.try_recv().is_ok());
+}

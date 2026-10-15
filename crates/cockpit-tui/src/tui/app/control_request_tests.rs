@@ -169,7 +169,9 @@ async fn control_request_daemon_error_reports_rejected() {
     let control = control_rx.recv().await.expect("control request");
     control
         .response_tx
-        .send(Err("no active session".to_string()))
+        .send(Err(
+            crate::tui::agent_runner::ControlRequestError::rejected("no active session"),
+        ))
         .unwrap();
     drain_control_events(&mut app).await;
 
@@ -242,7 +244,7 @@ fn control_response_outcome_table() {
         ControlRequestOutcome::Rejected(message) if message.contains("Unknown")
     ));
     assert!(matches!(
-        control_response_outcome(Err("daemon error".to_string())),
+        control_response_outcome(Err(crate::tui::agent_runner::ControlRequestError::rejected("daemon error"))),
         ControlRequestOutcome::Rejected(message) if message == "daemon error"
     ));
     assert!(matches!(
@@ -461,7 +463,7 @@ async fn successful_repair_resume_ack_wakes_retained_submission_retry() {
 }
 
 #[tokio::test]
-async fn control_request_runner_teardown_reports_not_delivered() {
+async fn control_request_runner_teardown_reports_unknown_delivery() {
     let mut app = app();
     let (record_tx, _record_rx) = mpsc::channel(1);
     let (control_tx, mut control_rx) = mpsc::channel(1);
@@ -473,7 +475,9 @@ async fn control_request_runner_teardown_reports_not_delivered() {
 
     assert_eq!(
         history_lines(&app),
-        vec!["/prune: request not sent - daemon control channel closed; try again"]
+        vec![
+            "/prune: daemon response unavailable: daemon request: runner stopped before returning a daemon response; delivery and effects are unknown"
+        ]
     );
     assert!(app.pending_control_requests.is_empty());
 }
@@ -731,4 +735,518 @@ fn epoch_abandon_action_source_has_no_wildcard() {
         !body.contains("_ =>"),
         "epoch abandonment must stay exhaustive over ControlApplied"
     );
+}
+
+#[test]
+fn fenced_epoch_retirement_settles_every_control_without_follow_ons() {
+    for reason in [
+        ControlEpochAbandonment::SameSession,
+        ControlEpochAbandonment::SessionTransition,
+        ControlEpochAbandonment::TerminalDisconnect,
+    ] {
+        for applied in sample_control_applied() {
+            let mut app = app();
+            match &applied {
+                ControlApplied::ModelSelection { selection_id } => {
+                    install_pending_model_selection(&mut app, *selection_id);
+                }
+                ControlApplied::ResponseMetricsTokenizer { confirm_id } => {
+                    app.pending_tokenizer_confirm = Some(super::TokenizerConfirmPending::new(
+                        *confirm_id,
+                        uuid::Uuid::nil(),
+                        0,
+                        cockpit_tokenizer::TiktokenEncoding::default(),
+                        std::time::Duration::ZERO,
+                    ));
+                }
+                _ => {}
+            }
+            let id = ControlRequestId(1);
+            app.pending_control_requests
+                .insert(id, PendingControlRequest::new("fenced", applied.clone()));
+            app.fence_pending_control_request(id);
+
+            app.abandon_epoch_bound_control_receipts(reason);
+
+            assert!(
+                app.pending_control_requests.is_empty(),
+                "{applied:?} {reason:?}"
+            );
+            assert!(
+                app.pending_model_selection.is_none(),
+                "{applied:?} {reason:?}"
+            );
+            assert!(
+                app.pending_tokenizer_confirm.is_none(),
+                "{applied:?} {reason:?}"
+            );
+            assert!(
+                !app.has_unsettled_local_authority(),
+                "{applied:?} {reason:?}"
+            );
+            assert!(!app.parked_control_follow_ons.is_pending());
+            assert!(!app.exit_requested);
+            assert!(app.exit_check_escape.is_none());
+            assert!(
+                history_lines(&app).is_empty(),
+                "no fenced confirmation/follow-on"
+            );
+            if matches!(applied, ControlApplied::ModelSelection { .. }) {
+                assert!(app.current_model_selection_retry().is_some());
+            }
+        }
+    }
+}
+
+fn install_pending_model_selection(app: &mut App, selection_id: uuid::Uuid) {
+    let order_sequence = app
+        .submission_order
+        .enqueue(crate::tui::structured_paste::OrderedIntent::ModelSwitch(
+            selection_id,
+        ))
+        .unwrap();
+    app.pending_model_selection = Some(super::PendingModelSelection {
+        order_sequence,
+        session_id: app.launch.session_id,
+        selection_id,
+        requested: cockpit_config::providers::ActiveModelRef {
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        trigger: cockpit_proto::ActiveModelSwitchTrigger::Picker,
+        minimum_generation: 0,
+        started_at: std::time::Instant::now(),
+        queued_submission: None,
+    });
+}
+
+#[test]
+fn fenced_epoch_retirement_preserves_slots_owned_by_other_correlations() {
+    let mut app = app();
+    let old = uuid::Uuid::from_u128(1);
+    let successor = uuid::Uuid::from_u128(2);
+    install_pending_model_selection(&mut app, successor);
+    app.pending_tokenizer_confirm = Some(super::TokenizerConfirmPending::new(
+        successor,
+        uuid::Uuid::nil(),
+        1,
+        cockpit_tokenizer::TiktokenEncoding::default(),
+        std::time::Duration::ZERO,
+    ));
+    for (id, applied) in [
+        (1, ControlApplied::ModelSelection { selection_id: old }),
+        (
+            2,
+            ControlApplied::ResponseMetricsTokenizer { confirm_id: old },
+        ),
+    ] {
+        let id = ControlRequestId(id);
+        app.pending_control_requests
+            .insert(id, PendingControlRequest::new("old", applied));
+        app.fence_pending_control_request(id);
+    }
+
+    app.abandon_epoch_bound_control_receipts(ControlEpochAbandonment::SameSession);
+
+    assert!(app.pending_control_requests.is_empty());
+    assert_eq!(
+        app.pending_model_selection.as_ref().unwrap().selection_id,
+        successor
+    );
+    assert_eq!(
+        app.pending_tokenizer_confirm.as_ref().unwrap().request_id,
+        successor
+    );
+    assert!(app.current_model_selection_retry().is_none());
+    assert!(history_lines(&app).is_empty());
+}
+
+// Keep the independent r6 App-boundary regression: accepted receipts use
+// the real send helper, queue and event router on both sides of resync.
+#[tokio::test]
+async fn reviewer_r6_fenced_control_receipt_is_settled_after_resync() {
+    use crate::tui::composer_controls::ComposerControlKind;
+
+    for resync in [false, true] {
+        for kind in [ComposerControlKind::Approval, ComposerControlKind::Sandbox] {
+            for refused in [false, true] {
+                let mut app = app();
+                let (record_tx, _record_rx) = mpsc::channel(1);
+                let (control_tx, mut control_rx) = mpsc::channel(4);
+                install_runner(&mut app, record_tx, control_tx);
+                let runner = app.agent_runner.as_ref().unwrap().as_ref().unwrap();
+                app.visible_attachment_epoch = runner.attachment_epoch();
+                app.launch.session_id = Some(runner.session_id());
+                let notify = runner.event_notifier();
+                app.composer_controls.pending =
+                    Some(super::composer_controls::PendingComposerMutation {
+                        generation: app.composer_controls.generation,
+                        session_id: app.launch.session_id,
+                        attachment_epoch: app.visible_attachment_epoch,
+                        kind,
+                        request_id: None,
+                    });
+                app.composer_controls.dispatch_armed = true;
+                let request = match kind {
+                    ComposerControlKind::Approval => Request::SetApprovalMode {
+                        mode: ApprovalMode::default(),
+                    },
+                    ComposerControlKind::Sandbox => Request::SetSandbox {
+                        mode: Some(cockpit_proto::SandboxMode::Sandbox),
+                        container_network_enabled: None,
+                    },
+                    _ => unreachable!(),
+                };
+                app.send_daemon_request("composer", request, ControlApplied::None);
+                let control = control_rx.recv().await.unwrap();
+                let id = *app.pending_control_requests.keys().next().unwrap();
+                assert_eq!(
+                    app.composer_controls.pending.as_ref().unwrap().request_id,
+                    Some(id)
+                );
+                if resync {
+                    advance_control_epoch(&mut app);
+                    assert!(
+                        !app.pending_control_requests.contains_key(&id),
+                        "retirement itself settles the fenced correlation"
+                    );
+                    assert!(!app.has_unsettled_local_authority());
+                } else {
+                    app.invalidate_composer_control_ownership(true, false);
+                    assert!(app.pending_control_requests.get(&id).unwrap().fenced);
+                    assert!(app.has_unsettled_local_authority());
+                }
+                assert!(app.composer_controls.pending.is_none());
+
+                // A live successor must survive both the old success and refusal.
+                app.send_daemon_request(
+                    "/agent",
+                    Request::SetAgent {
+                        name: "Plan".to_string(),
+                    },
+                    ControlApplied::PrimaryAgentSwitch {
+                        name: "Plan".to_string(),
+                    },
+                );
+                let successor = control_rx.recv().await.unwrap();
+                let successor_id = ControlRequestId(app.next_control_request_seq);
+                assert_eq!(
+                    successor.intended_attachment_epoch,
+                    app.visible_attachment_epoch
+                );
+                let history_before = history_lines(&app)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let response = if refused {
+                    Err(crate::tui::agent_runner::ControlRequestError::rejected(
+                        "old refusal",
+                    ))
+                } else {
+                    Ok(Response::Ack)
+                };
+                control.response_tx.send(response).unwrap();
+                await_control_receipt(&mut app, &notify).await;
+                assert!(
+                    !app.pending_control_requests.contains_key(&id),
+                    "fenced completed control leaked after resync={resync}"
+                );
+                assert!(app.pending_control_requests.contains_key(&successor_id));
+                assert_eq!(history_lines(&app), history_before);
+                assert!(app.composer_controls.picker.is_none());
+                assert!(app.exit_check_escape.is_none());
+                assert!(!app.exit_requested);
+
+                successor.response_tx.send(Ok(Response::Ack)).unwrap();
+                await_control_receipt(&mut app, &notify).await;
+                assert!(app.pending_control_requests.is_empty());
+                assert!(!app.has_unsettled_local_authority());
+                assert!(history_lines(&app).contains(&"Switched primary agent to `Plan`"));
+            }
+        }
+    }
+}
+
+fn advance_control_epoch(app: &mut App) {
+    app.agent_runner
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .attachment_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    app.apply_event(TurnEvent::DaemonLinkResynced {
+        active_model_state: None,
+    });
+}
+
+async fn await_control_receipt(app: &mut App, notify: &tokio::sync::Notify) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), notify.notified())
+        .await
+        .expect("actual accepted-control receipt must be queued");
+    assert!(
+        app.drain_agent_events(),
+        "actual queued receipt must be routed"
+    );
+}
+
+#[tokio::test]
+async fn retired_fenced_exit_receipts_never_confirm_or_arm_escape() {
+    for outcome in [
+        ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner: false,
+            has_live_work: false,
+        },
+        ControlRequestOutcome::Unauthorized("old authorization refusal".to_string()),
+        ControlRequestOutcome::TransportFailed("old response loss".to_string()),
+    ] {
+        let mut app = app();
+        let (record_tx, _record_rx) = mpsc::channel(1);
+        let (control_tx, mut control_rx) = mpsc::channel(4);
+        let events = install_runner(&mut app, record_tx, control_tx);
+        let runner = app.agent_runner.as_ref().unwrap().as_ref().unwrap();
+        app.launch.session_id = Some(runner.session_id());
+        app.visible_attachment_epoch = runner.attachment_epoch();
+        app.send_daemon_request(
+            "exit check",
+            Request::ExitGuardStatus,
+            ControlApplied::ExitGuardStatus,
+        );
+        let old = control_rx.recv().await.unwrap();
+        let id = ControlRequestId(app.next_control_request_seq);
+        app.fence_pending_control_request(id);
+        advance_control_epoch(&mut app);
+        assert!(app.pending_control_requests.is_empty());
+        assert!(!app.has_unsettled_local_authority());
+        assert!(
+            control_rx.try_recv().is_err(),
+            "a fenced exit must not be reissued"
+        );
+
+        // Route the stamped old result, then also check exact-ID reduction
+        // cannot revive a retired correlation through an untagged caller.
+        events.lock().unwrap().push(QueuedTurnEvent {
+            attachment_epoch: old.intended_attachment_epoch,
+            event: TurnEvent::ControlRequestFinished {
+                request_id: id,
+                outcome: outcome.clone(),
+            },
+        });
+        assert!(app.drain_agent_events());
+        app.apply_control_request_outcome(id, outcome);
+        assert!(app.exit_check_escape.is_none());
+        assert!(!app.exit_requested);
+        assert!(
+            !app.request_guarded_exit(),
+            "a fresh check is still required"
+        );
+        let successor = control_rx.recv().await.unwrap();
+        assert!(matches!(successor.request, Request::ExitGuardStatus));
+        let notify = app
+            .agent_runner
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .event_notifier();
+        successor
+            .response_tx
+            .send(Ok(Response::ExitGuardStatus {
+                ephemeral_owner: false,
+                has_live_work: false,
+            }))
+            .unwrap();
+        await_control_receipt(&mut app, &notify).await;
+        assert!(app.pending_control_requests.is_empty());
+        assert!(
+            app.exit_requested,
+            "a legitimate new-epoch check still completes exit"
+        );
+        assert!(app.exit_check_escape.is_none());
+    }
+}
+
+fn default_model_selection() -> cockpit_config::providers::ActiveModelRef {
+    cockpit_config::providers::ActiveModelRef {
+        provider: "openai".to_string(),
+        model: "gpt-test".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    }
+}
+
+#[tokio::test]
+async fn default_model_epoch_retirement_settles_before_and_after_ack() {
+    for ack_before_resync in [false, true] {
+        let mut app = app();
+        let (record_tx, _record_rx) = mpsc::channel(1);
+        let (control_tx, mut control_rx) = mpsc::channel(4);
+        let events = install_runner(&mut app, record_tx, control_tx);
+        let runner = app.agent_runner.as_ref().unwrap().as_ref().unwrap();
+        app.launch.session_id = Some(runner.session_id());
+        app.visible_attachment_epoch = runner.attachment_epoch();
+        let notify = runner.event_notifier();
+        app.request_default_model_only(default_model_selection());
+        let old = control_rx.recv().await.unwrap();
+        let old_id = app.pending_default_model_update_id.unwrap();
+        let old_epoch = old.intended_attachment_epoch;
+        let mut old_response = Some(old.response_tx);
+        if ack_before_resync {
+            old_response
+                .take()
+                .unwrap()
+                .send(Ok(Response::Ack))
+                .unwrap();
+            await_control_receipt(&mut app, &notify).await;
+            assert!(app.pending_control_requests.is_empty());
+            assert_eq!(app.pending_default_model_update_id, Some(old_id));
+        }
+        advance_control_epoch(&mut app);
+        assert!(
+            app.pending_default_model_update_id.is_none(),
+            "epoch-only default-model owner must retire even after Ack removed its control entry"
+        );
+        assert!(!app.has_unsettled_local_authority());
+
+        app.request_default_model_only(default_model_selection());
+        let successor = control_rx.recv().await.unwrap();
+        let successor_id = app.pending_default_model_update_id.unwrap();
+        assert_ne!(old_id, successor_id);
+        let before = history_lines(&app)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        events.lock().unwrap().push(QueuedTurnEvent {
+            attachment_epoch: old_epoch,
+            event: default_model_refusal(old_id, "old refusal"),
+        });
+        events.lock().unwrap().push(QueuedTurnEvent {
+            attachment_epoch: old_epoch,
+            event: TurnEvent::DefaultModelUpdateResult {
+                default_update_id: old_id,
+                outcome: cockpit_proto::DefaultModelStandaloneOutcome::Applied {
+                    selection: Some(default_model_selection()),
+                    generation: 1,
+                    authority_revision:
+                        "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
+                            .to_string(),
+                    scope_label: "user".to_string(),
+                    unchanged: false,
+                },
+            },
+        });
+        assert!(app.drain_agent_events());
+        if let Some(response) = old_response {
+            response
+                .send(Err(
+                    crate::tui::agent_runner::ControlRequestError::rejected("old failed control"),
+                ))
+                .unwrap();
+            await_control_receipt(&mut app, &notify).await;
+        }
+        assert_eq!(app.pending_default_model_update_id, Some(successor_id));
+        assert_eq!(history_lines(&app), before);
+        assert!(app.exit_check_escape.is_none());
+
+        successor.response_tx.send(Ok(Response::Ack)).unwrap();
+        await_control_receipt(&mut app, &notify).await;
+        assert_eq!(app.pending_default_model_update_id, Some(successor_id));
+        events.lock().unwrap().push(QueuedTurnEvent {
+            attachment_epoch: app.visible_attachment_epoch,
+            event: default_model_refusal(successor_id, "successor refusal"),
+        });
+        assert!(app.drain_agent_events());
+        assert!(!app.has_unsettled_local_authority());
+        assert!(history_lines(&app).contains(&"Default model was not changed — successor refusal"));
+    }
+}
+
+fn default_model_refusal(default_update_id: uuid::Uuid, message: &str) -> TurnEvent {
+    TurnEvent::DefaultModelUpdateResult {
+        default_update_id,
+        outcome: cockpit_proto::DefaultModelStandaloneOutcome::Rejected {
+            user_message: message.to_string(),
+            diagnostic_code: "effective_default_target_unwritable".to_string(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn default_model_failed_control_receipts_release_only_their_slot() {
+    for code in [
+        cockpit_proto::ErrorCode::Internal,
+        cockpit_proto::ErrorCode::Authorization,
+    ] {
+        let mut app = app();
+        let (record_tx, _record_rx) = mpsc::channel(1);
+        let (control_tx, mut control_rx) = mpsc::channel(4);
+        install_runner(&mut app, record_tx, control_tx);
+        let notify = app
+            .agent_runner
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .event_notifier();
+        let refusal = || {
+            crate::tui::agent_runner::control_request_result(Ok(Err(cockpit_proto::ErrorPayload {
+                code: code.clone(),
+                message: "default write refused".to_string(),
+            })))
+        };
+        app.request_default_model_only(default_model_selection());
+        let old = control_rx.recv().await.unwrap();
+        app.request_default_model_only(default_model_selection());
+        let successor = control_rx.recv().await.unwrap();
+        let successor_id = app.pending_default_model_update_id.unwrap();
+        old.response_tx.send(refusal()).unwrap();
+        await_control_receipt(&mut app, &notify).await;
+        assert_eq!(app.pending_default_model_update_id, Some(successor_id));
+        successor.response_tx.send(refusal()).unwrap();
+        await_control_receipt(&mut app, &notify).await;
+        assert!(app.pending_default_model_update_id.is_none());
+        assert!(!app.has_unsettled_local_authority());
+        assert!(app.exit_check_escape.is_none());
+
+        app.request_default_model_only(default_model_selection());
+        control_rx
+            .recv()
+            .await
+            .unwrap()
+            .response_tx
+            .send(Err("delivery unknown".to_string().into()))
+            .unwrap();
+        await_control_receipt(&mut app, &notify).await;
+        assert!(app.pending_default_model_update_id.is_none());
+        assert!(!app.has_unsettled_local_authority());
+        assert!(app.exit_check_escape.is_none());
+    }
+}
+
+#[test]
+fn default_model_non_delivery_never_leaves_a_confirmation_owner() {
+    let mut detached = app();
+    detached.request_default_model_only(default_model_selection());
+    assert!(detached.pending_default_model_update_id.is_none());
+    assert!(!detached.has_unsettled_local_authority());
+    for full in [false, true] {
+        let mut app = app();
+        let (record_tx, _record_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        if full {
+            control_tx.try_send(dummy_control_request()).unwrap();
+        } else {
+            drop(control_rx);
+        }
+        install_runner(&mut app, record_tx, control_tx);
+        app.request_default_model_only(default_model_selection());
+        assert!(app.pending_default_model_update_id.is_none());
+        assert!(app.pending_control_requests.is_empty());
+        assert!(!app.has_unsettled_local_authority());
+        assert!(app.exit_check_escape.is_none());
+    }
 }

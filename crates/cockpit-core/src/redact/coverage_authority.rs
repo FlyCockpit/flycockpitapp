@@ -436,19 +436,27 @@ impl CoverageError {
     }
 }
 
-/// The typed reason behind an acquisition error chain: the first
-/// [`CoverageError`] in it, or [`cockpit_proto::RedactionCoverageFailure::CaptureFailed`]
-/// for any other failure (a source the acquisition could not open).
+/// The typed reason behind an acquisition error chain. Binding preflight
+/// reads happen before admission and can return the source error directly;
+/// preserve the same over-limit reason as the authority's capture path.
+/// Unclassified source/read failures remain content-free `CaptureFailed`.
 pub(crate) fn coverage_failure_reason(
     error: &anyhow::Error,
 ) -> cockpit_proto::RedactionCoverageFailure {
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<CoverageError>())
-        .map_or(
-            cockpit_proto::RedactionCoverageFailure::CaptureFailed,
-            |coverage| coverage.failure_reason(),
-        )
+        .map(|coverage| coverage.failure_reason())
+        .unwrap_or_else(|| {
+            if error
+                .chain()
+                .any(|cause| cause.is::<super::EnvFileOverLimitError>())
+            {
+                cockpit_proto::RedactionCoverageFailure::SourceFileOverLimit
+            } else {
+                cockpit_proto::RedactionCoverageFailure::CaptureFailed
+            }
+        })
 }
 
 struct LiveCurrentBindingGuard {

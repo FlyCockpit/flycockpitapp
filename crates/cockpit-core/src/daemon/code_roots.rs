@@ -1,7 +1,10 @@
 //! Daemon-owned ACP Code-root authority.
 //!
 //! Capabilities, discovery snapshots, and idempotency receipts are deliberately
-//! boot-local. Only the redacted delivery projection and logical-client ACK
+//! boot-local. Create/attach receipts freeze the canonical operation result;
+//! the dispatch return boundary projects a copy with current session coverage,
+//! including its typed status, on both initial delivery and exact replay.
+//! Only the redacted delivery projection and logical-client ACK
 //! cursor are durable (in `cockpit-db`).
 
 use std::{
@@ -423,7 +426,7 @@ impl CodeRootAuthorityV1 {
 
     /// Replays must never share an attachment capability with an uncertain
     /// original transport. Reissue one for the authenticated logical client,
-    /// preserving the root and frozen response; this makes an ambiguous
+    /// preserving the root and frozen canonical response; this makes an ambiguous
     /// disconnect exactly replayable even before its teardown has drained.
     fn reissue_receipt_attachment(
         &mut self,

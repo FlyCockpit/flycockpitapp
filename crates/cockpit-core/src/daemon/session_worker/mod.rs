@@ -319,7 +319,13 @@ fn send_session_event_with_agent(
 /// attention row therefore leaves two durable transition deliveries even when
 /// no ACP client polls while it is open.
 fn record_code_root_state_transition(session: &Session, event: &proto::Event) -> bool {
-    if session.session_entry_mode() != proto::SessionEntryMode::Code {
+    // The driver republishes these derived counters at startup and after
+    // control requests, even when no root state changed. They are absent
+    // from CodeRootReadV1, so hydration must not mint durable invalidations.
+    // The ordinary session broadcast still delivers the counters to the TUI.
+    if matches!(event, proto::Event::ContextProjection { .. })
+        || session.session_entry_mode() != proto::SessionEntryMode::Code
+    {
         return true;
     }
     let payload = match serde_json::to_string(&proto::CodeRootDeliveryPayloadV1::RootStateChanged) {

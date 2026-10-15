@@ -3447,6 +3447,82 @@ async fn turn_refresh_refuses_when_dotenv_exceeds_the_file_cap() {
     );
 }
 
+#[tokio::test]
+async fn context_projection_rehydration_does_not_mint_code_root_deliveries() {
+    let session = Session::create_for_test(
+        Db::open_in_memory().unwrap(),
+        PathBuf::from("/proj"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    assert_eq!(session.session_entry_mode(), proto::SessionEntryMode::Code);
+    let (event_tx, mut event_rx) = broadcast::channel(8);
+    let table = Arc::new(RedactionTable::empty());
+    send_session_event(
+        &session,
+        &event_tx,
+        &table,
+        proto::Event::Notice {
+            session_id: session.id,
+            text: "A real durable notice".into(),
+        },
+        NoticeSource::DaemonDirect,
+    );
+    assert!(matches!(
+        event_rx.try_recv().unwrap().event,
+        proto::Event::Notice { .. }
+    ));
+    let deliveries = session
+        .db
+        .read_code_root_projection_deliveries(session.id, None, 256)
+        .await
+        .unwrap();
+    assert_eq!(
+        deliveries.len(),
+        1,
+        "real durable changes still invalidate the root"
+    );
+    assert_eq!(deliveries[0].kind, "root_state_changed");
+
+    for (prunable_tokens, cache_cold) in [(0, false), (7, true), (7, true)] {
+        send_session_event(
+            &session,
+            &event_tx,
+            &table,
+            proto::Event::ContextProjection {
+                session_id: session.id,
+                prunable_tokens,
+                cache_cold,
+            },
+            NoticeSource::EngineTurn,
+        );
+        assert!(matches!(event_rx.try_recv().unwrap().event,
+            proto::Event::ContextProjection {
+                session_id, prunable_tokens: tokens, cache_cold: cold,
+            } if session_id == session.id && tokens == prunable_tokens && cold == cache_cold
+        ));
+        assert_eq!(
+            session
+                .db
+                .read_code_root_projection_deliveries(session.id, None, 256)
+                .await
+                .unwrap(),
+            deliveries,
+            "derived context snapshots never mint durable root deliveries"
+        );
+    }
+    assert_eq!(
+        session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 async fn persisted_notice_text(session: &Session) -> String {
     let events = session.db.list_session_events(session.id).await.unwrap();
     assert_eq!(events.len(), 1);

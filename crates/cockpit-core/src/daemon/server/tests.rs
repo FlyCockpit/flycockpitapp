@@ -1,5 +1,8 @@
 #![allow(deprecated)]
 
+#[path = "code_root_receipt_tests.rs"]
+mod code_root_receipt_tests;
+
 #[path = "provider_onboarding_settlement_tests.rs"]
 mod provider_onboarding_settlement_tests;
 
@@ -37173,6 +37176,28 @@ async fn recv_writer_body(
     }
 }
 
+/// Owner attachment responses are preceded by the global coverage snapshot;
+/// assert it rather than treating it as arbitrary replay or skipping events.
+async fn recv_owner_attach_response(
+    writer_rx: &mut mpsc::Receiver<ClientWriterMessage>,
+    label: &'static str,
+) -> Body {
+    let notice = recv_writer_body(writer_rx, "owner attach coverage snapshot").await;
+    assert!(
+        matches!(
+            &notice,
+            Body::Event {
+                event: proto::Event::RedactionCoverageStatus {
+                    session_id: None,
+                    unavailable: None,
+                }
+            }
+        ),
+        "owner attach must establish healthy global coverage before its response: {notice:?}"
+    );
+    recv_writer_body(writer_rx, label).await
+}
+
 fn fs_read_request(project_root: &std::path::Path, path: &str) -> Request {
     Request::FsRead {
         project_root: project_root.to_string_lossy().into_owned(),
@@ -37187,6 +37212,7 @@ fn fs_read_hook_key(project_root: &std::path::Path, path: &str) -> String {
 
 #[tokio::test]
 async fn serialized_requests_apply_in_receipt_order() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx_with_fake_secure_key_actor().await;
     let tmp = tempfile::tempdir().unwrap();
     ctx.db
@@ -37262,7 +37288,7 @@ async fn serialized_requests_apply_in_receipt_order() {
         ))))
         .await
         .unwrap();
-    match recv_writer_body(&mut writer_rx, "attach response").await {
+    match recv_owner_attach_response(&mut writer_rx, "attach response").await {
         Body::Response { id, response } => {
             assert_eq!(id, attach_id);
             assert!(matches!(*response, Response::Attached { .. }));
@@ -37820,6 +37846,7 @@ async fn hello_only_probe_does_not_claim_client_lifetime() {
 
 #[tokio::test]
 async fn attach_replay_precedes_live_events_under_task_split() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     ctx.db
@@ -37889,7 +37916,7 @@ async fn attach_replay_precedes_live_events_under_task_split() {
     .unwrap();
 
     assert!(matches!(
-        recv_writer_body(&mut writer_rx, "attach response").await,
+        recv_owner_attach_response(&mut writer_rx, "attach response").await,
         Body::Response { .. }
     ));
     let mut saw_drain = false;
@@ -37920,6 +37947,7 @@ async fn attach_replay_precedes_live_events_under_task_split() {
 
 #[tokio::test]
 async fn attach_replay_precedes_live_events_under_concurrency() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("slow.txt"), "slow").unwrap();
@@ -38012,7 +38040,7 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
     .await
     .unwrap();
 
-    match recv_writer_body(&mut writer_rx, "attach response").await {
+    match recv_owner_attach_response(&mut writer_rx, "attach response").await {
         Body::Response { id, response } => {
             assert_eq!(id, attach_id);
             assert!(matches!(*response, Response::Attached { .. }));

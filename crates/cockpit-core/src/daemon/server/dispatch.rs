@@ -6212,7 +6212,7 @@ async fn rollback_acp_catalog_composition_failure(
     let Some(attachment) = pending.attachment else {
         return error;
     };
-    let close = Box::pin(handle_serialized_request_impl(
+    let close = Box::pin(handle_serialized_request_inner(
         request_id,
         Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
             attachment_capability: attachment,
@@ -6257,7 +6257,45 @@ async fn rollback_acp_catalog_composition_failure(
     }
 }
 
+/// All serialized entry points return through this projection boundary. The
+/// inner routes (including ACP composition) record canonical, frozen operation
+/// results before we scrub a response copy. Receipt replays therefore retain
+/// their original history/identity/cursor while using current session coverage
+/// and reporting its typed disposition on every connection and every retry.
 async fn handle_serialized_request_impl(
+    request_id: Uuid,
+    request: Request,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let mut response = Box::pin(handle_serialized_request_inner(
+        request_id,
+        request,
+        state,
+        shared,
+        ctx,
+        effects,
+        #[cfg(feature = "remote")]
+        remote_operation,
+    ))
+    .await?;
+    let root = match &mut response {
+        Response::CodeRootCreated(result) => &mut result.root,
+        Response::CodeRootAttached(result) => &mut result.root,
+        Response::CodeRootWithAcpIngressCreated(result) => &mut result.base.root,
+        Response::CodeRootWithAcpIngressAttached(result) => &mut result.base.root,
+        _ => return Ok(response),
+    };
+    let handle = require_attached(state)?.handle.clone();
+    ensure_agent_tree_attached_session(root.root_id.0, &handle)?;
+    scrub_code_root_read_current(root, &handle, &mut state.pending_replay).await;
+    Ok(response)
+}
+
+async fn handle_serialized_request_inner(
     request_id: Uuid,
     request: Request,
     state: &mut MutableClientState,
@@ -6921,7 +6959,7 @@ async fn handle_serialized_request_impl(
                 root_id: None,
                 attachment: None,
             });
-            let base_response = Box::pin(handle_serialized_request_impl(
+            let base_response = Box::pin(handle_serialized_request_inner(
                 request_id,
                 Request::CreateCodeRootV1(request.base.clone()),
                 state,
@@ -6996,7 +7034,7 @@ async fn handle_serialized_request_impl(
                 root_id: None,
                 attachment: None,
             });
-            let base_response = Box::pin(handle_serialized_request_impl(
+            let base_response = Box::pin(handle_serialized_request_inner(
                 request_id,
                 Request::AttachExistingCodeRootV1(request.base.clone()),
                 state,
@@ -7051,7 +7089,7 @@ async fn handle_serialized_request_impl(
                 .record_for_capability(&request.attachment_capability)
                 .map_err(code_root_contract_error)?
                 .root_id;
-            let base_response = Box::pin(handle_serialized_request_impl(
+            let base_response = Box::pin(handle_serialized_request_inner(
                 request_id,
                 Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
                     attachment_capability: request.attachment_capability.clone(),
@@ -7191,7 +7229,7 @@ async fn handle_serialized_request_impl(
                     return Err(error);
                 }
             };
-            let mut root = match code_root_read_from_attached_response(ctx, attached).await {
+            let root = match code_root_read_from_attached_response(ctx, attached).await {
                 Ok(root) => root,
                 Err(error) => {
                     crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -7199,14 +7237,6 @@ async fn handle_serialized_request_impl(
                     return Err(error);
                 }
             };
-            if let Some(attached) = state.attached.as_ref() {
-                scrub_code_root_read_current(
-                    &mut root,
-                    &attached.handle,
-                    &mut state.pending_replay,
-                )
-                .await;
-            }
             if let Some(attached) = state.attached.as_ref() {
                 if let Err(error) = attached.handle.persist_if_needed() {
                     crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -7377,7 +7407,7 @@ async fn handle_serialized_request_impl(
                     return Err(error);
                 }
             };
-            let mut root = match code_root_read_from_attached_response(ctx, attached).await {
+            let root = match code_root_read_from_attached_response(ctx, attached).await {
                 Ok(root) => root,
                 Err(error) => {
                     crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -7385,14 +7415,6 @@ async fn handle_serialized_request_impl(
                     return Err(error);
                 }
             };
-            if let Some(attached) = state.attached.as_ref() {
-                scrub_code_root_read_current(
-                    &mut root,
-                    &attached.handle,
-                    &mut state.pending_replay,
-                )
-                .await;
-            }
             let writer =
                 crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
             let initial = match writer.write_root_state_changed(root.root_id).await {

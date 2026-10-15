@@ -1261,9 +1261,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
     }
 }
 
-/// Scrub a code-root attach projection with the session's *current* coverage
+/// Scrub a frozen code-root operation result with the session's *current* coverage
 /// (#547). When none can be established every free-text field is withheld
-/// and the client is told why through the attach replay.
+/// and the client is told why through the attach replay on every return,
+/// including same-connection and reconnect receipt retries.
 pub(super) async fn scrub_code_root_read_current(
     root: &mut proto::CodeRootReadV1,
     handle: &SessionWorkerHandle,

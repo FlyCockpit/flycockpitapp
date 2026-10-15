@@ -2343,11 +2343,11 @@ async fn fatal_locked_loop_exit_settles_the_in_flight_construction() {
             .ready_transition_inflight
             .load(std::sync::atomic::Ordering::Acquire)
     );
-    assert_ne!(
-        locked.ready_construction_phase(),
-        cockpit_proto::LockedReadyConstruction::Failed {
-            reason: cockpit_proto::ReadyConstructionFailure::Unclassified,
-        },
+    assert!(
+        !matches!(
+            locked.ready_construction_phase(),
+            cockpit_proto::LockedReadyConstruction::Failed { .. }
+        ),
         "a successful construction retired by the exit is not rolled back"
     );
 }

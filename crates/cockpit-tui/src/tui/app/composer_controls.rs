@@ -189,8 +189,9 @@ impl App {
     /// A pending composer mutation is the picker's claim to show Applying /
     /// Confirmed. The bound `pending_control_requests` entry uniquely owns
     /// correlated in-flight slots (`pending_model_selection`, tokenizer
-    /// confirm) and must stay until the outcome is observed: dropping it
-    /// would orphan those slots on Rejected/NotDelivered. Every close,
+    /// confirm) and stays until the outcome is observed or epoch retirement
+    /// releases those slots. Dropping it without either settlement would
+    /// orphan those slots on Rejected/NotDelivered. Every close,
     /// reconnect, session-generation, reset, terminal, and timeout path
     /// must call this so a later receipt cannot confirm the picker. The
     /// correlation is marked `fenced` rather than removed. When

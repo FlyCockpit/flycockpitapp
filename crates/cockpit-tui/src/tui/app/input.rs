@@ -1118,12 +1118,9 @@ impl App {
                     self.open_default_model_from_settings();
                 }
             } else if let Some(req) = self.dialog.take_daemon_request() {
-                // A staged default-model request carries its own correlation
-                // id; adopt it so the terminal result is matched to this
-                // operation and not silently dropped.
-                if let Some(id) = self.dialog.take_pending_default_model_update_id() {
-                    self.pending_default_model_update_id = Some(id);
-                }
+                // The send boundary binds the id carried by SetDefaultModel
+                // and retires it on non-delivery or a failed receipt.
+                let _ = self.dialog.take_pending_default_model_update_id();
                 self.send_daemon_request("/settings", req, ControlApplied::None);
             }
             self.drain_oauth_actions();

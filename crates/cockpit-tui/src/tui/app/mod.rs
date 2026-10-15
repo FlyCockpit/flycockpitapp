@@ -257,10 +257,14 @@ pub(crate) struct PendingControlRequest {
     applied: ControlApplied,
     /// Fenced requests keep correlation so Rejected/NotDelivered can still
     /// release uniquely-owned slots (`pending_model_selection`, tokenizer
-    /// confirm) without driving picker confirmation side-effects.
+    /// confirm) without driving picker confirmation side-effects. Epoch
+    /// retirement releases them when that receipt route is no longer live.
     fenced: bool,
     /// The attachment the request was sent for.
     binding: Option<ExitCheckBinding>,
+    /// A separate daemon event confirms this default-model write after Ack.
+    /// A failed control receipt can release only this exact owned slot.
+    default_model_update_id: Option<uuid::Uuid>,
 }
 
 impl PendingControlRequest {
@@ -270,6 +274,7 @@ impl PendingControlRequest {
             applied,
             fenced: false,
             binding: None,
+            default_model_update_id: None,
         }
     }
 }

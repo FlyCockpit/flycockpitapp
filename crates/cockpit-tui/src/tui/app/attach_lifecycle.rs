@@ -545,15 +545,21 @@ impl App {
         }
         // A submission held by the pending model transaction is not an
         // independently dispatchable paste fence. Keep it intact while the
-        // model control is converted into a session-scoped retry below; that
-        // path parks its order sequence and recreates it behind the retried
-        // model switch. Generic epoch cleanup would otherwise delete the
-        // fence first and leave the retained payload with nothing to release.
+        // model control is converted into a session-scoped retry. Receipt
+        // retirement may already have parked a fenced model control before
+        // this phase. Both paths retain the exact fence and recreate its
+        // order behind the retried model switch. Generic epoch cleanup would
+        // otherwise leave the retained payload with nothing to release.
         let model_held_fence = self
             .pending_model_selection
             .as_ref()
             .and_then(|pending| pending.queued_submission.as_ref())
-            .map(|queued| queued.client_submission_id);
+            .map(|queued| queued.client_submission_id)
+            .or_else(|| {
+                self.current_model_selection_retry()
+                    .and_then(|retry| retry.queued_submission.as_ref())
+                    .map(|queued| queued.client_submission_id)
+            });
         let mut cancelled_sequences = Vec::new();
         let mut cancelled_fences = Vec::new();
         let reconciling_fences = self

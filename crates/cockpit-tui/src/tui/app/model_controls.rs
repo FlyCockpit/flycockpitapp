@@ -730,6 +730,13 @@ impl App {
         };
         let mut pending = PendingControlRequest::new(label.to_string(), applied);
         pending.binding = Some(binding);
+        if let cockpit_proto::Request::SetDefaultModel {
+            default_update_id, ..
+        } = &req
+        {
+            pending.default_model_update_id = Some(*default_update_id);
+            self.pending_default_model_update_id = Some(*default_update_id);
+        }
         self.pending_control_requests.insert(request_id, pending);
         self.bind_composer_control_request(request_id);
         let result = agent_runner::send_control_request(
@@ -743,6 +750,9 @@ impl App {
         );
         if let Err(reason) = result {
             let removed = self.pending_control_requests.remove(&request_id);
+            if let Some(pending) = &removed {
+                self.clear_pending_default_model_update(pending.default_model_update_id);
+            }
             let tool_surface_override = removed.as_ref().is_some_and(|pending| {
                 matches!(pending.applied, ControlApplied::ToolSurfaceOverride { .. })
             });
@@ -791,6 +801,10 @@ impl App {
         &mut self,
         reason: super::ControlEpochAbandonment,
     ) {
+        // Ack can retire the control correlation before the separately
+        // stamped DefaultModelUpdateResult arrives. Retire that owner even
+        // when its control entry has already completed.
+        self.pending_default_model_update_id = None;
         let pending = std::mem::take(&mut self.pending_control_requests);
         let mut refresh_snapshot = false;
         let interruption = match reason {
@@ -798,16 +812,36 @@ impl App {
             super::ControlEpochAbandonment::SessionTransition => "session change",
             super::ControlEpochAbandonment::TerminalDisconnect => "the daemon connection ending",
         };
-        for (id, request) in pending {
-            // Fenced correlations still swallow late receipts without
-            // confirming; dropping them would lose that settlement path.
-            if request.fenced {
-                self.pending_control_requests.insert(id, request);
+        for request in pending.into_values() {
+            let action = request.applied.epoch_abandon_action(reason);
+            // A fence suppresses presentation, not retirement. The old
+            // epoch's receipt can no longer settle this correlation. Only
+            // owned-slot cleanup survives the fence; never replay a fenced
+            // follow-on, confirm it, or turn it into exit authority.
+            if request.fenced
+                && !matches!(
+                    action,
+                    super::ControlEpochAbandonAction::ModelSelection
+                        | super::ControlEpochAbandonAction::FailTokenizer
+                )
+            {
                 continue;
             }
-            match request.applied.epoch_abandon_action(reason) {
-                super::ControlEpochAbandonAction::Silent
-                | super::ControlEpochAbandonAction::ModelSelection => {}
+            match action {
+                super::ControlEpochAbandonAction::Silent => {}
+                super::ControlEpochAbandonAction::ModelSelection => {
+                    if request.fenced
+                        && let ControlApplied::ModelSelection { selection_id } = request.applied
+                        && self
+                            .pending_model_selection
+                            .as_ref()
+                            .is_some_and(|pending| pending.selection_id == selection_id)
+                    {
+                        // Preserve held submissions through the same epoch
+                        // cancellation path as an unfenced model selection.
+                        let _ = self.cancel_model_controls_for_runner_epoch();
+                    }
+                }
                 super::ControlEpochAbandonAction::RefreshSnapshot => {
                     refresh_snapshot = true;
                 }
@@ -815,7 +849,11 @@ impl App {
                     if let ControlApplied::ResponseMetricsTokenizer { confirm_id } = request.applied
                         && let Some(tok) = self.pending_tokenizer_confirm.take()
                     {
-                        let outcome = tok.on_response(confirm_id, 0, false, Some("refresh_failed"));
+                        let outcome = if request.fenced && tok.request_id == confirm_id {
+                            tok.supersede()
+                        } else {
+                            tok.on_response(confirm_id, 0, false, Some("refresh_failed"))
+                        };
                         self.apply_tokenizer_confirm_outcome(outcome);
                     }
                 }
@@ -939,6 +977,15 @@ impl App {
         let Some(pending) = self.pending_control_requests.remove(&request_id) else {
             return;
         };
+        if matches!(
+            outcome,
+            ControlRequestOutcome::Unauthorized(_)
+                | ControlRequestOutcome::Rejected(_)
+                | ControlRequestOutcome::TransportFailed(_)
+                | ControlRequestOutcome::NotDelivered(_)
+        ) {
+            self.clear_pending_default_model_update(pending.default_model_update_id);
+        }
         let skip_confirmation =
             pending.fenced || self.discard_stale_composer_control_receipt(request_id);
         let selection_id = match pending.applied {
@@ -1072,6 +1119,12 @@ impl App {
                     );
                 }
             }
+        }
+    }
+
+    fn clear_pending_default_model_update(&mut self, id: Option<uuid::Uuid>) {
+        if id.is_some() && self.pending_default_model_update_id == id {
+            self.pending_default_model_update_id = None;
         }
     }
 
@@ -1402,8 +1455,6 @@ impl super::App {
             clear: false,
         };
         self.send_daemon_request("/settings default model", req, ControlApplied::None);
-        // Stash id for terminal handling.
-        self.pending_default_model_update_id = Some(default_update_id);
     }
 }
 

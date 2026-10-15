@@ -1479,15 +1479,30 @@ fn session_reset_and_terminal_link_terminate_composer_pending() {
         "terminal disconnect must not leave Applying…"
     );
     assert!(app.composer_controls.picker.is_none());
+    // Terminal retirement ends the receipt route and releases its authority.
+    // Same-epoch picker-close correlation is covered separately above.
     assert!(
-        app.pending_control_requests
-            .get(&request_id)
-            .is_some_and(|pending| pending.fenced),
-        "terminal disconnect fences composer confirmation and keeps correlation"
+        !app.pending_control_requests.contains_key(&request_id),
+        "terminal disconnect must retire the fenced correlation"
     );
-    apply_control_applied(&mut app, request_id);
-    assert!(app.composer_controls.pending.is_none());
-    assert!(app.composer_controls.picker.is_none());
+    assert!(!app.has_unsettled_local_authority());
+    let history_before = history_plain_lines(&app)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for outcome in [
+        ControlRequestOutcome::Applied,
+        ControlRequestOutcome::Unauthorized("old refusal".to_string()),
+        ControlRequestOutcome::TransportFailed("old response loss".to_string()),
+    ] {
+        apply_control_outcome(&mut app, request_id, outcome);
+        assert!(app.composer_controls.pending.is_none());
+        assert!(app.composer_controls.picker.is_none());
+        assert!(!app.has_unsettled_local_authority());
+        assert!(app.exit_check_escape.is_none());
+        assert!(!app.exit_requested);
+        assert_eq!(history_plain_lines(&app), history_before);
+    }
 }
 
 #[test]

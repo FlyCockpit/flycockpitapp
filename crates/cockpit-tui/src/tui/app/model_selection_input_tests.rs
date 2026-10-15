@@ -748,7 +748,7 @@ enum ModelEpochPath {
     SessionSwitch,
 }
 
-fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
+fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath, fenced: bool) {
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -826,6 +826,10 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
             },
         ),
     );
+
+    if fenced {
+        app.fence_pending_control_request(cockpit_client::presentation::ControlRequestId(77));
+    }
 
     let automatically_retried = matches!(
         path,
@@ -1011,27 +1015,40 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
 
 #[test]
 fn session_replacement_starts_new_model_generation_epoch() {
-    assert_runner_epoch_reset_and_followup_completion(ModelEpochPath::AdoptReplacement);
+    assert_runner_epoch_reset_and_followup_completion(ModelEpochPath::AdoptReplacement, false);
 }
 
 #[test]
 fn same_session_reconnect_starts_new_model_generation_epoch() {
-    assert_runner_epoch_reset_and_followup_completion(ModelEpochPath::AdoptSameSession);
+    assert_runner_epoch_reset_and_followup_completion(ModelEpochPath::AdoptSameSession, false);
 }
 
 #[test]
 fn same_runner_daemon_reconnect_starts_new_model_generation_epoch() {
-    assert_runner_epoch_reset_and_followup_completion(ModelEpochPath::SameRunnerReconnect);
+    assert_runner_epoch_reset_and_followup_completion(ModelEpochPath::SameRunnerReconnect, false);
 }
 
 #[test]
 fn event_stream_lag_resync_starts_new_model_generation_epoch() {
-    assert_runner_epoch_reset_and_followup_completion(ModelEpochPath::EventStreamLagResync);
+    assert_runner_epoch_reset_and_followup_completion(ModelEpochPath::EventStreamLagResync, false);
 }
 
 #[test]
 fn session_switch_outcome_starts_new_model_generation_epoch() {
-    assert_runner_epoch_reset_and_followup_completion(ModelEpochPath::SessionSwitch);
+    assert_runner_epoch_reset_and_followup_completion(ModelEpochPath::SessionSwitch, false);
+}
+
+#[test]
+fn fenced_model_epoch_retirement_retains_exact_submission_and_allows_successor() {
+    for path in [
+        ModelEpochPath::AdoptReplacement,
+        ModelEpochPath::AdoptSameSession,
+        ModelEpochPath::SameRunnerReconnect,
+        ModelEpochPath::EventStreamLagResync,
+        ModelEpochPath::SessionSwitch,
+    ] {
+        assert_runner_epoch_reset_and_followup_completion(path, true);
+    }
 }
 
 #[test]

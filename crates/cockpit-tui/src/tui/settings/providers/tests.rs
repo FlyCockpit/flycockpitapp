@@ -8496,6 +8496,9 @@ fn pending_daemon_deep_success_after_escape_adopts_current_snapshot() {
                     }
                     Err(error) => panic!("{error}"),
                 };
+                // Accepted sockets inherit O_NONBLOCK on macOS. The listener
+                // stays nonblocking for shutdown, but request reads must wait.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(10)))
                     .unwrap();
@@ -8640,6 +8643,9 @@ fn pending_daemon_deep_lost_reply_after_escape_reads_committed_snapshot() {
                     }
                     Err(error) => panic!("{error}"),
                 };
+                // Accepted sockets inherit O_NONBLOCK on macOS. The listener
+                // stays nonblocking for shutdown, but request reads must wait.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(10)))
                     .unwrap();
@@ -9789,5 +9795,364 @@ fn sparse_membership_save_rejects_oversized_single_authored_layer_without_writes
         assert_eq!(current.authority.base_revision, revision);
         assert_eq!(current.authority.config_generation, generation);
         assert_eq!(current.config.providers["p"].entry.models.len(), 1);
+        // Assert the typed failure at the actual client/daemon RPC boundary,
+        // in addition to the ordinary settings error projection above.
+        let mut entry = dialog.config.providers["p"].clone();
+        entry.models.clear();
+        let mutation = cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "p".into(),
+                header_secrets: vec![None; entry.headers.len()],
+                entry,
+                model_patch: Some(delta),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        };
+        let intent = mutation.sanitized_intent_hash().unwrap();
+        let authority = current.authority;
+        let error = runtime
+            .block_on(
+                client.request(cockpit_proto::Request::ApplyProviderMutation {
+                    snapshot_session_id: authority.snapshot_session_id,
+                    layer_id: authority.layer_id,
+                    expected_revision: authority.base_revision,
+                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    mutation_intent_hash: intent,
+                    mutation,
+                }),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, cockpit_proto::ErrorCode::BadRequest);
+        assert!(
+            error.message.contains("authored provider entry exceeds"),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+        assert_eq!(std::fs::read(&provider_path).unwrap(), provider_before);
+        let unchanged = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(unchanged.authority.base_revision, revision);
+        assert_eq!(unchanged.authority.config_generation, generation);
+    });
+}
+
+#[derive(Clone, Copy)]
+enum ByteBoundedReorderCase {
+    BoundedRotation,
+    FullOrder,
+    WeightedSparse,
+    AccumulatedAuthored,
+}
+
+#[test]
+fn byte_bounded_reorder_301_bounded_ids_rotation_through_actual_settings() {
+    assert_byte_bounded_reorder_through_actual_settings(ByteBoundedReorderCase::BoundedRotation);
+}
+
+#[test]
+fn byte_bounded_reorder_full_order_over_16k_through_actual_settings() {
+    assert_byte_bounded_reorder_through_actual_settings(ByteBoundedReorderCase::FullOrder);
+}
+
+#[test]
+fn byte_bounded_reorder_weighted_sparse_through_actual_settings() {
+    assert_byte_bounded_reorder_through_actual_settings(ByteBoundedReorderCase::WeightedSparse);
+}
+
+#[test]
+fn byte_bounded_reorder_accumulated_authored_selects_fitting_full_order() {
+    assert_byte_bounded_reorder_through_actual_settings(
+        ByteBoundedReorderCase::AccumulatedAuthored,
+    );
+}
+
+fn assert_byte_bounded_reorder_through_actual_settings(case: ByteBoundedReorderCase) {
+    use cockpit_config::config::providers::ModelPlacement;
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cap = cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES;
+        let entry = |models| ProviderEntry {
+            url: "https://example.com/v1".into(),
+            auth: Some(AuthKind::None),
+            models,
+            ..Default::default()
+        };
+        let (global_ids, local_ids) = match case {
+            ByteBoundedReorderCase::WeightedSparse => (
+                vec![format!("a-{}", "a".repeat(135 * 1024)), "short".into()],
+                vec![format!("b-{}", "b".repeat(135 * 1024))],
+            ),
+            _ => {
+                let ids = (0..150)
+                    .map(|i| format!("a{i:03}-{}", "x".repeat(900)))
+                    .chain((0..151).map(|i| format!("b{i:03}")))
+                    .collect::<Vec<_>>();
+                assert!(
+                    ids.iter()
+                        .all(|id| id.len() <= cockpit_proto::MAX_OWNER_PROVIDER_MODEL_ID_BYTES)
+                );
+                (ids, Vec::new())
+            }
+        };
+        let rows = |ids: &[String]| {
+            ids.iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let mut row = model(id, false);
+                    row.name = Some(format!("image-{i}"));
+                    row.favorite = i % 3 == 0;
+                    row
+                })
+                .collect::<Vec<_>>()
+        };
+        let global_entry = entry(rows(&global_ids));
+        assert!(serde_json::to_vec(&global_entry).unwrap().len() < cap);
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut source = ProvidersConfig::default();
+        source.providers.insert("p".into(), global_entry);
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let mut owner_entry = entry(Vec::new());
+        if matches!(case, ByteBoundedReorderCase::AccumulatedAuthored) {
+            // Retained explicit pins fit initially. A tiny additional move
+            // exceeds the accumulated sparse budget, while full order fits.
+            owner_entry.model_membership.placements = global_ids
+                .iter()
+                .take(100)
+                .enumerate()
+                .map(|(i, id)| ModelPlacement {
+                    id: id.clone(),
+                    after: i.checked_sub(1).map(|prior| global_ids[prior].clone()),
+                })
+                .collect();
+            owner_entry.name = Some(String::new());
+            let overhead = serde_json::to_vec(&owner_entry).unwrap().len();
+            owner_entry.name = Some("n".repeat(cap - overhead - 512));
+        }
+        let mut owner = ProvidersConfig::default();
+        owner.providers.insert("p".into(), owner_entry);
+        let (tmp, mut dialog) = dialog_with_config(owner);
+        if !local_ids.is_empty() {
+            let local_dir = cockpit_config::config::dirs::local_config_dir_for(tmp.path()).unwrap();
+            std::fs::create_dir_all(local_dir.join("providers")).unwrap();
+            std::fs::write(local_dir.join("config.json"), "{}").unwrap();
+            let local_entry = entry(rows(&local_ids));
+            assert!(serde_json::to_vec(&local_entry).unwrap().len() < cap);
+            std::fs::write(
+                local_dir.join("providers/p.json"),
+                serde_json::to_vec(&local_entry).unwrap(),
+            )
+            .unwrap();
+        }
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let before = current.config.providers["p"].entry.models.clone();
+        assert!(
+            before
+                .iter()
+                .map(|row| &row.id)
+                .eq(global_ids.iter().chain(&local_ids))
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(current.config.providers["p"].entry.favorite, Some(true));
+        let mut after = before.clone();
+        match case {
+            ByteBoundedReorderCase::BoundedRotation => after.rotate_left(150),
+            ByteBoundedReorderCase::FullOrder => after.reverse(),
+            ByteBoundedReorderCase::WeightedSparse => after.rotate_left(1),
+            ByteBoundedReorderCase::AccumulatedAuthored => after.swap(100, 101),
+        }
+        let patch = cockpit_proto::ProviderModelPatch::between(&before, &after).unwrap();
+        let mut metadata = current.config.providers["p"].entry.clone();
+        metadata.models.clear();
+        let authored_before = ConfigDoc::load(&tmp.path().join(".cockpit/config.json"))
+            .unwrap()
+            .providers()
+            .providers["p"]
+            .clone();
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        if !matches!(case, ByteBoundedReorderCase::AccumulatedAuthored) {
+            // The old count-based encoding is a valid reorder but exceeds
+            // complete ingress. Its rejection must have no partial effect.
+            let mut oversized = patch.clone();
+            oversized.order = None;
+            oversized.moves = match case {
+                ByteBoundedReorderCase::WeightedSparse => vec![ModelPlacement {
+                    id: global_ids[0].clone(),
+                    after: Some(local_ids[0].clone()),
+                }],
+                ByteBoundedReorderCase::FullOrder => after
+                    .iter()
+                    .enumerate()
+                    .take(after.len() - 1)
+                    .map(|(i, row)| ModelPlacement {
+                        id: row.id.clone(),
+                        after: i.checked_sub(1).map(|prior| after[prior].id.clone()),
+                    })
+                    .collect(),
+                _ => after
+                    .iter()
+                    .enumerate()
+                    .skip(151)
+                    .map(|(i, row)| ModelPlacement {
+                        id: row.id.clone(),
+                        after: Some(after[i - 1].id.clone()),
+                    })
+                    .collect(),
+            };
+            let mut applied = before.clone();
+            oversized.apply(&mut applied).unwrap();
+            assert_eq!(
+                serde_json::to_value(&applied).unwrap(),
+                serde_json::to_value(&after).unwrap()
+            );
+            assert!(
+                serde_json::to_vec(&(&metadata, Some(&oversized)))
+                    .unwrap()
+                    .len()
+                    > cap
+            );
+            let file_before = std::fs::read(&provider_path).unwrap();
+            let config_before = std::fs::read(&config_path).unwrap();
+            let mutation = cockpit_proto::ProviderMutationBatch {
+                upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                    provider_id: "p".into(),
+                    header_secrets: vec![None; metadata.headers.len()],
+                    entry: metadata.clone(),
+                    model_patch: Some(oversized),
+                }],
+                deletes: Vec::new(),
+                metadata: None,
+            };
+            let authority = &current.authority;
+            let intent = mutation.sanitized_intent_hash().unwrap();
+            let error = runtime
+                .block_on(
+                    client.request(cockpit_proto::Request::ApplyProviderMutation {
+                        snapshot_session_id: authority.snapshot_session_id.clone(),
+                        layer_id: authority.layer_id.clone(),
+                        expected_revision: authority.base_revision.clone(),
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
+                        mutation_intent_hash: intent,
+                        mutation,
+                    }),
+                )
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, cockpit_proto::ErrorCode::BadRequest);
+            assert!(
+                error
+                    .message
+                    .contains("provider entry exceeds maximum length")
+            );
+            assert_eq!(std::fs::read(&provider_path).unwrap(), file_before);
+            assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+            let unchanged = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            assert_eq!(
+                unchanged.authority.base_revision,
+                current.authority.base_revision
+            );
+            assert_eq!(
+                unchanged.authority.config_generation,
+                current.authority.config_generation
+            );
+            assert_eq!(
+                serde_json::to_value(&unchanged.config.providers["p"].entry.models).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+        }
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models = after.clone();
+        dialog
+            .save_config()
+            .expect("ordinary settings save must select a fitting encoding");
+        dialog.settle_test_effects();
+        assert!(
+            serde_json::to_vec(&(&metadata, Some(&patch)))
+                .unwrap()
+                .len()
+                <= cap,
+            "complete ordinary metadata + delta must fit ingress"
+        );
+        match case {
+            ByteBoundedReorderCase::BoundedRotation => {}
+            ByteBoundedReorderCase::FullOrder => {
+                assert!(
+                    serde_json::to_vec(patch.order.as_ref().unwrap())
+                        .unwrap()
+                        .len()
+                        > 16 * 1024
+                );
+                assert!(patch.moves.is_empty());
+            }
+            ByteBoundedReorderCase::WeightedSparse => {
+                assert!(patch.order.is_none());
+                assert_eq!(
+                    patch.moves,
+                    vec![
+                        ModelPlacement {
+                            id: "short".into(),
+                            after: None
+                        },
+                        ModelPlacement {
+                            id: local_ids[0].clone(),
+                            after: Some("short".into())
+                        },
+                    ],
+                    "two cheaper moves beat one move containing both huge IDs"
+                );
+            }
+            ByteBoundedReorderCase::AccumulatedAuthored => {
+                assert!(patch.order.is_none());
+                let mut sparse = authored_before.clone();
+                patch.apply_to_layer(&before, &mut sparse).unwrap();
+                assert!(
+                    serde_json::to_vec(&sparse).unwrap().len() > cap,
+                    "request fits but accumulated sparse intent does not"
+                );
+            }
+        }
+        let actual = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&after).unwrap(),
+            "independent daemon read preserves every row image and exact order"
+        );
+        let durable: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert!(serde_json::to_vec(&durable).unwrap().len() <= cap);
+        if matches!(case, ByteBoundedReorderCase::AccumulatedAuthored) {
+            assert!(
+                durable.get("model_order").is_some(),
+                "final authored budget selects the fitting complete order"
+            );
+        }
     });
 }

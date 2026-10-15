@@ -21655,6 +21655,16 @@ fn config_write_target_error(
     }
 }
 
+/// Expected prospective-write validation is a client error; filesystem and
+/// serialization failures retain Internal, including through anyhow contexts.
+fn provider_write_error(error: anyhow::Error) -> ErrorPayload {
+    if error.is::<crate::config::providers::ProviderWriteValidationError>() {
+        bad_request(format!("{error:#}"))
+    } else {
+        internal(error)
+    }
+}
+
 /// The durable workspace-trust decision a policy bundle import or export of
 /// `project_root` runs under. Unset or untrusted workspaces are refused.
 async fn policy_bundle_trust_policy(
@@ -22409,7 +22419,56 @@ fn catalog_config_after_layer_writes(
         ));
     }
     crate::config::providers::ConfigDoc::providers_from_paths_after_writes(&paths, &writes)
-        .map_err(internal)
+        .map_err(provider_write_error)
+}
+
+/// Request-byte minimization cannot see accumulated authored intent or raw
+/// unknown fields. Check the actual final layer too. If retaining sparse pins
+/// exceeds its quota, a complete order can still fit without dropping any old
+/// pin/tombstone authority. Never compact by silently unpinning previous moves.
+fn fit_provider_model_authoring(
+    doc: &crate::config::providers::ConfigDoc,
+    provider_id: &str,
+    entry: &mut crate::config::providers::ProviderEntry,
+    patch: Option<&proto::ProviderModelPatch>,
+    effective: &crate::config::providers::ProvidersConfig,
+    authored: &crate::config::providers::ProvidersConfig,
+) -> std::result::Result<(), ErrorPayload> {
+    let error = match doc.validate_provider_write(provider_id, entry) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let Some(patch) = patch.filter(|patch| {
+        error.is::<crate::config::providers::ProviderWriteValidationError>()
+            && patch.order.is_none()
+            && !patch.clear
+            && (!patch.moves.is_empty() || !patch.deletes.is_empty() || !patch.upserts.is_empty())
+    }) else {
+        return Err(provider_write_error(error));
+    };
+    let before = &effective.providers[provider_id].models;
+    let mut after = before.clone();
+    patch.apply(&mut after).map_err(bad_request)?;
+    let mut full = patch.clone();
+    full.order = Some(after.iter().map(|row| row.id.clone()).collect());
+    full.moves.clear();
+    let mut layer = authored
+        .providers
+        .get(provider_id)
+        .cloned()
+        .unwrap_or_default();
+    full.apply_to_layer(before, &mut layer)
+        .map_err(bad_request)?;
+    let mut candidate = entry.clone();
+    candidate.models = layer.models;
+    candidate.models_replace = layer.models_replace;
+    candidate.model_field_patches = layer.model_field_patches;
+    candidate.model_order = layer.model_order;
+    candidate.model_membership = layer.model_membership;
+    doc.validate_provider_write(provider_id, &candidate)
+        .map_err(provider_write_error)?;
+    *entry = candidate;
+    Ok(())
 }
 
 async fn ensure_catalog_candidate_readable(
@@ -23934,6 +23993,14 @@ async fn stage_and_recover_provider_batch(
             upsert.entry.model_order = None;
             upsert.entry.model_membership = Default::default();
         }
+        fit_provider_model_authoring(
+            &doc,
+            &upsert.provider_id,
+            &mut upsert.entry,
+            upsert.model_patch.as_ref(),
+            &effective,
+            &desired,
+        )?;
         desired.providers.insert(upsert.provider_id, upsert.entry);
     }
     for delete in mutation.deletes {
@@ -34370,5 +34437,38 @@ fn assistant_inbox_item_wire(
         created_at_unix_ms: item.created_at_unix_ms,
         delivered_at_unix_ms: item.delivered_at_unix_ms,
         human_read_at_unix_ms: item.human_read_at_unix_ms,
+    }
+}
+
+#[cfg(test)]
+mod provider_write_error_tests {
+    use super::*;
+
+    #[test]
+    fn provider_write_quota_mapping_preserves_typed_validation_and_io_faults() {
+        use crate::config::providers::ProviderWriteValidationError;
+        for kind in [
+            ProviderWriteValidationError::AuthoredEntryTooLarge,
+            ProviderWriteValidationError::DocumentTooLarge,
+        ] {
+            let error = anyhow::Error::new(kind).context("prospective provider write");
+            assert_eq!(provider_write_error(error).code, ErrorCode::BadRequest);
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::Other,
+        ] {
+            let error = anyhow::Error::new(std::io::Error::new(
+                kind,
+                "authored provider entry exceeds maximum length",
+            ))
+            .context("actual file I/O");
+            assert_eq!(
+                provider_write_error(error).code,
+                ErrorCode::Internal,
+                "error text must not turn an actual I/O fault into a quota rejection"
+            );
+        }
     }
 }

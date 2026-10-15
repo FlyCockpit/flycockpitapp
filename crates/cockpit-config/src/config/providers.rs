@@ -112,6 +112,30 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
 /// writers and daemon edit ingress. Composition does not consume this budget.
 pub const MAX_AUTHORED_PROVIDER_ENTRY_BYTES: usize = 256 * 1024;
 
+/// Expected validation failures from the common prospective/durable serializer.
+/// Keep these typed through anyhow contexts so RPCs can distinguish quota
+/// rejection (before writing) from an actual filesystem or serialization fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderWriteValidationError {
+    AuthoredEntryTooLarge,
+    DocumentTooLarge,
+}
+
+impl std::fmt::Display for ProviderWriteValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AuthoredEntryTooLarge => {
+                "authored provider entry exceeds maximum length; no provider configuration was written"
+            }
+            Self::DocumentTooLarge => {
+                "serialized provider/config layer exceeds the readable byte limit; no provider configuration was written"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ProviderWriteValidationError {}
+
 const MODEL_WIZARD_MODEL_FIELD_KEYS: &[&str] = &[
     "trust",
     "subagent_invokable",
@@ -1408,31 +1432,60 @@ impl ModelPlacement {
         Ok(())
     }
 
-    /// Minimal moves relative to the surviving rows followed by appended new
-    /// rows. An increasing subsequence stays in place, avoiding O(catalog size)
-    /// operations when one row moves from the beginning to the end.
+    /// Minimum serialized placement bytes relative to the surviving rows
+    /// followed by appended new rows. A maximum-weight increasing subsequence
+    /// stays in place: the weight saved by keeping a row includes its ID, its
+    /// desired predecessor, JSON escaping, and the operation's comma. Counting
+    /// moves alone can select an oversized encoding when ID lengths differ.
     pub fn between(before: &[String], after: &[String]) -> Vec<Self> {
         let positions = before
             .iter()
             .enumerate()
             .map(|(i, id)| (id, i))
             .collect::<BTreeMap<_, _>>();
-        let mut tails: Vec<usize> = Vec::new();
+        // Fenwick prefix maxima make the weighted subsequence O(n log n).
+        // All placements use the preceding desired row, so moving the other
+        // rows from left to right gives exactly `after` for any such subsequence.
+        let mut prefixes = vec![(0usize, None); before.len() + 1];
         let mut previous = vec![None; after.len()];
         for (i, id) in after.iter().enumerate() {
             let position = positions[id];
-            let slot = tails.partition_point(|prior| positions[&after[*prior]] < position);
-            if slot > 0 {
-                previous[i] = Some(tails[slot - 1]);
+            let mut best = (0, None);
+            let mut slot = position;
+            while slot > 0 {
+                if prefixes[slot].0 > best.0 {
+                    best = prefixes[slot];
+                }
+                slot &= slot - 1;
             }
-            if slot == tails.len() {
-                tails.push(i);
-            } else {
-                tails[slot] = i;
+            previous[i] = best.1;
+            let placement = Self {
+                id: id.clone(),
+                after: i.checked_sub(1).map(|prior| after[prior].clone()),
+            };
+            let weight = serde_json::to_vec(&placement)
+                .expect("string placement serializes")
+                .len()
+                + 1;
+            let candidate = (best.0 + weight, Some(i));
+            slot = position + 1;
+            while slot < prefixes.len() {
+                if candidate.0 > prefixes[slot].0 {
+                    prefixes[slot] = candidate;
+                }
+                slot += slot & slot.wrapping_neg();
             }
         }
         let mut stable = std::collections::BTreeSet::new();
-        let mut cursor = tails.last().copied();
+        let mut best = (0, None);
+        let mut slot = before.len();
+        while slot > 0 {
+            if prefixes[slot].0 > best.0 {
+                best = prefixes[slot];
+            }
+            slot &= slot - 1;
+        }
+        let mut cursor = best.1;
         while let Some(index) = cursor {
             stable.insert(index);
             cursor = previous[index];

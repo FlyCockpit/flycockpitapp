@@ -153,34 +153,36 @@ impl ProviderModelPatch {
                 .map(|model| model.id.clone())
                 .collect::<Vec<_>>()
         };
-        // Select centrally for settings, CLI, and every other producer. Never
-        // make a small edit pay for an unchanged ID sequence when operations
-        // are cheaper. Complete small orders retain exact membership semantics.
+        // Select centrally for settings, CLI, and every other producer. Compare
+        // complete serialized patches, without a separate full-order cutoff.
+        // Metadata contributes the same bytes to either (entry, patch) tuple,
+        // so the smaller patch also minimizes the complete ingress charge.
         let mut baseline = before_order;
         baseline.retain(|id| !deletes.contains(id));
         baseline.extend(upserts.iter().map(|row| row.id.clone()));
-        let mut moves = if changed && !clear {
+        let moves = if changed && !clear {
             cockpit_config::config::providers::ModelPlacement::between(&baseline, &after_order)
         } else {
             Vec::new()
         };
-        let order_bytes = serde_json::to_vec(&after_order)?.len();
-        let order = (changed
-            && (clear
-                || (order_bytes <= 16 * 1024 && order_bytes <= serde_json::to_vec(&moves)?.len())))
-        .then_some(after_order);
-        if order.is_some() {
-            moves.clear();
-        }
-        Ok(Self {
-            order,
+        let mut patch = Self {
+            order: clear.then(Vec::new),
             moves,
             clear,
             base_digest: Self::digest(before)?,
             upserts,
             updates,
             deletes,
-        })
+        };
+        if changed && !clear {
+            let mut full = patch.clone();
+            full.order = Some(after_order);
+            full.moves.clear();
+            if serde_json::to_vec(&full)?.len() <= serde_json::to_vec(&patch)?.len() {
+                patch = full;
+            }
+        }
+        Ok(patch)
     }
 
     /// Preserve this layer's authored rows/edits while recording only the
@@ -984,9 +986,22 @@ mod model_patch_tests {
                 })
                 .collect::<Vec<_>>();
             let patch = ProviderModelPatch::between(&before, &after).unwrap();
+            // Full orders above 16 KiB are now permitted. Whichever form is
+            // selected must cost no more than the alternative complete patch.
+            let mut alternative = patch.clone();
+            if patch.order.is_some() {
+                alternative.order = None;
+                alternative.moves = cockpit_config::config::providers::ModelPlacement::between(
+                    &before.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+                    &order,
+                );
+            } else if before.iter().map(|row| &row.id).ne(order.iter()) {
+                alternative.order = Some(order.clone());
+                alternative.moves.clear();
+            }
             assert!(
-                patch.order.is_none(),
-                "large catalogs always use sparse membership"
+                serde_json::to_vec(&patch).unwrap().len()
+                    <= serde_json::to_vec(&alternative).unwrap().len()
             );
             assert!(patch.upserts.is_empty() && patch.updates.is_empty());
             let mut applied = before.clone();

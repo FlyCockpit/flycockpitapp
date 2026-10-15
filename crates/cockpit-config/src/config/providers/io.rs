@@ -1458,6 +1458,24 @@ impl ConfigDoc {
         Ok(())
     }
 
+    /// Validate the exact raw candidate, including retained unknown fields and
+    /// the same patching/readable/canonical budgets used by the durable writer.
+    /// This does not write or acquire an additional mutation lock.
+    pub fn validate_provider_write(&self, id: &str, entry: &ProviderEntry) -> Result<()> {
+        let original = self.providers();
+        let original_entry = original.providers.get(id);
+        let original_raw = original_entry
+            .map(|entry| serialize_json_object(entry, "provider"))
+            .transpose()?;
+        self.provider_raw_for_write(
+            id,
+            original_entry,
+            serialize_json_object(entry, "provider")?,
+            original_raw.as_ref(),
+        )?;
+        Ok(())
+    }
+
     fn provider_raw_for_write(
         &self,
         id: &str,
@@ -1575,10 +1593,9 @@ impl ConfigDoc {
 /// views omit unknown provider keys, so charge these bytes before writing too.
 fn readable_provider_bytes(value: &Map<String, Value>) -> Result<Vec<u8>> {
     let bytes = readable_document_bytes(value)?;
-    anyhow::ensure!(
-        serde_json::to_vec(value)?.len() <= super::MAX_AUTHORED_PROVIDER_ENTRY_BYTES,
-        "authored provider entry exceeds maximum length; no provider configuration was written"
-    );
+    if serde_json::to_vec(value)?.len() > super::MAX_AUTHORED_PROVIDER_ENTRY_BYTES {
+        return Err(ProviderWriteValidationError::AuthoredEntryTooLarge.into());
+    }
     Ok(bytes)
 }
 
@@ -1586,10 +1603,9 @@ fn readable_document_bytes(value: &impl Serialize) -> Result<Vec<u8>> {
     let mut bytes =
         serde_json::to_vec_pretty(value).context("serializing provider/config layer")?;
     bytes.push(b'\n');
-    anyhow::ensure!(
-        bytes.len() <= crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES,
-        "serialized provider/config layer exceeds the readable byte limit; no provider configuration was written"
-    );
+    if bytes.len() > crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES {
+        return Err(ProviderWriteValidationError::DocumentTooLarge.into());
+    }
     Ok(bytes)
 }
 

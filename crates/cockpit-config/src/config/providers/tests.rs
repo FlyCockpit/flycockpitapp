@@ -3085,3 +3085,65 @@ fn resolve_text_embedded_recovery_three_tier_precedence() {
 mod model_defaults_and_capabilities;
 mod multimodal_capability;
 mod trust_mode_orthogonality;
+
+#[test]
+fn byte_bounded_placements_minimize_serialized_cost_for_unequal_escaped_ids() {
+    fn permutations(ids: &mut [String], start: usize, all: &mut Vec<Vec<String>>) {
+        if start == ids.len() {
+            all.push(ids.to_vec());
+        } else {
+            for i in start..ids.len() {
+                ids.swap(start, i);
+                permutations(ids, start + 1, all);
+                ids.swap(start, i);
+            }
+        }
+    }
+    let before = vec![
+        "long".repeat(40),
+        "s".into(),
+        "\\\"\n".repeat(32),
+        "é".repeat(30),
+        "z".into(),
+    ];
+    let mut orders = Vec::new();
+    permutations(&mut before.clone(), 0, &mut orders);
+    for after in orders {
+        let selected = ModelPlacement::between(&before, &after);
+        let mut applied = before.clone();
+        for placement in &selected {
+            placement.apply(&mut applied, true).unwrap();
+        }
+        assert_eq!(
+            applied, after,
+            "byte optimization preserves exact membership and order"
+        );
+        let mut minimum = usize::MAX;
+        for mask in 0..(1 << after.len()) {
+            let stable = after
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, id)| before.iter().position(|prior| prior == id).unwrap())
+                .collect::<Vec<_>>();
+            if !stable.windows(2).all(|pair| pair[0] < pair[1]) {
+                continue;
+            }
+            let candidate = after
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) == 0)
+                .map(|(i, id)| ModelPlacement {
+                    id: id.clone(),
+                    after: i.checked_sub(1).map(|prior| after[prior].clone()),
+                })
+                .collect::<Vec<_>>();
+            minimum = minimum.min(serde_json::to_vec(&candidate).unwrap().len());
+        }
+        assert_eq!(
+            serde_json::to_vec(&selected).unwrap().len(),
+            minimum,
+            "compare actual JSON bytes, including escaping, anchors, separators and null"
+        );
+    }
+}

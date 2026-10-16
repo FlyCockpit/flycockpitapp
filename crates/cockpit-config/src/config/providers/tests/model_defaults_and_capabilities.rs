@@ -2059,6 +2059,7 @@ fn model_fetch_failure_status_classifies_auth_and_redacts_reason() {
     let mut provider = ProviderEntry::default();
     provider.mark_model_fetch_failed_kept_existing(
             "https://api.example.test/v1/models returned 401 — credentials rejected. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456",
+            ModelFetchFailure::CredentialsRejected,
         );
 
     let status = provider.last_model_fetch.unwrap();
@@ -2069,8 +2070,10 @@ fn model_fetch_failure_status_classifies_auth_and_redacts_reason() {
     assert!(!reason.contains("sk-test-token"));
 
     let mut provider = ProviderEntry::default();
-    provider
-        .mark_model_fetch_failed_kept_existing("https://api.example.test/v1/models returned 503");
+    provider.mark_model_fetch_failed_kept_existing(
+        "https://api.example.test/v1/models returned 503",
+        ModelFetchFailure::Other,
+    );
     assert_eq!(
         provider.last_model_fetch.unwrap().status,
         ModelFetchStatusKind::FailedKeptExisting
@@ -2388,4 +2391,91 @@ fn missing_output_limit_fails_closed() {
         .to_string();
     assert!(error.contains("no output limit"), "{error}");
     assert!(error.contains("max_output_tokens"), "{error}");
+}
+
+/// Review C7: xAI identity comes from the immutable template, so a renamed
+/// Grok entry behind a proxy keeps the multi-agent entitlement rule even
+/// though fetched model metadata is no longer persisted; an aggregator that
+/// merely lists Grok models (OpenRouter) is not treated as xAI.
+#[test]
+fn xai_rule_follows_template_identity_not_catalog_metadata() {
+    let model = |id: &str, owned_by: &str| ModelEntry {
+        id: id.into(),
+        provider_metadata: serde_json::Map::from_iter([(
+            "owned_by".to_string(),
+            serde_json::json!(owned_by),
+        )]),
+        ..ModelEntry::default()
+    };
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "my-grok-proxy".into(),
+        ProviderEntry {
+            template: Some("grok".into()),
+            url: "https://llm-proxy.example/v1".into(),
+            models: vec![ModelEntry {
+                id: "grok-4-multi-agent".into(),
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+    cfg.providers.insert(
+        "openrouter".into(),
+        ProviderEntry {
+            template: Some("openrouter".into()),
+            url: "https://openrouter.ai/api/v1".into(),
+            models: vec![model("x-ai/grok-4-multi-agent", "xai")],
+            ..ProviderEntry::default()
+        },
+    );
+    assert!(
+        cfg.xai_multi_agent_client_side_tools_rule("my-grok-proxy", "grok-4-multi-agent")
+            .is_some()
+    );
+    assert!(
+        cfg.xai_multi_agent_client_side_tools_rule("openrouter", "x-ai/grok-4-multi-agent")
+            .is_none()
+    );
+}
+
+#[test]
+fn fetched_model_identity_coalescing_preserves_first_row_and_distinct_ids() {
+    let fetched = vec![
+        ModelEntry {
+            id: "same".into(),
+            name: Some("first".into()),
+            ..Default::default()
+        },
+        ModelEntry {
+            id: "same".into(),
+            name: Some("second".into()),
+            ..Default::default()
+        },
+        ModelEntry {
+            id: "Same".into(),
+            ..Default::default()
+        },
+        ModelEntry {
+            id: "模型".into(),
+            ..Default::default()
+        },
+    ];
+    for policy in [
+        ModelMergePolicy::KeepUnlisted,
+        ModelMergePolicy::RemoveUnlisted,
+    ] {
+        let existing = vec![ModelEntry {
+            id: "same".into(),
+            favorite: true,
+            ..Default::default()
+        }];
+        let models = merge_fetched_models_with_policy(None, &existing, fetched.clone(), policy);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["same", "Same", "模型"]
+        );
+        assert_eq!(models[0].name.as_deref(), Some("first"));
+        assert!(models[0].favorite);
+    }
 }

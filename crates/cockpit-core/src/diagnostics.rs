@@ -1315,7 +1315,7 @@ async fn provider_network_lines(
         .await
         {
             Ok(_) => (format!("{id}: reachable · credentials verified"), false),
-            Err(crate::providers::auth_check::AuthCheckError::CredentialsRejected(error)) => (
+            Err(crate::providers::auth_check::AuthCheckError::CredentialsRejected { message: error, .. }) => (
                 format!(
                     "{id}: reachable · credentials REJECTED ({}) — run: cockpit provider add {template_id}",
                     one_line(&error)
@@ -1340,7 +1340,13 @@ async fn provider_network_lines(
                 ),
                 true,
             ),
-            Err(crate::providers::auth_check::AuthCheckError::Other(error)) => (
+            Err(error @ crate::providers::auth_check::AuthCheckError::UnsafeModelIdentity) => (
+                format!("{id}: check failed ({error}) — run: cockpit provider add {template_id}"),
+                true,
+            ),
+            Err(crate::providers::auth_check::AuthCheckError::Other(error))
+            | Err(crate::providers::auth_check::AuthCheckError::Parse(error))
+            | Err(crate::providers::auth_check::AuthCheckError::HttpStatus { message: error, .. }) => (
                 format!(
                     "{id}: check failed ({}) — run: cockpit provider add {template_id}",
                     one_line(&error)

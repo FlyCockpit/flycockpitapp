@@ -336,7 +336,7 @@ fn validate_owner_identifier(label: &str, value: &str, max: usize) -> Result<(),
 /// Wire-boundary cap for owner identifiers (operation ids, capabilities,
 /// revisions, intent hashes). Field validation re-checks the exact per-field
 /// bound; ingress enforces the loosest one.
-const MAX_OWNER_WIRE_IDENTIFIER_BYTES: usize = 128;
+pub const MAX_OWNER_WIRE_IDENTIFIER_BYTES: usize = 128;
 
 fn deserialize_owner_identifier<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -2113,6 +2113,22 @@ pub enum Request {
         /// Client nonce binding the returned opaque edit capability.
         #[serde(deserialize_with = "deserialize_nonempty_string")]
         snapshot_session_id: String,
+    },
+
+    /// Continue a catalog snapshot that exceeds one interactive frame. The
+    /// client verifies the complete serialized snapshot digest across pages.
+    GetProviderCatalogPage {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_owner_optional_provider_id"
+        )]
+        provider_id: Option<String>,
+        #[serde(deserialize_with = "deserialize_nonempty_string")]
+        snapshot_session_id: String,
+        offset: u64,
     },
 
     /// Apply one complete provider-layer edit under the daemon's snapshot CAS.
@@ -4243,9 +4259,19 @@ impl Request {
                 project_root,
                 provider_id,
                 snapshot_session_id,
+            }
+            | Self::GetProviderCatalogPage {
+                project_root,
+                provider_id,
+                snapshot_session_id,
+                ..
             } => {
                 validate_owner_project_root(project_root)?;
-                validate_owner_identifier("provider snapshot session", snapshot_session_id, 128)?;
+                validate_owner_identifier(
+                    "provider snapshot session",
+                    snapshot_session_id,
+                    MAX_OWNER_WIRE_IDENTIFIER_BYTES,
+                )?;
                 if let Some(provider_id) = provider_id {
                     validate_owner_identifier(
                         "provider id",
@@ -4317,7 +4343,12 @@ impl Request {
                     if upsert.header_secrets.len() != upsert.entry.headers.len() {
                         return Err("provider header secret count does not match headers".into());
                     }
-                    if serde_json::to_vec(&upsert.entry)
+                    if upsert.model_patch.is_some() && !upsert.entry.models.is_empty() {
+                        return Err(
+                            "provider model patch requires an empty replacement inventory".into(),
+                        );
+                    }
+                    if serde_json::to_vec(&(&upsert.entry, &upsert.model_patch))
                         .map_err(|_| "provider entry must be serializable".to_string())?
                         .len()
                         > MAX_OWNER_PROVIDER_ENTRY_BYTES
@@ -4743,6 +4774,7 @@ macro_rules! request_variants {
             #[cfg(feature = "remote")]
             (Request::GetFlycockpitAccount, "get_flycockpit_account");
             (Request::GetProviderCatalogSnapshot { .. }, "get_provider_catalog_snapshot");
+            (Request::GetProviderCatalogPage { .. }, "get_provider_catalog_page");
             (Request::ApplyProviderMutation { .. }, "apply_provider_mutation");
             (Request::FetchProviderModels { .. }, "fetch_provider_models");
             (Request::GetProviderUsageSnapshot { .. }, "get_provider_usage_snapshot");
@@ -5127,6 +5159,7 @@ macro_rules! command {
             #[cfg(feature = "remote")]
             (Request::GetFlycockpitAccount, "get_flycockpit_account", owner_only, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetProviderCatalogSnapshot { project_root, provider_id, snapshot_session_id }, "get_provider_catalog_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|provider_id:Option<String>|snapshot_session_id:String", [project_root: String => project_root, provider_id: Option<String> => param, snapshot_session_id: String => param]);
+            (Request::GetProviderCatalogPage { project_root, provider_id, snapshot_session_id, offset }, "get_provider_catalog_page", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|provider_id:Option<String>|snapshot_session_id:String|offset:u64", [project_root: String => project_root, provider_id: Option<String> => param, snapshot_session_id: String => param, offset: u64 => param]);
             (Request::ApplyProviderMutation { snapshot_session_id, layer_id, expected_revision, client_operation_id, mutation_intent_hash, mutation }, "apply_provider_mutation", owner_only, none, true, local_only, none, serialized, none, "snapshot_session_id:String|layer_id:String|expected_revision:String|client_operation_id:String|mutation_intent_hash:String|mutation:crate::ProviderMutationBatch", [snapshot_session_id: String => param, layer_id: String => param, expected_revision: String => param, client_operation_id: String => param, mutation_intent_hash: String => param, mutation: crate::ProviderMutationBatch => param]);
             (Request::FetchProviderModels { project_root, provider_id, model_id, deep, on_unlisted, allow_fallback }, "fetch_provider_models", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:Option<String>|model_id:Option<String>|deep:bool|on_unlisted:Option<cockpit_config::config::providers::OnUnlistedModelsFetch>|allow_fallback:bool", [project_root: String => project_root, provider_id: Option<String> => param, model_id: Option<String> => param, deep: bool => param, on_unlisted: Option<cockpit_config::config::providers::OnUnlistedModelsFetch> => param, allow_fallback: bool => param]);
             (Request::GetProviderUsageSnapshot { project_root, provider_id }, "get_provider_usage_snapshot", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);

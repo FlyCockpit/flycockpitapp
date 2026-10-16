@@ -28,12 +28,457 @@ pub(crate) fn build_with_timeout(timeout: Duration) -> Result<reqwest::Client> {
         .context("building credentialed provider HTTP client")
 }
 
+/// Charge decoded bytes on every consuming provider path, irrespective of
+/// status, transfer encoding, or retry. Status-only callers drop the response.
+pub(crate) async fn read_body_limited(response: reqwest::Response, name: &str) -> Result<String> {
+    read_body_with_limit(
+        response,
+        name,
+        super::models_fetch::MAX_PROVIDER_RESPONSE_BYTES,
+    )
+    .await
+}
+
+pub(crate) async fn read_body_with_limit(
+    mut response: reqwest::Response,
+    name: &str,
+    limit: usize,
+) -> Result<String> {
+    if response
+        .content_length()
+        .is_some_and(|bytes| bytes > limit as u64)
+    {
+        anyhow::bail!("{name} response body exceeded {limit} byte limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("reading provider response body")?
+    {
+        if body.len().saturating_add(chunk.len()) > limit {
+            anyhow::bail!("{name} response body exceeded {limit} byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).with_context(|| format!("{name} response body was not valid UTF-8"))
+}
+
+tokio::task_local! {
+    static DIAGNOSTIC_CREDENTIALS: crate::redact::RedactionTable;
+}
+
+/// The daemon supplies its complete owner credential table. Lower transport
+/// APIs add the actual outbound literals (including refreshed credentials).
+/// FuturesUnordered is polled within this task scope; no child task carries
+/// untrusted diagnostics beyond it.
+pub(crate) async fn diagnostic_scope<F: std::future::Future>(
+    table: crate::redact::RedactionTable,
+    work: F,
+) -> F::Output {
+    DIAGNOSTIC_CREDENTIALS.scope(table.enforced(), work).await
+}
+
+/// Config owns the grammar for public protocol metadata. Such literals are
+/// not credentials (e.g. MIME types or anthropic-version dates).
+pub(crate) fn public_header_literal(name: &str, value: &str) -> bool {
+    !value.contains('$')
+        && crate::config::providers::is_safe_provider_header_reference(
+            &name.to_ascii_lowercase(),
+            value,
+        )
+}
+
+pub(crate) fn authorization_payload(value: &str) -> Option<&str> {
+    let (scheme, payload) = value.trim().split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer")
+        || scheme.eq_ignore_ascii_case("basic")
+        || scheme.eq_ignore_ascii_case("token"))
+    .then_some(payload.trim())
+    .filter(|payload| !payload.is_empty())
+}
+
+/// Include actual outbound credentials before any provider-controlled field is
+/// transformed. Directory diagnostics and every inference client constructor
+/// use this same boundary, including authorization payloads and private headers.
+pub(crate) fn with_diagnostic_credentials(
+    table: crate::redact::RedactionTable,
+    headers: &[super::models_fetch::ResolvedHeader],
+) -> Result<crate::redact::RedactionTable> {
+    table.union(&diagnostic_credentials(headers)?)
+}
+
+/// Exact outbound credential coverage, without claiming ambient coverage.
+pub(crate) fn diagnostic_credentials(
+    headers: &[super::models_fetch::ResolvedHeader],
+) -> Result<crate::redact::RedactionTable> {
+    let mut values = Vec::new();
+    for header in headers {
+        if public_header_literal(&header.name, &header.value) {
+            continue;
+        }
+        // Native clients normalize surrounding HTTP whitespace on credential
+        // fields such as x-api-key/account-id. Cover both actual forms.
+        for value in std::iter::once(header.value.as_str())
+            .chain((header.value.trim() != header.value).then_some(header.value.trim()))
+            .chain(authorization_payload(&header.value))
+        {
+            if value.is_empty() {
+                continue;
+            }
+            if value.len() < crate::redact::MIN_REDACTION_ENTRY_LENGTH {
+                anyhow::bail!(
+                    "provider request credential is below the safe diagnostic coverage length"
+                );
+            }
+            values.push(value.to_string());
+        }
+    }
+    crate::redact::RedactionTable::for_provider_credentials(values)
+}
+
+fn scrub_diagnostic_value(value: &mut serde_json::Value, table: &crate::redact::RedactionTable) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(text)
+                && (inner.is_object() || inner.is_array())
+            {
+                scrub_diagnostic_value(&mut inner, table);
+                *text = serde_json::to_string(&inner)
+                    .unwrap_or_else(|_| "[provider diagnostic omitted]".into());
+            } else {
+                *text = table.scrub(text);
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|v| scrub_diagnostic_value(v, table)),
+        serde_json::Value::Object(fields) => {
+            let prior = std::mem::take(fields);
+            for (key, mut value) in prior {
+                scrub_diagnostic_value(&mut value, table);
+                fields.insert(table.scrub(&key), value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scrub decoded successful usage values before compact JSON can escape literals.
+pub(crate) fn diagnostic_value(
+    value: &mut serde_json::Value,
+    headers: &[super::models_fetch::ResolvedHeader],
+) -> Result<()> {
+    let table = match DIAGNOSTIC_CREDENTIALS.try_with(Clone::clone) {
+        Ok(table) => with_diagnostic_credentials(table, headers)?,
+        Err(_) => diagnostic_credentials(headers)?,
+    };
+    scrub_diagnostic_value(value, &table);
+    Ok(())
+}
+
+/// Inspect the same decoded JSON string/key surfaces as diagnostics, without
+/// serializing or canonicalizing an identity that contains no credential.
+pub(crate) fn catalog_identity_contains_credentials(
+    identity: &str,
+    table: &crate::redact::RedactionTable,
+) -> bool {
+    if !matches!(table.scrub_cow(identity), std::borrow::Cow::Borrowed(text) if text == identity) {
+        return true;
+    }
+    fn contains(value: &serde_json::Value, table: &crate::redact::RedactionTable) -> bool {
+        match value {
+            serde_json::Value::String(text) => catalog_identity_contains_credentials(text, table),
+            serde_json::Value::Array(values) => values.iter().any(|value| contains(value, table)),
+            serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+                catalog_identity_contains_credentials(key, table) || contains(value, table)
+            }),
+            _ => false,
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(identity).is_ok_and(|value| contains(&value, table))
+}
+
+/// Operational IDs are provider addresses, not display text. Reject a catalog
+/// whose IDs cannot be published safely; never replace an address with a hash
+/// or a diagnostic marker. This runs before merge/count/preview/write, including
+/// existing catalogs and fallback catalogs. Safe IDs remain byte-exact.
+pub(crate) fn scrub_catalog_models(
+    models: Vec<crate::config::providers::ModelEntry>,
+    headers: &[super::models_fetch::ResolvedHeader],
+) -> Result<Vec<crate::config::providers::ModelEntry>> {
+    let table = match DIAGNOSTIC_CREDENTIALS.try_with(Clone::clone) {
+        Ok(table) => with_diagnostic_credentials(table, headers)?,
+        Err(_) => diagnostic_credentials(headers)?,
+    };
+    scrub_catalog_models_with_table(models, &table)
+}
+
+pub(crate) fn scrub_catalog_models_with_table(
+    models: Vec<crate::config::providers::ModelEntry>,
+    table: &crate::redact::RedactionTable,
+) -> Result<Vec<crate::config::providers::ModelEntry>> {
+    if models
+        .iter()
+        .any(|model| catalog_identity_contains_credentials(&model.id, table))
+    {
+        return Err(super::auth_check::AuthCheckError::UnsafeModelIdentity.into());
+    }
+    // Typed owner controls and capability enum values are not diagnostic text.
+    Ok(crate::config::providers::coalesce_fetched_models(models))
+}
+
+/// Scrub complete decoded fields before callers slice, escape, persist or log
+/// provider diagnostics. The table includes every outbound header literal and
+/// its authorization payload, including dynamically resolved credentials.
+/// Failure to construct the table omits the diagnostic rather than releasing it.
+pub(crate) fn diagnostic_body(
+    raw: &str,
+    headers: &[super::models_fetch::ResolvedHeader],
+) -> String {
+    let table = match DIAGNOSTIC_CREDENTIALS.try_with(Clone::clone) {
+        Ok(table) => table,
+        Err(_) => match diagnostic_credentials(headers) {
+            Ok(table) => table,
+            Err(_) => return "[provider diagnostic omitted]".into(),
+        },
+    };
+    diagnostic_body_with_table(raw, headers, table)
+}
+
+pub(crate) fn diagnostic_body_with_table(
+    raw: &str,
+    headers: &[super::models_fetch::ResolvedHeader],
+    table: crate::redact::RedactionTable,
+) -> String {
+    let Ok(table) = with_diagnostic_credentials(table.enforced(), headers) else {
+        return "[provider diagnostic omitted]".into();
+    };
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) {
+        scrub_diagnostic_value(&mut value, &table);
+        // A nested encoded envelope (e.g. metadata.raw) is scrubbed again after
+        // decoding by the inference projection; discovery never exposes it.
+        serde_json::to_string(&value).unwrap_or_else(|_| "[provider diagnostic omitted]".into())
+    } else if raw.trim_start().starts_with(['{', '[']) {
+        // Malformed JSON has no safely decoded fields. Its escaped literals
+        // may not match complete registered credentials, so omit its body.
+        "[malformed provider JSON diagnostic omitted]".into()
+    } else {
+        table.scrub(raw)
+    }
+}
+
+/// Real finite HTTP bodies for provider transport regressions. Early client
+/// rejection may close the socket while the fixture is writing its body.
+#[cfg(test)]
+pub(crate) async fn serve_test_bodies(
+    responses: Vec<(u16, String, bool)>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        for (status, body, chunked) in responses {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16384];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            let framing = if chunked {
+                "transfer-encoding: chunked".into()
+            } else {
+                format!("content-length: {}", body.len())
+            };
+            let headers = format!(
+                "HTTP/1.1 {status} Test\r\n{framing}\r\ncontent-type: application/json\r\nretry-after: 0\r\nconnection: close\r\n\r\n"
+            );
+            if socket.write_all(headers.as_bytes()).await.is_err() {
+                continue;
+            }
+            if chunked {
+                for chunk in body.as_bytes().chunks(16384) {
+                    if socket
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await
+                        .is_err()
+                        || socket.write_all(chunk).await.is_err()
+                        || socket.write_all(b"\r\n").await.is_err()
+                    {
+                        break;
+                    }
+                }
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            } else {
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        }
+    });
+    (format!("http://{address}/v1"), task)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn decoded_body_limit_accepts_boundary_and_rejects_declared_and_chunked_overflow() {
+        let limit = super::super::models_fetch::MAX_PROVIDER_RESPONSE_BYTES;
+        for chunked in [false, true] {
+            for size in [limit, limit + 1] {
+                let (url, server) = serve_test_bodies(vec![(400, "x".repeat(size), chunked)]).await;
+                let response = build_with_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .get(url)
+                    .send()
+                    .await
+                    .unwrap();
+                let result = read_body_limited(response, "fixture").await;
+                if size == limit {
+                    assert_eq!(result.unwrap().len(), limit);
+                } else {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("exceeded 8388608 byte limit")
+                    );
+                }
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decoded_body_limit_times_out_a_slow_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            socket
+                .write_all(b"HTTP/1.1 400 Test\r\ntransfer-encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let response = build_with_timeout(Duration::from_millis(150))
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_body_limited(response, "slow").await.unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelling_decoded_body_read_releases_the_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            socket
+                .write_all(b"HTTP/1.1 400 Test\r\ntransfer-encoding: chunked\r\n\r\n1\r\nx\r\n")
+                .await
+                .unwrap();
+            started.send(()).unwrap();
+            let mut remaining = [0; 1];
+            let eof = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut remaining))
+                .await
+                .unwrap();
+            assert!(
+                matches!(eof, Ok(0)) || eof.is_err(),
+                "cancelled reader retained its body connection"
+            );
+        });
+        let reader = tokio::spawn(async move {
+            let response = build_with_timeout(Duration::from_secs(5))
+                .unwrap()
+                .get(format!("http://{address}"))
+                .send()
+                .await
+                .unwrap();
+            read_body_limited(response, "cancelled").await
+        });
+        ready.await.unwrap();
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_scrub_preserves_public_protocol_literals_and_model_ids() {
+        use super::super::models_fetch::{FetchOutcome, ResolvedHeader};
+        let headers = vec![
+            ResolvedHeader {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            },
+            ResolvedHeader {
+                name: "anthropic-version".into(),
+                value: "2023-06-01".into(),
+            },
+            ResolvedHeader {
+                name: "Authorization".into(),
+                value: "Bearer known/session-key/+fragment-0042".into(),
+            },
+        ];
+        let body = diagnostic_body(
+            "application/json version 2023-06-01 denied known/session-key/+fragment-0042",
+            &headers,
+        );
+        assert!(
+            body.contains("application/json version 2023-06-01"),
+            "{body}"
+        );
+        assert!(!body.contains("known/session"), "{body}");
+        let (url, server) = serve_test_bodies(vec![(
+            200,
+            r#"{"data":[{"id":"model-2023-06-01"}]}"#.into(),
+            true,
+        )])
+        .await;
+        let outcome =
+            super::super::models_fetch::fetch_models(&url, &headers, Duration::from_secs(5))
+                .await
+                .unwrap();
+        let FetchOutcome::Models { models, .. } = outcome else {
+            panic!("catalog");
+        };
+        assert_eq!(models[0].id, "model-2023-06-01");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_scrub_covers_all_supported_authorization_schemes() {
+        const SECRET: &str = "known/session-key/+fragment-0042";
+        for scheme in ["Bearer", "Basic", "Token", "tOkEn"] {
+            let headers = vec![super::super::models_fetch::ResolvedHeader {
+                name: "Authorization".into(),
+                value: format!("{scheme} {SECRET}"),
+            }];
+            let body = format!("useful diagnostic {}{SECRET}", "word ".repeat(44));
+            let (url, server) = serve_test_bodies(vec![(400, body, true)]).await;
+            let error =
+                super::super::models_fetch::fetch_models(&url, &headers, Duration::from_secs(5))
+                    .await
+                    .unwrap_err();
+            let shown = error.to_string();
+            assert!(!shown.contains("known/session"), "{scheme}: {shown}");
+            assert!(shown.contains("useful diagnostic"), "{shown}");
+            server.await.unwrap();
+        }
+    }
 
     static PROXY_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -288,5 +733,76 @@ mod tests {
                 .contains("x-api-key: leaked-secret"),
             "{captured}"
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_floor_tests {
+    use super::*;
+
+    #[test]
+    fn credential_coverage_below_matcher_floor_fails_closed() {
+        let headers = vec![super::super::models_fetch::ResolvedHeader {
+            name: "x-api-key".into(),
+            value: "abc".into(),
+        }];
+        assert!(
+            with_diagnostic_credentials(crate::redact::RedactionTable::empty(), &headers).is_err()
+        );
+        assert_eq!(
+            diagnostic_body("abc reflected", &headers),
+            "[provider diagnostic omitted]"
+        );
+    }
+}
+
+#[cfg(test)]
+mod catalog_identity_tests {
+    use super::*;
+    use crate::config::providers::{CapabilityStatus, ModelEntry, WireApi};
+    use crate::providers::models_fetch::ResolvedHeader;
+
+    #[test]
+    fn identity_projection_does_not_scrub_owner_control_keys() {
+        let model = ModelEntry {
+            id: "owner".into(),
+            manual: true,
+            favorite: true,
+            wire_api: WireApi::Responses,
+            ..Default::default()
+        };
+        let expected = serde_json::to_value(&model).unwrap();
+        let result = scrub_catalog_models(
+            vec![model],
+            &[ResolvedHeader {
+                name: "X-Private".into(),
+                value: "manual".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&result[0]).unwrap(),
+            expected,
+            "a credential equal to manual must not remove the protected flag"
+        );
+    }
+
+    #[test]
+    fn identity_projection_does_not_scrub_native_capability_enum_values() {
+        let mut model = ModelEntry {
+            id: "native".into(),
+            ..Default::default()
+        };
+        model.capabilities.tool_calling = CapabilityStatus::Supported;
+        let expected = serde_json::to_value(&model).unwrap();
+        let result = scrub_catalog_models(
+            vec![model],
+            &[ResolvedHeader {
+                name: "X-Private".into(),
+                value: "supported".into(),
+            }],
+        )
+        .expect("typed capability enum values must not be re-parsed as scrubbed upstream prose");
+        assert_eq!(serde_json::to_value(&result[0]).unwrap(), expected);
     }
 }

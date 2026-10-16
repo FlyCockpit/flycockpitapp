@@ -227,29 +227,15 @@ pub fn retained_provider_model_source_from_workspace_layer_snapshots(
         let provider = provider
             .as_object()
             .context("retained provider config root must be an object")?;
-        let Some(models) = provider.get("models").and_then(Value::as_array) else {
+        let Some(model) = authored_model_value(provider, model_id)? else {
             continue;
         };
-        let mut matching = models.iter().filter(|model| {
-            model
-                .as_object()
-                .and_then(|model| model.get("id"))
-                .and_then(Value::as_str)
-                == Some(model_id)
-        });
-        let Some(model) = matching.next() else {
-            continue;
-        };
-        anyhow::ensure!(
-            matching.next().is_none(),
-            "retained provider `{provider_id}` contains duplicate model `{model_id}`"
-        );
         return Ok(Some(RetainedProviderModelSource {
             layer_index,
             provider_id: provider_id.to_string(),
             model_id: model_id.to_string(),
             provider_digest: sha256_bytes(provider_bytes),
-            model_digest: sha256_model_value(model)?,
+            model_digest: sha256_model_value(&model)?,
         }));
     }
     Ok(None)
@@ -491,10 +477,8 @@ impl RetainedProviderModelFavoriteTarget {
             favorite,
         )
         .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
-        let pretty = serde_json::to_string_pretty(&Value::Object(provider.clone()))
-            .context("serializing captured provider config")
+        let new_bytes = readable_provider_bytes(provider)
             .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?;
-        let new_bytes = format!("{pretty}\n").into_bytes();
         let receipt = RetainedProviderModelFavoriteWriteReceipt {
             source: self.source.clone(),
             old_provider_digest: self.source.provider_digest,
@@ -543,98 +527,132 @@ fn sha256_model_value(value: &Value) -> Result<[u8; 32]> {
     Ok(sha256_bytes(&canonical))
 }
 
-/// Retained favorite writes differ deliberately from the ambient edit helper:
-/// an attached session may update only the model object it actually observed.
-/// It must never manufacture a model after a source has changed.
+/// Project one authored row, including sparse edits whose base lives in a
+/// lower layer. The provider digest still binds all exact source bytes.
+fn authored_model_value(provider: &Map<String, Value>, model_id: &str) -> Result<Option<Value>> {
+    let mut matching = provider
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|model| model.get("id").and_then(Value::as_str) == Some(model_id));
+    let mut model = matching.next().cloned();
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "captured provider has duplicate model `{model_id}`"
+    );
+    if model.is_none()
+        && provider
+            .get("model_order")
+            .and_then(Value::as_array)
+            .is_some_and(|order| order.iter().any(|id| id.as_str() == Some(model_id)))
+    {
+        model = Some(serde_json::json!({"id":model_id}));
+    }
+    if let Some(raw) = provider.get("model_field_patches") {
+        let patches: Vec<ModelEntryFieldPatch> = serde_json::from_value(raw.clone())?;
+        let mut matching = patches.iter().filter(|patch| patch.id == model_id);
+        if let Some(patch) = matching.next() {
+            anyhow::ensure!(
+                matching.next().is_none(),
+                "captured provider has duplicate model patch `{model_id}`"
+            );
+            let model = model.get_or_insert_with(|| serde_json::json!({"id": model_id}));
+            patch.apply_value(model)?;
+        }
+    }
+    Ok(model)
+}
+
+fn update_existing_model_field_patch(
+    provider: &mut Map<String, Value>,
+    update: &ModelEntryFieldPatch,
+) -> Result<bool> {
+    let Some(raw) = provider.get("model_field_patches") else {
+        return Ok(false);
+    };
+    let mut patches: Vec<ModelEntryFieldPatch> = serde_json::from_value(raw.clone())?;
+    let Some(patch) = patches.iter_mut().find(|patch| patch.id == update.id) else {
+        return Ok(false);
+    };
+    patch.extend(update);
+    provider.insert("model_field_patches".into(), serde_json::to_value(patches)?);
+    if let Some(models) = provider.get_mut("models").and_then(Value::as_array_mut) {
+        for model in models
+            .iter_mut()
+            .filter(|model| model.get("id").and_then(Value::as_str) == Some(update.id.as_str()))
+        {
+            if let Some(object) = model.as_object_mut() {
+                for key in update.set.keys().chain(update.remove.iter()) {
+                    object.remove(key);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn apply_captured_model_favorite(
     provider: &mut Map<String, Value>,
     model_id: &str,
     expected_model_digest: [u8; 32],
     favorite: bool,
 ) -> Result<[u8; 32]> {
-    let models = provider
-        .get_mut("models")
-        .and_then(Value::as_array_mut)
-        .context("captured provider models are missing or malformed")?;
-    let matches = models
-        .iter()
-        .enumerate()
-        .filter_map(|(index, model)| {
-            (model
-                .as_object()
-                .and_then(|model| model.get("id"))
-                .and_then(Value::as_str)
-                == Some(model_id))
-            .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let index = *matches
-        .first()
+    let model = authored_model_value(provider, model_id)?
         .context("captured provider model is no longer present")?;
     anyhow::ensure!(
-        matches.len() == 1,
-        "captured provider now contains duplicate model `{model_id}`"
-    );
-    let model = &mut models[index];
-    anyhow::ensure!(
-        sha256_model_value(model)? == expected_model_digest,
+        sha256_model_value(&model)? == expected_model_digest,
         "captured provider model changed after attached snapshot"
     );
-    let model = model
-        .as_object_mut()
-        .context("captured provider model must be an object")?;
-    model.insert("favorite".to_string(), Value::Bool(favorite));
-    sha256_model_value(&Value::Object(model.clone()))
+    apply_model_favorite(provider, model_id, favorite)?;
+    sha256_model_value(
+        &authored_model_value(provider, model_id)?.expect("favorite creates an authored row"),
+    )
 }
 
-/// Prove that the exact captured model object is still present and already
-/// carries the requested favorite. This is deliberately separate from the
-/// mutating helper so a no-op RPC never reformats a provider file.
+/// Validate a no-op without changing a file or its exact-byte capability.
 fn validate_captured_model_favorite(
     provider: &Map<String, Value>,
     model_id: &str,
     expected_model_digest: [u8; 32],
     favorite: bool,
 ) -> Result<()> {
-    let models = provider
-        .get("models")
-        .and_then(Value::as_array)
-        .context("captured provider models are missing or malformed")?;
-    let mut matching = models.iter().filter(|model| {
-        model
-            .as_object()
-            .and_then(|model| model.get("id"))
-            .and_then(Value::as_str)
-            == Some(model_id)
-    });
-    let model = matching
-        .next()
+    let model = authored_model_value(provider, model_id)?
         .context("captured provider model is no longer present")?;
     anyhow::ensure!(
-        matching.next().is_none(),
-        "captured provider has duplicate model `{model_id}`"
-    );
-    anyhow::ensure!(
-        sha256_model_value(model)? == expected_model_digest,
+        sha256_model_value(&model)? == expected_model_digest,
         "captured provider model changed after attached snapshot"
     );
-    let model = model
-        .as_object()
-        .context("captured provider model must be an object")?;
-    let observed_favorite = match model.get("favorite") {
-        Some(value) => value
-            .as_bool()
-            .context("captured provider model favorite must be a boolean")?,
-        None => false,
-    };
+    let observed = model
+        .get("favorite")
+        .map(|value| {
+            value
+                .as_bool()
+                .context("captured provider model favorite must be a boolean")
+        })
+        .transpose()?
+        .unwrap_or(false);
     anyhow::ensure!(
-        observed_favorite == favorite,
+        observed == favorite,
         "captured provider model favorite no longer matches requested value"
     );
     Ok(())
 }
 
-fn apply_model_favorite(provider: &mut Map<String, Value>, model_id: &str, favorite: bool) {
+fn apply_model_favorite(
+    provider: &mut Map<String, Value>,
+    model_id: &str,
+    favorite: bool,
+) -> Result<()> {
+    let update = ModelEntryFieldPatch {
+        id: model_id.into(),
+        replace: false,
+        set: BTreeMap::from([("favorite".into(), Value::Bool(favorite))]),
+        remove: Vec::new(),
+    };
+    if update_existing_model_field_patch(provider, &update)? {
+        return Ok(());
+    }
     let models = provider
         .entry("models".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -659,6 +677,7 @@ fn apply_model_favorite(provider: &mut Map<String, Value>, model_id: &str, favor
         model.insert("favorite".to_string(), Value::Bool(favorite));
         models.push(Value::Object(model));
     }
+    Ok(())
 }
 
 /// How an atomic active-model mutation should treat an existing effective
@@ -1152,6 +1171,17 @@ impl ConfigDoc {
             originally_loaded.on_unlisted_models_fetch != cfg.on_unlisted_models_fetch,
             originally_loaded.category_defaults != cfg.category_defaults,
         )?;
+        // Validate the entire prospective batch before publishing metadata or
+        // removing any sibling provider. Actual writes use the same serializer.
+        readable_document_bytes(&current.raw)?;
+        for (id, entry) in &cfg.providers {
+            let requested = serialize_json_object(entry, "provider")?;
+            let original_entry = self.originally_loaded_providers.get(id);
+            let original = original_entry
+                .map(|entry| serialize_json_object(entry, "provider"))
+                .transpose()?;
+            current.provider_raw_for_write(id, original_entry, requested, original.as_ref())?;
+        }
         current.persist_raw_unlocked()?;
         current.merge_provider_files_unlocked(&self.originally_loaded_providers, &cfg.providers)?;
         self.refresh_from_disk_unlocked()
@@ -1205,6 +1235,9 @@ impl ConfigDoc {
         crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut provider = self.provider_raw_object(provider_id)?;
+        provider.remove("model_field_patches");
+        provider.remove("model_order");
+        provider.remove("model_membership");
         provider.insert(
             "models".to_string(),
             serde_json::to_value(models).context("serializing provider models")?,
@@ -1274,7 +1307,7 @@ impl ConfigDoc {
         crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut provider = self.provider_raw_object(provider_id)?;
-        apply_model_favorite(&mut provider, model_id, favorite);
+        apply_model_favorite(&mut provider, model_id, favorite)?;
         self.persist_provider_raw_unlocked(provider_id, provider)?;
         self.refresh_from_disk_unlocked()
     }
@@ -1287,6 +1320,31 @@ impl ConfigDoc {
         crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut provider = self.provider_raw_object(provider_id)?;
+        let serialized = serde_json::to_value(model).context("serializing model wizard fields")?;
+        let Value::Object(serialized) = serialized else {
+            unreachable!("ModelEntry serializes to object");
+        };
+        let update = ModelEntryFieldPatch {
+            id: model.id.clone(),
+            replace: false,
+            set: MODEL_WIZARD_MODEL_FIELD_KEYS
+                .iter()
+                .filter_map(|key| {
+                    serialized
+                        .get(*key)
+                        .map(|value| ((*key).to_string(), value.clone()))
+                })
+                .collect(),
+            remove: MODEL_WIZARD_MODEL_FIELD_KEYS
+                .iter()
+                .filter(|key| !serialized.contains_key(**key))
+                .map(|key| (*key).to_string())
+                .collect(),
+        };
+        if update_existing_model_field_patch(&mut provider, &update)? {
+            self.persist_provider_raw_unlocked(provider_id, provider)?;
+            return self.refresh_from_disk_unlocked();
+        }
         let models = provider
             .entry("models".to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
@@ -1294,10 +1352,6 @@ impl ConfigDoc {
             *models = Value::Array(Vec::new());
         }
         let models = models.as_array_mut().expect("models reset to array");
-        let serialized = serde_json::to_value(model).context("serializing model wizard fields")?;
-        let Value::Object(serialized) = serialized else {
-            unreachable!("ModelEntry serializes to object");
-        };
         let mut found = false;
         for raw_model in models.iter_mut() {
             let Some(model_obj) = raw_model.as_object_mut() else {
@@ -1330,8 +1384,7 @@ impl ConfigDoc {
 
     fn persist_raw_unlocked(&self) -> Result<()> {
         crate::config::dirs::authorize_config_file_write(&self.path)?;
-        let pretty = serde_json::to_string_pretty(&self.raw).context("serializing config.json")?;
-        atomic_write(&self.path, format!("{pretty}\n").as_bytes())?;
+        atomic_write(&self.path, &readable_document_bytes(&self.raw)?)?;
         Ok(())
     }
 
@@ -1365,9 +1418,7 @@ impl ConfigDoc {
     ) -> Result<()> {
         let path = provider_file_path_for_config(&self.path, provider_id)?;
         crate::config::dirs::authorize_config_file_write(&path)?;
-        let pretty = serde_json::to_string_pretty(&Value::Object(provider))
-            .context("serializing provider")?;
-        atomic_write(&path, format!("{pretty}\n").as_bytes())?;
+        atomic_write(&path, &readable_provider_bytes(&provider)?)?;
         Ok(())
     }
 
@@ -1396,39 +1447,167 @@ impl ConfigDoc {
                 continue;
             }
 
-            let provider_path = provider_file_path_for_config(&self.path, id)?;
-            let provider_exists = provider_path.exists();
-            let mut raw = self.provider_raw_object(id)?;
-            match original_entry {
-                Some(_) if provider_exists => {
-                    merge_changed_provider_fields(
-                        &mut raw,
-                        original_raw.as_ref().expect("serialized original provider"),
-                        &requested_raw,
-                    );
-                    for key in PROVIDER_SKIPPED_KEYS {
-                        if !requested_raw.contains_key(*key) {
-                            raw.remove(*key);
-                        }
-                    }
-                }
-                Some(_) => {
-                    raw = requested_raw;
-                }
-                None => {
-                    for key in PROVIDER_SKIPPED_KEYS {
-                        if !requested_raw.contains_key(*key) {
-                            raw.remove(*key);
-                        }
-                    }
-                    for (key, value) in requested_raw {
-                        raw.insert(key, value);
-                    }
-                }
-            }
+            let raw = self.provider_raw_for_write(
+                id,
+                original_entry,
+                requested_raw,
+                original_raw.as_ref(),
+            )?;
             self.persist_provider_raw_unlocked(id, raw)?;
         }
         Ok(())
+    }
+
+    /// Validate the exact raw candidate, including retained unknown fields and
+    /// the same patching/readable/canonical budgets used by the durable writer.
+    /// This does not write or acquire an additional mutation lock.
+    pub fn validate_provider_write(&self, id: &str, entry: &ProviderEntry) -> Result<()> {
+        let original = self.providers();
+        let original_entry = original.providers.get(id);
+        let original_raw = original_entry
+            .map(|entry| serialize_json_object(entry, "provider"))
+            .transpose()?;
+        self.provider_raw_for_write(
+            id,
+            original_entry,
+            serialize_json_object(entry, "provider")?,
+            original_raw.as_ref(),
+        )?;
+        Ok(())
+    }
+
+    /// Remaining canonical bytes for a nonempty placement vector in this
+    /// exact raw write. Retained unknown fields use the same patching as the
+    /// writer. This is a search bound only; candidates still require complete
+    /// raw validation (including pretty-document size) before publication.
+    pub fn provider_placement_byte_budget(&self, id: &str, entry: &ProviderEntry) -> Result<usize> {
+        let mut probe = entry.clone();
+        probe.model_membership.placements = vec![super::ModelPlacement {
+            id: String::new(),
+            after: None,
+        }];
+        let original = self.providers();
+        let original_entry = original.providers.get(id);
+        let original_raw = original_entry
+            .map(|entry| serialize_json_object(entry, "provider"))
+            .transpose()?;
+        let raw = self.provider_raw_for_write(
+            id,
+            original_entry,
+            serialize_json_object(&probe, "provider")?,
+            original_raw.as_ref(),
+        )?;
+        // The probe can equal an already oversized raw layer. Charge it even
+        // when the ordinary unchanged-write fast path skipped serialization.
+        readable_provider_bytes(&raw)?;
+        let framing = serde_json::to_vec(&raw)?.len()
+            - serde_json::to_vec(&probe.model_membership.placements)?.len();
+        Ok(super::MAX_AUTHORED_PROVIDER_ENTRY_BYTES - framing)
+    }
+
+    fn provider_raw_for_write(
+        &self,
+        id: &str,
+        original_entry: Option<&ProviderEntry>,
+        requested_raw: Map<String, Value>,
+        original_raw: Option<&Map<String, Value>>,
+    ) -> Result<Map<String, Value>> {
+        let changed = original_raw != Some(&requested_raw);
+        let provider_path = provider_file_path_for_config(&self.path, id)?;
+        let provider_exists = provider_path.exists();
+        let mut raw = self.provider_raw_object(id)?;
+        match original_entry {
+            Some(_) if provider_exists => {
+                merge_changed_provider_fields(
+                    &mut raw,
+                    original_raw.expect("serialized original provider"),
+                    &requested_raw,
+                );
+                for key in PROVIDER_SKIPPED_KEYS {
+                    if !requested_raw.contains_key(*key) {
+                        raw.remove(*key);
+                    }
+                }
+            }
+            Some(_) => {
+                raw = requested_raw;
+            }
+            None => {
+                for key in PROVIDER_SKIPPED_KEYS {
+                    if !requested_raw.contains_key(*key) {
+                        raw.remove(*key);
+                    }
+                }
+                for (key, value) in requested_raw {
+                    raw.insert(key, value);
+                }
+            }
+        }
+        if changed {
+            readable_provider_bytes(&raw)?;
+        }
+        Ok(raw)
+    }
+
+    /// Resolve the exact prospective files through the same merge as reads,
+    /// without writing a file or changing ambient process/thread state.
+    pub fn providers_from_paths_after_writes(
+        paths: &[PathBuf],
+        writes: &BTreeMap<PathBuf, ProvidersConfig>,
+    ) -> Result<ProvidersConfig> {
+        let mut merged = Value::Object(Map::new());
+        let mut warnings = Vec::new();
+        for path in paths {
+            if let Some(requested) = writes.get(path) {
+                let mut doc = Self::load(path)?;
+                let original = doc.providers();
+                doc.set_layer_metadata_raw(
+                    requested,
+                    original.on_unlisted_models_fetch != requested.on_unlisted_models_fetch,
+                    original.category_defaults != requested.category_defaults,
+                )?;
+                readable_document_bytes(&doc.raw)?;
+                let mut layer = doc.raw.clone();
+                if let Some(object) = layer.as_object_mut() {
+                    object.remove("providers");
+                }
+                deep_merge_value(&mut merged, &layer);
+                for (id, entry) in &requested.providers {
+                    let requested_raw = serialize_json_object(entry, "provider")?;
+                    let original_raw = original
+                        .providers
+                        .get(id)
+                        .map(|entry| serialize_json_object(entry, "provider"))
+                        .transpose()?;
+                    let raw = doc.provider_raw_for_write(
+                        id,
+                        original.providers.get(id),
+                        requested_raw,
+                        original_raw.as_ref(),
+                    )?;
+                    // Apply project executable-config stripping and URL-change
+                    // credential tombstones exactly as ordinary file reads do.
+                    merge_provider_raw_for_layer(&mut merged, path, id, raw, &mut warnings);
+                }
+            } else {
+                // Re-read raw files so omitted/default fields and URL-change
+                // tombstones keep their ordinary layered semantics.
+                if path.exists() {
+                    let mut raw = Self::load(path)?.raw;
+                    if let Some(object) = raw.as_object_mut() {
+                        object.remove("providers");
+                    }
+                    deep_merge_value(&mut merged, &raw);
+                }
+                merge_provider_files_for_layer(&mut merged, path, &mut warnings);
+            }
+        }
+        Ok(Self {
+            path: PathBuf::new(),
+            raw: merged,
+            originally_loaded_providers: BTreeMap::new(),
+        }
+        .providers())
     }
 
     fn refresh_from_disk_unlocked(&mut self) -> Result<()> {
@@ -1437,6 +1616,26 @@ impl ConfigDoc {
         self.originally_loaded_providers = refreshed.originally_loaded_providers;
         Ok(())
     }
+}
+
+/// Same pretty JSON plus newline that the durable writer publishes. Parsed
+/// views omit unknown provider keys, so charge these bytes before writing too.
+fn readable_provider_bytes(value: &Map<String, Value>) -> Result<Vec<u8>> {
+    let bytes = readable_document_bytes(value)?;
+    if serde_json::to_vec(value)?.len() > super::MAX_AUTHORED_PROVIDER_ENTRY_BYTES {
+        return Err(ProviderWriteValidationError::AuthoredEntryTooLarge.into());
+    }
+    Ok(bytes)
+}
+
+fn readable_document_bytes(value: &impl Serialize) -> Result<Vec<u8>> {
+    let mut bytes =
+        serde_json::to_vec_pretty(value).context("serializing provider/config layer")?;
+    bytes.push(b'\n');
+    if bytes.len() > crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES {
+        return Err(ProviderWriteValidationError::DocumentTooLarge.into());
+    }
+    Ok(bytes)
 }
 
 fn serialize_json_object<T: Serialize>(value: &T, label: &str) -> Result<Map<String, Value>> {
@@ -1590,11 +1789,15 @@ pub fn is_xai_grok_provider(provider_id: &str, entry: &ProviderEntry) -> bool {
             .as_deref()
             .is_some_and(|credential| credential.eq_ignore_ascii_case("grok-oauth"))
         || entry.url.to_ascii_lowercase().contains("api.x.ai")
-        || metadata_mentions_xai_grok(&entry.provider_metadata)
+        // The immutable template identity covers renamed or proxied xAI
+        // entries; it no longer depends on fetched model metadata, which is
+        // not persisted (#545) and misfired on aggregators whose catalogs
+        // merely list `x-ai/grok-*` models (OpenRouter).
         || entry
-            .models
-            .iter()
-            .any(|model| metadata_mentions_xai_grok(&model.provider_metadata))
+            .template
+            .as_deref()
+            .is_some_and(|template| matches!(template, "grok" | "grok-oauth"))
+        || metadata_mentions_xai_grok(&entry.provider_metadata)
 }
 
 fn metadata_mentions_xai_grok(metadata: &Map<String, Value>) -> bool {
@@ -1656,6 +1859,15 @@ fn merge_provider_files_for_layer(
     config_path: &Path,
     warnings: &mut Vec<String>,
 ) {
+    merge_provider_files_for_layer_mode(merged, config_path, warnings, false);
+}
+
+fn merge_provider_files_for_layer_mode(
+    merged: &mut Value,
+    config_path: &Path,
+    warnings: &mut Vec<String>,
+    preserve_authored_models: bool,
+) {
     let Some(config_dir) = config_path.parent() else {
         return;
     };
@@ -1670,50 +1882,23 @@ fn merge_provider_files_for_layer(
             continue;
         };
         match load_provider_raw_file(&path) {
-            Ok(mut provider) => {
-                if !config_path_is_global_user_layer(config_path) {
-                    strip_project_auth_command(
-                        &id,
-                        &mut provider,
-                        "project provider config",
-                        warnings,
-                    );
-                    strip_project_oauth_descriptor(
-                        &id,
-                        &mut provider,
-                        "project provider config",
-                        warnings,
-                    );
+            Ok(provider) => {
+                let authored = preserve_authored_models.then(|| provider.clone());
+                merge_provider_raw_for_layer(merged, config_path, &id, provider, warnings);
+                if let Some(authored) = authored {
+                    for key in [
+                        "models",
+                        "model_field_patches",
+                        "model_order",
+                        "model_membership",
+                    ] {
+                        if let Some(value) = authored.get(key) {
+                            merged["providers"][&id][key] = value.clone();
+                        } else if let Some(provider) = merged["providers"][&id].as_object_mut() {
+                            provider.remove(key);
+                        }
+                    }
                 }
-                let url_changed = provider.get("url").is_some_and(|new_url| {
-                    merged
-                        .get("providers")
-                        .and_then(Value::as_object)
-                        .and_then(|providers| providers.get(&id))
-                        .and_then(Value::as_object)
-                        .and_then(|previous| previous.get("url"))
-                        .is_some_and(|previous_url| new_url != previous_url)
-                });
-                if url_changed {
-                    provider
-                        .entry("credential_ref".to_string())
-                        .or_insert(Value::Null);
-                    provider
-                        .entry("headers".to_string())
-                        .or_insert_with(|| Value::Array(Vec::new()));
-                    // A higher-precedence destination must never inherit a
-                    // host-executed global credential producer. `null` is a
-                    // deliberate deep-merge tombstone for the optional field.
-                    provider
-                        .entry("auth_command".to_string())
-                        .or_insert(Value::Null);
-                    provider.entry("oauth".to_string()).or_insert(Value::Null);
-                }
-                let mut layer = Map::new();
-                let mut providers = Map::new();
-                providers.insert(id, Value::Object(provider));
-                layer.insert("providers".to_string(), Value::Object(providers));
-                deep_merge_value(merged, &Value::Object(layer));
             }
             Err(error) => {
                 tracing::warn!(
@@ -1725,6 +1910,48 @@ fn merge_provider_files_for_layer(
             }
         }
     }
+}
+
+fn merge_provider_raw_for_layer(
+    merged: &mut Value,
+    config_path: &Path,
+    id: &str,
+    mut provider: Map<String, Value>,
+    warnings: &mut Vec<String>,
+) {
+    if !config_path_is_global_user_layer(config_path) {
+        strip_project_auth_command(id, &mut provider, "project provider config", warnings);
+        strip_project_oauth_descriptor(id, &mut provider, "project provider config", warnings);
+    }
+    let url_changed = provider.get("url").is_some_and(|new_url| {
+        merged
+            .get("providers")
+            .and_then(Value::as_object)
+            .and_then(|providers| providers.get(id))
+            .and_then(Value::as_object)
+            .and_then(|previous| previous.get("url"))
+            .is_some_and(|previous_url| new_url != previous_url)
+    });
+    if url_changed {
+        provider
+            .entry("credential_ref".to_string())
+            .or_insert(Value::Null);
+        provider
+            .entry("headers".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        // A higher-precedence destination must never inherit a
+        // host-executed global credential producer. `null` is a
+        // deliberate deep-merge tombstone for the optional field.
+        provider
+            .entry("auth_command".to_string())
+            .or_insert(Value::Null);
+        provider.entry("oauth".to_string()).or_insert(Value::Null);
+    }
+    let mut layer = Map::new();
+    let mut providers = Map::new();
+    providers.insert(id.to_string(), Value::Object(provider));
+    layer.insert("providers".to_string(), Value::Object(providers));
+    deep_merge_value(merged, &Value::Object(layer));
 }
 
 /// Only the canonical platform global config file has global authority.
@@ -1778,7 +2005,7 @@ fn strip_project_oauth_descriptor(
 
 fn load_provider_files_into_config(config_path: &Path, cfg: &mut ProvidersConfig) {
     let mut merged = Value::Object(Map::new());
-    merge_provider_files_for_layer(&mut merged, config_path, &mut Vec::new());
+    merge_provider_files_for_layer_mode(&mut merged, config_path, &mut Vec::new(), true);
     if let Some(map) = merged.get("providers").and_then(Value::as_object) {
         for (id, v) in map {
             match serde_json::from_value::<ProviderEntry>(v.clone()) {
@@ -1823,6 +2050,390 @@ mod atomic_write_tests {
     use serde_json::{Map, Value};
 
     use super::{strip_project_auth_command, strip_project_oauth_descriptor};
+
+    #[test]
+    fn sparse_membership_raw_writer_enforces_single_authored_budget_before_any_write() {
+        use super::super::{
+            ConfigDoc, ModelEntry, ModelMembershipPatch, ModelPlacement, OnUnlistedModelsFetch,
+            ProviderEntry, ProvidersConfig,
+        };
+        use std::collections::BTreeMap;
+        let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
+        let path = crate::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: "https://example.com".into(),
+                models: vec![ModelEntry {
+                    id: "owner".into(),
+                    name: Some("x".repeat(240 * 1024)),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let mut doc = ConfigDoc::load(&path).unwrap();
+        doc.write(&config).unwrap();
+        let provider_path = path.parent().unwrap().join("providers/p.json");
+        let original_provider = std::fs::read(&provider_path).unwrap();
+        let original_config = std::fs::read(&path).unwrap();
+        let mut desired = doc.providers();
+        desired.on_unlisted_models_fetch = Some(OnUnlistedModelsFetch::Ask);
+        desired.providers.get_mut("p").unwrap().model_membership = ModelMembershipPatch {
+            deletes: vec!["deleted".into()],
+            placements: vec![ModelPlacement {
+                id: "owner".into(),
+                after: None,
+            }],
+        };
+        // The delta itself fits ingress, but the total authored layer does not.
+        desired
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .push(ModelEntry {
+                id: "new".into(),
+                name: Some("y".repeat(32 * 1024)),
+                ..Default::default()
+            });
+        let error = ConfigDoc::providers_from_paths_after_writes(
+            std::slice::from_ref(&path),
+            &BTreeMap::from([(path.clone(), desired.clone())]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("authored provider entry exceeds"),
+            "{error}"
+        );
+        let error = doc.write(&desired).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("authored provider entry exceeds"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&provider_path).unwrap(), original_provider);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original_config,
+            "failed preflight must not write layer metadata"
+        );
+    }
+
+    #[test]
+    fn authored_model_edits_do_not_fabricate_rows_omitted_from_the_authored_file() {
+        use super::ConfigDoc;
+        let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
+        let path = crate::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap().join("providers")).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        let provider_path = path.parent().unwrap().join("providers/p.json");
+        std::fs::write(&provider_path,r#"{"url":"https://example.com","model_field_patches":[{"id":"same","set":{"favorite":true},"remove":[]}]}"#).unwrap();
+        let mut doc = ConfigDoc::load(&path).unwrap();
+        let mut desired = doc.providers();
+        assert!(
+            desired.providers["p"].models.is_empty(),
+            "authored view must not materialize sparse rows"
+        );
+        assert_eq!(desired.providers["p"].model_field_patches.len(), 1);
+        desired.providers.get_mut("p").unwrap().name = Some("metadata edit".into());
+        doc.write(&desired).unwrap();
+        let raw = super::load_provider_raw_file(&provider_path).unwrap();
+        assert!(
+            !raw.contains_key("models"),
+            "unchanged omitted authored rows stay omitted after save"
+        );
+        let effective = ConfigDoc::providers_from_paths(&[path]);
+        assert!(effective.providers["p"].models[0].favorite);
+    }
+
+    #[test]
+    fn sparse_model_edits_keep_multi_megabyte_composed_rows_in_their_owner_layers() {
+        use super::super::{ConfigDoc, ModelEntryFieldPatch};
+        use std::collections::BTreeMap;
+        let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
+        let root = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..12 {
+            let path = root.path().join(format!("layer-{index}/config.json"));
+            std::fs::create_dir_all(path.parent().unwrap().join("providers")).unwrap();
+            std::fs::write(&path, "{}").unwrap();
+            let row = serde_json::json!({"id":"same", "extra": {format!("owner-{index}"): "x".repeat(190*1024)}});
+            std::fs::write(
+                path.parent().unwrap().join("providers/p.json"),
+                serde_json::to_vec(
+                    &serde_json::json!({"url":"https://example.com", "models":[row]}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        let path = paths.last().unwrap();
+        let mut doc = ConfigDoc::load(path).unwrap();
+        let before = ConfigDoc::providers_from_paths(&paths);
+        assert!(
+            serde_json::to_vec(&before.providers["p"].models[0])
+                .unwrap()
+                .len()
+                > crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES
+        );
+        let mut desired = doc.providers();
+        desired
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .model_field_patches
+            .push(ModelEntryFieldPatch {
+                id: "same".into(),
+                replace: false,
+                set: BTreeMap::from([("favorite".into(), Value::Bool(true))]),
+                remove: Vec::new(),
+            });
+        let preview = ConfigDoc::providers_from_paths_after_writes(
+            &paths,
+            &BTreeMap::from([(path.clone(), desired.clone())]),
+        )
+        .unwrap();
+        doc.write(&desired).unwrap();
+        let actual = ConfigDoc::providers_from_paths(&paths);
+        assert_eq!(
+            serde_json::to_value(&preview).unwrap(),
+            serde_json::to_value(&actual).unwrap()
+        );
+        assert!(actual.providers["p"].models[0].favorite);
+        assert_eq!(
+            actual.providers["p"].models[0].extra,
+            before.providers["p"].models[0].extra
+        );
+        let authored = doc.providers();
+        assert_eq!(
+            authored.providers["p"].model_field_patches.len(),
+            1,
+            "authored deltas survive ConfigDoc reload"
+        );
+        assert!(
+            std::fs::metadata(path.parent().unwrap().join("providers/p.json"))
+                .unwrap()
+                .len()
+                < 256 * 1024
+        );
+        doc.write_model_favorite("p", "same", false).unwrap();
+        let actual = ConfigDoc::providers_from_paths(&paths);
+        assert!(
+            !actual.providers["p"].models[0].favorite,
+            "direct favorite supersedes prior sparse edit"
+        );
+        assert_eq!(
+            actual.providers["p"].models[0].extra,
+            before.providers["p"].models[0].extra
+        );
+        let mut desired = doc.providers();
+        desired.providers.get_mut("p").unwrap().model_order = Some(Vec::new());
+        doc.write(&desired).unwrap();
+        assert!(
+            ConfigDoc::providers_from_paths(&paths).providers["p"]
+                .models
+                .is_empty()
+        );
+        assert!(
+            ConfigDoc::providers_from_paths(&paths).providers["p"]
+                .model_order
+                .is_none(),
+            "effective view consumes authoring instructions"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_favorite_obeys_authored_budget_before_replacing_the_captured_file() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::create_dir(root.path().join("providers")).unwrap();
+        let provider_path = root.path().join("providers/p.json");
+        let mut raw =
+            serde_json::json!({"url":"https://example.com","models":[{"id":"same","name":""}]});
+        let overhead = serde_json::to_vec(&raw).unwrap().len();
+        raw["models"][0]["name"] = Value::String(
+            "x".repeat(super::super::MAX_AUTHORED_PROVIDER_ENTRY_BYTES - overhead - 1),
+        );
+        let bytes = serde_json::to_vec(&raw).unwrap();
+        assert!(bytes.len() < super::super::MAX_AUTHORED_PROVIDER_ENTRY_BYTES);
+        std::fs::write(&provider_path, &bytes).unwrap();
+        let source = retained_provider_model_source_from_workspace_layer_snapshots(
+            &[crate::config::WorkspaceConfigLayerSnapshot {
+                origin: None,
+                project_root: None,
+                config_json: None,
+                provider_files: vec![("p".into(), bytes.clone())],
+                effective_default_artifact_digest: None,
+                digest: "source".into(),
+            }],
+            "p",
+            "same",
+        )
+        .unwrap()
+        .unwrap();
+        let target = RetainedProviderModelFavoriteTarget::new(
+            std::fs::File::open(root.path()).unwrap(),
+            std::fs::canonicalize(&path).unwrap(),
+            source,
+        )
+        .unwrap();
+        let error = target.write_model_favorite(true).unwrap_err();
+        let RetainedProviderModelFavoriteWriteError::Rejected(cause) = error else {
+            panic!("budget must reject before the durable boundary")
+        };
+        assert!(
+            cause
+                .to_string()
+                .contains("authored provider entry exceeds"),
+            "{cause}"
+        );
+        assert_eq!(std::fs::read(&provider_path).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_favorite_uses_the_sparse_edit_layer_and_supersedes_its_field() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::create_dir(root.path().join("providers")).unwrap();
+        let provider_path = root.path().join("providers/p.json");
+        std::fs::write(&provider_path,r#"{"url":"https://example.com","models":[],"model_field_patches":[{"id":"same","replace":true,"set":{"favorite":true,"name":"fresh image"},"remove":[]}]}"#).unwrap();
+        let source_for = |bytes: Vec<u8>| {
+            retained_provider_model_source_from_workspace_layer_snapshots(
+                &[crate::config::WorkspaceConfigLayerSnapshot {
+                    origin: None,
+                    project_root: None,
+                    config_json: None,
+                    provider_files: vec![("p".into(), bytes)],
+                    effective_default_artifact_digest: None,
+                    digest: "source".into(),
+                }],
+                "p",
+                "same",
+            )
+            .unwrap()
+            .expect("sparse source")
+        };
+        let source = source_for(std::fs::read(&provider_path).unwrap());
+        let target = RetainedProviderModelFavoriteTarget::new(
+            std::fs::File::open(root.path()).unwrap(),
+            std::fs::canonicalize(&path).unwrap(),
+            source,
+        )
+        .unwrap();
+        target.validate_model_favorite_noop(true).unwrap();
+        let receipt = target.write_model_favorite(false).unwrap();
+        assert!(
+            receipt.matches_committed_source(&source_for(std::fs::read(&provider_path).unwrap()))
+        );
+        let raw = load_provider_raw_file(&provider_path).unwrap();
+        assert!(
+            !authored_model_value(&raw, "same").unwrap().unwrap()["favorite"]
+                .as_bool()
+                .unwrap()
+        );
+        let source = source_for(std::fs::read(&provider_path).unwrap());
+        let next = RetainedProviderModelFavoriteTarget::new(
+            std::fs::File::open(root.path()).unwrap(),
+            std::fs::canonicalize(&path).unwrap(),
+            source,
+        )
+        .unwrap();
+        next.validate_model_favorite_noop(false).unwrap();
+        next.write_model_favorite(true).unwrap();
+        let mut doc = ConfigDoc::load(&path).unwrap();
+        doc.write_model_wizard_fields(
+            "p",
+            &ModelEntry {
+                id: "same".into(),
+                system_prompt: Some("fresh prompt".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let effective = ConfigDoc::providers_from_paths(&[path]);
+        let model = &effective.providers["p"].models[0];
+        assert!(
+            model.favorite,
+            "direct favorite survives a replacement-row reset"
+        );
+        assert_eq!(model.name.as_deref(), Some("fresh image"));
+        assert_eq!(
+            model.system_prompt.as_deref(),
+            Some("fresh prompt"),
+            "wizard fields override replacement-row values"
+        );
+    }
+
+    #[test]
+    fn explicit_model_membership_has_a_retained_favorite_source_without_a_lower_row() {
+        let membership = serde_json::json!({"model_order":["same"]});
+        assert!(
+            super::authored_model_value(membership.as_object().unwrap(), "same")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn prospective_layer_write_matches_actual_raw_patch_and_reloaded_composition() {
+        use super::super::{ConfigDoc, ModelEntry};
+        use std::collections::BTreeMap;
+        let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
+        let global = crate::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap().join("providers")).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        std::fs::write(global.parent().unwrap().join("providers/p.json"), r#"{"url":"https://example.com","models":[{"id":"a","name":"retained"},{"id":"b"}],"opaque_field":{"keep":true}}"#).unwrap();
+        let paths = vec![global.clone()];
+        for models in [
+            vec![ModelEntry {
+                id: "a".into(),
+                name: Some("fresh".into()),
+                ..Default::default()
+            }],
+            Vec::new(),
+        ] {
+            let mut doc = ConfigDoc::load(&global).unwrap();
+            let mut desired = doc.providers();
+            desired.providers.get_mut("p").unwrap().models = models;
+            desired.providers.get_mut("p").unwrap().models_replace = true;
+            let before = std::fs::read(global.parent().unwrap().join("providers/p.json")).unwrap();
+            let preview = ConfigDoc::providers_from_paths_after_writes(
+                &paths,
+                &BTreeMap::from([(global.clone(), desired.clone())]),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(global.parent().unwrap().join("providers/p.json")).unwrap(),
+                before,
+                "preflight must not write"
+            );
+            doc.write(&desired).unwrap();
+            let actual = ConfigDoc::providers_from_paths(&paths);
+            assert_eq!(
+                serde_json::to_value(&preview).unwrap(),
+                serde_json::to_value(&actual).unwrap()
+            );
+            assert_eq!(
+                super::load_provider_raw_file(&global.parent().unwrap().join("providers/p.json"))
+                    .unwrap()["opaque_field"],
+                serde_json::json!({"keep":true})
+            );
+        }
+    }
 
     #[test]
     fn project_auth_command_is_ignored_and_reported() {

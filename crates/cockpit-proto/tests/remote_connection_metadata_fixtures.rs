@@ -1,5 +1,6 @@
 // Mirror the shared JSON corpus. Schema metadata is asserted alongside the
 // encoded vectors so no parsed fixture field is silently ignored.
+// Every parsed fixture field is asserted against the typed schema or codec.
 
 use cockpit_proto::remote_connection_metadata::{
     self, BytesBucket, COMPONENT_KIND_ACCOUNT, COMPONENT_KIND_ATTEMPT, COMPONENT_KIND_DEVICE,
@@ -246,6 +247,51 @@ fn remote_metadata_cross_language_fixtures() {
             (DOMAIN_ATTEMPT, COMPONENT_KIND_ATTEMPT, "attempt_id"),
         ]),
         "every fixture schema must match the production domain/kind and canonical component name"
+    );
+
+    let actual_schemas = fixture
+        .pseudonym_schemas
+        .iter()
+        .map(|schema| {
+            let component = &schema.components[0];
+            let value = PseudonymComponent {
+                kind: component.kind,
+                bytes: [7; 16],
+            };
+            let message = pseudonym_message(&schema.domain, &[value])
+                .expect("fixture schema must be accepted by its typed domain");
+            let decoded = decode_pseudonym_message(&message).expect("schema message decodes");
+            assert_eq!(decoded.domain, schema.domain);
+            assert_eq!(decoded.component.kind, component.kind);
+            (
+                schema.domain.as_str(),
+                component.kind,
+                component.name.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let expected_schemas = BTreeSet::from([
+        (DOMAIN_TENANT, COMPONENT_KIND_TENANT, "tenant_id"),
+        (DOMAIN_ACCOUNT, COMPONENT_KIND_ACCOUNT, "account_id"),
+        (
+            remote_connection_metadata::DOMAIN_DEVICE,
+            remote_connection_metadata::COMPONENT_KIND_DEVICE,
+            "device_id",
+        ),
+        (
+            remote_connection_metadata::DOMAIN_INSTANCE,
+            remote_connection_metadata::COMPONENT_KIND_INSTANCE,
+            "instance_id",
+        ),
+        (
+            remote_connection_metadata::DOMAIN_ATTEMPT,
+            remote_connection_metadata::COMPONENT_KIND_ATTEMPT,
+            "attempt_id",
+        ),
+    ]);
+    assert_eq!(
+        actual_schemas, expected_schemas,
+        "every declared schema field must match the complete typed contract"
     );
 
     for vector in &fixture.positive_vectors {

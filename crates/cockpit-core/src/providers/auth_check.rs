@@ -7,7 +7,7 @@ use reqwest::StatusCode;
 use serde_json::json;
 
 use crate::config::providers::{ModelEntry, ProviderEntry, ProviderModelCatalog};
-use crate::providers::models_fetch::{self, FetchOutcome, ResolvedHeader};
+use crate::providers::models_fetch::{self, FetchOutcome, ModelFetchFailureKind, ResolvedHeader};
 use crate::providers::{AuthCheckKind, ProviderTemplate};
 
 #[derive(Debug)]
@@ -20,18 +20,39 @@ pub enum AuthCheckSuccess {
         models: Vec<ModelEntry>,
         catalog: ProviderModelCatalog,
         reason: String,
+        failure_kind: ModelFetchFailureKind,
     },
     Checked,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthCheckError {
+    #[error("provider catalog contains an unsafe operational model ID; no catalog was written")]
+    UnsafeModelIdentity,
+    #[error("{message}")]
+    CredentialsRejected { status: StatusCode, message: String },
+    #[error("{message}")]
+    HttpStatus { status: StatusCode, message: String },
     #[error("{0}")]
-    CredentialsRejected(String),
+    Parse(String),
     #[error("{0}")]
     Network(String),
     #[error("{0}")]
     Other(String),
+}
+
+impl AuthCheckError {
+    pub(crate) fn failure_kind(&self) -> ModelFetchFailureKind {
+        match self {
+            Self::CredentialsRejected { status, .. } | Self::HttpStatus { status, .. } => {
+                ModelFetchFailureKind::HttpStatus(*status)
+            }
+            Self::Network(_) => ModelFetchFailureKind::Network,
+            Self::Parse(_) | Self::Other(_) | Self::UnsafeModelIdentity => {
+                ModelFetchFailureKind::Parse
+            }
+        }
+    }
 }
 
 pub async fn check_provider_auth(
@@ -60,7 +81,7 @@ pub async fn check_provider_auth_with_store(
     env_lookup: impl Fn(&str) -> Option<String> + Sync,
 ) -> Result<AuthCheckSuccess, AuthCheckError> {
     let fetch_store = store.clone();
-    let resolved = match store {
+    let mut resolved = match store {
         Some(store) => {
             models_fetch::resolve_provider_request_async_with_store(
                 provider_id,
@@ -81,37 +102,62 @@ pub async fn check_provider_auth_with_store(
             })
         }
     }
-    .map_err(|error| AuthCheckError::Other(error.to_string()))?;
-    match template.auth_check {
-        AuthCheckKind::ModelsEndpoint => {
-            let outcome = models_fetch::fetch_models_for_provider_with_store(
+    .map_err(classify_error)?;
+    match crate::providers::effective_auth_check(template.auth_check, &resolved.base_url) {
+        AuthCheckKind::AuthenticatedGetThenModels { path, docs_url } => {
+            // A public catalog answers any key, so authenticate first and only
+            // then fetch the catalog the caller persists.
+            let mut probed = get_credential_probe(
+                &resolved.base_url,
+                &resolved.headers,
+                path,
+                docs_url,
+                timeout,
+            )
+            .await;
+            if matches!(&probed, Err(AuthCheckError::CredentialsRejected { .. }))
+                && let Some(store) = fetch_store.clone()
+                && let Some(refreshed) = models_fetch::refresh_provider_request_async_with_store(
+                    provider_id,
+                    entry,
+                    store,
+                    |name| env_lookup(name),
+                    resolved.command_credential_generation(),
+                )
+                .await
+                .map_err(classify_error)?
+            {
+                probed = get_credential_probe(
+                    &refreshed.base_url,
+                    &refreshed.headers,
+                    path,
+                    docs_url,
+                    timeout,
+                )
+                .await;
+                resolved = refreshed;
+            }
+            probed?;
+            fetch_models_check(
                 provider_id,
                 entry,
                 &resolved,
                 timeout,
                 fetch_store,
-                |name| env_lookup(name),
+                env_lookup,
             )
             .await
-            .map_err(classify_error)?;
-            match outcome {
-                FetchOutcome::Models { models, catalog } => {
-                    Ok(AuthCheckSuccess::Models { models, catalog })
-                }
-                FetchOutcome::FallbackAvailable {
-                    models,
-                    catalog,
-                    reason,
-                } => Ok(AuthCheckSuccess::FallbackAvailable {
-                    models,
-                    catalog,
-                    reason,
-                }),
-                FetchOutcome::Unsupported => Err(AuthCheckError::Other(
-                    "credential validation endpoint returned 404; no authenticated response was received"
-                        .to_string(),
-                )),
-            }
+        }
+        AuthCheckKind::ModelsEndpoint => {
+            fetch_models_check(
+                provider_id,
+                entry,
+                &resolved,
+                timeout,
+                fetch_store,
+                env_lookup,
+            )
+            .await
         }
         AuthCheckKind::ChatCompletions {
             path,
@@ -127,7 +173,7 @@ pub async fn check_provider_auth_with_store(
                 timeout,
             )
             .await;
-            if matches!(&outcome, Err(AuthCheckError::CredentialsRejected(_)))
+            if matches!(&outcome, Err(AuthCheckError::CredentialsRejected { .. }))
                 && let Some(store) = fetch_store
             {
                 let refreshed = models_fetch::refresh_provider_request_async_with_store(
@@ -138,7 +184,7 @@ pub async fn check_provider_auth_with_store(
                     resolved.command_credential_generation(),
                 )
                 .await
-                .map_err(|error| AuthCheckError::Other(error.to_string()))?;
+                .map_err(classify_error)?;
                 if let Some(refreshed) = refreshed {
                     return post_chat_completion_probe(
                         &refreshed.base_url,
@@ -156,6 +202,117 @@ pub async fn check_provider_auth_with_store(
     }
 }
 
+/// Fetch the `/models` catalog as the credential proof (or, after an
+/// authenticated probe, as the catalog the caller persists).
+async fn fetch_models_check(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    resolved: &models_fetch::ResolvedRequest,
+    timeout: Duration,
+    fetch_store: Option<crate::credentials::CredentialStore>,
+    env_lookup: impl Fn(&str) -> Option<String> + Sync,
+) -> Result<AuthCheckSuccess, AuthCheckError> {
+    let outcome = models_fetch::fetch_models_for_provider_with_store(
+        provider_id,
+        entry,
+        resolved,
+        timeout,
+        fetch_store,
+        |name| env_lookup(name),
+    )
+    .await
+    .map_err(classify_error)?;
+    match outcome {
+        FetchOutcome::Models { models, catalog } => {
+            Ok(AuthCheckSuccess::Models { models, catalog })
+        }
+        FetchOutcome::FallbackAvailable {
+            models,
+            catalog,
+            reason,
+            failure_kind,
+        } => Ok(AuthCheckSuccess::FallbackAvailable {
+            models,
+            catalog,
+            reason,
+            failure_kind,
+        }),
+        FetchOutcome::Unsupported => Err(AuthCheckError::HttpStatus {
+            status: StatusCode::NOT_FOUND,
+            message: "credential validation endpoint returned 404; no authenticated response was received".to_string(),
+        }),
+    }
+}
+
+/// `GET {base_url}{path}` with the resolved credential headers. 401/403 is a
+/// rejected credential; any other non-success is a failed check. The body is
+/// drained, never surfaced (it can echo account data).
+pub(crate) async fn get_credential_probe(
+    base_url: &str,
+    headers: &[ResolvedHeader],
+    path: &str,
+    docs_url: &str,
+    timeout: Duration,
+) -> Result<(), AuthCheckError> {
+    let url = probe_url(base_url, path);
+    let client = crate::providers::provider_http::client_builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| classify_error(error.into()))?;
+    let mut request = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, probe_user_agent(headers));
+    for header in headers {
+        if header.name.eq_ignore_ascii_case("user-agent") {
+            continue;
+        }
+        request = request.header(&header.name, &header.value);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))
+        .map_err(|error| classify_chat_error(error, docs_url))?;
+    let status = response.status();
+    // Only the status matters. Never buffer the body: a configured provider
+    // or proxy owns it and could stream an unbounded payload (review C6).
+    drop(response);
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(AuthCheckError::CredentialsRejected {
+            status,
+            message: format!("credentials rejected ({status}). See {docs_url}"),
+        });
+    }
+    if !status.is_success() {
+        return Err(AuthCheckError::HttpStatus {
+            status,
+            message: format!("credential check returned {status}. See {docs_url}"),
+        });
+    }
+    Ok(())
+}
+
+fn probe_url(base_url: &str, path: &str) -> String {
+    format!(
+        "{}{}",
+        base_url.trim_end_matches('/'),
+        if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        }
+    )
+}
+
+fn probe_user_agent(headers: &[ResolvedHeader]) -> String {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
+        .map(|header| header.value.clone())
+        .unwrap_or_else(|| crate::user_agent::user_agent().to_string())
+}
+
 async fn post_chat_completion_probe(
     base_url: &str,
     headers: &[ResolvedHeader],
@@ -164,24 +321,12 @@ async fn post_chat_completion_probe(
     docs_url: &str,
     timeout: Duration,
 ) -> Result<AuthCheckSuccess, AuthCheckError> {
-    let url = format!(
-        "{}{}",
-        base_url.trim_end_matches('/'),
-        if path.starts_with('/') {
-            path.to_string()
-        } else {
-            format!("/{path}")
-        }
-    );
+    let url = probe_url(base_url, path);
     let client = crate::providers::provider_http::client_builder()
         .timeout(timeout)
         .build()
-        .map_err(|error| AuthCheckError::Other(error.to_string()))?;
-    let user_agent = headers
-        .iter()
-        .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
-        .map(|header| header.value.clone())
-        .unwrap_or_else(|| crate::user_agent::user_agent().to_string());
+        .map_err(|error| classify_error(error.into()))?;
+    let user_agent = probe_user_agent(headers);
     let mut request = client
         .post(&url)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -205,49 +350,48 @@ async fn post_chat_completion_probe(
         .with_context(|| format!("POST {url}"))
         .map_err(|error| classify_chat_error(error, docs_url))?;
     let status = response.status();
-    // Drain body without surfacing it — ChatCompletions failures are status +
-    // docs_url only (never raw body or key material).
-    let _ = response.text().await;
+    // ChatCompletions failures are status + docs_url only (never raw body or
+    // key material). The body is dropped unread rather than buffered without
+    // a byte ceiling (review C6).
+    drop(response);
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        return Err(AuthCheckError::CredentialsRejected(format!(
-            "credentials rejected ({status}). See {docs_url}"
-        )));
+        return Err(AuthCheckError::CredentialsRejected {
+            status,
+            message: format!("credentials rejected ({status}). See {docs_url}"),
+        });
     }
     if !status.is_success() {
-        return Err(AuthCheckError::Other(format!(
-            "chat completions check returned {status}. See {docs_url}"
-        )));
+        return Err(AuthCheckError::HttpStatus {
+            status,
+            message: format!("chat completions check returned {status}. See {docs_url}"),
+        });
     }
     Ok(AuthCheckSuccess::Checked)
 }
 
 fn classify_error(error: anyhow::Error) -> AuthCheckError {
+    if matches!(
+        error.downcast_ref::<AuthCheckError>(),
+        Some(AuthCheckError::UnsafeModelIdentity)
+    ) {
+        return AuthCheckError::UnsafeModelIdentity;
+    }
     let message = error.to_string();
-    if message.contains("returned 401") || message.contains("returned 403") {
-        return AuthCheckError::CredentialsRejected(message);
+    match models_fetch::model_fetch_failure_kind(&error) {
+        ModelFetchFailureKind::HttpStatus(status)
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN =>
+        {
+            AuthCheckError::CredentialsRejected { status, message }
+        }
+        ModelFetchFailureKind::HttpStatus(status) => AuthCheckError::HttpStatus { status, message },
+        ModelFetchFailureKind::Network => AuthCheckError::Network(message),
+        ModelFetchFailureKind::Parse => AuthCheckError::Parse(message),
     }
-    if error.chain().any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(|reqwest| reqwest.is_connect() || reqwest.is_timeout())
-    }) {
-        return AuthCheckError::Network(message);
-    }
-    AuthCheckError::Other(message)
 }
 
 fn classify_chat_error(error: anyhow::Error, docs_url: &str) -> AuthCheckError {
-    match classify_error(error) {
-        AuthCheckError::CredentialsRejected(message) => {
-            AuthCheckError::CredentialsRejected(format!("{message}. See {docs_url}"))
-        }
-        AuthCheckError::Network(message) => {
-            AuthCheckError::Network(format!("{message}. See {docs_url}"))
-        }
-        AuthCheckError::Other(message) => {
-            AuthCheckError::Other(format!("{message}. See {docs_url}"))
-        }
-    }
+    let message = format!("{error}. See {docs_url}");
+    classify_error(error.context(message))
 }
 
 #[cfg(test)]
@@ -417,7 +561,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, AuthCheckError::CredentialsRejected(_)));
+        assert!(matches!(error, AuthCheckError::CredentialsRejected { .. }));
         assert!(error.to_string().contains("credentials rejected"));
     }
 
@@ -431,7 +575,13 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, AuthCheckError::Other(_)));
+        assert!(matches!(
+            error,
+            AuthCheckError::HttpStatus {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }
+        ));
         assert!(error.to_string().contains("no authenticated response"));
     }
 
@@ -498,7 +648,7 @@ mod tests {
                 .unwrap_err();
             let msg = err.to_string();
             assert!(
-                matches!(err, AuthCheckError::CredentialsRejected(_)),
+                matches!(err, AuthCheckError::CredentialsRejected { .. }),
                 "{}: {err:?}",
                 template.id
             );
@@ -622,7 +772,11 @@ mod tests {
         let template = z_ai_template();
         let entry = test_entry(format!("http://{addr}/v1"));
         let result = check_provider_auth("z-ai", &entry, &template, Duration::from_secs(2)).await;
-        let Err(AuthCheckError::Other(message)) = result else {
+        let Err(AuthCheckError::HttpStatus {
+            status: StatusCode::FOUND,
+            message,
+        }) = result
+        else {
             panic!("redirected auth check must fail closed: {result:?}");
         };
         assert!(message.contains("302"), "{message}");
@@ -633,5 +787,192 @@ mod tests {
                 .contains("authorization: bearer"),
             "{captured}"
         );
+    }
+
+    /// A public-catalog provider: `/models` answers 200 for any key, `/key`
+    /// authenticates with `key_status`. Returns the base URL and the request
+    /// paths served, in order.
+    async fn public_catalog_server(
+        key_status: StatusCode,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let served = std::sync::Arc::clone(&paths);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                served.lock().unwrap().push(path.clone());
+                let (status, body) = if path.ends_with("/key") {
+                    (
+                        key_status,
+                        r#"{"error":{"message":"User not found.","code":401}}"#,
+                    )
+                } else {
+                    (StatusCode::OK, r#"{"data":[{"id":"vendor/model-a"}]}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or("OK"),
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}/api/v1"), paths)
+    }
+
+    /// #550: OpenRouter's `/models` is public, so a wrong key used to pass
+    /// verification. The template now proves the key on `/key` first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn openrouter_rejects_bad_key_even_though_models_is_public() {
+        let (base, paths) = public_catalog_server(StatusCode::UNAUTHORIZED).await;
+        let entry = test_entry(base);
+        let template = crate::providers::template_by_id("openrouter").expect("openrouter");
+
+        let result =
+            check_provider_auth("openrouter", &entry, template, Duration::from_secs(2)).await;
+
+        assert!(
+            matches!(result, Err(AuthCheckError::CredentialsRejected { .. })),
+            "a rejected key must not verify: {result:?}"
+        );
+        assert_eq!(paths.lock().unwrap().as_slice(), ["/api/v1/key"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn openrouter_valid_key_probes_key_then_fetches_catalog() {
+        let (base, paths) = public_catalog_server(StatusCode::OK).await;
+        let entry = test_entry(base);
+        let template = crate::providers::template_by_id("openrouter").expect("openrouter");
+
+        let result =
+            check_provider_auth("openrouter", &entry, template, Duration::from_secs(2)).await;
+
+        let Ok(AuthCheckSuccess::Models { models, .. }) = result else {
+            panic!("an accepted key verifies and returns the catalog: {result:?}");
+        };
+        assert_eq!(models[0].id, "vendor/model-a");
+        assert_eq!(
+            paths.lock().unwrap().as_slice(),
+            ["/api/v1/key", "/api/v1/models"]
+        );
+    }
+
+    /// A generic template pointed at a known public catalog host is upgraded
+    /// to that host's authenticated probe; other hosts keep their check.
+    #[test]
+    fn public_catalog_hosts_upgrade_models_endpoint_checks() {
+        use crate::providers::{OPENROUTER_AUTH_CHECK, effective_auth_check};
+        assert_eq!(
+            effective_auth_check(
+                AuthCheckKind::ModelsEndpoint,
+                "https://openrouter.ai/api/v1"
+            ),
+            OPENROUTER_AUTH_CHECK
+        );
+        assert_eq!(
+            effective_auth_check(AuthCheckKind::ModelsEndpoint, "https://api.openai.com/v1"),
+            AuthCheckKind::ModelsEndpoint
+        );
+        for upgraded in [
+            "https://OpenRouter.AI/api/v1",
+            "https://openrouter.ai./api/v1",
+            "https://eu.openrouter.ai/api/v1",
+            "https://user:pass@openrouter.ai/api/v1",
+            "https://openrouter.ai:443/api/v1/",
+        ] {
+            assert_eq!(
+                effective_auth_check(AuthCheckKind::ModelsEndpoint, upgraded),
+                OPENROUTER_AUTH_CHECK,
+                "{upgraded}"
+            );
+        }
+        for lookalike in [
+            "https://openrouter.ai.evil.example/api/v1",
+            "https://notopenrouter.ai/api/v1",
+            "https://openrouter.ai@evil.example/api/v1",
+            "https://openrouter.aix/api/v1",
+        ] {
+            assert_eq!(
+                effective_auth_check(AuthCheckKind::ModelsEndpoint, lookalike),
+                AuthCheckKind::ModelsEndpoint,
+                "{lookalike}"
+            );
+        }
+        let chat = z_ai_template().auth_check;
+        assert_eq!(
+            effective_auth_check(chat, "https://openrouter.ai/api/v1"),
+            chat
+        );
+    }
+
+    /// Review C6: the key probe reads only the status. An endless chunked
+    /// body must neither be buffered nor hold the check until its timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn key_probe_does_not_buffer_an_unbounded_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let chunk = format!("{:x}\r\n{}\r\n", 64 * 1024, "x".repeat(64 * 1024));
+            // Stream until the client hangs up.
+            while stream.write_all(chunk.as_bytes()).await.is_ok() {}
+        });
+        let started = std::time::Instant::now();
+        let result = get_credential_probe(
+            &format!("http://{addr}/api/v1"),
+            &[],
+            "/key",
+            "https://openrouter.ai/keys",
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "probe waited on the body: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Records how the pinned `url` crate exposes an absolute (terminal-dot)
+    /// DNS name, which decides whether review C5's bypass is reachable.
+    #[test]
+    fn url_host_str_for_terminal_dot_host() {
+        let host = url::Url::parse("https://openrouter.ai./api/v1")
+            .unwrap()
+            .host_str()
+            .map(str::to_string);
+        eprintln!("LANE545_C5_HOST={host:?}");
+        assert_eq!(host.as_deref(), Some("openrouter.ai."));
+        assert!(matches!(
+            crate::providers::public_catalog_auth_check("https://openrouter.ai./api/v1"),
+            Some(crate::providers::AuthCheckKind::AuthenticatedGetThenModels { path: "/key", .. })
+        ));
     }
 }

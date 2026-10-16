@@ -450,15 +450,7 @@ fn provider_mutation_request(
         upserts: plan
             .saves
             .into_iter()
-            .map(|save| cockpit_proto::ProviderMutationUpsert {
-                provider_id: save.provider_id,
-                entry: save.entry,
-                header_secrets: save
-                    .header_secrets
-                    .into_iter()
-                    .map(|secret| secret)
-                    .collect(),
-            })
+            .map(ProviderSavePlan::into_upsert)
             .collect(),
         deletes: plan
             .deletes
@@ -636,7 +628,22 @@ pub(crate) struct ProviderMutationPlan {
 pub(crate) struct ProviderSavePlan {
     provider_id: String,
     entry: ProviderEntry,
+    model_patch: Option<cockpit_proto::ProviderModelPatch>,
     header_secrets: Vec<Option<cockpit_proto::ProviderSecretValue>>,
+}
+
+impl ProviderSavePlan {
+    fn into_upsert(mut self) -> cockpit_proto::ProviderMutationUpsert {
+        if self.model_patch.is_some() {
+            self.entry.models.clear();
+        }
+        cockpit_proto::ProviderMutationUpsert {
+            provider_id: self.provider_id,
+            entry: self.entry,
+            model_patch: self.model_patch,
+            header_secrets: self.header_secrets,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -665,6 +672,7 @@ enum PendingOnboardingValidationCommit {
     FailedKeptExisting {
         provider_id: String,
         reason: String,
+        failure: cockpit_config::providers::ModelFetchFailure,
     },
 }
 
@@ -715,18 +723,25 @@ fn provider_plan_intent_hash(
     cockpit_proto::ProviderMutationBatch {
         upserts: saves
             .iter()
-            .map(|save| cockpit_proto::ProviderMutationUpsert {
-                provider_id: save.provider_id.clone(),
-                entry: save.entry.clone(),
-                header_secrets: save
-                    .header_secrets
-                    .iter()
-                    .map(|secret| {
-                        secret
-                            .as_ref()
-                            .map(|_| cockpit_proto::ProviderSecretValue::new(String::new()))
-                    })
-                    .collect(),
+            .map(|save| {
+                let mut entry = save.entry.clone();
+                if save.model_patch.is_some() {
+                    entry.models.clear();
+                }
+                cockpit_proto::ProviderMutationUpsert {
+                    model_patch: save.model_patch.clone(),
+                    provider_id: save.provider_id.clone(),
+                    entry,
+                    header_secrets: save
+                        .header_secrets
+                        .iter()
+                        .map(|secret| {
+                            secret
+                                .as_ref()
+                                .map(|_| cockpit_proto::ProviderSecretValue::new(String::new()))
+                        })
+                        .collect(),
+                }
             })
             .collect(),
         deletes: deletes
@@ -886,19 +901,16 @@ pub(crate) async fn execute_settings_daemon_work(
             committed_refresh_needed: None,
         }),
         SettingsDaemonEffectWork::ProviderMutation(plan) => {
+            let expected_upserts = plan
+                .saves
+                .iter()
+                .map(|save| (save.provider_id.clone(), save.entry.clone()))
+                .collect::<Vec<_>>();
             let mutation = cockpit_proto::ProviderMutationBatch {
                 upserts: plan
                     .saves
                     .into_iter()
-                    .map(|save| cockpit_proto::ProviderMutationUpsert {
-                        provider_id: save.provider_id,
-                        entry: save.entry,
-                        header_secrets: save
-                            .header_secrets
-                            .into_iter()
-                            .map(|secret| secret)
-                            .collect(),
-                    })
+                    .map(ProviderSavePlan::into_upsert)
                     .collect(),
                 deletes: plan
                     .deletes
@@ -934,11 +946,7 @@ pub(crate) async fn execute_settings_daemon_work(
             let expected_layer_id = plan.layer_id.clone();
             let expected_owner_root = plan.owner_root.clone();
             let expected_revision = plan.expected_revision.clone();
-            let expected_upserts = mutation
-                .upserts
-                .iter()
-                .map(|upsert| (upsert.provider_id.clone(), upsert.entry.clone()))
-                .collect::<Vec<_>>();
+
             let expected_deletes = mutation
                 .deletes
                 .iter()
@@ -966,6 +974,8 @@ pub(crate) async fn execute_settings_daemon_work(
                     mutation_intent_hash,
                     consumed_revision,
                     config,
+                    config_generation,
+                    catalog_readback,
                     status: cockpit_proto::ConfigCommitStatus::Committed,
                     ..
                 } if client_operation_id == &expected_operation_id
@@ -974,12 +984,19 @@ pub(crate) async fn execute_settings_daemon_work(
                     && owner_root == &expected_owner_root
                     && mutation_intent_hash == &expected_intent_hash
                     && consumed_revision == &expected_revision
-                    && provider_view_matches_mutation(
-                        config,
-                        &expected_upserts,
-                        &expected_deletes,
-                        expected_metadata.as_ref(),
-                    ) => {}
+                    && match catalog_readback {
+                        cockpit_proto::ProviderCatalogReadback::Required => false,
+                        cockpit_proto::ProviderCatalogReadback::Current {
+                            config_generation: read_generation,
+                            ..
+                        } if read_generation > config_generation => true,
+                        _ => provider_view_matches_mutation(
+                            config,
+                            &expected_upserts,
+                            &expected_deletes,
+                            expected_metadata.as_ref(),
+                        ),
+                    } => {}
                 other => {
                     return Err(format!(
                         "provider mutation returned an unbound or semantically mismatched receipt: {other:?}"
@@ -2555,7 +2572,8 @@ pub(crate) async fn secret_inventory_contains(
         cursor = Some(next_cursor);
     }
 }
-use cockpit_proto::{ProviderModelFetchOutcome as FetchOutcome, Request, Response};
+use auth::FetchOutcome;
+use cockpit_proto::{Request, Response};
 use shell::{
     SettingsHeaderAction, SettingsPointerAction, SettingsPointerSurface, SettingsScrollStates,
     marker, muted_style, selected_or_field,
@@ -2795,6 +2813,9 @@ pub struct SettingsDialog {
     /// exact boxed page object, including cursor and scroll state.
     stack: Vec<PageBox>,
     cx: SettingsCx,
+    /// One single-provider fetch can await authority recovery. The observation
+    /// outlives its consumed handle and is applied exactly once after adoption.
+    pending_fetch_observation: Option<auth::FetchObservation>,
 }
 
 fn setup_wizard_dialog(
@@ -3231,6 +3252,8 @@ pub struct SettingsCx {
     /// into the authoritative raw document.
     original_config: ProvidersConfig,
     provider_edit_authority: Option<ProviderEditAuthority>,
+    provider_catalog_reload_required: bool,
+    provider_catalog_rebase_from: Option<ProvidersConfig>,
     latest_provider_snapshot_session_id: Option<String>,
     /// Cached secret-free cockpit-only settings projection. Read by the UI and
     /// Tools pages; mutations are committed only by the daemon.
@@ -3940,8 +3963,10 @@ impl SettingsCx {
             PendingOnboardingValidationCommit::Fallback { reason, .. } => {
                 entry.mark_model_fetch_fallback(reason);
             }
-            PendingOnboardingValidationCommit::FailedKeptExisting { reason, .. } => {
-                entry.mark_model_fetch_failed_kept_existing(reason);
+            PendingOnboardingValidationCommit::FailedKeptExisting {
+                reason, failure, ..
+            } => {
+                entry.mark_model_fetch_failed_kept_existing(reason, failure);
             }
         }
         let entry = entry.clone();
@@ -3959,11 +3984,127 @@ impl SettingsCx {
         }
     }
 
+    fn adopt_refreshed_provider_snapshot(
+        &mut self,
+        snapshot: Result<auth::ProviderSnapshot, String>,
+    ) -> Result<(), String> {
+        let snapshot = snapshot.and_then(|snapshot| {
+            if snapshot.authority.layer_id.is_empty() || snapshot.authority.base_revision.is_empty()
+            {
+                Err("provider snapshot has no edit authority".into())
+            } else {
+                Ok(snapshot)
+            }
+        });
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.provider_edit_authority = None;
+                self.provider_catalog_reload_required = true;
+                self.extended_warnings = vec![format!(
+                    "Catalog refresh could not be adopted: {error}. Editing is disabled; Enter reloads, Esc closes settings."
+                )];
+                return Err(error);
+            }
+        };
+        if self
+            .provider_edit_authority
+            .as_ref()
+            .is_some_and(|current| current.config_generation > snapshot.authority.config_generation)
+        {
+            return Ok(());
+        }
+        let mut fresh = providers_config_from_view(&snapshot.config);
+        fresh.set_resolution_generation(snapshot.authority.config_generation);
+        let mut staged = fresh.clone();
+        for (id, entry) in &self.config.providers {
+            if let (Some(baseline), Some(new_entry)) = (
+                self.original_config.providers.get(id),
+                staged.providers.get_mut(id),
+            ) {
+                *new_entry = rebase_provider_entry(baseline, entry, new_entry);
+            }
+        }
+        if self.config.category_defaults != self.original_config.category_defaults {
+            staged.category_defaults = self.config.category_defaults.clone();
+        }
+        if self.config.on_unlisted_models_fetch != self.original_config.on_unlisted_models_fetch {
+            staged.on_unlisted_models_fetch = self.config.on_unlisted_models_fetch;
+        }
+        self.provider_warnings = snapshot.config.configuration_warnings.clone();
+        self.adopt_provider_mcp_view(snapshot.config);
+        if self.provider_catalog_rebase_from.is_none() {
+            self.provider_catalog_rebase_from = Some(self.original_config.clone());
+        }
+        self.original_config = fresh;
+        self.config = staged;
+        self.latest_provider_snapshot_session_id =
+            Some(snapshot.authority.snapshot_session_id.clone());
+        self.provider_edit_authority = Some(snapshot.authority);
+        self.provider_catalog_reload_required = false;
+        Ok(())
+    }
+
+    fn adopt_provider_mcp_view(&mut self, config: cockpit_proto::ProviderConfigView) {
+        self.mcp_owner_root = None;
+        self.mcp_config_path = None;
+        self.mcp_edit_capability = None;
+        self.mcp_revision = None;
+        self.mcp_authored_config = cockpit_core::mcp::config::McpConfig::default();
+        self.mcp_shadow_warnings.clear();
+        if let (
+            Some(raw),
+            Some(authored_raw),
+            Some(owner_root),
+            Some(config_path),
+            Some(capability),
+            Some(revision),
+        ) = (
+            config.mcp_config_json,
+            config.mcp_authored_config_json,
+            config.mcp_owner_root,
+            config.mcp_config_path,
+            config.mcp_edit_capability,
+            config.mcp_revision,
+        ) && let (Ok(mcp), Ok(authored)) = (
+            cockpit_core::mcp::config::McpConfig::parse(&raw),
+            cockpit_core::mcp::config::McpConfig::parse(&authored_raw),
+        ) {
+            self.mcp_shadow_warnings = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|value| value.get("shadowed").cloned())
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| {
+                    let agent = entry.get("agent").and_then(|value| value.as_str());
+                    Some(format!(
+                        "{}{} ({}) is shadowed by {}",
+                        agent
+                            .map(|value| format!("agent `{value}`: "))
+                            .unwrap_or_default(),
+                        entry.get("server")?.as_str()?,
+                        entry.get("source")?.as_str()?,
+                        entry.get("shadowed_by")?.as_str()?,
+                    ))
+                })
+                .collect();
+            self.mcp_config = mcp;
+            self.mcp_authored_config = authored;
+            self.mcp_owner_root = Some(owner_root);
+            self.mcp_config_path = Some(config_path);
+            self.mcp_edit_capability = Some(capability);
+            self.mcp_revision = Some(revision);
+        }
+    }
+
     fn queue_provider_catalog_for(
         &mut self,
         provider_id: Option<String>,
         navigation: Option<ProviderNavigation>,
     ) {
+        self.provider_edit_authority = None;
+        self.provider_catalog_reload_required = true;
         let project_root = self
             .active_project_root
             .clone()
@@ -3987,7 +4128,7 @@ impl SettingsCx {
             },
             Request::GetProviderCatalogSnapshot {
                 project_root: project_root.clone(),
-                provider_id: provider_id.clone(),
+                provider_id: None,
                 snapshot_session_id: snapshot_session_id.clone(),
             },
         );
@@ -4270,6 +4411,7 @@ impl SettingsCx {
                         result_revision,
                         config_generation,
                         config,
+                        catalog_readback,
                         status: cockpit_proto::ConfigCommitStatus::Committed,
                         publication,
                     }) if returned_operation_id == client_operation_id
@@ -4283,18 +4425,58 @@ impl SettingsCx {
                         && self.latest_provider_snapshot_session_id.as_deref()
                             == Some(returned_session_id.as_str()) =>
                     {
+                        let inline_default = matches!(
+                            &catalog_readback,
+                            cockpit_proto::ProviderCatalogReadback::Inline
+                        );
+                        let (next_session, next_layer, next_root, next_revision, next_generation) =
+                            match catalog_readback {
+                                cockpit_proto::ProviderCatalogReadback::Inline => (
+                                    returned_session_id,
+                                    returned_layer_id,
+                                    returned_owner_root,
+                                    result_revision,
+                                    config_generation,
+                                ),
+                                cockpit_proto::ProviderCatalogReadback::Current {
+                                    snapshot_session_id,
+                                    layer_id,
+                                    owner_root,
+                                    base_revision,
+                                    config_generation,
+                                } => (
+                                    snapshot_session_id,
+                                    layer_id,
+                                    owner_root,
+                                    base_revision,
+                                    config_generation,
+                                ),
+                                cockpit_proto::ProviderCatalogReadback::Required => {
+                                    self.provider_edit_authority = None;
+                                    self.provider_catalog_reload_required = true;
+                                    self.completed_provider_mutation =
+                                        Some(Err("provider catalog read-back required".into()));
+                                    self.extended_warnings = vec![
+                                        "provider catalog must be read back before editing".into(),
+                                    ];
+                                    return Ok(());
+                                }
+                            };
                         let mut authoritative = providers_config_from_view(&config);
-                        authoritative.set_resolution_generation(config_generation);
-                        authoritative.active_model = staged_default;
+                        authoritative.set_resolution_generation(next_generation);
+                        if inline_default {
+                            authoritative.active_model = staged_default;
+                        }
                         self.config = authoritative.clone();
                         self.original_config = authoritative;
                         self.provider_edit_authority = Some(ProviderEditAuthority {
-                            snapshot_session_id: returned_session_id,
-                            layer_id: returned_layer_id,
-                            owner_root: returned_owner_root,
-                            base_revision: result_revision,
-                            config_generation,
+                            snapshot_session_id: next_session.clone(),
+                            layer_id: next_layer,
+                            owner_root: next_root,
+                            base_revision: next_revision,
+                            config_generation: next_generation,
                         });
+                        self.latest_provider_snapshot_session_id = Some(next_session);
                         self.last_provider_mutation_operation_id =
                             Some(client_operation_id.clone());
                         self.last_provider_mutation_intent_hash =
@@ -4417,18 +4599,21 @@ impl SettingsCx {
                         && self.latest_provider_snapshot_session_id.as_deref()
                             == Some(returned_session_id.as_str()) =>
                     {
-                        let mut parsed = providers_config_from_view(&config);
-                        parsed.set_resolution_generation(config_generation);
-                        self.config = parsed.clone();
-                        self.original_config = parsed;
-                        self.provider_warnings = config.configuration_warnings.clone();
-                        self.provider_edit_authority = Some(ProviderEditAuthority {
-                            snapshot_session_id,
-                            layer_id,
-                            owner_root,
-                            base_revision,
-                            config_generation,
-                        });
+                        if self
+                            .adopt_refreshed_provider_snapshot(Ok(auth::ProviderSnapshot {
+                                config: config.clone(),
+                                authority: ProviderEditAuthority {
+                                    snapshot_session_id,
+                                    layer_id,
+                                    owner_root,
+                                    base_revision,
+                                    config_generation,
+                                },
+                            }))
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                         if self
                             .pending_onboarding_validation_commit
                             .as_ref()
@@ -4442,61 +4627,13 @@ impl SettingsCx {
                             self.completed_provider_navigation =
                                 Some((navigation, self.config.clone()));
                         }
-                        self.mcp_owner_root = None;
-                        self.mcp_config_path = None;
-                        self.mcp_edit_capability = None;
-                        self.mcp_revision = None;
-                        self.mcp_authored_config = cockpit_core::mcp::config::McpConfig::default();
-                        self.mcp_shadow_warnings.clear();
-                        if let (
-                            Some(raw),
-                            Some(authored_raw),
-                            Some(owner_root),
-                            Some(config_path),
-                            Some(capability),
-                            Some(revision),
-                        ) = (
-                            config.mcp_config_json,
-                            config.mcp_authored_config_json,
-                            config.mcp_owner_root,
-                            config.mcp_config_path,
-                            config.mcp_edit_capability,
-                            config.mcp_revision,
-                        ) && let (Ok(mcp), Ok(authored)) = (
-                            cockpit_core::mcp::config::McpConfig::parse(&raw),
-                            cockpit_core::mcp::config::McpConfig::parse(&authored_raw),
-                        ) {
-                            self.mcp_shadow_warnings =
-                                serde_json::from_str::<serde_json::Value>(&raw)
-                                    .ok()
-                                    .and_then(|value| value.get("shadowed").cloned())
-                                    .and_then(|value| value.as_array().cloned())
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .filter_map(|entry| {
-                                        let agent =
-                                            entry.get("agent").and_then(|value| value.as_str());
-                                        Some(format!(
-                                            "{}{} ({}) is shadowed by {}",
-                                            agent
-                                                .map(|value| format!("agent `{value}`: "))
-                                                .unwrap_or_default(),
-                                            entry.get("server")?.as_str()?,
-                                            entry.get("source")?.as_str()?,
-                                            entry.get("shadowed_by")?.as_str()?,
-                                        ))
-                                    })
-                                    .collect();
-                            self.mcp_config = mcp;
-                            self.mcp_authored_config = authored;
-                            self.mcp_owner_root = Some(owner_root);
-                            self.mcp_config_path = Some(config_path);
-                            self.mcp_edit_capability = Some(capability);
-                            self.mcp_revision = Some(revision);
-                        }
                     }
                     Ok(other) => {
-                        tracing::warn!(response = ?other, "unexpected async provider catalog response");
+                        tracing::warn!("unexpected async provider catalog response");
+                        let _ = other;
+                        let _ = self.adopt_refreshed_provider_snapshot(Err(
+                            "unexpected catalog response".into(),
+                        ));
                         if self.pending_onboarding_validation_commit.take().is_some() {
                             self.completed_provider_add = Some(Err(
                                 "daemon returned an unexpected provider catalog refresh response"
@@ -4505,7 +4642,8 @@ impl SettingsCx {
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "async provider catalog load failed");
+                        tracing::warn!("async provider catalog load failed");
+                        let _ = self.adopt_refreshed_provider_snapshot(Err(error.clone()));
                         if self.pending_onboarding_validation_commit.take().is_some() {
                             self.completed_provider_add =
                                 Some(Err(format!("provider catalog refresh failed: {error}")));
@@ -7139,6 +7277,46 @@ fn dispatch_from_settings_action(
 }
 
 impl SettingsDialog {
+    fn sync_refreshed_provider_editor(&mut self) {
+        let Some(baseline) = self.provider_catalog_rebase_from.take() else {
+            return;
+        };
+        let fresh = self.original_config.clone();
+        let update = |parent: &mut providers::EditState| {
+            if let (Some(old), Some(new)) = (
+                baseline.providers.get(&parent.provider_id),
+                fresh.providers.get(&parent.provider_id),
+            ) {
+                *parent.entry = rebase_provider_entry(old, &parent.entry, new);
+            }
+        };
+        if let Some(page) = self.page.downcast_mut::<ProvidersPage>() {
+            match page {
+                ProvidersPage::Edit(parent) => update(parent),
+                ProvidersPage::Headers { parent, .. }
+                | ProvidersPage::Models { parent, .. }
+                | ProvidersPage::ModelSettings { parent, .. }
+                | ProvidersPage::ProviderSettings { parent, .. }
+                | ProvidersPage::DeepFetch { parent, .. }
+                | ProvidersPage::CopilotSetup { parent, .. }
+                | ProvidersPage::OAuthSetup { parent, .. } => update(parent),
+                _ => {}
+            }
+        }
+    }
+
+    fn resume_provider_fetch(&mut self) {
+        if self.provider_catalog_reload_required || self.provider_edit_authority.is_none() {
+            return;
+        }
+        if let Some(observation) = self.pending_fetch_observation.take() {
+            self.sync_refreshed_provider_editor();
+            let provider_id = observation.provider_id.clone();
+            let outcome = observation.into_outcome(&self.original_config);
+            self.apply_fetch_result(&provider_id, outcome);
+        }
+    }
+
     fn authority_operation_pending(&self) -> bool {
         self.cx.authority_operation_pending()
             || self
@@ -7378,6 +7556,8 @@ impl SettingsDialog {
                         .filter(|warning| warning.as_str() != "loading daemon-owned settings…")
                         .cloned();
                 }
+                self.resume_provider_fetch();
+                self.drain_fetch_all();
                 self.apply_completed_provider_navigation();
                 if let Some(prompt) = self.cx.pending_shadow_prompt.take()
                     && let Some(page) = self.page.downcast_mut::<CategoryPage>()
@@ -7935,6 +8115,7 @@ impl SettingsDialog {
         Self {
             page: root_page(0),
             stack: Vec::new(),
+            pending_fetch_observation: None,
             cx: SettingsCx {
                 lifecycle: cockpit_client::LifecycleClient::disconnected(),
                 dialog_id: uuid::Uuid::new_v4(),
@@ -7968,6 +8149,8 @@ impl SettingsDialog {
                 original_config: config.clone(),
                 config,
                 provider_edit_authority: None,
+                provider_catalog_reload_required: false,
+                provider_catalog_rebase_from: None,
                 latest_provider_snapshot_session_id: None,
                 extended,
                 extended_base,
@@ -8140,11 +8323,20 @@ impl SettingsDialog {
         if let Some(handle) = pending
             && let Some(result) = handle.take()
         {
-            self.apply_fetch_result(&handle.provider_id, result);
+            let adopted = self
+                .adopt_refreshed_provider_snapshot(result.snapshot)
+                .is_ok();
+            self.pending_fetch_observation = Some(result.observation);
+            self.clear_fetch_handle(&handle.provider_id);
+            if !adopted {
+                self.queue_provider_catalog(None);
+            }
         }
+        self.resume_provider_fetch();
 
         self.drain_fetch_all();
         self.drain_deep_fetch();
+        self.sync_refreshed_provider_editor();
         self.refresh_oauth_inventory_state();
         if let Some(page) = self.page.downcast_mut::<ProvidersPage>() {
             match page {
@@ -8498,6 +8690,19 @@ impl SettingsDialog {
         #[cfg(test)]
         self.settle_test_effects();
         self.cx.retry_unknown_settlement();
+        if self.provider_catalog_reload_required {
+            if matches!(key.code, KeyCode::Esc) {
+                return true;
+            }
+            if matches!(key.code, KeyCode::Enter)
+                && !self.pending_settings.values().any(|pending| {
+                    matches!(pending, PendingSettingsOperation::ProviderCatalog { .. })
+                })
+            {
+                self.queue_provider_catalog(None);
+            }
+            return false;
+        }
         if self.authority_operation_pending() {
             // OAuth is the sole authority operation with an interactive
             // terminal settlement control. Route only plain Escape to the
@@ -8574,7 +8779,9 @@ impl SettingsDialog {
             x: mouse.column,
             y: mouse.row,
         }));
-        if self.authority_operation_pending() && !matches!(mouse.kind, MouseEventKind::Moved) {
+        if (self.provider_catalog_reload_required || self.authority_operation_pending())
+            && !matches!(mouse.kind, MouseEventKind::Moved)
+        {
             self.cx.extended_warnings = vec![
                 "Waiting for the daemon to settle this settings operation; controls are disabled."
                     .into(),
@@ -9584,6 +9791,9 @@ impl SettingsCx {
         {
             return Err("a provider settings save is already pending".into());
         }
+        if self.provider_catalog_reload_required {
+            return Err("provider catalog must be reloaded before editing".into());
+        }
         let authority = self.provider_edit_authority.clone().ok_or_else(|| {
             "provider snapshot has no edit capability; reload before saving".to_string()
         })?;
@@ -9646,7 +9856,12 @@ impl SettingsCx {
                         }
                     })
                     .collect::<Vec<_>>();
+                let model_patch = self.original_config.providers.get(provider_id).map(|original| {
+                    cockpit_proto::ProviderModelPatch::between_for_entry(&original.models, &entry.models, entry)
+                        .expect("model entries serialize")
+                });
                 Some(ProviderSavePlan {
+                    model_patch,
                     provider_id: provider_id.clone(),
                     // Every staged plaintext was moved, not cloned, before
                     // this reference-only projection was cloned.
@@ -9731,6 +9946,9 @@ impl SettingsCx {
             .any(|pending| matches!(pending, PendingSettingsOperation::ProviderMutation { .. }))
         {
             return Err("a provider settings save is already pending".into());
+        }
+        if self.provider_catalog_reload_required {
+            return Err("provider catalog must be reloaded before editing".into());
         }
         let authority = self.provider_edit_authority.clone().ok_or_else(|| {
             "provider snapshot has no edit capability; reload before deleting".to_string()
@@ -9896,26 +10114,144 @@ fn merge_dialog_provider_config(
     }
 }
 
+/// Reapply only staged intent to a new authoritative entry. Unchanged old
+/// models are never reintroduced after daemon trimming. Model overrides are
+/// rebased by id, and explicit new manual entries remain staged.
+fn rebase_provider_entry(
+    baseline: &ProviderEntry,
+    staged: &ProviderEntry,
+    fresh: &ProviderEntry,
+) -> ProviderEntry {
+    fn rebase(old: &serde_json::Value, edited: &serde_json::Value, fresh: &mut serde_json::Value) {
+        if old == edited {
+            return;
+        }
+        if let (Some(old), Some(edited), Some(fresh)) =
+            (old.as_object(), edited.as_object(), fresh.as_object_mut())
+        {
+            for key in old
+                .keys()
+                .chain(edited.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                match (old.get(key), edited.get(key)) {
+                    (Some(old), Some(edited)) => {
+                        rebase(
+                            old,
+                            edited,
+                            fresh.entry(key.clone()).or_insert(serde_json::Value::Null),
+                        );
+                    }
+                    (None, Some(value)) => {
+                        fresh.insert(key.clone(), value.clone());
+                    }
+                    (Some(_), None) => {
+                        fresh.remove(key);
+                    }
+                    (None, None) => {}
+                }
+            }
+        } else {
+            *fresh = edited.clone();
+        }
+    }
+    let mut old = baseline.clone();
+    old.models.clear();
+    let mut edited = staged.clone();
+    edited.models.clear();
+    let mut value = serde_json::to_value(fresh).expect("provider entry serializes");
+    rebase(
+        &serde_json::to_value(old).expect("provider entry serializes"),
+        &serde_json::to_value(edited).expect("provider entry serializes"),
+        &mut value,
+    );
+    let mut result: ProviderEntry =
+        serde_json::from_value(value).expect("rebased provider entry retains typed fields");
+    let old_models = baseline
+        .models
+        .iter()
+        .map(|m| (m.id.as_str(), m))
+        .collect::<std::collections::HashMap<_, _>>();
+    let edited_models = staged
+        .models
+        .iter()
+        .map(|m| (m.id.as_str(), m))
+        .collect::<std::collections::HashMap<_, _>>();
+    result.models.retain(|model| {
+        !old_models.contains_key(model.id.as_str()) || edited_models.contains_key(model.id.as_str())
+    });
+    for model in &mut result.models {
+        if let (Some(old), Some(edited)) = (
+            old_models.get(model.id.as_str()),
+            edited_models.get(model.id.as_str()),
+        ) {
+            let mut value = serde_json::to_value(&*model).expect("model serializes");
+            rebase(
+                &serde_json::to_value(old).expect("model serializes"),
+                &serde_json::to_value(edited).expect("model serializes"),
+                &mut value,
+            );
+            *model = serde_json::from_value(value).expect("rebased model retains typed fields");
+        }
+    }
+    let mut positions = result
+        .models
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id.clone(), i))
+        .collect::<std::collections::HashMap<_, _>>();
+    for model in &staged.models {
+        let owner_changed = old_models.get(model.id.as_str()).is_some_and(|old| {
+            serde_json::to_value(old).expect("model serializes")
+                != serde_json::to_value(model).expect("model serializes")
+        });
+        if (model.manual && !old_models.contains_key(model.id.as_str())) || owner_changed {
+            if let Some(&index) = positions.get(&model.id) {
+                // Present rows already rebased onto their fresh metadata.
+                if !old_models.contains_key(model.id.as_str()) {
+                    result.models[index] = model.clone();
+                }
+            } else {
+                positions.insert(model.id.clone(), result.models.len());
+                result.models.push(model.clone());
+            }
+        }
+    }
+    let old_order = baseline
+        .models
+        .iter()
+        .filter(|m| edited_models.contains_key(m.id.as_str()))
+        .map(|m| m.id.as_str())
+        .collect::<Vec<_>>();
+    let edited_order = staged
+        .models
+        .iter()
+        .filter(|m| old_models.contains_key(m.id.as_str()))
+        .map(|m| m.id.as_str())
+        .collect::<Vec<_>>();
+    if old_order != edited_order {
+        let order = staged
+            .models
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.id.as_str(), i))
+            .collect::<std::collections::HashMap<_, _>>();
+        result.models.sort_by_key(|m| {
+            order
+                .get(m.id.as_str())
+                .copied()
+                .unwrap_or(staged.models.len())
+        });
+    }
+    result
+}
+
 fn providers_config_from_view(view: &cockpit_proto::ProviderConfigView) -> ProvidersConfig {
     ProvidersConfig {
         providers: view
             .providers
             .iter()
-            .map(|(provider_id, entry_view)| {
-                let mut entry = entry_view.entry.clone();
-                // Keep only a non-secret editor marker. The daemon accepts
-                // this marker as "preserve the existing value" on a later
-                // save, so the literal never remains in TUI state.
-                entry.headers = entry_view
-                    .headers
-                    .iter()
-                    .map(|header| cockpit_config::config::providers::HeaderSpec {
-                        name: header.name.clone(),
-                        value: secret_display::MASKED_VALUE.to_string(),
-                    })
-                    .collect();
-                (provider_id.clone(), entry)
-            })
+            .map(|(provider_id, entry_view)| (provider_id.clone(), entry_view.editable_entry()))
             .collect(),
         category_defaults: view.category_defaults.clone(),
         on_unlisted_models_fetch: view.on_unlisted_models_fetch,
@@ -9943,7 +10279,11 @@ fn provider_view_matches_mutation(
         let mut expected_entry = expected.clone();
         expected_entry.url = cockpit_proto::redact_url_for_owner_view(&expected_entry.url);
         expected_entry.credential_ref = None;
+        expected_entry.auth_command = None;
         expected_entry.headers.clear();
+        // The daemon writes complete inventories, including an explicit empty
+        // one. Match its durable membership marker without dropping model checks.
+        expected_entry.models_replace = true;
         if serde_json::to_value(&expected_entry).ok() != serde_json::to_value(&observed.entry).ok()
             || observed.headers.len() != expected.headers.len()
             || !observed

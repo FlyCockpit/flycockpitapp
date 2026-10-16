@@ -11,8 +11,10 @@
 //! The body parser is tolerant: it accepts the canonical
 //! `{"data": [...]}` envelope, Codex's `{"models": [...]}` envelope, and the
 //! bare-array shape some compat gateways emit. Entries missing an `id` are
-//! dropped rather than erroring (matches mixer-rs's behavior; see
-//! `mixer-rs/src/providers/common/models_list.rs`).
+//! dropped rather than erroring; duplicate IDs keep their first projected row.
+//! Normalization follows credential scrubbing and precedes every catalog consumer.
+//! Missing-ID handling matches mixer-rs's behavior; see
+//! `mixer-rs/src/providers/common/models_list.rs`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -913,6 +915,69 @@ pub(crate) fn resolve_codex_model_list_request(
     })
 }
 
+/// Transport observations and catalog failures, independent of diagnostic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelFetchFailureKind {
+    HttpStatus(StatusCode),
+    Network,
+    Parse,
+}
+
+impl ModelFetchFailureKind {
+    pub fn persisted_failure(self) -> crate::config::providers::ModelFetchFailure {
+        use crate::config::providers::ModelFetchFailure;
+        match self {
+            Self::HttpStatus(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
+                ModelFetchFailure::CredentialsRejected
+            }
+            Self::HttpStatus(_) | Self::Network | Self::Parse => ModelFetchFailure::Other,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct ModelFetchError {
+    pub kind: ModelFetchFailureKind,
+    pub message: String,
+}
+
+impl ModelFetchError {
+    pub fn http(status: StatusCode, message: String) -> Self {
+        Self {
+            kind: ModelFetchFailureKind::HttpStatus(status),
+            message,
+        }
+    }
+
+    fn parse(message: String) -> Self {
+        Self {
+            kind: ModelFetchFailureKind::Parse,
+            message,
+        }
+    }
+}
+
+pub(crate) fn model_fetch_failure_kind(error: &anyhow::Error) -> ModelFetchFailureKind {
+    if let Some(failure) = error.downcast_ref::<ModelFetchError>() {
+        return failure.kind;
+    }
+    if let Some(transport) = error.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = transport.status() {
+            return ModelFetchFailureKind::HttpStatus(status);
+        }
+        if transport.is_connect()
+            || transport.is_timeout()
+            || transport.is_request()
+            || transport.is_body()
+        {
+            return ModelFetchFailureKind::Network;
+        }
+    }
+    // Local request/catalog validation has no observed HTTP failure status.
+    ModelFetchFailureKind::Parse
+}
+
 /// Outcome of [`fetch_models`].
 #[derive(Debug)]
 pub enum FetchOutcome {
@@ -927,6 +992,7 @@ pub enum FetchOutcome {
         models: Vec<ModelEntry>,
         catalog: ProviderModelCatalog,
         reason: String,
+        failure_kind: ModelFetchFailureKind,
     },
     /// The provider doesn't expose `/models` (404).
     Unsupported,
@@ -982,18 +1048,25 @@ async fn fetch_models_at_detailed(
         });
     }
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        anyhow::bail!(
+        return Err(ModelFetchError::http(status, format!(
             "{url} returned {status} — credentials rejected. Verify the API key, OAuth login, and headers."
-        );
+        )).into());
     }
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("{url} returned {status}: {}", response_body_snippet(&body));
+        let body = super::provider_http::read_body_limited(resp, "/models")
+            .await
+            .map_err(|error| ModelFetchError::http(status, error.to_string()))?;
+        let body = super::provider_http::diagnostic_body(&body, headers);
+        return Err(ModelFetchError::http(
+            status,
+            format!("{url} returned {status}: {}", response_body_snippet(&body)),
+        )
+        .into());
     }
 
-    let body = read_success_body_limited(resp, "/models").await?;
+    let body = super::provider_http::read_body_limited(resp, "/models").await?;
     let body_nonempty = !body.trim().is_empty();
-    let models = parse_models_body_with_abi(&body, catalog_abi)?;
+    let models = parse_credential_safe_models_body(&body, catalog_abi, headers)?;
     Ok(FetchModelsAtResult {
         outcome: FetchOutcome::Models {
             models,
@@ -1039,6 +1112,7 @@ async fn send_models_request_with_retries(
                 {
                     let delay = crate::providers::http_retry::delay_for(resp.headers(), attempt);
                     attempt += 1;
+                    drop(resp);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -1079,7 +1153,7 @@ pub async fn fetch_models_for_provider_with_store(
     env_lookup: impl Fn(&str) -> Option<String> + Sync,
 ) -> Result<FetchOutcome> {
     let auth_store = store.clone();
-    let request = resolve_model_list_request_async_with_store(
+    let mut request = resolve_model_list_request_async_with_store(
         provider_id,
         entry,
         resolved,
@@ -1128,10 +1202,16 @@ pub async fn fetch_models_for_provider_with_store(
         .await
         .and_then(|result| validate_anthropic_fetch_result(provider_id, entry, result));
         url = refreshed_url;
+        request = refreshed;
     }
     if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
     }
+    // Validate the offered fallback only after selecting a fallback outcome.
+    // A fallback projection failure must not replace an observed rejection or
+    // prevent a successful live catalog from being used.
+    let safe_fallback_models =
+        || super::provider_http::scrub_catalog_models(fallback_models.clone(), &request.headers);
     match outcome {
         Ok(FetchModelsAtResult {
             outcome: FetchOutcome::Unsupported,
@@ -1143,9 +1223,13 @@ pub async fn fetch_models_for_provider_with_store(
                 "provider /models unavailable; fallback catalog available"
             );
             Ok(FetchOutcome::FallbackAvailable {
-                models: fallback_models,
+                models: safe_fallback_models()?,
                 catalog: fallback_catalog,
-                reason: format!("{url} returned 404"),
+                reason: super::provider_http::diagnostic_body(
+                    &format!("{url} returned 404"),
+                    &request.headers,
+                ),
+                failure_kind: ModelFetchFailureKind::HttpStatus(StatusCode::NOT_FOUND),
             })
         }
         Ok(FetchModelsAtResult {
@@ -1160,21 +1244,37 @@ pub async fn fetch_models_for_provider_with_store(
                 "provider /models returned an empty model list; fallback catalog available"
             );
             Ok(FetchOutcome::FallbackAvailable {
-                models: fallback_models,
+                models: safe_fallback_models()?,
                 catalog: fallback_catalog,
-                reason: format!("{url} returned an empty model list (status {status})"),
+                reason: super::provider_http::diagnostic_body(
+                    &format!("{url} returned an empty model list (status {status})"),
+                    &request.headers,
+                ),
+                failure_kind: ModelFetchFailureKind::Parse,
             })
         }
         Err(error) => {
-            let reason = error.to_string();
-            if reason.contains("returned 401") || reason.contains("returned 403") {
+            let failure_kind = model_fetch_failure_kind(&error);
+            let reason =
+                super::provider_http::diagnostic_body(&error.to_string(), &request.headers);
+            if auth_rejection_error(&error)
+                || matches!(
+                    error.downcast_ref::<super::auth_check::AuthCheckError>(),
+                    Some(super::auth_check::AuthCheckError::UnsafeModelIdentity)
+                )
+            {
                 return Err(error);
             }
-            tracing::warn!(provider_id, url, error = %reason, "provider /models fetch failed; fallback catalog available");
+            tracing::warn!(
+                provider_id,
+                url,
+                "provider /models fetch failed; fallback catalog available"
+            );
             Ok(FetchOutcome::FallbackAvailable {
-                models: fallback_models,
+                models: safe_fallback_models()?,
                 catalog: fallback_catalog,
                 reason,
+                failure_kind,
             })
         }
         Ok(result) => Ok(result.outcome),
@@ -1182,8 +1282,10 @@ pub async fn fetch_models_for_provider_with_store(
 }
 
 fn auth_rejection_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("returned 401") || message.contains("returned 403")
+    matches!(
+        model_fetch_failure_kind(error),
+        ModelFetchFailureKind::HttpStatus(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+    )
 }
 
 fn validate_anthropic_fetch_result(
@@ -1205,47 +1307,15 @@ fn validate_anthropic_fetch_result(
             if let Err(error) =
                 validate_anthropic_model_configuration(&candidate_provider, &fetched.id)
             {
-                anyhow::bail!(
+                return Err(ModelFetchError::parse(format!(
                     "rejecting invalid Anthropic catalog entry `{}`: {error:#}",
                     fetched.id
-                );
+                ))
+                .into());
             }
         }
     }
     Ok(result)
-}
-
-/// Read a provider success response while retaining a strict upper bound for
-/// both declared and chunked bodies. Configurable provider endpoints must not
-/// be able to exhaust the daemon before their response is parsed.
-pub(crate) async fn read_success_body_limited(
-    mut resp: reqwest::Response,
-    response_name: &str,
-) -> Result<String> {
-    if resp
-        .content_length()
-        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
-    {
-        anyhow::bail!(
-            "{response_name} response body exceeded {} byte limit",
-            MAX_PROVIDER_RESPONSE_BYTES
-        );
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .with_context(|| format!("reading {response_name} response body"))?
-    {
-        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
-            anyhow::bail!(
-                "{response_name} response body exceeded {} byte limit",
-                MAX_PROVIDER_RESPONSE_BYTES
-            );
-        }
-        body.extend_from_slice(&chunk);
-    }
-    String::from_utf8(body).context("/models response body was not valid UTF-8")
 }
 
 pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
@@ -1272,27 +1342,108 @@ impl From<ProviderRequestKind> for ModelCatalogAbi {
     }
 }
 
+/// Protect identities before applying the existing decoded-field diagnostic
+/// scrub. Restore them by row, then run the native typed projection. Scrubbing
+/// a serialized ModelEntry instead would corrupt trusted flags/enum values
+/// when a credential happens to equal a schema word such as `manual`.
+fn parse_credential_safe_models_body(
+    body: &str,
+    catalog_abi: ModelCatalogAbi,
+    headers: &[ResolvedHeader],
+) -> Result<Vec<ModelEntry>> {
+    let original = parse_models_body_with_abi(body, catalog_abi).map_err(|_| {
+        let safe_body = super::provider_http::diagnostic_body(body, headers);
+        let message = parse_models_body_with_abi(&safe_body, catalog_abi)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| {
+                "provider catalog contains invalid credential-bearing metadata".into()
+            });
+        ModelFetchError::parse(message)
+    })?;
+    let original_ids = original
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let projected = super::provider_http::scrub_catalog_models(original, headers)?;
+    if projected.len() != original_ids.len() {
+        return Err(ModelFetchError::parse(
+            "catalog identity projection changed model count".into(),
+        )
+        .into());
+    }
+    let identities = original_ids
+        .into_iter()
+        .zip(projected.into_iter().map(|model| model.id))
+        .collect::<std::collections::HashMap<_, _>>();
+    // The raw parser above has already validated the root/envelope and types.
+    let entries = model_catalog_entries(serde_json::from_str(body)?)?;
+    let safe_body =
+        super::provider_http::diagnostic_body(&serde_json::to_string(&entries)?, headers);
+    let mut safe_entries: Vec<Value> = serde_json::from_str(&safe_body).map_err(|_| {
+        ModelFetchError::parse("provider catalog metadata could not be scrubbed safely".into())
+    })?;
+    if safe_entries.len() != entries.len() {
+        return Err(ModelFetchError::parse(
+            "provider catalog changed length during credential projection".into(),
+        )
+        .into());
+    }
+    for (raw, safe) in entries.iter().zip(&mut safe_entries) {
+        if let Some(id) = catalog_entry_id(raw) {
+            let projected_id = identities
+                .get(id)
+                .context("catalog identity projection is incomplete")?;
+            safe.as_object_mut()
+                .context("catalog row changed type during credential projection")?
+                .insert("id".into(), Value::String(projected_id.clone()));
+        }
+    }
+    // Each restored ID was validated above and remains the raw upstream
+    // address. Metadata scrubbing must never change its operational identity.
+    parse_models_body_projection(&serde_json::to_string(&safe_entries)?, catalog_abi)
+        .map(crate::config::providers::coalesce_fetched_models)
+        .map_err(|error| ModelFetchError::parse(error.to_string()).into())
+}
+
+fn catalog_entry_id(raw: &Value) -> Option<&str> {
+    let object = raw.as_object()?;
+    object
+        .get("id")
+        .or_else(|| object.get("slug"))
+        .and_then(Value::as_str)
+}
+
+fn model_catalog_entries(parsed: Value) -> Result<Vec<Value>> {
+    match parsed {
+        Value::Array(entries) => Ok(entries),
+        Value::Object(mut object) => match (object.remove("data"), object.remove("models")) {
+            (Some(Value::Array(entries)), _) | (_, Some(Value::Array(entries))) => Ok(entries),
+            _ => Err(anyhow!("models response lacks a `data` or `models` array")),
+        },
+        _ => Err(anyhow!("unexpected models response root")),
+    }
+}
+
 fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Result<Vec<ModelEntry>> {
+    parse_models_body_projection(body, catalog_abi)
+        .map(crate::config::providers::coalesce_fetched_models)
+        .map_err(|error| ModelFetchError::parse(error.to_string()).into())
+}
+
+fn parse_models_body_projection(
+    body: &str,
+    catalog_abi: ModelCatalogAbi,
+) -> Result<Vec<ModelEntry>> {
     let parsed: Value = serde_json::from_str(body)
         .with_context(|| format!("parsing /models response: {}", response_body_snippet(body)))?;
-    let entries: Vec<Value> = match parsed {
-        Value::Array(xs) => xs,
-        Value::Object(mut m) => match (m.remove("data"), m.remove("models")) {
-            (Some(Value::Array(xs)), _) | (_, Some(Value::Array(xs))) => xs,
-            _ => return Err(anyhow!("models response lacks a `data` or `models` array")),
-        },
-        _ => return Err(anyhow!("unexpected models response root")),
-    };
+    let entries = model_catalog_entries(parsed)?;
 
     entries
         .into_iter()
         .filter_map(|raw| {
             let obj = raw.as_object()?;
-            let id = obj
-                .get("id")
-                .or_else(|| obj.get("slug"))
-                .and_then(Value::as_str)?
-                .to_string();
+            let id = catalog_entry_id(&raw)?.to_string();
 
             let name = obj
                 .get("display_name")
@@ -1325,23 +1476,14 @@ fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Resul
                 Err(error) => return Some(Err(anyhow!("model `{id}` capabilities: {error}"))),
             };
 
-            // Stash every remaining field into `extra` so re-saving
-            // doesn't lose provider-specific metadata.
-            let mut extra = Map::new();
-            for (k, v) in obj {
-                if matches!(
-                    k.as_str(),
-                    "id" | "name"
-                        | "display_name"
-                        | "thinking_modes"
-                        | "inputs"
-                        | "context_length"
-                        | "max_tokens"
-                ) {
-                    continue;
-                }
-                extra.insert(k.clone(), v.clone());
-            }
+            // Raw upstream metadata is deliberately NOT retained. The typed
+            // projection above (name, context, capabilities) is the catalog
+            // contract; the remaining upstream fields (descriptions,
+            // benchmarks, pricing tables, links, ...) have no consumer and
+            // roughly double a large catalog's persisted and wire size —
+            // OpenRouter's 462-model catalog is ~770 KB raw, which used to be
+            // stored twice per model and pushed every provider snapshot past
+            // the interactive RPC payload limit (#545).
 
             // Several providers include a request context window under
             // different names. Keep `context_length` in sync with the typed
@@ -1384,10 +1526,10 @@ fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Resul
                 // (implementation note).
                 wire_api: Default::default(),
                 wire_api_provenance: Default::default(),
-                extra: extra.clone(),
+                extra: Map::new(),
                 capabilities,
                 capability_overrides: Default::default(),
-                provider_metadata: extra,
+                provider_metadata: Map::new(),
             }))
         })
         .collect()
@@ -1836,7 +1978,7 @@ fn reasoning_effort_capability_from_metadata(
 
     // A default without selectable values cannot establish either a valid UI
     // choice or an outbound request encoding. Treat it as informational
-    // provider metadata only (it remains in `provider_metadata`).
+    // provider metadata only and is not projected.
     if values.is_empty() {
         return Ok(None);
     }
@@ -2132,7 +2274,10 @@ mod tests {
         let entries = parse_models_body(body).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "gpt-5.2");
-        assert!(entries[0].extra.contains_key("created"));
+        // Raw upstream fields are not retained (#545): the typed projection
+        // is the catalog contract.
+        assert!(entries[0].extra.is_empty());
+        assert!(entries[0].provider_metadata.is_empty());
     }
 
     #[test]
@@ -2161,22 +2306,9 @@ mod tests {
         assert_eq!(model.context_length, Some(262144));
         assert_eq!(model.capabilities.context_tokens, Some(262144));
         assert_eq!(model.capabilities.max_output_tokens, Some(16384));
-        assert_eq!(
-            model
-                .provider_metadata
-                .get("pricing")
-                .and_then(Value::as_object)
-                .and_then(|pricing| pricing.get("prompt"))
-                .and_then(Value::as_str),
-            Some("0.000001")
-        );
-        assert_eq!(
-            model
-                .provider_metadata
-                .get("quantization")
-                .and_then(Value::as_str),
-            Some("fp8")
-        );
+        // Pricing/quantization have no typed consumer and are not retained.
+        assert!(model.provider_metadata.is_empty());
+        assert!(model.extra.is_empty());
     }
 
     #[test]
@@ -2208,24 +2340,7 @@ mod tests {
         let model = &entries[0];
         assert_eq!(model.id, "gpt-5.2-codex");
         assert_eq!(model.name.as_deref(), Some("GPT-5.2 Codex"));
-        assert_eq!(
-            model.provider_metadata.get("slug").and_then(Value::as_str),
-            Some("gpt-5.2-codex")
-        );
-        assert_eq!(
-            model
-                .provider_metadata
-                .get("default_reasoning_level")
-                .and_then(Value::as_str),
-            Some("minimal")
-        );
-        assert_eq!(
-            model
-                .provider_metadata
-                .get("family")
-                .and_then(Value::as_str),
-            Some("gpt-5")
-        );
+        assert!(model.provider_metadata.is_empty());
 
         let reasoning = model
             .capabilities
@@ -2443,20 +2558,8 @@ mod tests {
         let entries = parse_models_body(body).unwrap();
         assert_eq!(entries[0].thinking_modes.len(), 2);
         assert_eq!(entries[0].inputs.as_ref().unwrap().images, Some(true));
-        assert_eq!(
-            entries[0]
-                .provider_metadata
-                .get("owned_by")
-                .and_then(serde_json::Value::as_str),
-            Some("provider")
-        );
-        assert_eq!(
-            entries[0]
-                .extra
-                .get("owned_by")
-                .and_then(serde_json::Value::as_str),
-            Some("provider")
-        );
+        assert!(entries[0].provider_metadata.is_empty());
+        assert!(entries[0].extra.is_empty());
     }
 
     #[test]
@@ -3792,6 +3895,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_timeout_fallback_retains_network_kind_and_scrubs_reason() {
+        let env = crate::test_env::lock_async().await;
+        let tmp = tempfile::tempdir().unwrap();
+        install_codex_tokens(&env, &tmp);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            loop {
+                sockets.push(listener.accept().await.unwrap().0);
+            }
+        });
+        let base_url = format!("http://{address}/codex-access-1");
+        let entry = codex_entry(base_url.clone());
+        let resolved = ResolvedRequest {
+            base_url,
+            headers: Vec::new(),
+            is_codex_credential: false,
+        };
+        let outcome = fetch_models_for_provider_with_store(
+            "codex-oauth",
+            &entry,
+            &resolved,
+            Duration::from_millis(20),
+            Some(crate::credentials::CredentialStore::open_default().unwrap()),
+            |_| None,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let FetchOutcome::FallbackAvailable {
+            failure_kind,
+            reason,
+            models,
+            ..
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(failure_kind, ModelFetchFailureKind::Network);
+        assert_eq!(models.len(), 3);
+        assert!(!reason.contains("codex-access-1"));
+    }
+
+    #[tokio::test]
     async fn codex_empty_success_responses_offer_fallback_catalog() {
         let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
@@ -3848,7 +3997,9 @@ mod tests {
                     models,
                     catalog,
                     reason,
+                    failure_kind,
                 } => {
+                    assert_eq!(failure_kind, ModelFetchFailureKind::Parse);
                     assert_eq!(catalog, ProviderModelCatalog::CodexFallback);
                     assert_eq!(models.len(), 3);
                     assert!(reason.contains("empty model list"));
@@ -3960,6 +4111,28 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains(&format!("returned {status}")));
             assert_eq!(request_handle.await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_consumed_bodies_are_limited_on_success_and_error() {
+        for chunked in [false, true] {
+            for status in [200, 400] {
+                let (url, server) = super::super::provider_http::serve_test_bodies(vec![(
+                    status,
+                    "x".repeat(MAX_PROVIDER_RESPONSE_BYTES + 1),
+                    chunked,
+                )])
+                .await;
+                let error = fetch_models(&url, &[], Duration::from_secs(5))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("exceeded 8388608 byte limit"),
+                    "{status}/{chunked}: {error:#}"
+                );
+                server.await.unwrap();
+            }
         }
     }
 
@@ -4372,14 +4545,17 @@ mod tests {
                     .unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("response body exceeded"), "{msg}");
-            entry.mark_model_fetch_failed_kept_existing(msg);
+            entry.mark_model_fetch_failed_kept_existing(
+                msg,
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_eq!(entry.models[0].id, "manual-keep");
             assert_eq!(entry.models.len(), 1);
         }
     }
 
     #[test]
-    fn baseten_models_preserve_unknown_catalog_metadata() {
+    fn baseten_models_drop_unknown_catalog_metadata() {
         // Table-driven unrecognised field shapes: absent key, object, array,
         // number, boolean, null, and malformed (non-object) top-level data entry.
         let cases: &[(&str, &str, serde_json::Value)] = &[
@@ -4423,8 +4599,9 @@ mod tests {
                 "null" => "weird",
                 _ => unreachable!(),
             };
+            // Unknown upstream fields are dropped rather than retained.
             for bag in [&m.extra, &m.provider_metadata] {
-                assert_eq!(bag.get(key), Some(expected), "{label}");
+                assert!(bag.get(key).is_none(), "{label}: {expected}");
             }
             let cfg = crate::config::providers::ProvidersConfig {
                 providers: std::collections::BTreeMap::from([(
@@ -4447,7 +4624,7 @@ mod tests {
 
         // Absent: bare id has no opaque capability/price keys and stays Unknown.
         let bare = parse_models_body(r#"{"data":[{"id":"m-absent"}]}"#).unwrap();
-        assert!(bare[0].extra.is_empty() || bare[0].extra.get("id").is_none());
+        assert!(bare[0].extra.is_empty());
         assert!(bare[0].cost_rank.is_none());
         let cfg = crate::config::providers::ProvidersConfig {
             providers: std::collections::BTreeMap::from([(
@@ -4468,29 +4645,17 @@ mod tests {
                 .expect("malformed siblings");
         assert_eq!(mixed.len(), 1);
         assert_eq!(mixed[0].id, "kept");
-        assert_eq!(
-            mixed[0]
-                .provider_metadata
-                .get("nested")
-                .and_then(|v| v.get("a")),
-            Some(&serde_json::json!([1, 2]))
-        );
+        assert!(mixed[0].provider_metadata.is_empty());
 
-        // Malformed field values remain opaque without widening capabilities.
+        // Malformed field values are dropped without widening capabilities.
         let malformed_field = parse_models_body(
             r#"{"data":[{"id":"m-mal","pricing":"not-an-object","capabilities":"nope"}]}"#,
         )
         .expect("malformed field values");
         assert_eq!(malformed_field.len(), 1);
         assert!(malformed_field[0].cost_rank.is_none());
-        assert_eq!(
-            malformed_field[0].extra.get("pricing"),
-            Some(&serde_json::json!("not-an-object"))
-        );
-        assert_eq!(
-            malformed_field[0].provider_metadata.get("capabilities"),
-            Some(&serde_json::json!("nope"))
-        );
+        assert!(malformed_field[0].extra.is_empty());
+        assert!(malformed_field[0].provider_metadata.is_empty());
         let cfg = crate::config::providers::ProvidersConfig {
             providers: std::collections::BTreeMap::from([(
                 "baseten".into(),
@@ -4571,7 +4736,10 @@ mod tests {
             let _ = request_handle.await;
             let msg = err.to_string();
             assert!(msg.contains(&format!("returned {status}")), "{msg}");
-            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            entry.mark_model_fetch_failed_kept_existing(
+                msg.clone(),
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_kept(&entry, &msg, true);
         }
 
@@ -4612,7 +4780,10 @@ mod tests {
             );
             let msg = err.to_string();
             assert!(msg.contains("429"), "{msg}");
-            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            entry.mark_model_fetch_failed_kept_existing(
+                msg.clone(),
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_kept(&entry, &msg, false);
         }
 
@@ -4637,7 +4808,10 @@ mod tests {
                     .await
                     .unwrap_err();
             let msg = err.to_string();
-            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            entry.mark_model_fetch_failed_kept_existing(
+                msg.clone(),
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_kept(&entry, &msg, false);
         }
 
@@ -4669,7 +4843,10 @@ mod tests {
                     .await
                     .unwrap_err();
             let msg = err.to_string();
-            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            entry.mark_model_fetch_failed_kept_existing(
+                msg.clone(),
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_kept(&entry, &msg, false);
         }
 
@@ -4697,7 +4874,10 @@ mod tests {
                     .await
                     .unwrap_err();
             let msg = err.to_string();
-            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            entry.mark_model_fetch_failed_kept_existing(
+                msg.clone(),
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_kept(&entry, &msg, false);
         }
     }

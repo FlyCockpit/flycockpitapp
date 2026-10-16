@@ -2471,6 +2471,37 @@ impl RedactionTable {
         }
     }
 
+    /// A scrub-only table for the exact credentials owned by a provider
+    /// operation. This is not complete workspace/daemon coverage and carries
+    /// no binding, so it cannot authorize a coverage-gated sink. Empty input
+    /// means the operation has no credentials, not failed source capture.
+    pub(crate) fn for_provider_credentials(
+        values: impl IntoIterator<Item = String>,
+    ) -> Result<Self> {
+        let mut entries = Vec::new();
+        for value in values {
+            if value.is_empty() {
+                continue;
+            }
+            anyhow::ensure!(
+                value.len() >= MIN_REDACTION_ENTRY_LENGTH,
+                "provider credential is below the safe diagnostic coverage length"
+            );
+            entries.push((
+                value,
+                "$secret:provider credential".into(),
+                OrdinarySource::Credential,
+            ));
+        }
+        Self::from_entries(
+            entries,
+            RedactConfig::default().placeholder,
+            false,
+            Vec::new(),
+            ProtectedPaths::default(),
+        )
+    }
+
     /// A table that withholds every non-empty string, replacing it with
     /// [`COVERAGE_WITHHELD_PLACEHOLDER`]. It carries no entries and no
     /// binding. The owner response backstop uses it when current
@@ -3204,6 +3235,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/engine/agent/tool_dispatch.rs",
         "crates/cockpit-core/src/engine/driver/mod.rs",
         "crates/cockpit-core/src/engine/model/dispatch.rs",
+        "crates/cockpit-core/src/engine/model/failure.rs",
         "crates/cockpit-core/src/engine/model/mod.rs",
         "crates/cockpit-core/src/engine/model/outbound_guard.rs",
         "crates/cockpit-core/src/engine/model/redact.rs",
@@ -3216,6 +3248,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/mcp/builtin.rs",
         "crates/cockpit-core/src/mcp/network.rs",
         "crates/cockpit-core/src/mcp/sandbox.rs",
+        "crates/cockpit-core/src/providers/provider_http.rs",
         "crates/cockpit-core/src/redact/coverage_authority.rs",
         "crates/cockpit-core/src/redact/mod.rs",
         "crates/cockpit-core/src/session/export/mod.rs",

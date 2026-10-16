@@ -70,6 +70,7 @@ async fn provider_settlement_sequence(scenario: Scenario) {
     let catalog = take_onboarding_catalog(&ctx, &mut state, &workspace, "provider-verify").await;
     let mutation = proto::ProviderMutationBatch {
         upserts: vec![proto::ProviderMutationUpsert {
+            model_patch: None,
             provider_id: "onboard".into(),
             entry: crate::config::providers::ProviderEntry {
                 template: Some("openai-compatible".into()),
@@ -126,7 +127,7 @@ async fn provider_settlement_sequence(scenario: Scenario) {
     assert!(matches!(
         &results[0].outcome,
         proto::ProviderModelFetchOutcome::Models { models, .. }
-            if models.iter().any(|model| model.id == "verified-model")
+            if models.ids.iter().any(|id| id == "verified-model")
     ));
 
     if matches!(scenario, Scenario::InterveningAfterCatalog) {

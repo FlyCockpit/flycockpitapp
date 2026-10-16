@@ -1381,7 +1381,7 @@ impl App {
                             ),
                             Err(error) => shell.apply_provider_verification(
                                 &completion.provider_id,
-                                crate::tui::onboarding::VerifyOutcome::Network(error),
+                                crate::tui::onboarding::VerifyOutcome::Failed(error),
                                 completion.settlement,
                             ),
                         }
@@ -1393,9 +1393,11 @@ impl App {
                             .verifying_provider_id()
                             .unwrap_or_default()
                             .to_string();
+                        // Endpoint/connect/save failures before the provider
+                        // was ever contacted: never the user's network.
                         shell.apply_provider_verification(
                             &provider_id,
-                            crate::tui::onboarding::VerifyOutcome::Network(error),
+                            crate::tui::onboarding::VerifyOutcome::Failed(error),
                             None,
                         );
                     }

@@ -18218,6 +18218,22 @@ async fn handle_serialized_request_inner(
             .map(|account| Response::FlycockpitAccount { account })
             .map_err(internal),
 
+        Request::GetProviderCatalogPage {
+            project_root,
+            provider_id,
+            snapshot_session_id,
+            offset,
+        } => {
+            provider_catalog_snapshot_page(
+                ctx,
+                &project_root,
+                provider_id.as_deref(),
+                &snapshot_session_id,
+                settings_capability_owner(state),
+                offset,
+            )
+            .await
+        }
         Request::GetProviderCatalogSnapshot {
             project_root,
             provider_id,
@@ -21448,6 +21464,22 @@ async fn handle_concurrent_request_impl(
         // sibling `GetProviderUsageSnapshot` stays serialized because it needs
         // the attached session's env overlay snapshot, which is not carried on
         // the concurrent (shared) path.
+        Request::GetProviderCatalogPage {
+            project_root,
+            provider_id,
+            snapshot_session_id,
+            offset,
+        } => {
+            provider_catalog_snapshot_page(
+                &ctx,
+                &project_root,
+                provider_id.as_deref(),
+                &snapshot_session_id,
+                shared.capability_owner.clone(),
+                offset,
+            )
+            .await
+        }
         Request::GetProviderCatalogSnapshot {
             project_root,
             provider_id,
@@ -21620,6 +21652,16 @@ fn config_write_target_error(
             E::InvalidProviderId(_) | E::Unresolved(_) => ErrorCode::BadRequest,
         },
         message: error.to_string(),
+    }
+}
+
+/// Expected prospective-write validation is a client error; filesystem and
+/// serialization failures retain Internal, including through anyhow contexts.
+fn provider_write_error(error: anyhow::Error) -> ErrorPayload {
+    if error.is::<crate::config::providers::ProviderWriteValidationError>() {
+        bad_request(format!("{error:#}"))
+    } else {
+        internal(error)
     }
 }
 
@@ -22033,8 +22075,108 @@ async fn provider_catalog_snapshot(
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     recover_provider_config_journals(ctx, project_root, None).await?;
-    let (cwd, trust_policy, mut config, provider_warnings) =
+    let (cwd, trust_policy, config, provider_warnings) =
         daemon_provider_config_with_warnings(ctx, project_root).await?;
+    let response = provider_catalog_candidate_snapshot(
+        ctx,
+        project_root,
+        provider_id,
+        snapshot_session_id,
+        capability_owner,
+        cwd,
+        trust_policy,
+        config,
+        provider_warnings,
+        inventory::current_config_generation(),
+        true,
+    )
+    .await?;
+    catalog_snapshot_wire_page(response, 0)
+}
+
+/// Serialize the complete durable view before slicing it. No model or
+/// auxiliary field is dropped to make a frame fit, and every root (including
+/// roots unknown at mutation time) uses the same bounded page representation.
+fn catalog_snapshot_wire_page(
+    response: Response,
+    offset: usize,
+) -> std::result::Result<Response, ErrorPayload> {
+    let json = serde_json::to_string(&response).map_err(internal)?;
+    if json.len() > proto::MAX_CONFIG_TRANSFER_BYTES {
+        return Err(bad_request(
+            "provider catalog exceeds the complete transfer limit",
+        ));
+    }
+    if offset == 0 && json.len() <= proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES {
+        return Ok(response);
+    }
+    if offset >= json.len() || !json.is_char_boundary(offset) {
+        return Err(bad_request("invalid provider catalog page offset"));
+    }
+    let mut end = offset
+        .saturating_add(proto::PROVIDER_CATALOG_PAGE_BYTES)
+        .min(json.len());
+    while !json.is_char_boundary(end) {
+        end -= 1;
+    }
+    bounded_provider_response(Response::ProviderCatalogPage {
+        snapshot_digest: crate::intel::hex_lower(&<Sha256 as sha2::Digest>::digest(
+            json.as_bytes(),
+        )),
+        offset,
+        total_bytes: json.len(),
+        json: json[offset..end].to_string(),
+    })
+}
+
+async fn provider_catalog_snapshot_page(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: Option<&str>,
+    snapshot_session_id: &str,
+    capability_owner: String,
+    offset: u64,
+) -> std::result::Result<Response, ErrorPayload> {
+    let offset = usize::try_from(offset)
+        .map_err(|_| bad_request("provider catalog page offset is out of range"))?;
+    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    recover_provider_config_journals(ctx, project_root, None).await?;
+    let (cwd, policy, config, warnings) =
+        daemon_provider_config_with_warnings(ctx, project_root).await?;
+    let response = provider_catalog_candidate_snapshot(
+        ctx,
+        project_root,
+        provider_id,
+        snapshot_session_id,
+        capability_owner,
+        cwd,
+        policy,
+        config,
+        warnings,
+        inventory::current_config_generation(),
+        false,
+    )
+    .await?;
+    catalog_snapshot_wire_page(response, offset)
+}
+
+/// Both reads and pre-commit guards serialize this exact representation. A
+/// dry run includes all authority/envelope/MCP/extended fields but publishes no
+/// capability; generation is charged at its maximum width before a commit.
+#[allow(clippy::too_many_arguments)]
+async fn provider_catalog_candidate_snapshot(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: Option<&str>,
+    snapshot_session_id: &str,
+    capability_owner: String,
+    cwd: std::path::PathBuf,
+    trust_policy: crate::config::trust::WorkspaceTrustPolicy,
+    mut config: crate::config::providers::ProvidersConfig,
+    provider_warnings: Vec<String>,
+    config_generation: u64,
+    publish_capability: bool,
+) -> std::result::Result<Response, ErrorPayload> {
     // The CAS covers the complete effective provider projection even when the
     // caller asks to render only one row. A sibling provider edit therefore
     // invalidates this capability instead of being overwritten by a partial
@@ -22048,7 +22190,6 @@ async fn provider_catalog_snapshot(
         config.providers.clear();
         config.providers.insert(provider_id.to_string(), entry);
     }
-    let config_generation = inventory::current_config_generation();
     let canonical_root = crate::secret_ownership::canonical_owner_root(project_root);
     // User-level config always has a writable home: the resolver falls back
     // to the global layer even when that directory does not yet exist, so
@@ -22125,50 +22266,52 @@ async fn provider_catalog_snapshot(
             mcp_scope_targets.insert("workspace".to_string(), (path, revision));
         }
     }
-    let mut mcp_scope_revisions = std::collections::BTreeMap::new();
+    let mcp_scope_revisions = mcp_scope_targets
+        .iter()
+        .map(|(scope, (_, revision))| (scope.clone(), revision.clone()))
+        .collect();
     let minted_edit_capability = if let Some(target_path) = target_path {
         let create_on_first_write = is_missing_global_layer_target(&target_path);
-        let mut capabilities = PROVIDER_EDIT_CAPABILITIES
-            .lock()
-            .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
-        let now = Instant::now();
-        capabilities.retain(|_, capability| capability.expires_at > now);
-        if capabilities.len() >= PROVIDER_EDIT_CAPABILITY_CAPACITY
-            && !capabilities.contains_key(snapshot_session_id)
-        {
-            return Err(bad_request(
-                "provider edit capability capacity reached; retry after an edit expires",
-            ));
+        if publish_capability {
+            let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+                .lock()
+                .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+            let now = Instant::now();
+            capabilities.retain(|_, capability| capability.expires_at > now);
+            if capabilities.len() >= PROVIDER_EDIT_CAPABILITY_CAPACITY
+                && !capabilities.contains_key(snapshot_session_id)
+            {
+                return Err(bad_request(
+                    "provider edit capability capacity reached; retry after an edit expires",
+                ));
+            }
+
+            capabilities.insert(
+                snapshot_session_id.to_string(),
+                ProviderEditCapability {
+                    owner: capability_owner,
+                    project_root: canonical_root.clone(),
+                    target_path,
+                    layer_id: layer_id.clone(),
+                    revision: revision.clone(),
+                    config_generation,
+                    create_on_first_write,
+                    // An absent MCP layer leaves empty bindings; `save_mcp_config`
+                    // then fails its path/revision equality checks, so the
+                    // capability cannot be replayed against an MCP target.
+                    mcp_target_path: mcp
+                        .as_ref()
+                        .map(|mcp| std::path::PathBuf::from(&mcp.config_path))
+                        .unwrap_or_default(),
+                    mcp_revision: mcp
+                        .as_ref()
+                        .map(|mcp| mcp.revision.clone())
+                        .unwrap_or_default(),
+                    mcp_scope_targets,
+                    expires_at: now + PROVIDER_EDIT_CAPABILITY_TTL,
+                },
+            );
         }
-        mcp_scope_revisions = mcp_scope_targets
-            .iter()
-            .map(|(scope, (_path, revision))| (scope.clone(), revision.clone()))
-            .collect();
-        capabilities.insert(
-            snapshot_session_id.to_string(),
-            ProviderEditCapability {
-                owner: capability_owner,
-                project_root: canonical_root.clone(),
-                target_path,
-                layer_id: layer_id.clone(),
-                revision: revision.clone(),
-                config_generation,
-                create_on_first_write,
-                // An absent MCP layer leaves empty bindings; `save_mcp_config`
-                // then fails its path/revision equality checks, so the
-                // capability cannot be replayed against an MCP target.
-                mcp_target_path: mcp
-                    .as_ref()
-                    .map(|mcp| std::path::PathBuf::from(&mcp.config_path))
-                    .unwrap_or_default(),
-                mcp_revision: mcp
-                    .as_ref()
-                    .map(|mcp| mcp.revision.clone())
-                    .unwrap_or_default(),
-                mcp_scope_targets,
-                expires_at: now + PROVIDER_EDIT_CAPABILITY_TTL,
-            },
-        );
         true
     } else {
         false
@@ -22192,7 +22335,7 @@ async fn provider_catalog_snapshot(
         }
     }
     view.extended_config_json = Some(redacted_extended_config_json(ctx, &cwd, &trust_policy)?);
-    bounded_provider_response(Response::ProviderCatalogSnapshot {
+    Ok(Response::ProviderCatalogSnapshot {
         config: view,
         snapshot_session_id: snapshot_session_id.to_string(),
         layer_id,
@@ -22200,6 +22343,432 @@ async fn provider_catalog_snapshot(
         base_revision: revision,
         config_generation,
     })
+}
+
+/// Charge the exact editable header representation, the standard favorite
+/// toggle, and maximum timestamp fractional precision used by status saves.
+fn editable_provider_entry_bytes(view: &proto::ProviderEntryView) -> usize {
+    let mut entry = view.editable_entry();
+    entry.favorite = Some(false);
+    entry.models_fetched_at = entry.models_fetched_at.map(|time| {
+        chrono::Timelike::with_nanosecond(&time, 999_999_999).expect("valid nanosecond")
+    });
+    if let Some(status) = entry.last_model_fetch.as_mut() {
+        status.at =
+            chrono::Timelike::with_nanosecond(&status.at, 999_999_999).expect("valid nanosecond");
+    }
+    serde_json::to_vec(&entry)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn ensure_catalog_entries_editable(
+    config: &crate::config::providers::ProvidersConfig,
+) -> std::result::Result<(), ErrorPayload> {
+    let view = crate::secret_ref::redact_provider_view(config);
+    if view.providers.values().any(|view| {
+        let mut entry = view.editable_entry();
+        entry.models.clear();
+        let metadata_bytes = serde_json::to_vec(&entry)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX);
+        // Existing rows are edited as field deltas and stay in their owning
+        // layers. Bound metadata itself here; request admission charges the
+        // actual (metadata, patch), and ConfigDoc validates the final raw owner
+        // entry and document. A fixed patch reserve would reject fitting edits.
+        metadata_bytes > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
+    }) {
+        return Err(bad_request(
+            "protected models or other provider configuration exceed the editable entry limit; no catalog was written",
+        ));
+    }
+    Ok(())
+}
+
+/// The prospective serializer and the real writer share ConfigDoc's raw-field
+/// patching and layer merge. This charges inherited fields, URL tombstones,
+/// empty catalogs and lower/higher precedence rows before any durable intent.
+fn catalog_config_after_layer_writes(
+    ctx: &DaemonContext,
+    cwd: &std::path::Path,
+    policy: &crate::config::trust::WorkspaceTrustPolicy,
+    writes: &std::collections::BTreeMap<
+        std::path::PathBuf,
+        crate::config::providers::ProvidersConfig,
+    >,
+) -> std::result::Result<crate::config::providers::ProvidersConfig, ErrorPayload> {
+    let paths = if global_config_root(cwd)? {
+        vec![cockpit_config::config::dirs::global_config_file().map_err(internal)?]
+    } else {
+        crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
+            ctx.config_source().watch_paths(cwd).config_files
+        })
+    };
+    let writes = writes
+        .iter()
+        .map(|(path, layer)| {
+            Ok((
+                crate::config::providers::ConfigDoc::load(path)
+                    .map_err(internal)?
+                    .path,
+                layer.clone(),
+            ))
+        })
+        .collect::<std::result::Result<std::collections::BTreeMap<_, _>, ErrorPayload>>()?;
+    if writes.keys().any(|path| !paths.contains(path)) {
+        return Err(bad_request(
+            "provider write target is absent from the authoritative layer chain; no provider configuration was written",
+        ));
+    }
+    crate::config::providers::ConfigDoc::providers_from_paths_after_writes(&paths, &writes)
+        .map_err(provider_write_error)
+}
+
+struct ProviderAuthoringReadback<'a> {
+    ctx: &'a DaemonContext,
+    cwd: &'a std::path::Path,
+    trust_policy: &'a crate::config::trust::WorkspaceTrustPolicy,
+}
+
+fn provider_model_authoring_candidate(
+    readback: &ProviderAuthoringReadback<'_>,
+    doc: &crate::config::providers::ConfigDoc,
+    provider_id: &str,
+    candidate: crate::config::providers::ProviderEntry,
+    expected: &[crate::config::providers::ModelEntry],
+    authored: &crate::config::providers::ProvidersConfig,
+) -> std::result::Result<Option<crate::config::providers::ProviderEntry>, ErrorPayload> {
+    match doc.validate_provider_write(provider_id, &candidate) {
+        Ok(()) => {}
+        Err(error) if error.is::<crate::config::providers::ProviderWriteValidationError>() => {
+            return Ok(None);
+        }
+        Err(error) => return Err(provider_write_error(error)),
+    }
+    let mut layer = authored.clone();
+    layer
+        .providers
+        .insert(provider_id.into(), candidate.clone());
+    let composed = catalog_config_after_layer_writes(
+        readback.ctx,
+        readback.cwd,
+        readback.trust_policy,
+        &std::collections::BTreeMap::from([(doc.path.clone(), layer)]),
+    )?;
+    let observed = &composed
+        .providers
+        .get(provider_id)
+        .ok_or_else(|| bad_request("provider inventory changed; reload before saving"))?
+        .models;
+    if serde_json::to_vec(observed).map_err(internal)?
+        == serde_json::to_vec(expected).map_err(internal)?
+    {
+        Ok(Some(candidate))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Request-byte minimization cannot see accumulated authored intent or raw
+/// unknown fields. Check the actual final layer too: reuse prior pins or a
+/// raw-equivalent incoming program before trying full order. Every candidate
+/// retains prior pin/tombstone authority. Never silently unpin previous moves.
+fn fit_provider_model_authoring(
+    readback: ProviderAuthoringReadback<'_>,
+    doc: &crate::config::providers::ConfigDoc,
+    provider_id: &str,
+    entry: &mut crate::config::providers::ProviderEntry,
+    patch: Option<&proto::ProviderModelPatch>,
+    effective: &crate::config::providers::ProvidersConfig,
+    authored: &crate::config::providers::ProvidersConfig,
+) -> std::result::Result<(), ErrorPayload> {
+    let Some(patch) = patch else {
+        return doc
+            .validate_provider_write(provider_id, entry)
+            .map_err(provider_write_error);
+    };
+    let before = &effective.providers[provider_id].models;
+    let mut after = before.clone();
+    patch.apply(&mut after).map_err(bad_request)?;
+    let original_error = match doc.validate_provider_write(provider_id, entry) {
+        Ok(()) => {
+            if provider_model_authoring_candidate(
+                &readback,
+                doc,
+                provider_id,
+                entry.clone(),
+                &after,
+                authored,
+            )?
+            .is_some()
+            {
+                return Ok(());
+            }
+            None
+        }
+        Err(error) if error.is::<crate::config::providers::ProviderWriteValidationError>() => {
+            Some(error)
+        }
+        Err(error) => return Err(provider_write_error(error)),
+    };
+    // Metadata-only re-entry preserves even a non-idempotent authored program.
+    // Order/membership/image edits may choose another representation, but every
+    // candidate must retain surviving durable pins and exact raw composition.
+    if patch.clear {
+        // Empty replacement and empty complete order each exclude every lower
+        // row, including future refreshes. Try the individual constant-size
+        // forms if charging both redundant directives exhausted raw headroom.
+        for (models_replace, model_order) in [(true, None), (false, Some(Vec::new()))] {
+            let mut candidate = entry.clone();
+            candidate.models_replace = models_replace;
+            candidate.model_order = model_order;
+            if let Some(candidate) = provider_model_authoring_candidate(
+                &readback,
+                doc,
+                provider_id,
+                candidate,
+                &after,
+                authored,
+            )? {
+                *entry = candidate;
+                return Ok(());
+            }
+        }
+        return Err(original_error.map(provider_write_error).unwrap_or_else(|| bad_request("provider model authoring changed the effective inventory; no configuration was written")));
+    }
+    if patch.order.is_none()
+        && patch.moves.is_empty()
+        && patch.deletes.is_empty()
+        && patch.upserts.is_empty()
+        && patch.updates.is_empty()
+    {
+        return Err(original_error.map(provider_write_error).unwrap_or_else(|| bad_request("provider model authoring changed the effective inventory; no configuration was written")));
+    }
+    let order = after.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let prior = authored.providers.get(provider_id);
+    let required_pins = prior
+        .into_iter()
+        .flat_map(|layer| {
+            layer
+                .model_membership
+                .placements
+                .iter()
+                .map(|placement| placement.id.as_str())
+                .chain(layer.model_order.iter().flatten().map(String::as_str))
+        })
+        .chain(patch.upserts.iter().map(|row| row.id.as_str()))
+        .chain(
+            patch
+                .updates
+                .iter()
+                .filter(|update| update.replace)
+                .map(|update| update.id.as_str()),
+        )
+        .filter(|id| order.iter().any(|next| next == id))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut sparse = entry.clone();
+    sparse.model_order = None;
+    sparse.model_membership.placements.clear();
+    let mut unplaced = authored.clone();
+    unplaced
+        .providers
+        .insert(provider_id.into(), sparse.clone());
+    // Reconstruct the actual order BEFORE this layer's placements. Replaying
+    // incoming operations over the already composed inventory is insufficient.
+    let baseline = match doc.validate_provider_write(provider_id, &sparse) {
+        Ok(()) => {
+            let config = catalog_config_after_layer_writes(
+                readback.ctx,
+                readback.cwd,
+                readback.trust_policy,
+                &std::collections::BTreeMap::from([(doc.path.clone(), unplaced)]),
+            )?;
+            Some(
+                config
+                    .providers
+                    .get(provider_id)
+                    .ok_or_else(|| bad_request("provider inventory changed; reload before saving"))?
+                    .models
+                    .clone(),
+            )
+        }
+        Err(error) if error.is::<crate::config::providers::ProviderWriteValidationError>() => None,
+        Err(error) => return Err(provider_write_error(error)),
+    };
+    if let Some(baseline) = &baseline {
+        let baseline_order = baseline
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        if baseline_order
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            == order.iter().collect()
+            && baseline_order.len() == order.len()
+        {
+            sparse.model_membership.placements =
+                crate::config::providers::ModelPlacement::between_with_pins(
+                    &baseline_order,
+                    &order,
+                    &required_pins,
+                );
+            if let Some(candidate) = provider_model_authoring_candidate(
+                &readback,
+                doc,
+                provider_id,
+                sparse.clone(),
+                &after,
+                authored,
+            )? {
+                *entry = candidate;
+                return Ok(());
+            }
+        }
+    }
+    if !patch.moves.is_empty() {
+        let incoming = patch
+            .moves
+            .iter()
+            .map(|placement| placement.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let retained = required_pins
+            .iter()
+            .copied()
+            .filter(|id| !incoming.contains(id))
+            .collect();
+        let mut candidate = sparse.clone();
+        candidate.model_membership.placements = patch.moves.clone();
+        candidate.model_membership.placements.extend(
+            crate::config::providers::ModelPlacement::for_pinned_order(&order, &retained),
+        );
+        if let Some(candidate) = provider_model_authoring_candidate(
+            &readback,
+            doc,
+            provider_id,
+            candidate,
+            &after,
+            authored,
+        )? {
+            *entry = candidate;
+            return Ok(());
+        }
+    }
+    let mut full = patch.clone();
+    full.order = Some(order.clone());
+    full.moves.clear();
+    let mut layer = prior.cloned().unwrap_or_default();
+    full.apply_to_layer(before, &mut layer)
+        .map_err(bad_request)?;
+    let mut candidate = entry.clone();
+    candidate.models = layer.models;
+    candidate.models_replace = layer.models_replace;
+    candidate.model_field_patches = layer.model_field_patches;
+    candidate.model_order = layer.model_order;
+    candidate.model_membership = layer.model_membership;
+    if let Some(candidate) = provider_model_authoring_candidate(
+        &readback,
+        doc,
+        provider_id,
+        candidate.clone(),
+        &after,
+        authored,
+    )? {
+        *entry = candidate;
+        return Ok(());
+    }
+    // Complete order already excludes every ID outside `after`, including
+    // all inherited tombstones. When their duplicate literal representation
+    // exhausts the raw budget, retain the complete exclusion/pin authority in
+    // model_order instead. Actual image/order read-back remains mandatory.
+    if !candidate.model_membership.deletes.is_empty() {
+        candidate.model_membership.deletes.clear();
+        if let Some(candidate) = provider_model_authoring_candidate(
+            &readback,
+            doc,
+            provider_id,
+            candidate,
+            &after,
+            authored,
+        )? {
+            *entry = candidate;
+            return Ok(());
+        }
+    }
+    if let Some(baseline) = baseline {
+        let baseline_order = baseline
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        // The raw budget includes retained unknown metadata. Candidate read-back
+        // remains mandatory even after exact schedule search: order alone is
+        // insufficient to prove complete row images or layered composition.
+        match doc.provider_placement_byte_budget(provider_id, &sparse) {
+            Ok(budget) => {
+                let mut accepted = None;
+                crate::config::providers::ModelPlacement::find_fitting(
+                    &baseline_order,
+                    &order,
+                    &required_pins,
+                    budget,
+                    |program| {
+                        let mut candidate = sparse.clone();
+                        candidate.model_membership.placements = program.to_vec();
+                        accepted = provider_model_authoring_candidate(
+                            &readback,
+                            doc,
+                            provider_id,
+                            candidate,
+                            &after,
+                            authored,
+                        )?;
+                        Ok::<_, ErrorPayload>(accepted.is_some())
+                    },
+                )?;
+                if let Some(candidate) = accepted {
+                    *entry = candidate;
+                    return Ok(());
+                }
+            }
+            Err(error) if error.is::<crate::config::providers::ProviderWriteValidationError>() => {}
+            Err(error) => return Err(provider_write_error(error)),
+        }
+    }
+    Err(original_error.map(provider_write_error).unwrap_or_else(|| bad_request("provider model authoring cannot preserve the effective inventory within the authored entry limit; no configuration was written")))
+}
+
+async fn ensure_catalog_candidate_readable(
+    ctx: &DaemonContext,
+    project_root: &str,
+    cwd: &std::path::Path,
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+    config: &crate::config::providers::ProvidersConfig,
+    allow_paged_edit: bool,
+) -> std::result::Result<(), ErrorPayload> {
+    ensure_catalog_entries_editable(config)?;
+    let (_, _, _, warnings) = daemon_provider_config_with_warnings(ctx, project_root).await?;
+    let candidate = provider_catalog_candidate_snapshot(
+        ctx,
+        project_root,
+        None,
+        &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES),
+        String::new(),
+        cwd.to_path_buf(),
+        trust_policy.clone(),
+        config.clone(),
+        warnings,
+        u64::MAX,
+        false,
+    )
+    .await?;
+    let checked = if allow_paged_edit {
+        catalog_snapshot_wire_page(candidate, 0)
+    } else {
+        bounded_provider_response(candidate)
+    };
+    checked.map(|_| ()).map_err(|_| bad_request(
+        "the complete provider/config snapshot exceeds the readable limit; no provider configuration was written"
+    ))
 }
 
 fn provider_config_revision(
@@ -22235,6 +22804,15 @@ async fn apply_provider_mutation(
     capability_owner: String,
     provider_env: std::collections::HashMap<String, String>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    for upsert in &mutation.upserts {
+        if serde_json::to_vec(&(&upsert.entry, &upsert.model_patch))
+            .map_err(internal)?
+            .len()
+            > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
+        {
+            return Err(bad_request("provider entry exceeds maximum length"));
+        }
+    }
     let observed_intent_hash = mutation.sanitized_intent_hash().map_err(internal)?;
     if observed_intent_hash != mutation_intent_hash {
         return Err(bad_request(
@@ -23349,6 +23927,36 @@ async fn commit_local_provider_credential(
     Ok(response)
 }
 
+/// The durable operation ledger and provider journal both cap receipts at
+/// 1 MiB. Large catalogs remain behind the existing paged snapshot RPC; the
+/// receipt contains only its committed authority and an explicit read-back state.
+fn bound_provider_mutation_receipt(
+    response: &mut Response,
+) -> std::result::Result<(), ErrorPayload> {
+    if !matches!(response, Response::ProviderMutationCommitted { .. }) {
+        return Ok(());
+    }
+    if serde_json::to_vec(&*response).map_err(internal)?.len()
+        > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES
+        && let Response::ProviderMutationCommitted {
+            config,
+            catalog_readback,
+            ..
+        } = response
+    {
+        *config = Default::default();
+        *catalog_readback = proto::ProviderCatalogReadback::Required;
+    }
+    if serde_json::to_vec(&*response).map_err(internal)?.len()
+        > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES
+    {
+        return Err(bad_request(
+            "provider receipt exceeds durable byte limit; no provider configuration was written",
+        ));
+    }
+    Ok(())
+}
+
 fn client_operation_id_from_response(
     response: &Response,
 ) -> std::result::Result<String, ErrorPayload> {
@@ -23525,7 +24133,38 @@ async fn stage_and_recover_provider_batch(
         .map(|upsert| upsert.provider_id.clone())
         .collect::<Vec<_>>();
 
+    // Metadata/deletion-only edits also retain the already readable model
+    // inventory. They must not force a composed catalog back into one frame.
+    let allow_paged_edit = mutation
+        .upserts
+        .iter()
+        .all(|upsert| upsert.model_patch.is_some());
     for mut upsert in mutation.upserts {
+        if let Some(patch) = &upsert.model_patch {
+            if !upsert.entry.models.is_empty() {
+                return Err(bad_request(
+                    "provider model patch requires an empty replacement inventory",
+                ));
+            }
+            let effective_models = &effective
+                .providers
+                .get(&upsert.provider_id)
+                .ok_or_else(|| bad_request("provider model patch has no existing inventory"))?
+                .models;
+            let mut authored = desired
+                .providers
+                .get(&upsert.provider_id)
+                .cloned()
+                .unwrap_or_default();
+            patch
+                .apply_to_layer(effective_models, &mut authored)
+                .map_err(bad_request)?;
+            upsert.entry.models = authored.models;
+            upsert.entry.models_replace = authored.models_replace;
+            upsert.entry.model_field_patches = authored.model_field_patches;
+            upsert.entry.model_order = authored.model_order;
+            upsert.entry.model_membership = authored.model_membership;
+        }
         // Secret resolution validates a header against the complete provider
         // projection. Keep that projection separate from the mutable headers
         // below so a batch cannot observe a partially staged entry.
@@ -23542,7 +24181,7 @@ async fn stage_and_recover_provider_batch(
                 .or_default()
                 .extend(refs.1);
             for (index, header) in upsert.entry.headers.iter_mut().enumerate() {
-                if header.value.trim() == "********"
+                if header.value.trim() == proto::PRESERVED_PROVIDER_HEADER_VALUE
                     && let Some(old_header) = prior
                         .headers
                         .iter()
@@ -23614,6 +24253,25 @@ async fn stage_and_recover_provider_batch(
         if let Some(reference) = &upsert.entry.credential_ref {
             credential_claims.push((upsert.provider_id.clone(), reference.clone()));
         }
+        if upsert.model_patch.is_none() {
+            upsert.entry.models_replace = true;
+            upsert.entry.model_field_patches.clear();
+            upsert.entry.model_order = None;
+            upsert.entry.model_membership = Default::default();
+        }
+        fit_provider_model_authoring(
+            ProviderAuthoringReadback {
+                ctx,
+                cwd: &cwd,
+                trust_policy: &trust_policy,
+            },
+            &doc,
+            &upsert.provider_id,
+            &mut upsert.entry,
+            upsert.model_patch.as_ref(),
+            &effective,
+            &desired,
+        )?;
         desired.providers.insert(upsert.provider_id, upsert.entry);
     }
     for delete in mutation.deletes {
@@ -23636,6 +24294,22 @@ async fn stage_and_recover_provider_batch(
         }
     }
 
+    let candidate = catalog_config_after_layer_writes(
+        ctx,
+        &cwd,
+        &trust_policy,
+        &std::collections::BTreeMap::from([(target.clone(), desired.clone())]),
+    )?;
+    ensure_catalog_candidate_readable(
+        ctx,
+        project_root,
+        &cwd,
+        &trust_policy,
+        &candidate,
+        allow_paged_edit,
+    )
+    .await?;
+
     // Cleanup is pair-scoped. A reference retained by the same provider in
     // the final layer must keep both its vault row and its exact ownership
     // claim; a global "reference is live somewhere" check is too late because
@@ -23652,6 +24326,7 @@ async fn stage_and_recover_provider_batch(
     // leave both a lying receipt and a generation from the wrong daemon boot.
     let config_generation = 0;
     let response = Response::ProviderMutationCommitted {
+        catalog_readback: Default::default(),
         client_operation_id: client_operation_id.to_owned(),
         snapshot_session_id: snapshot_session_id.to_owned(),
         layer_id: layer_id.to_owned(),
@@ -23661,10 +24336,12 @@ async fn stage_and_recover_provider_batch(
         consumed_revision: consumed_revision.to_owned(),
         result_revision: result_revision.clone(),
         config_generation,
-        config: crate::secret_ref::redact_provider_view(&desired),
+        config: crate::secret_ref::redact_provider_view(&candidate),
         status: cockpit_proto::ConfigCommitStatus::Committed,
         publication: cockpit_proto::ConfigPublicationStatus::Published,
     };
+    let mut response = response;
+    bound_provider_mutation_receipt(&mut response)?;
     let terminal_response_json = serde_json::to_string(&response).map_err(internal)?;
     let journal_id = format!("provider-batch-{batch_id}");
     let cleanup_named_json = serde_json::to_string(&cleanup_named).map_err(internal)?;
@@ -23676,6 +24353,29 @@ async fn stage_and_recover_provider_batch(
     let receipt_operation_id = client_operation_id.to_owned();
     let journal_owner = receipt_owner.clone();
     let journal_operation_id = receipt_operation_id.clone();
+    let mut projected_claims =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for (provider, reference) in &credential_claims {
+        projected_claims
+            .entry(provider.clone())
+            .or_default()
+            .insert(reference.clone());
+    }
+    let projected_payload = ProviderBatchJournalPayload {
+        config: desired.clone(),
+        cleanup_credentials: cleanup_credentials.clone(),
+        inserted_named_claims: staged.iter().map(|(name, _)| name.clone()).collect(),
+        inserted_credential_claims: projected_claims,
+    };
+    if serde_json::to_vec(&projected_payload)
+        .map_err(internal)?
+        .len()
+        > proto::MAX_CONFIG_TRANSFER_BYTES
+    {
+        return Err(bad_request(
+            "provider batch intent exceeds durable byte limit; no provider configuration was written",
+        ));
+    }
     let consumed_revision_for_tx = consumed_revision.to_owned();
     let intended_revision_for_tx = result_revision.clone();
     let consumed_config_generation_for_tx = i64::try_from(consumed_config_generation)
@@ -23744,6 +24444,7 @@ async fn stage_and_recover_provider_batch(
                 inserted_named_claims,
                 inserted_credential_claims,
             })?;
+            if payload_json.len() > proto::MAX_CONFIG_TRANSFER_BYTES {anyhow::bail!("provider batch intent exceeds durable byte limit");}
             conn.execute(
                 "INSERT INTO provider_config_journals
                  (journal_id, owner_digest, client_operation_id, request_hash,
@@ -24125,7 +24826,6 @@ pub(super) async fn provider_models_fetch(
     if provider_ids.is_empty() {
         return bounded_provider_response(Response::ProviderModelsFetched {
             results: Vec::new(),
-            config: crate::secret_ref::redact_provider_view(&config),
             config_generation: inventory::current_config_generation(),
         });
     }
@@ -24148,14 +24848,38 @@ pub(super) async fn provider_models_fetch(
         &crate::secret_ref::provider_credential_record_references(&config),
     )
     .map_err(internal)?;
+    let credential_table = provider_response_credential_table(&store, &config, &env)?;
+    // Validate existing operational addresses before preview/merge or deep
+    // probes. Rejection preserves the exact persisted preimage; identities are
+    // never rewritten, so subsequent targets and inference use upstream IDs.
+    for id in &provider_ids {
+        let entry = config.providers.get_mut(id).expect("selected provider");
+        entry.models = crate::providers::provider_http::scrub_catalog_models_with_table(
+            std::mem::take(&mut entry.models),
+            &credential_table,
+        )
+        .map_err(|error| bad_request(error.to_string()))?;
+    }
+    crate::providers::provider_http::diagnostic_scope(credential_table, async {
     let selected_policy = on_unlisted
         .or(config.on_unlisted_models_fetch)
         .unwrap_or(crate::config::providers::OnUnlistedModelsFetch::Keep);
     let mut changed_provider_ids = std::collections::BTreeSet::new();
-    let results = if deep {
-        let (results, completed_provider_ids) =
-            daemon_deep_provider_fetch(&mut config, &provider_ids, model_id, store.clone(), &env)
-                .await?;
+    let mut fetched_model_ids =
+        std::collections::BTreeMap::<String, std::collections::HashSet<String>>::new();
+    // One preview budget shared by every result keeps the summary response
+    // bounded for any catalog size and any number of providers.
+    let mut id_budget = proto::MAX_PROVIDER_MODEL_SUMMARY_ID_BYTES;
+    let mut results = if deep {
+        let (results, completed_provider_ids) = daemon_deep_provider_fetch(
+            &mut config,
+            &provider_ids,
+            model_id,
+            store.clone(),
+            &env,
+            &mut id_budget,
+        )
+        .await?;
         // A failed provider may have completed an earlier target before its
         // later probe failed. Do not expose or persist that ambiguous partial
         // mutation; retain the original provider snapshot and account only
@@ -24215,10 +24939,12 @@ pub(super) async fn provider_models_fetch(
                         models,
                         catalog,
                         reason,
+                        failure_kind,
                     } => crate::providers::models_fetch::FetchOutcome::FallbackAvailable {
                         models,
                         catalog,
                         reason,
+                        failure_kind,
                     },
                     crate::providers::auth_check::AuthCheckSuccess::Checked => {
                         crate::providers::models_fetch::FetchOutcome::Unsupported
@@ -24226,20 +24952,42 @@ pub(super) async fn provider_models_fetch(
                 })
                 .map_err(anyhow::Error::new)
             } else {
-                crate::providers::models_fetch::fetch_models_for_provider_with_store(
-                    &provider_id,
-                    &entry,
-                    &resolved,
-                    std::time::Duration::from_secs(15),
-                    Some(store.clone()),
-                    |name| env.get(name).cloned(),
-                )
+                // A template-less entry pointed at a public catalog (OpenRouter
+                // answers `/models` for any key) must still prove its key.
+                let probe = match crate::providers::public_catalog_auth_check(&resolved.base_url) {
+                    Some(crate::providers::AuthCheckKind::AuthenticatedGetThenModels {
+                        path,
+                        docs_url,
+                    }) => crate::providers::auth_check::get_credential_probe(
+                        &resolved.base_url,
+                        &resolved.headers,
+                        path,
+                        docs_url,
+                        std::time::Duration::from_secs(15),
+                    )
+                    .await
+                    .map_err(anyhow::Error::new),
+                    _ => Ok(()),
+                };
+                async {
+                    probe?;
+                    crate::providers::models_fetch::fetch_models_for_provider_with_store(
+                        &provider_id,
+                        &entry,
+                        &resolved,
+                        std::time::Duration::from_secs(15),
+                        Some(store.clone()),
+                        |name| env.get(name).cloned(),
+                    )
+                    .await
+                }
                 .await
                 .and_then(|outcome| match outcome {
                     crate::providers::models_fetch::FetchOutcome::Unsupported => Err(
-                        anyhow::anyhow!(
-                            "provider models endpoint returned 404; no authenticated response was received"
-                        ),
+                        crate::providers::models_fetch::ModelFetchError::http(
+                            reqwest::StatusCode::NOT_FOUND,
+                            "provider models endpoint returned 404; no authenticated response was received".into()
+                        ).into(),
                     ),
                     outcome => Ok(outcome),
                 })
@@ -24247,6 +24995,10 @@ pub(super) async fn provider_models_fetch(
             let mut verification = None;
             let outcome = match fetched {
                 Ok(crate::providers::models_fetch::FetchOutcome::Models { models, catalog }) => {
+                    fetched_model_ids.insert(
+                        provider_id.clone(),
+                        models.iter().map(|model| model.id.clone()).collect(),
+                    );
                     let mut updated = entry.clone();
                     let unlisted = entry
                         .models
@@ -24262,7 +25014,10 @@ pub(super) async fn provider_models_fetch(
                         results.push(crate::daemon::proto::ProviderModelFetchResult {
                             provider_id,
                             outcome: crate::daemon::proto::ProviderModelFetchOutcome::UnlistedModelsPreview {
-                                unlisted_count: u32::try_from(unlisted.len()).unwrap_or(u32::MAX),
+                                unlisted: proto::ProviderModelIdSummary::bounded(
+                                    unlisted.iter().map(|model| model.id.clone()),
+                                    &mut id_budget,
+                                ),
                             },
                             verification: None,
                         });
@@ -24285,19 +25040,26 @@ pub(super) async fn provider_models_fetch(
                     );
                     updated.models_fetched_at = Some(chrono::Utc::now());
                     updated.model_catalog = catalog;
+                    updated.mark_model_fetch_success(catalog);
                     config.providers.insert(provider_id.clone(), updated);
                     changed_provider_ids.insert(provider_id.clone());
-                    crate::daemon::proto::ProviderModelFetchOutcome::Models { models, catalog }
+                    crate::daemon::proto::ProviderModelFetchOutcome::Models {
+                        models: proto::ProviderModelIdSummary::bounded(
+                            models.iter().map(|model| model.id.clone()),
+                            &mut id_budget,
+                        ),
+                        catalog,
+                        kept: u32::try_from(models.len()).unwrap_or(u32::MAX),
+                    }
                 }
                 Ok(crate::providers::models_fetch::FetchOutcome::FallbackAvailable {
                     models,
                     catalog,
                     reason,
+                    failure_kind,
                 }) => {
-                    verification = Some(categorize_provider_model_fetch_error(&anyhow::anyhow!(
-                        reason.clone()
-                    )));
-                    let reason = crate::config::providers::redact_model_fetch_reason(reason);
+                    let reason = redact_provider_response_text(&reason, &store, &config, &env);
+                    verification = Some(provider_model_verification(failure_kind, &reason));
                     if allow_fallback {
                         let mut updated = entry.clone();
                         let merge_policy = match selected_policy {
@@ -24325,12 +25087,15 @@ pub(super) async fn provider_models_fetch(
                         // failure marker. A later --allow-fallback retry can
                         // safely activate the returned fallback catalog.
                         let mut updated = entry.clone();
-                        updated.mark_model_fetch_failed_kept_existing(reason.clone());
+                        updated.mark_model_fetch_failed_kept_existing(reason.clone(), failure_kind.persisted_failure());
                         config.providers.insert(provider_id.clone(), updated);
                         changed_provider_ids.insert(provider_id.clone());
                     }
                     crate::daemon::proto::ProviderModelFetchOutcome::FallbackAvailable {
-                        models,
+                        models: proto::ProviderModelIdSummary::bounded(
+                            models.iter().map(|model| model.id.clone()),
+                            &mut id_budget,
+                        ),
                         catalog,
                         reason,
                     }
@@ -24350,12 +25115,21 @@ pub(super) async fn provider_models_fetch(
                     crate::daemon::proto::ProviderModelFetchOutcome::Unsupported
                 }
                 Err(error) => {
-                    verification = Some(categorize_provider_model_fetch_error(&error));
-                    crate::daemon::proto::ProviderModelFetchOutcome::Error {
-                        message: crate::config::providers::redact_model_fetch_reason(
-                            error.to_string(),
-                        ),
+                    if matches!(error.downcast_ref::<crate::providers::auth_check::AuthCheckError>(),
+                        Some(crate::providers::auth_check::AuthCheckError::UnsafeModelIdentity))
+                    {
+                        // Unsafe operational addresses are an admission failure,
+                        // including through the auth-check/fallback wrappers.
+                        // Reject before even persisting a requested policy.
+                        return Err(bad_request(error.to_string()));
                     }
+                    let message =
+                        redact_provider_response_text(&error.to_string(), &store, &config, &env);
+                    // Keep the error's typed cause for classification, while
+                    // exposing only the fully scrubbed outer diagnostic.
+                    let safe_error = error.context(message.clone());
+                    verification = Some(categorize_provider_model_fetch_error(&safe_error));
+                    crate::daemon::proto::ProviderModelFetchOutcome::Error { message }
                 }
             };
             results.push(crate::daemon::proto::ProviderModelFetchResult {
@@ -24374,7 +25148,7 @@ pub(super) async fn provider_models_fetch(
             )
         });
     if aggregate_fetch_failed && !deep {
-        config = original_config;
+        config = original_config.clone();
         changed_provider_ids.clear();
     }
     if let Some(on_unlisted) = on_unlisted {
@@ -24385,20 +25159,105 @@ pub(super) async fn provider_models_fetch(
             config.on_unlisted_models_fetch = Some(on_unlisted);
         }
     }
-    // Build and bound the exact response before any persistence. Otherwise a
-    // large fetched catalog could become durable while the caller receives an
-    // error and therefore cannot distinguish a safe retry from a replay.
+    if !changed_provider_ids.is_empty() || on_unlisted.is_some_and(|_| !aggregate_fetch_failed) {
+        for id in &changed_provider_ids {
+            config.providers.get_mut(id).expect("changed provider exists").models_replace = true;
+        }
+        let (_, _, _, warnings) = daemon_provider_config_with_warnings(ctx, project_root).await?;
+        let snapshot = provider_catalog_candidate_snapshot(
+            ctx,
+            project_root,
+            None,
+            &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES),
+            String::new(),
+            cwd.clone(),
+            trust_policy.clone(),
+            config.clone(),
+            warnings.clone(),
+            u64::MAX,
+            false,
+        )
+        .await?;
+        let provider_bytes = serde_json::to_vec(&crate::secret_ref::redact_provider_view(&config))
+            .map_err(internal)?
+            .len();
+        let complete_bytes = serde_json::to_vec(&snapshot).map_err(internal)?.len();
+        let overhead = complete_bytes.saturating_sub(provider_bytes);
+        let limit = proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES.checked_sub(overhead)
+            .ok_or_else(|| bad_request("MCP/extended configuration alone exceeds the readable snapshot limit; no catalog was written"))?;
+        for id in &changed_provider_ids {
+            let previous = &original_config.providers[id];
+            let fetched = config.providers[id].models.clone();
+            // Trim every changed provider; the final exact check rejects the
+            // whole operation if protected or unchanged data still cannot fit.
+            let _ = enforce_persisted_catalog_budget(&mut config, id, previous, &fetched, limit);
+        }
+        ensure_catalog_entries_editable(&config)?;
+        bounded_provider_response(provider_catalog_candidate_snapshot(
+            ctx, project_root, None, &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES), String::new(),
+            cwd.clone(), trust_policy.clone(), config.clone(), warnings, u64::MAX, false,
+        ).await?).map_err(|_| bad_request("protected models or auxiliary configuration exceed the readable snapshot limit; no catalog was written"))?;
+        for result in &mut results {
+            if let crate::daemon::proto::ProviderModelFetchOutcome::Models { kept, .. } =
+                &mut result.outcome
+            {
+                *kept = u32::try_from(
+                    config.providers[&result.provider_id]
+                        .models
+                        .iter()
+                        .filter(|model| {
+                            fetched_model_ids
+                                .get(&result.provider_id)
+                                .is_none_or(|ids| ids.contains(&model.id))
+                        })
+                        .count(),
+                )
+                .unwrap_or(u32::MAX);
+            }
+        }
+    }
+    // Build and bound the exact response before any persistence. The
+    // response is a bounded summary (no provider config, a budgeted id
+    // preview), so this check is a backstop rather than a catalog-size limit;
+    // it still runs first so a durable write can never be paired with an
+    // error the caller cannot distinguish from a safe retry.
     // Size-check the worst-case generation width before any durable write.
     // The exact generation is installed after publication below.
     let response = Response::ProviderModelsFetched {
         results,
-        config: crate::secret_ref::redact_provider_view(&config),
         config_generation: u64::MAX,
     };
     let mut response =
         bounded_provider_response(scrub_provider_response(response, &config, &store, &env)?)?;
     let config_changed =
         !changed_provider_ids.is_empty() || on_unlisted.is_some_and(|_| !aggregate_fetch_failed);
+    // Preflight every durable intermediate projection before the first
+    // write. Multi-provider operations must also stay readable if interrupted
+    // between layer updates, not only after their final write.
+    let mut planned_writes = std::collections::BTreeMap::new();
+    for id in &changed_provider_ids {
+        let path = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || ctx.config_source().config_write_target_for_provider(&cwd, id)).map_err(config_write_target_error)?;
+        let path = canonical_user_level_write_target(ctx, &path)?;
+        let doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+        let path = doc.path.clone();
+        let layer = match planned_writes.entry(path.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(doc.providers()),
+        };
+        layer.providers.insert(id.clone(), config.providers[id].clone());
+        let intermediate = catalog_config_after_layer_writes(ctx, &cwd, &trust_policy, &planned_writes)?;
+        ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &intermediate, false).await?;
+    }
+    if let Some(policy) = on_unlisted.filter(|_| !aggregate_fetch_failed) {
+        let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || ctx.config_source().config_write_target_for_provider(&cwd, "default")).map_err(config_write_target_error)?;
+        let target = canonical_user_level_write_target(ctx, &target)?;
+        let doc = crate::config::providers::ConfigDoc::load(&target).map_err(internal)?;
+        let layer = planned_writes.entry(doc.path.clone()).or_insert_with(|| doc.providers());
+        layer.category_defaults = config.category_defaults.clone();
+        layer.on_unlisted_models_fetch = Some(policy);
+        let final_config = catalog_config_after_layer_writes(ctx, &cwd, &trust_policy, &planned_writes)?;
+        ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &final_config, false).await?;
+    }
     for provider_id in changed_provider_ids {
         let entry = config
             .providers
@@ -24440,89 +25299,149 @@ pub(super) async fn provider_models_fetch(
     };
     *response_generation = config_generation;
     Ok(response)
+    }).await
+}
+
+/// A small explicit limit for the pure trim regression; production computes
+/// its limit from the complete reader representation below.
+#[cfg(test)]
+pub(super) const MAX_PERSISTED_PROVIDER_VIEW_BYTES: usize =
+    proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES - 128 * 1024;
+
+/// Trim unprotected fetched models to the caller's measured provider budget.
+/// Manual/favorite entries and other providers are retained. The caller must
+/// check the complete snapshot before writing, even if trimming exhausts this
+/// provider's removable entries. Newly fetched entries go first, then older
+/// fetched entries. Auxiliary configuration is never silently discarded.
+pub(super) fn enforce_persisted_catalog_budget(
+    config: &mut crate::config::providers::ProvidersConfig,
+    provider_id: &str,
+    previous: &crate::config::providers::ProviderEntry,
+    fetched: &[crate::config::providers::ModelEntry],
+    limit: usize,
+) -> std::result::Result<u32, String> {
+    let fetched_ids = fetched
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let kept_count = |entry: &crate::config::providers::ProviderEntry| {
+        u32::try_from(
+            entry
+                .models
+                .iter()
+                .filter(|model| fetched_ids.contains(model.id.as_str()))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    };
+    let view_sizes = |config: &crate::config::providers::ProvidersConfig| {
+        let view = crate::secret_ref::redact_provider_view(config);
+        let total = serde_json::to_vec(&view)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        (
+            total,
+            editable_provider_entry_bytes(&view.providers[provider_id]),
+        )
+    };
+    let (total, editable) = view_sizes(config);
+    let entry = config
+        .providers
+        .get_mut(provider_id)
+        .expect("refreshed provider is configured");
+    if total <= limit && editable <= proto::MAX_OWNER_PROVIDER_ENTRY_BYTES {
+        return Ok(kept_count(entry));
+    }
+    for model in entry.models.iter_mut().filter(|model| !model.manual) {
+        model.provider_metadata.clear();
+        model.extra.clear();
+    }
+    let (total, editable) = view_sizes(config);
+    let entry = config
+        .providers
+        .get_mut(provider_id)
+        .expect("refreshed provider is configured");
+    if total <= limit && editable <= proto::MAX_OWNER_PROVIDER_ENTRY_BYTES {
+        return Ok(kept_count(entry));
+    }
+    let previous_ids = previous
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let protected = |model: &crate::config::providers::ModelEntry| model.manual || model.favorite;
+    // Each serialized model costs its JSON plus a separating comma. Newly
+    // fetched models go first (from the end of upstream order), then older
+    // fetched ones.
+    let mut excess = total
+        .saturating_sub(limit)
+        .max(editable.saturating_sub(proto::MAX_OWNER_PROVIDER_ENTRY_BYTES));
+    let mut drop = vec![false; entry.models.len()];
+    for newly_fetched_pass in [true, false] {
+        for (index, model) in entry.models.iter().enumerate().rev() {
+            if excess == 0 {
+                break;
+            }
+            if drop[index]
+                || protected(model)
+                || previous_ids.contains(model.id.as_str()) == newly_fetched_pass
+            {
+                continue;
+            }
+            let cost = serde_json::to_vec(model)
+                .map(|bytes| bytes.len() + 1)
+                .unwrap_or(0);
+            excess = excess.saturating_sub(cost);
+            drop[index] = true;
+        }
+    }
+    let mut index = 0;
+    entry.models.retain(|_| {
+        let keep = !drop[index];
+        index += 1;
+        keep
+    });
+    let kept = kept_count(entry);
+    if excess > 0 {
+        return Err(
+            "protected models or other configuration exceed the readable snapshot limit".into(),
+        );
+    }
+    Ok(kept)
 }
 
 pub(super) fn categorize_provider_model_fetch_error(
     error: &anyhow::Error,
 ) -> crate::daemon::proto::ProviderModelVerification {
-    if let Some(auth_error) = error.downcast_ref::<crate::providers::auth_check::AuthCheckError>() {
-        match auth_error {
-            crate::providers::auth_check::AuthCheckError::CredentialsRejected(message) => {
-                let status = provider_http_status(&message.to_ascii_lowercase()).unwrap_or(401);
-                return crate::daemon::proto::ProviderModelVerification::Unauthorized { status };
-            }
-            crate::providers::auth_check::AuthCheckError::Network(message) => {
-                return crate::daemon::proto::ProviderModelVerification::Network {
-                    message: bounded_provider_model_error(message),
-                };
-            }
-            crate::providers::auth_check::AuthCheckError::Other(_) => {}
-        }
-    }
     let message = crate::config::providers::redact_model_fetch_reason(error.to_string());
-    let lower = message.to_ascii_lowercase();
-    let status = provider_http_status(&lower);
-    if let Some(401) = status {
-        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 401 };
-    }
-    if let Some(403) = status {
-        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 403 };
-    }
-    if status == Some(404) {
-        return crate::daemon::proto::ProviderModelVerification::NotFound;
-    }
-    if let Some(status) = status.filter(|value| *value >= 400) {
-        return crate::daemon::proto::ProviderModelVerification::HttpStatus {
-            status,
-            snippet: bounded_provider_model_error(&message),
-        };
-    }
-    let message = bounded_provider_model_error(&message);
-    if lower.contains("unauthorized") {
-        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 401 };
-    }
-    if lower.contains("forbidden") || lower.contains("credentials rejected") {
-        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 403 };
-    }
-    if lower.contains("not found") {
-        return crate::daemon::proto::ProviderModelVerification::NotFound;
-    }
-    if lower.contains("json")
-        || lower.contains("model array")
-        || lower.contains("model list")
-        || lower.contains("parse")
-    {
-        return crate::daemon::proto::ProviderModelVerification::Parse { message };
-    }
-    if lower.contains("dns")
-        || lower.contains("tls")
-        || lower.contains("connect")
-        || lower.contains("timeout")
-        || lower.contains("sending request")
-        || lower.contains("request error")
-    {
-        return crate::daemon::proto::ProviderModelVerification::Network { message };
-    }
-    crate::daemon::proto::ProviderModelVerification::HttpStatus {
-        status: status.unwrap_or(500),
-        snippet: message,
-    }
+    let kind = error
+        .downcast_ref::<crate::providers::auth_check::AuthCheckError>()
+        .map(|error| error.failure_kind())
+        .unwrap_or_else(|| crate::providers::models_fetch::model_fetch_failure_kind(error));
+    provider_model_verification(kind, &message)
 }
 
-fn provider_http_status(message: &str) -> Option<u16> {
-    ["returned http ", "returned ", "rejected (", "http "]
-        .into_iter()
-        .find_map(|marker| {
-            let tail = message.split_once(marker)?.1;
-            let digits = tail
-                .trim_start_matches(|character: char| !character.is_ascii_digit())
-                .chars()
-                .take_while(|character| character.is_ascii_digit())
-                .collect::<String>();
-            (digits.len() == 3)
-                .then(|| digits.parse::<u16>().ok())
-                .flatten()
-        })
+fn provider_model_verification(
+    kind: crate::providers::models_fetch::ModelFetchFailureKind,
+    message: &str,
+) -> crate::daemon::proto::ProviderModelVerification {
+    use crate::daemon::proto::ProviderModelVerification;
+    use crate::providers::models_fetch::ModelFetchFailureKind;
+    let message = bounded_provider_model_error(message);
+    match kind {
+        ModelFetchFailureKind::HttpStatus(status) => match status.as_u16() {
+            401 | 403 => ProviderModelVerification::Unauthorized {
+                status: status.as_u16(),
+            },
+            404 => ProviderModelVerification::NotFound,
+            status => ProviderModelVerification::HttpStatus {
+                status,
+                snippet: message,
+            },
+        },
+        ModelFetchFailureKind::Network => ProviderModelVerification::Network { message },
+        ModelFetchFailureKind::Parse => ProviderModelVerification::Parse { message },
+    }
 }
 
 fn bounded_provider_model_error(message: &str) -> String {
@@ -24542,6 +25461,7 @@ async fn daemon_deep_provider_fetch(
     model_id: Option<&str>,
     store: crate::credentials::CredentialStore,
     env: &std::collections::HashMap<String, String>,
+    id_budget: &mut usize,
 ) -> std::result::Result<
     (
         Vec<crate::daemon::proto::ProviderModelFetchResult>,
@@ -24558,6 +25478,7 @@ async fn daemon_deep_provider_fetch(
     };
     let targets = collect_deepfetch_targets(config, &scope).map_err(internal)?;
     let mut resolved = std::collections::BTreeMap::new();
+    let mut credential_headers = Vec::new();
     let mut failures = std::collections::BTreeMap::new();
     for target in &targets {
         if resolved.contains_key(&target.provider_id) {
@@ -24576,6 +25497,7 @@ async fn daemon_deep_provider_fetch(
         .await;
         match request {
             Ok(request) => {
+                credential_headers.extend(request.headers.iter().cloned());
                 resolved.insert(target.provider_id.clone(), request);
             }
             Err(error) => {
@@ -24607,6 +25529,7 @@ async fn daemon_deep_provider_fetch(
             .await
             {
                 Ok(Some(request)) => {
+                    credential_headers.extend(request.headers.iter().cloned());
                     client.replace_resolved(target.provider_id.clone(), request);
                     probe = probe_target(&mut client, config, target).await;
                 }
@@ -24629,6 +25552,14 @@ async fn daemon_deep_provider_fetch(
             );
         }
     }
+    for id in provider_ids {
+        let entry = config.providers.get_mut(id).expect("selected provider");
+        entry.models = crate::providers::provider_http::scrub_catalog_models(
+            std::mem::take(&mut entry.models),
+            &credential_headers,
+        )
+        .map_err(internal)?;
+    }
     // Persistence happens only after the caller has a bounded complete
     // response; see `provider_models_fetch`.
     let completed = provider_ids
@@ -24647,9 +25578,16 @@ async fn daemon_deep_provider_fetch(
             .filter_map(|provider_id| {
                 config.providers.get(provider_id).map(|entry| {
                     let outcome = failures.get(provider_id).map_or_else(
-                        || crate::daemon::proto::ProviderModelFetchOutcome::Models {
-                            models: entry.models.clone(),
-                            catalog: entry.model_catalog,
+                        || {
+                            let models = proto::ProviderModelIdSummary::bounded(
+                                entry.models.iter().map(|model| model.id.clone()),
+                                id_budget,
+                            );
+                            crate::daemon::proto::ProviderModelFetchOutcome::Models {
+                                kept: models.count,
+                                models,
+                                catalog: entry.model_catalog,
+                            }
                         },
                         |message| crate::daemon::proto::ProviderModelFetchOutcome::Error {
                             message: message.clone(),
@@ -24693,11 +25631,15 @@ async fn provider_usage_snapshot(
         &crate::secret_ref::provider_credential_record_references(&config),
     )
     .map_err(internal)?;
-    let rows = crate::providers::usage::probes::fetch_all_provider_usage_with_store(
-        &config,
-        provider_id,
-        Some(store.clone()),
-        env.clone(),
+    let credential_table = provider_response_credential_table(&store, &config, &env)?;
+    let rows = crate::providers::provider_http::diagnostic_scope(
+        credential_table,
+        crate::providers::usage::probes::fetch_all_provider_usage_with_store(
+            &config,
+            provider_id,
+            Some(store.clone()),
+            env.clone(),
+        ),
     )
     .await
     .map_err(internal)?;
@@ -24812,12 +25754,25 @@ pub(super) fn redact_provider_response_text_with_values(
     secret_values: impl IntoIterator<Item = String>,
 ) -> String {
     let mut value = text.to_string();
+    let mut secret_values = secret_values.into_iter().collect::<Vec<_>>();
+    secret_values.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     for secret in secret_values {
         if !secret.is_empty() {
             value = value.replace(&secret, "[redacted]");
         }
     }
     crate::config::providers::redact_model_fetch_reason(value)
+}
+
+fn provider_response_credential_table(
+    store: &crate::credentials::CredentialStore,
+    config: &crate::config::providers::ProvidersConfig,
+    env: &std::collections::HashMap<String, String>,
+) -> std::result::Result<crate::redact::RedactionTable, ErrorPayload> {
+    crate::redact::RedactionTable::for_provider_credentials(provider_response_secret_values(
+        store, config, env,
+    ))
+    .map_err(internal)
 }
 
 /// Provider APIs can reflect credentials in error, quota, and even catalog
@@ -24839,6 +25794,25 @@ fn provider_response_secret_values(
     values.extend(configured_provider_env_values(config, |name| {
         env.get(name).cloned()
     }));
+    for header in config.providers.values().flat_map(|entry| &entry.headers) {
+        if !header.value.contains('$')
+            && !header.value.is_empty()
+            && !crate::providers::provider_http::public_header_literal(&header.name, &header.value)
+        {
+            values.insert(header.value.clone());
+            if let Some(value) =
+                crate::providers::provider_http::authorization_payload(&header.value)
+            {
+                values.insert(value.to_string());
+            }
+        }
+    }
+    let payloads = values
+        .iter()
+        .filter_map(|value| crate::providers::provider_http::authorization_payload(value))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    values.extend(payloads);
     values
 }
 
@@ -24849,15 +25823,21 @@ pub(super) fn configured_provider_env_values<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    config
-        .providers
-        .values()
-        .flat_map(|entry| &entry.headers)
-        .flat_map(|header| crate::envref::referenced_names(&header.value))
-        .filter(|name| !name.starts_with("secret:"))
-        .filter_map(|name| lookup(&name))
-        .filter(|value| !value.is_empty())
-        .collect()
+    let mut values = std::collections::BTreeSet::new();
+    for header in config.providers.values().flat_map(|entry| &entry.headers) {
+        for name in crate::envref::referenced_names(&header.value) {
+            if name.starts_with("secret:") {
+                continue;
+            }
+            if let Some(value) = lookup(&name)
+                && !value.is_empty()
+                && !crate::providers::provider_http::public_header_literal(&header.name, &value)
+            {
+                values.insert(value);
+            }
+        }
+    }
+    values
 }
 
 /// Fetch results contain upstream-owned strings such as model labels and
@@ -24869,31 +25849,59 @@ pub(super) fn scrub_provider_response(
     store: &crate::credentials::CredentialStore,
     env: &std::collections::HashMap<String, String>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    fn scrub_value(value: &mut serde_json::Value, secret_values: &[String]) {
+    fn scrub_value(
+        value: &mut serde_json::Value,
+        secret_values: &[String],
+        credential_table: &crate::redact::RedactionTable,
+        identity: bool,
+    ) -> std::result::Result<(), ErrorPayload> {
         match value {
             serde_json::Value::String(text) => {
-                *text =
-                    redact_provider_response_text_with_values(text, secret_values.iter().cloned());
+                if identity {
+                    // Never rename an identity after catalog decisions. Reject
+                    // before persistence if any producer missed the boundary.
+                    if crate::providers::provider_http::catalog_identity_contains_credentials(
+                        text,
+                        credential_table,
+                    ) {
+                        return Err(bad_request(
+                            "provider response contains an unsafe catalog identity",
+                        ));
+                    }
+                } else {
+                    *text = redact_provider_response_text_with_values(
+                        text,
+                        secret_values.iter().cloned(),
+                    );
+                }
             }
             serde_json::Value::Array(items) => {
                 for item in items {
-                    scrub_value(item, secret_values);
+                    scrub_value(item, secret_values, credential_table, identity)?;
                 }
             }
             serde_json::Value::Object(fields) => {
-                for value in fields.values_mut() {
-                    scrub_value(value, secret_values);
+                for (key, value) in fields {
+                    scrub_value(
+                        value,
+                        secret_values,
+                        credential_table,
+                        key == "ids" || key == "provider_id",
+                    )?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
-    let secret_values = provider_response_secret_values(store, config, env)
+    let credential_table = provider_response_credential_table(store, config, env)?;
+    let mut secret_values = provider_response_secret_values(store, config, env)
         .into_iter()
         .collect::<Vec<_>>();
+    secret_values.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     let mut value = serde_json::to_value(response).map_err(internal)?;
-    scrub_value(&mut value, &secret_values);
+    scrub_value(&mut value, &secret_values, &credential_table, false)?;
     serde_json::from_value(value).map_err(internal)
 }
 
@@ -25775,6 +26783,7 @@ async fn recover_provider_config_journals_inner(
                     )));
                 }
             }
+            bound_provider_mutation_receipt(&mut response)?;
             *response_json = serde_json::to_string(&response).map_err(internal)?;
         } else {
             // Legacy delete journals have no typed receipt, but still advance
@@ -26507,7 +27516,7 @@ async fn provider_config_save_under_lock(
     if let Some(old_entry) = config.providers.get(provider_id) {
         validate_unique_provider_header_names(&old_entry.headers)?;
         for (index, header) in entry.headers.iter_mut().enumerate() {
-            if header.value.trim() == "********"
+            if header.value.trim() == proto::PRESERVED_PROVIDER_HEADER_VALUE
                 && let Some(old_header) = old_entry
                     .headers
                     .iter()
@@ -26560,6 +27569,7 @@ async fn provider_config_save_under_lock(
             ));
         }
     }
+    entry.models_replace = true;
     let entry_json = serde_json::to_string(&entry).map_err(internal)?;
     let named_json = serde_json::to_string(&old_references.0).map_err(internal)?;
     let credentials_json = serde_json::to_string(&old_references.1).map_err(internal)?;
@@ -26580,11 +27590,12 @@ async fn provider_config_save_under_lock(
         .into_iter()
         .filter(|name| !staged_name_set.contains(name))
         .collect::<std::collections::BTreeSet<_>>();
-    let config_path = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
-        ctx.config_source()
-            .config_write_target_for_provider(&cwd, provider_id)
-    })
-    .map_err(config_write_target_error)?;
+    let config_path =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            ctx.config_source()
+                .config_write_target_for_provider(&cwd, provider_id)
+        })
+        .map_err(config_write_target_error)?;
     let config_path = prepare_user_level_write_target(ctx, &config_path)?;
     let raw_layer = crate::config::providers::ConfigDoc::load(&config_path)
         .map_err(internal)?
@@ -26594,6 +27605,14 @@ async fn provider_config_save_under_lock(
     intended_layer
         .providers
         .insert(provider_id.to_owned(), entry.clone());
+    let candidate = catalog_config_after_layer_writes(
+        ctx,
+        &cwd,
+        &trust_policy,
+        &std::collections::BTreeMap::from([(config_path.clone(), intended_layer.clone())]),
+    )?;
+    ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &candidate, false)
+        .await?;
     let intended_revision = provider_config_revision(ctx, &config_path, &intended_layer)?;
     let consumed_config_generation = inventory::current_config_generation();
     let intended_config_generation = consumed_config_generation
@@ -33698,5 +34717,38 @@ fn assistant_inbox_item_wire(
         created_at_unix_ms: item.created_at_unix_ms,
         delivered_at_unix_ms: item.delivered_at_unix_ms,
         human_read_at_unix_ms: item.human_read_at_unix_ms,
+    }
+}
+
+#[cfg(test)]
+mod provider_write_error_tests {
+    use super::*;
+
+    #[test]
+    fn provider_write_quota_mapping_preserves_typed_validation_and_io_faults() {
+        use crate::config::providers::ProviderWriteValidationError;
+        for kind in [
+            ProviderWriteValidationError::AuthoredEntryTooLarge,
+            ProviderWriteValidationError::DocumentTooLarge,
+        ] {
+            let error = anyhow::Error::new(kind).context("prospective provider write");
+            assert_eq!(provider_write_error(error).code, ErrorCode::BadRequest);
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::Other,
+        ] {
+            let error = anyhow::Error::new(std::io::Error::new(
+                kind,
+                "authored provider entry exceeds maximum length",
+            ))
+            .context("actual file I/O");
+            assert_eq!(
+                provider_write_error(error).code,
+                ErrorCode::Internal,
+                "error text must not turn an actual I/O fault into a quota rejection"
+            );
+        }
     }
 }

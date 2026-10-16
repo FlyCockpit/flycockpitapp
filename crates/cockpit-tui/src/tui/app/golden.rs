@@ -1019,11 +1019,9 @@ pub fn assert_onboarding_native_screens() {
         ("verify-fetching", None),
         (
             "verify-connected",
-            Some(crate::tui::onboarding::VerifyOutcome::Models(vec![
-                "gpt-5.4".into(),
-                "gpt-5.4-mini".into(),
-                "o4-mini".into(),
-            ])),
+            Some(crate::tui::onboarding::VerifyOutcome::Models(
+                vec!["gpt-5.4".into(), "gpt-5.4-mini".into(), "o4-mini".into()].into(),
+            )),
         ),
         (
             "verify-no-endpoint",

@@ -349,7 +349,11 @@ async fn fetch_onboarding_provider_models(
     provider_id: &str,
 ) -> Result<(crate::tui::onboarding::VerifyOutcome, u64), String> {
     use cockpit_proto::{ProviderModelFetchOutcome, Request, Response};
-    let response = client
+    // Keep the daemon's answer kinds apart: a transport failure means the
+    // local daemon is unreachable, a typed `ErrorPayload` means the daemon
+    // itself refused or failed the request, and only a categorized provider
+    // verification is about the provider (or the user's network).
+    let response = match client
         .request(Request::FetchProviderModels {
             project_root: project_root.to_string(),
             provider_id: Some(provider_id.to_string()),
@@ -359,8 +363,24 @@ async fn fetch_onboarding_provider_models(
             allow_fallback: false,
         })
         .await
-        .map_err(|error| error_chain(&error))?
-        .map_err(|error| error.to_string())?;
+    {
+        Err(error) => {
+            return Ok((
+                crate::tui::onboarding::VerifyOutcome::DaemonUnreachable(error_chain(&error)),
+                0,
+            ));
+        }
+        Ok(Err(error)) => {
+            return Ok((
+                crate::tui::onboarding::VerifyOutcome::Daemon {
+                    code: error.code.to_string(),
+                    message: error.message,
+                },
+                0,
+            ));
+        }
+        Ok(Ok(response)) => response,
+    };
     let Response::ProviderModelsFetched {
         mut results,
         config_generation,
@@ -392,15 +412,27 @@ async fn fetch_onboarding_provider_models(
             cockpit_proto::ProviderModelVerification::Parse { message } => {
                 crate::tui::onboarding::VerifyOutcome::Parse(message)
             }
+            cockpit_proto::ProviderModelVerification::CatalogTooLarge { message } => {
+                crate::tui::onboarding::VerifyOutcome::Failed(message)
+            }
         };
         return Ok((outcome, config_generation));
     }
     let outcome = match result.outcome {
-        ProviderModelFetchOutcome::Models { models, .. }
-        | ProviderModelFetchOutcome::FallbackAvailable { models, .. } => {
-            crate::tui::onboarding::VerifyOutcome::Models(
-                models.into_iter().map(|model| model.id).collect(),
-            )
+        ProviderModelFetchOutcome::Models { models, kept, .. } => {
+            crate::tui::onboarding::VerifyOutcome::Models(crate::tui::onboarding::ModelList {
+                total: usize::try_from(models.count).unwrap_or(usize::MAX),
+                kept: usize::try_from(kept).unwrap_or(usize::MAX),
+                ids: models.ids,
+            })
+        }
+        ProviderModelFetchOutcome::FallbackAvailable { models, .. } => {
+            let total = usize::try_from(models.count).unwrap_or(usize::MAX);
+            crate::tui::onboarding::VerifyOutcome::Models(crate::tui::onboarding::ModelList {
+                total,
+                kept: total,
+                ids: models.ids,
+            })
         }
         ProviderModelFetchOutcome::Unsupported => crate::tui::onboarding::VerifyOutcome::NoEndpoint,
         ProviderModelFetchOutcome::UnlistedModelsPreview { .. } => {
@@ -2326,6 +2358,7 @@ impl App {
                 );
                 let mutation = ProviderMutationBatch {
                     upserts: vec![ProviderMutationUpsert {
+                        model_patch: None,
                         provider_id: provider_id.clone(),
                         entry,
                         header_secrets,

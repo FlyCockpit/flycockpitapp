@@ -275,7 +275,7 @@ fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
     // hidden entries skipped), so the test never depends on `rg` being
     // installed. Rows keep ripgrep's `path:line:text` shape.
     let query = regex::Regex::new(
-        r"RedactionTable::build(?:_[[:alnum:]_]+)?|build_daemon_redaction_table|refresh_global_redaction_table|RedactionTable::empty",
+        r"RedactionTable::build(?:_[[:alnum:]_]+)?|build_daemon_redaction_table|refresh_global_redaction_table|RedactionTable::empty|RedactionTable::for_provider_credentials",
     )
     .expect("canonical redaction inventory regex");
     let mut rows = Vec::new();
@@ -310,6 +310,7 @@ fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
     let mut authority_internal = 0usize;
     let mut raw_export = 0usize;
     let mut inert_empty = 0usize;
+    let mut provider_credentials = 0usize;
     let mut unclassified = Vec::new();
     for row in stdout.lines() {
         let mut fields = row.splitn(3, ':');
@@ -334,6 +335,12 @@ fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
             continue;
         }
         match path_text {
+            "crates/cockpit-core/src/providers/provider_http.rs"
+            | "crates/cockpit-core/src/daemon/server/dispatch.rs"
+                if matched.contains("RedactionTable::for_provider_credentials") =>
+            {
+                provider_credentials += 1;
+            }
             "crates/cockpit-core/src/redact/coverage_authority.rs"
                 if matched.contains("RedactionTable::build_with_env_and_credential_store")
                     || matched
@@ -367,6 +374,10 @@ fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
         "raw export must be the sole typed raw branch"
     );
     assert_eq!(inert_empty, 5, "inert empty-table ownership changed");
+    assert_eq!(
+        provider_credentials, 2,
+        "provider credential-only ownership changed"
+    );
     assert!(
         unclassified.is_empty(),
         "unclassified production redaction constructions:\n{}",

@@ -198,11 +198,9 @@ pub async fn turn_with_backup(
     let mut strategy_set = false;
     let mut billing_backup_used = false;
     let mut attempt_ordinal = 0i64;
-    // The primary attempt suppresses its own red inline error whenever a backup
-    // MIGHT run (any candidate configured) or a custody block must append its
-    // reason; the terminal branch below re-emits exactly once when advancement
-    // finally stops. Only a no-candidate, no-custody primary emits its UI
-    // directly. Loop-invariant by construction.
+    // A first failure may be repaired by credential rebuilding even without
+    // a backup. Defer its UI until that decision; a terminal standalone retry
+    // can emit directly, while candidate/custody paths retain wrapper ownership.
     let emit_failure_ui = candidates.is_empty() && custody_block.is_none();
     // One display lifetime spans every physical primary/failover dispatch in
     // this logical call. A failed visible stream stays open until either the
@@ -222,6 +220,9 @@ pub async fn turn_with_backup(
     // attempt (primary + each failover candidate). A success returns out of the
     // function, so a later independent dispatch starts with a fresh latch.
     let mut credentials_rebuild_used = false;
+    // A provider can reflect credentials received on any earlier physical
+    // request in this logical dispatch, including after retry/failover.
+    let mut diagnostic_redact = redact.clone();
     loop {
         let current_model: &Model = match current {
             None => &agent.model,
@@ -283,9 +284,18 @@ pub async fn turn_with_backup(
         // before the failover selection below.
         let mut rebuilt_model: Option<Arc<Model>> = None;
         let mut rebuilt_redact: Option<Arc<RedactionTable>> = None;
+        let mut attempt_emits_failure_ui;
         let attempt_result = loop {
             let is_credentials_retry = rebuilt_model.is_some();
+            attempt_emits_failure_ui = emit_failure_ui && is_credentials_retry;
             let model_for_attempt: &Model = rebuilt_model.as_deref().unwrap_or(current_model);
+            diagnostic_redact = Arc::new(
+                diagnostic_redact
+                    .union(&model_for_attempt.session_redact_table())
+                    .map_err(|_| {
+                        anyhow::anyhow!("provider diagnostic credential coverage unavailable")
+                    })?,
+            );
             // The retry dispatches under the refreshed redaction table so the
             // freshly-resolved token is scrubbed on the recorded request too.
             let redact_for_attempt: &Arc<RedactionTable> =
@@ -314,7 +324,7 @@ pub async fn turn_with_backup(
                     review_cage.clone(),
                     context_usage,
                     deferred_log.clone(),
-                    emit_failure_ui,
+                    attempt_emits_failure_ui,
                     call_id,
                     attempt_ordinal,
                     // Tandem shadowing is a PRIMARY, first-attempt concern; a
@@ -361,7 +371,7 @@ pub async fn turn_with_backup(
             match credentials_rejected_rebuild::rebuild_model_for_credentials(
                 &session,
                 &config,
-                &redact,
+                &diagnostic_redact,
                 &dispatch_agent.env_overlay,
                 model_for_attempt,
             )
@@ -473,17 +483,19 @@ pub async fn turn_with_backup(
                     // a visible partial. Audit settlement above retains the
                     // failure/auth classification even when this live UI event
                     // is suppressed.
-                    if !emit_failure_ui && !display_error_emitted {
-                        // Route the raw provider detail through the omission
-                        // funnel: the user-facing reason is the fixed marker
-                        // (optionally prefixed to the advisory custody block),
-                        // never the provider body.
-                        let safe = crate::engine::model::safe_provider_detail(failure);
+                    if !attempt_emits_failure_ui && !display_error_emitted {
+                        // UI-only inline error: the scrubbed, bounded
+                        // structured provider message (never the raw body;
+                        // persisted/audit/report sinks keep the omission
+                        // marker), optionally followed by the advisory
+                        // custody block.
+                        let shown = crate::engine::model::user_facing_provider_error(
+                            failure,
+                            &diagnostic_redact,
+                        );
                         let detail = match applied_block {
-                            Some(block) => {
-                                format!("{}\n{}", safe.marker, block.user_message())
-                            }
-                            None => safe.marker_string(),
+                            Some(block) => format!("{shown}\n{}", block.user_message()),
+                            None => shown,
                         };
                         let _ = tx
                             .send(TurnEvent::InferenceFailed {
@@ -598,6 +610,8 @@ pub(crate) struct InferenceOutcomeRecord<'a> {
     pub(crate) emit_inference_error_ui: bool,
     pub(crate) goal_provenance: Option<(Uuid, i64)>,
     pub(crate) tx: &'a mpsc::Sender<TurnEvent>,
+    /// Session redaction table for the UI-only provider error projection.
+    pub(crate) redact: Arc<RedactionTable>,
 }
 
 pub(crate) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow::Error) {
@@ -614,6 +628,7 @@ pub(crate) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
         emit_inference_error_ui,
         goal_provenance,
         tx,
+        redact,
     } = ctx;
     // Goal provenance is stamped on the row at body-insert time; the terminal
     // settle only advances status + phase columns.
@@ -735,9 +750,9 @@ pub(crate) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
                 provider: failure.provider.clone(),
                 model: failure.model.clone(),
                 error_class: failure.class.clone(),
-                // Raw provider detail is omitted; the red inline error shows the
-                // fixed marker (the typed `error_class` carries the real class).
-                detail: crate::engine::model::safe_provider_detail(failure).marker_string(),
+                // UI-only: the scrubbed structured provider message, never the
+                // raw body (the audit record above keeps the omission marker).
+                detail: crate::engine::model::user_facing_provider_error(failure, &redact),
                 auth_failure: crate::engine::model::auth_failure_kind(failure),
             })
             .await;
@@ -766,6 +781,7 @@ pub(crate) async fn record_inference_outcome_for_export_test(
             emit_inference_error_ui: false,
             goal_provenance: None,
             tx: &tx,
+            redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
         },
         err,
     )
@@ -882,6 +898,7 @@ mod inference_outcome_tests {
                 emit_inference_error_ui: true,
                 goal_provenance: None,
                 tx: &tx,
+                redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             },
             &err,
         )
@@ -966,6 +983,7 @@ mod inference_outcome_tests {
                 emit_inference_error_ui: true,
                 goal_provenance: None,
                 tx: &tx,
+                redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             },
             &err,
         )
@@ -1065,6 +1083,7 @@ mod inference_outcome_tests {
                 emit_inference_error_ui: false,
                 goal_provenance: None,
                 tx: &tx,
+                redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             },
             &err,
         )
@@ -1143,6 +1162,7 @@ mod inference_outcome_tests {
                 emit_inference_error_ui: true,
                 goal_provenance: None,
                 tx: &tx,
+                redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             },
             &err,
         )
@@ -1211,6 +1231,7 @@ mod inference_outcome_tests {
                 emit_inference_error_ui: true,
                 goal_provenance: None,
                 tx: &tx,
+                redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             },
             &err,
         )
@@ -3012,6 +3033,415 @@ mod backup_fallback_tests {
              not a cache-invalidate-only reuse of the stale one"
         );
         let _ = drain(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn retained_client_after_table_replacement_scrubs_both_terminal_emitters() {
+        use cockpit_test_support::provider::{ScriptedProvider, Turn};
+        for wrapper in [false, true] {
+            let credential_directory = tempfile::tempdir().unwrap();
+            let provider = ScriptedProvider::builder().turn(Turn::HttpError {
+                status: 400,
+                body: serde_json::json!({"error":{"message":format!("useful nonsecret diagnostic old/+key fresh/+key {}",credential_directory.path().display()), "code":"invalid_request_error"}}).to_string(),
+            }).start().await;
+            let db = crate::db::Db::open_in_memory().unwrap();
+            let root = tempfile::tempdir().unwrap().keep();
+            let session = Arc::new(
+                Session::create_for_test(
+                    db.clone(),
+                    root,
+                    "Build",
+                    crate::session::test_redaction_key_resolver(),
+                )
+                .unwrap(),
+            );
+            session.install_test_external_journal();
+            let mut cfg = ProvidersConfig::default();
+            cfg.providers.insert(
+                "cloud".into(),
+                ProviderEntry {
+                    url: provider.base_url(),
+                    headers: vec![
+                        crate::config::providers::HeaderSpec {
+                            name: "x-api-key".into(),
+                            value: "$RETAINED_TEST_KEY".into(),
+                        },
+                        crate::config::providers::HeaderSpec {
+                            name: "x-private-path".into(),
+                            value: "$RETAINED_TEST_PATH".into(),
+                        },
+                    ],
+                    models: vec![ModelEntry {
+                        id: "m".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let table = Arc::new(RedactionTable::empty());
+            let store = crate::credentials::CredentialStore::from_vault(
+                crate::secure_key::vault_for_db(&db).unwrap(),
+            )
+            .unwrap();
+            let mut primary = Model::for_provider_with_store(
+                &cfg,
+                "cloud",
+                "m",
+                table.clone(),
+                |name: &str| {
+                    Some(if name == "RETAINED_TEST_PATH" {
+                        credential_directory.path().display().to_string()
+                    } else {
+                        "old/+key".into()
+                    })
+                },
+                store,
+            )
+            .unwrap();
+            let discovered = Arc::new(
+                table
+                    .with_forced_literal("fresh/+key".into(), "new discovery".into())
+                    .unwrap(),
+            );
+            primary
+                .set_redact_table_for_config(&cfg, discovered)
+                .unwrap();
+            let agent = agent_with(Arc::new(primary));
+            let locks = Arc::new(crate::locks::LockManager::in_memory(
+                crate::db::Db::open_in_memory().unwrap(),
+            ));
+            let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+            let call_id = Uuid::new_v4();
+            let cwd = session.project_root.clone();
+            let outcome = turn_with_backup(
+                &agent,
+                wrapper.then_some(&agent.model),
+                &[],
+                &mut Vec::new(),
+                Message::user("hello"),
+                session.clone(),
+                locks,
+                table.clone(),
+                cwd,
+                crate::daemon::session_worker::SessionConfigHandle::detached(
+                    crate::daemon::session_worker::SessionConfigSnapshot::new(
+                        0,
+                        cfg.clone(),
+                        crate::config::extended::ExtendedConfig::default(),
+                    ),
+                ),
+                Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+                None,
+                None,
+                crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+                false,
+                crate::skills::manage::SkillWriteOrigin::Foreground,
+                None,
+                crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                crate::engine::deferred::DeferredLog::new(),
+                call_id,
+                None,
+                None,
+                None,
+                &tx,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(crate::engine::model::as_inference_failure(&outcome).is_some());
+            assert_eq!(
+                provider.request_count(),
+                1,
+                "retained client, no rebuild or second probe"
+            );
+            let captured = provider.captured();
+            assert!(
+                captured[0]
+                    .headers
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("x-api-key")
+                        && value == "old/+key")
+            );
+            let events = drain(&mut rx);
+            let details = events
+                .iter()
+                .filter_map(|event| match event {
+                    TurnEvent::InferenceFailed { detail, .. } => Some(detail),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(details.len(), 1);
+            assert!(
+                !details[0].contains("old/+"),
+                "retained credential leaked: {}",
+                details[0]
+            );
+            assert!(
+                !details[0].contains("fresh/+"),
+                "new discovery lost: {}",
+                details[0]
+            );
+            assert!(
+                !details[0].contains(&credential_directory.path().display().to_string()),
+                "private path credential leaked"
+            );
+            assert!(details[0].contains("useful nonsecret diagnostic"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rotated_terminal_error_uses_attempt_credentials_in_both_emitters() {
+        use cockpit_test_support::provider::{CapturedRequest, ScriptedProvider, Turn, Usage};
+
+        for mode in 0..3 {
+            let wrapper = mode != 0;
+            let body = serde_json::json!({"error": {
+                "message": "useful nonsecret diagnostic known/session-fresh/+fragment-0042 known/session-stale/+fragment-0042",
+                "code": "invalid_request_error",
+            }}).to_string();
+            let mut builder = ScriptedProvider::builder()
+                .turn(Turn::HttpError {
+                    status: 401,
+                    body: r#"{"error":{"message":"unauthorized"}}"#.into(),
+                })
+                .turn(Turn::HttpError {
+                    status: if mode == 2 { 503 } else { 400 },
+                    body: body.clone(),
+                });
+            if mode == 2 {
+                builder = builder.turn(Turn::HttpError { status: 400, body });
+            }
+            let provider = builder
+                .with_usage(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                    use_alias_names: false,
+                })
+                .start()
+                .await;
+
+            // Session whose vault holds the provider-owned command-backed secret.
+            let db = crate::db::Db::open_in_memory().unwrap();
+            let root = tempfile::tempdir().unwrap().keep();
+            let session = Arc::new(
+                Session::create_for_test(
+                    db.clone(),
+                    root,
+                    "Build",
+                    crate::session::test_redaction_key_resolver(),
+                )
+                .unwrap(),
+            );
+            session.install_test_external_journal();
+            let vault = crate::secure_key::vault_for_db(&db).unwrap();
+            let mut store = crate::credentials::CredentialStore::from_vault(vault).unwrap();
+            store
+                .set_named_secret_command(
+                    "ghcmd",
+                    vec!["gh".to_string(), "auth".to_string(), "token".to_string()],
+                )
+                .unwrap();
+            store.save().unwrap();
+            claim_provider_ownership_row(&db, "ghcmd", &session.project_root);
+
+            // startup resolves the stale token; the rebuild re-resolves the fresh one.
+            let cache = crate::secret_command::CommandSecretCache::new(Arc::new(
+                SequencedCommandExecutor {
+                    values: vec![
+                        "known/session-stale/+fragment-0042".to_string(),
+                        "known/session-fresh/+fragment-0042".to_string(),
+                    ],
+                    next: std::sync::atomic::AtomicUsize::new(0),
+                },
+            ));
+            session.set_command_secret_cache(Some(cache.clone()));
+
+            let mut cfg = ProvidersConfig::default();
+            cfg.providers.insert(
+                "cloud".into(),
+                ProviderEntry {
+                    url: provider.base_url(),
+                    // Trusted so the captured wire request is raw (no egress
+                    // redaction), letting the retry's Authorization header be
+                    // asserted against the freshly-resolved token directly.
+                    models: vec![ModelEntry {
+                        id: "m".into(),
+                        trust: Some(ModelTrust::Trusted),
+                        ..ModelEntry::default()
+                    }],
+                    headers: vec![crate::config::providers::HeaderSpec {
+                        name: "Authorization".into(),
+                        value: "Bearer $secret:ghcmd".into(),
+                    }],
+                    timeout: TimeoutConfig {
+                        ttft_secs: 5,
+                        idle_secs: 5,
+                    },
+                    ..ProviderEntry::default()
+                },
+            );
+
+            // Async startup pre-resolution → cache holds the stale token (exec 1).
+            session
+                .reresolve_provider_command_secrets(&cfg, "cloud")
+                .await;
+            assert_eq!(cache.exec_count(), 1);
+
+            // The primary client, built from the owner-scoped store, sends the stale
+            // token → the provider's first turn 401s.
+            let table = Arc::new(RedactionTable::empty());
+            let store_for_model = session.provider_credential_store(&cfg).unwrap();
+            let primary = Arc::new(
+                Model::for_provider_with_store(
+                    &cfg,
+                    "cloud",
+                    "m",
+                    table.clone(),
+                    |_name: &str| -> Option<String> { None },
+                    store_for_model,
+                )
+                .unwrap(),
+            );
+            let mut agent = agent_with(primary);
+            // A turn whose ordinary HTTP retry budget is already spent still
+            // rebuilds rejected credentials and hands terminal 503s to backup.
+            // Keep those three distinct physical dispatches explicit here.
+            let retry_budget = crate::engine::delegation_budget::TurnRetryBudget::new(1);
+            assert!(retry_budget.allow_retry(), "spend the prior turn retry");
+            assert!(
+                !retry_budget.allow_retry(),
+                "ordinary retries are exhausted"
+            );
+            agent.params.retry_budget = Some(retry_budget);
+
+            let locks = Arc::new(crate::locks::LockManager::in_memory(
+                crate::db::Db::open_in_memory().unwrap(),
+            ));
+            let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+            let call_id = Uuid::new_v4();
+            let cwd = session.project_root.clone();
+
+            let outcome = turn_with_backup(
+                &agent,
+                wrapper.then_some(&agent.model),
+                &[],
+                &mut Vec::new(),
+                Message::user("hello"),
+                session.clone(),
+                locks,
+                table.clone(),
+                cwd,
+                crate::daemon::session_worker::SessionConfigHandle::detached(
+                    crate::daemon::session_worker::SessionConfigSnapshot::new(
+                        0,
+                        cfg.clone(),
+                        crate::config::extended::ExtendedConfig::default(),
+                    ),
+                ),
+                Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+                None,
+                None,
+                crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+                false,
+                crate::skills::manage::SkillWriteOrigin::Foreground,
+                None,
+                crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                crate::engine::deferred::DeferredLog::new(),
+                call_id,
+                None,
+                None,
+                None,
+                &tx,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(crate::engine::model::as_inference_failure(&outcome).is_some());
+            // Exactly one re-resolve on the rebuild (startup exec + one).
+            assert_eq!(
+                cache.exec_count(),
+                2,
+                "one and only one re-resolve on the rebuild"
+            );
+
+            // Two physical attempts under one call_id at distinct ordinals.
+            let attempts = session
+                .db
+                .list_inference_requests_for_call(&call_id.to_string())
+                .await
+                .unwrap();
+            assert_eq!(
+                attempts.len(),
+                if mode == 2 { 3 } else { 2 },
+                "primary 401 + rebuilt retry are distinct rows"
+            );
+            assert_eq!(attempts[0].ordinal, 0);
+            assert_eq!(attempts[1].ordinal, 1);
+
+            // The retry dispatched a DISTINCT rebuilt client carrying the FRESH token.
+            let captured = provider.captured();
+            assert_eq!(
+                captured.len(),
+                if mode == 2 { 3 } else { 2 },
+                "primary + retry + optional failover"
+            );
+            let auth = |req: &CapturedRequest| {
+                req.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            };
+            assert!(
+                auth(&captured[0]).contains("known/session-stale/+fragment-0042"),
+                "the primary sent the stale token"
+            );
+            assert!(
+                auth(&captured[1]).contains("known/session-fresh/+fragment-0042"),
+                "the retry sent the freshly-resolved token — a distinct rebuilt client, \
+             not a cache-invalidate-only reuse of the stale one"
+            );
+            if mode == 2 {
+                assert!(
+                    auth(&captured[2]).contains("known/session-stale/+fragment-0042"),
+                    "the final candidate uses its earlier client while reflecting the fresh credential from the prior retry"
+                );
+            }
+            let events = drain(&mut rx);
+            let details = events
+                .iter()
+                .filter_map(|event| match event {
+                    TurnEvent::InferenceFailed { detail, .. } => Some(detail.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(details.len(), 1, "one terminal emitter: wrapper={wrapper}");
+            assert!(
+                !details[0].contains("known/session-fresh"),
+                "fresh credential escaped: {}",
+                details[0]
+            );
+            assert!(
+                !details[0].contains("known/session-stale"),
+                "old credential escaped: {}",
+                details[0]
+            );
+            assert!(
+                details[0].contains("useful nonsecret diagnostic"),
+                "{}",
+                details[0]
+            );
+            assert!(
+                details[0].contains("invalid_request_error"),
+                "{}",
+                details[0]
+            );
+        }
     }
 
     /// AC3/AC5 (HIGH #3, real path): the credentials rebuild latch is scoped to

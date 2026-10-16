@@ -672,9 +672,21 @@ pub enum Response {
         base_revision: String,
         config_generation: u64,
     },
+    /// A UTF-8 slice of the serialized complete ProviderCatalogSnapshot. Each
+    /// page is independently within the interactive frame budget; the client
+    /// assembles only contiguous pages with an identical SHA-256 digest.
+    ProviderCatalogPage {
+        snapshot_digest: String,
+        offset: usize,
+        total_bytes: usize,
+        json: String,
+    },
+    /// Summary of a daemon-owned catalog refresh. Deliberately carries no
+    /// provider config: a refreshed catalog can be arbitrarily large, so
+    /// clients that need the persisted entries re-read them with
+    /// `GetProviderCatalogSnapshot` at (or after) `config_generation`.
     ProviderModelsFetched {
         results: Vec<ProviderModelFetchResult>,
-        config: ProviderConfigView,
         /// Config authority after any fetched catalog was durably published.
         config_generation: u64,
     },
@@ -699,6 +711,11 @@ pub enum Response {
         result_revision: String,
         config_generation: u64,
         config: ProviderConfigView,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::ProviderCatalogReadback::is_inline"
+        )]
+        catalog_readback: crate::ProviderCatalogReadback,
         status: crate::ConfigCommitStatus,
         publication: crate::ConfigPublicationStatus,
     },
@@ -1774,6 +1791,7 @@ macro_rules! response_variants {
             (Response::McpOAuthCancelled { .. }, "mcp_oauth_cancelled");
             (Response::McpConfigCommitted { .. }, "mcp_config_committed");
             (Response::ProviderCatalogSnapshot { .. }, "provider_catalog_snapshot");
+            (Response::ProviderCatalogPage { .. }, "provider_catalog_page");
             (Response::ProviderModelsFetched { .. }, "provider_models_fetched");
             (Response::ProviderUsageSnapshot { .. }, "provider_usage_snapshot");
             (Response::ProviderConfigUpserted { .. }, "provider_config_upserted");

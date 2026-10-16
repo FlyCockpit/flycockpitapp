@@ -1,0 +1,1399 @@
+//! Real transport → daemon → catalog writes, with independent persisted read-back.
+use super::*;
+use crate::config::providers::{
+    AuthKind, ConfigDoc, HeaderSpec, ModelEntry, OnUnlistedModelsFetch, ProviderEntry,
+    ProviderModelCatalog, ProvidersConfig,
+};
+use crate::daemon::proto::{ProviderModelFetchOutcome, ProviderModelVerification};
+use std::collections::HashSet;
+
+fn seed(path: &Path, id: &str, entry: ProviderEntry) {
+    let mut config = ProvidersConfig::default();
+    config.providers.insert(id.into(), entry);
+    ConfigDoc::load(path).unwrap().write(&config).unwrap();
+}
+
+async fn fetch(
+    ctx: &DaemonContext,
+    workspace: &Path,
+    id: &str,
+    policy: Option<OnUnlistedModelsFetch>,
+    consent: bool,
+    env: HashMap<String, String>,
+) -> proto::ProviderModelFetchResult {
+    let response = provider_models_fetch(
+        ctx,
+        &workspace.to_string_lossy(),
+        Some(id),
+        None,
+        false,
+        policy,
+        consent,
+        env,
+    )
+    .await
+    .unwrap();
+    let Response::ProviderModelsFetched { mut results, .. } = response else {
+        panic!("wrong daemon response: {response:?}");
+    };
+    assert_eq!(results.len(), 1);
+    results.remove(0)
+}
+
+async fn reject_fetch(
+    ctx: &DaemonContext,
+    workspace: &Path,
+    id: &str,
+    policy: Option<OnUnlistedModelsFetch>,
+    consent: bool,
+    env: HashMap<String, String>,
+) -> ErrorPayload {
+    let error = provider_models_fetch(
+        ctx,
+        &workspace.to_string_lossy(),
+        Some(id),
+        None,
+        false,
+        policy,
+        consent,
+        env,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    error
+}
+
+fn read_entry(path: &Path, id: &str) -> ProviderEntry {
+    ConfigDoc::providers_from_paths(&[path.to_path_buf()])
+        .providers
+        .remove(id)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn fetched_catalog_duplicates_are_coalesced_before_preview_summary_and_save() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body = r#"{"data":[{"id":"same","name":"first"},{"id":"same","name":"second"},{"id":"Same"},{"id":"模型"},{"id":"模型"}]}"#;
+    for existing_catalog in [false, true] {
+        let requests = if existing_catalog { 2 } else { 1 };
+        let (url, server) = crate::providers::provider_http::serve_test_bodies(
+            (0..requests).map(|_| (200, body.into(), true)).collect(),
+        )
+        .await;
+        seed(
+            &path,
+            "local",
+            ProviderEntry {
+                url,
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: if existing_catalog {
+                    vec![ModelEntry {
+                        id: "old".into(),
+                        ..Default::default()
+                    }]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            },
+        );
+        if existing_catalog {
+            let before = std::fs::read(global_provider_path("local")).unwrap();
+            let preview = fetch(
+                &ctx,
+                &workspace,
+                "local",
+                Some(OnUnlistedModelsFetch::Ask),
+                false,
+                HashMap::new(),
+            )
+            .await;
+            let ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted } = preview.outcome
+            else {
+                panic!("{preview:?}");
+            };
+            assert_eq!(unlisted.count, 1);
+            assert_eq!(unlisted.ids, ["old"]);
+            assert_eq!(
+                std::fs::read(global_provider_path("local")).unwrap(),
+                before
+            );
+        }
+        let result = fetch(
+            &ctx,
+            &workspace,
+            "local",
+            Some(OnUnlistedModelsFetch::Keep),
+            false,
+            HashMap::new(),
+        )
+        .await;
+        let ProviderModelFetchOutcome::Models { models, kept, .. } = result.outcome else {
+            panic!("{result:?}");
+        };
+        assert_eq!(
+            models.count, 3,
+            "duplicate IDs must not inflate the summary"
+        );
+        assert_eq!(models.ids, ["same", "Same", "模型"]);
+        assert_eq!(kept, 3);
+        let saved = read_entry(&path, "local");
+        let expected = if existing_catalog {
+            vec!["same", "Same", "模型", "old"]
+        } else {
+            vec!["same", "Same", "模型"]
+        };
+        assert_eq!(
+            saved
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(saved.models[0].name.as_deref(), Some("first"));
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unsafe_catalog_collisions_reject_without_dropping_or_readdressing_models() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    const SECRET: &str = "synthetic-catalog-credential-0042";
+    let body =
+        serde_json::json!({"data":[{"id":SECRET},{"id":SECRET},{"id":"distinct"}]}).to_string();
+    let (url, server) =
+        crate::providers::provider_http::serve_test_bodies(vec![(200, body, true)]).await;
+    seed(
+        &path,
+        "local",
+        ProviderEntry {
+            url,
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: "Bearer $CATALOG_KEY".into(),
+            }],
+            ..Default::default()
+        },
+    );
+    let before = std::fs::read(global_provider_path("local")).unwrap();
+    let result = reject_fetch(
+        &ctx,
+        &workspace,
+        "local",
+        None,
+        false,
+        HashMap::from([("CATALOG_KEY".into(), SECRET.into())]),
+    )
+    .await;
+    let encoded = serde_json::to_string(&result).unwrap();
+    assert!(!encoded.contains(SECRET));
+    assert_eq!(
+        std::fs::read(global_provider_path("local")).unwrap(),
+        before,
+        "unsafe operational IDs must reject the entire write, including policy/status"
+    );
+    assert!(read_entry(&path, "local").models.is_empty());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn catalog_parse_class_is_independent_of_body_text_and_shape() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for template in [None, Some("openai-compatible")] {
+        for body in [
+            "hello",
+            "not found",
+            "DNS connect timeout",
+            "returned 401",
+            "42",
+            "{}",
+            r#"{"data":7}"#,
+        ] {
+            let (url, server) =
+                crate::providers::provider_http::serve_test_bodies(vec![(200, body.into(), true)])
+                    .await;
+            seed(
+                &path,
+                "local",
+                ProviderEntry {
+                    template: template.map(str::to_string),
+                    url,
+                    allow_insecure_http: true,
+                    auth: Some(AuthKind::None),
+                    models: vec![ModelEntry {
+                        id: "existing".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let before = std::fs::read(global_provider_path("local")).unwrap();
+            let result = fetch(&ctx, &workspace, "local", None, false, HashMap::new()).await;
+            assert!(
+                matches!(
+                    result.verification,
+                    Some(ProviderModelVerification::Parse { .. })
+                ),
+                "{template:?} {body}: {result:?}"
+            );
+            assert!(matches!(
+                result.outcome,
+                ProviderModelFetchOutcome::Error { .. }
+            ));
+            assert_eq!(read_entry(&path, "local").models[0].id, "existing");
+            assert_eq!(
+                std::fs::read(global_provider_path("local")).unwrap(),
+                before
+            );
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn catalog_observed_status_survives_long_url_scrubbing_and_body_spoofing() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for template in [Some("openai-compatible"), None, Some("z-ai")] {
+        for status in [403, 401, 404, 418] {
+            let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+                status,
+                "returned HTTP 401 not found DNS timeout".into(),
+                true,
+            )])
+            .await;
+            seed(
+                &path,
+                "local",
+                ProviderEntry {
+                    template: template.map(str::to_string),
+                    url: format!("{url}/{}", "long-segment/".repeat(30)),
+                    allow_insecure_http: true,
+                    auth: Some(AuthKind::None),
+                    models: vec![ModelEntry {
+                        id: "existing".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let before = std::fs::read(global_provider_path("local")).unwrap();
+            let result = fetch(&ctx, &workspace, "local", None, false, HashMap::new()).await;
+            assert!(
+                match (status, &result.verification) {
+                    (
+                        401 | 403,
+                        Some(ProviderModelVerification::Unauthorized { status: observed }),
+                    ) => *observed == status,
+                    (404, Some(ProviderModelVerification::NotFound)) => true,
+                    (418, Some(ProviderModelVerification::HttpStatus { status: 418, .. })) => true,
+                    _ => false,
+                },
+                "{template:?} observed {status}: {result:?}"
+            );
+            assert_eq!(read_entry(&path, "local").models[0].id, "existing");
+            assert_eq!(
+                std::fs::read(global_provider_path("local")).unwrap(),
+                before
+            );
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn codex_network_fallback_retains_kind_privacy_and_explicit_consent() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    const SECRET: &str = "synthetic-codex-fallback-access-0042";
+    ctx.mutate_owner_vault_item(cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+        crate::auth::codex_oauth::CREDENTIAL_KEY,
+        Some(&serde_json::to_vec(&serde_json::json!({"access_token":SECRET,"refresh_token":"synthetic-refresh","account_id":"synthetic-account","expires_at":i64::MAX})).unwrap())
+    ).await.unwrap();
+    // Reserve an address and close it: real connection refusal, no HTTP status.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    seed(
+        &path,
+        "codex-oauth",
+        ProviderEntry {
+            url: format!("http://{address}/{SECRET}"),
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            credential_ref: Some(crate::auth::codex_oauth::CREDENTIAL_KEY.into()),
+            models: vec![ModelEntry {
+                id: "existing".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    for consent in [false, true] {
+        let result = fetch(
+            &ctx,
+            &workspace,
+            "codex-oauth",
+            None,
+            consent,
+            HashMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(
+                result.verification,
+                Some(ProviderModelVerification::Network { .. })
+            ),
+            "{result:?}"
+        );
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(
+            !encoded.contains(SECRET),
+            "fallback diagnostics must scrub the actual resolved credential"
+        );
+        let ProviderModelFetchOutcome::FallbackAvailable {
+            models,
+            catalog,
+            reason,
+        } = result.outcome
+        else {
+            panic!("{result:?}");
+        };
+        assert_eq!(catalog, ProviderModelCatalog::CodexFallback);
+        assert_eq!(models.count, 3);
+        assert!(!reason.is_empty());
+        let saved = read_entry(&path, "codex-oauth");
+        if consent {
+            assert_eq!(saved.model_catalog, ProviderModelCatalog::CodexFallback);
+            for id in models.ids {
+                assert!(saved.models.iter().any(|m| m.id == id));
+            }
+        } else {
+            assert_eq!(
+                saved
+                    .models
+                    .iter()
+                    .map(|m| m.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["existing"]
+            );
+            assert_ne!(saved.model_catalog, ProviderModelCatalog::CodexFallback);
+        }
+        assert!(
+            !saved
+                .last_model_fetch
+                .unwrap()
+                .reason
+                .unwrap()
+                .contains(SECRET)
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_fallback_parse_and_status_are_observations_not_diagnostic_keywords() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    const SECRET: &str = "synthetic-codex-fallback-status-0042";
+    ctx.mutate_owner_vault_item(cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+        crate::auth::codex_oauth::CREDENTIAL_KEY,
+        Some(&serde_json::to_vec(&serde_json::json!({"access_token":SECRET,"refresh_token":"synthetic-refresh","account_id":"synthetic-account","expires_at":i64::MAX})).unwrap())
+    ).await.unwrap();
+    for (status, body) in [
+        (200, "hello"),
+        (200, "not found"),
+        (200, "42"),
+        (200, r#"{"data":[]}"#),
+        (404, "DNS timeout"),
+        (418, "returned 401"),
+        (401, "hello"),
+        (403, "hello"),
+    ] {
+        let (url, server) =
+            crate::providers::provider_http::serve_test_bodies(vec![(status, body.into(), true)])
+                .await;
+        seed(
+            &path,
+            "codex-oauth",
+            ProviderEntry {
+                url: format!("{url}/{SECRET}/{}", "long-segment/".repeat(30)),
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                credential_ref: Some(crate::auth::codex_oauth::CREDENTIAL_KEY.into()),
+                models: vec![ModelEntry {
+                    id: "existing".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let result = fetch(&ctx, &workspace, "codex-oauth", None, false, HashMap::new()).await;
+        assert!(
+            match (status, &result.verification) {
+                (200, Some(ProviderModelVerification::Parse { .. })) => true,
+                (404, Some(ProviderModelVerification::NotFound)) => true,
+                (418, Some(ProviderModelVerification::HttpStatus { status: 418, .. })) => true,
+                (401 | 403, Some(ProviderModelVerification::Unauthorized { status: observed })) =>
+                    *observed == status,
+                _ => false,
+            },
+            "observed {status} / {body}: {result:?}"
+        );
+        assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
+        if status == 401 || status == 403 {
+            assert!(
+                matches!(result.outcome, ProviderModelFetchOutcome::Error { .. }),
+                "rejected credentials cannot activate fallback"
+            );
+        } else {
+            assert!(matches!(
+                result.outcome,
+                ProviderModelFetchOutcome::FallbackAvailable { .. }
+            ));
+        }
+        assert_eq!(read_entry(&path, "codex-oauth").models[0].id, "existing");
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn distinct_catalog_ids_survive_the_final_response_scrubber_unchanged() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let prefix = format!("vendor/{}", "long-prefix/".repeat(30));
+    let ids = vec![
+        "a".repeat(48),
+        "b".repeat(48),
+        format!("{prefix}first"),
+        format!("{prefix}second"),
+        "~ordinary".into(),
+        format!("~{}", "a".repeat(64)),
+        cockpit_config::config::extended::RedactConfig::default().placeholder,
+        "[redacted]".into(),
+        format!("~{}", "G".repeat(64)),
+        r#"{"payload":" {\"n\": 1} "}"#.into(),
+        r#"{"payload":"{\"n\":1}"}"#.into(),
+    ];
+    for envelope in ["data", "models", "array"] {
+        let rows = ids
+            .iter()
+            .map(|id| serde_json::json!({"id":id}))
+            .collect::<Vec<_>>();
+        let body = match envelope {
+            "data" => serde_json::json!({"data":rows}),
+            "models" => serde_json::json!({"models":rows}),
+            _ => serde_json::json!(rows),
+        }
+        .to_string();
+        let (url, server) =
+            crate::providers::provider_http::serve_test_bodies(vec![(200, body, true)]).await;
+        seed(
+            &path,
+            "local",
+            ProviderEntry {
+                url,
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                ..Default::default()
+            },
+        );
+        let result = fetch(&ctx, &workspace, "local", None, false, HashMap::new()).await;
+        let ProviderModelFetchOutcome::Models { models, .. } = result.outcome else {
+            panic!("{result:?}");
+        };
+        assert_eq!(models.count as usize, ids.len());
+        assert_eq!(
+            models.ids, ids,
+            "final diagnostics must not collapse or truncate distinct catalog IDs"
+        );
+        assert_eq!(
+            read_entry(&path, "local")
+                .models
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unsafe_catalog_secret_marker_and_nested_ids_reject_before_write() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    const ONE: &str = "synthetic-r16-catalog-private-one-0042";
+    const TWO: &str = "COCKPIT";
+    const THREE: &str = "synthetic-r16-catalog-private-three-0042";
+    let marker = cockpit_config::config::extended::RedactConfig::default().placeholder;
+    let projected_marker = marker.replace(TWO, "[redacted]");
+    let encoded_secret = ONE
+        .chars()
+        .map(|ch| format!("\\u{:04x}", ch as u32))
+        .collect::<String>();
+    let nested = format!("{{\"credential\":\"{encoded_secret}\"}}");
+    let spaced_nested = format!(" {{\"credential\": \"{encoded_secret}\"}} ");
+    let rows = serde_json::json!([
+        {"id":ONE,"name":"first"}, {"id":ONE,"name":"duplicate"},
+        {"id":THREE,"name":"other secret"}, {"id":marker,"name":"marker"},
+        {"id":projected_marker,"name":"literal"}, {"id":"ordinary-distinct","name":"ordinary"},
+        {"id":nested,"name":"nested"}, {"id":spaced_nested,"name":"spaced nested"}
+    ]);
+    for policy in [OnUnlistedModelsFetch::Keep, OnUnlistedModelsFetch::Remove] {
+        for body in [
+            serde_json::json!({"data":rows}),
+            serde_json::json!({"models":rows}),
+            rows.clone(),
+        ] {
+            let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+                200,
+                body.to_string(),
+                true,
+            )])
+            .await;
+            seed(
+                &path,
+                "local",
+                ProviderEntry {
+                    url,
+                    allow_insecure_http: true,
+                    auth: Some(AuthKind::None),
+                    headers: vec![
+                        HeaderSpec {
+                            name: "X-Private-One".into(),
+                            value: "$R16_ONE".into(),
+                        },
+                        HeaderSpec {
+                            name: "X-Private-Two".into(),
+                            value: "$R16_TWO".into(),
+                        },
+                        HeaderSpec {
+                            name: "X-Private-Three".into(),
+                            value: "$R16_THREE".into(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+            );
+            let before = std::fs::read(global_provider_path("local")).unwrap();
+            let result = reject_fetch(
+                &ctx,
+                &workspace,
+                "local",
+                Some(policy),
+                false,
+                HashMap::from([
+                    ("R16_ONE".into(), ONE.into()),
+                    ("R16_TWO".into(), TWO.into()),
+                    ("R16_THREE".into(), THREE.into()),
+                ]),
+            )
+            .await;
+            let encoded = serde_json::to_string(&result).unwrap();
+            for secret in [ONE, TWO, THREE] {
+                assert!(!encoded.contains(secret), "credential in published result");
+            }
+            assert_eq!(
+                std::fs::read(global_provider_path("local")).unwrap(),
+                before
+            );
+            assert!(read_entry(&path, "local").models.is_empty());
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn unsafe_existing_catalog_rejects_preview_and_later_write_with_exact_preimage() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let marker = cockpit_config::config::extended::RedactConfig::default().placeholder;
+    let projected_marker = marker.replace("COCKPIT", "[redacted]");
+    let url = "http://127.0.0.1:1/v1".to_string();
+    seed(
+        &path,
+        "local",
+        ProviderEntry {
+            url,
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            headers: vec![HeaderSpec {
+                name: "X-Private".into(),
+                value: "$R16_MARKER".into(),
+            }],
+            models: vec![
+                ModelEntry {
+                    id: marker,
+                    name: Some("first".into()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: projected_marker.clone(),
+                    name: Some("second".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    let before = std::fs::read(global_provider_path("local")).unwrap();
+    let env = HashMap::from([("R16_MARKER".into(), "COCKPIT".into())]);
+    for policy in [
+        OnUnlistedModelsFetch::Ask,
+        OnUnlistedModelsFetch::Keep,
+        OnUnlistedModelsFetch::Remove,
+    ] {
+        let error = reject_fetch(&ctx, &workspace, "local", Some(policy), false, env.clone()).await;
+        assert!(!serde_json::to_string(&error).unwrap().contains("COCKPIT"));
+        assert_eq!(
+            std::fs::read(global_provider_path("local")).unwrap(),
+            before,
+            "an unsafe preview must never create an unusable later persisted address"
+        );
+        let saved = read_entry(&path, "local");
+        assert_eq!(saved.models.len(), 2);
+        assert_eq!(saved.models[0].name.as_deref(), Some("first"));
+        assert_eq!(saved.models[1].id, projected_marker);
+        assert_eq!(saved.models[1].name.as_deref(), Some("second"));
+    }
+}
+
+#[tokio::test]
+async fn persisted_fallback_failure_category_ignores_credential_rejection_prose() {
+    use crate::config::providers::{ModelFetchSource, ModelFetchStatusKind};
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    ctx.mutate_owner_vault_item(cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+        crate::auth::codex_oauth::CREDENTIAL_KEY,
+        Some(&serde_json::to_vec(&serde_json::json!({"access_token":"synthetic-r16-codex-key","refresh_token":"synthetic-r16-refresh","account_id":"synthetic-r16-account","expires_at":i64::MAX})).unwrap())
+    ).await.unwrap();
+    for body in [
+        "credentials rejected",
+        "returned 401",
+        "returned 403",
+        "subscription auth",
+        "authorization for provider",
+        "requires an official github token",
+        "missing chatgpt-account-id",
+    ] {
+        let (url, server) =
+            crate::providers::provider_http::serve_test_bodies(vec![(200, body.into(), true)])
+                .await;
+        let mut entry = ProviderEntry {
+            url,
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            credential_ref: Some(crate::auth::codex_oauth::CREDENTIAL_KEY.into()),
+            models: vec![ModelEntry {
+                id: "existing".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // A previous real rejection must not contaminate this new Parse attempt.
+        entry.mark_model_fetch_failed_kept_existing(
+            "earlier rejection",
+            crate::config::providers::ModelFetchFailure::CredentialsRejected,
+        );
+        seed(&path, "codex-oauth", entry);
+        let result = fetch(&ctx, &workspace, "codex-oauth", None, false, HashMap::new()).await;
+        assert!(
+            matches!(
+                result.verification,
+                Some(ProviderModelVerification::Parse { .. })
+            ),
+            "{result:?}"
+        );
+        assert!(matches!(
+            result.outcome,
+            ProviderModelFetchOutcome::FallbackAvailable { .. }
+        ));
+        let saved = read_entry(&path, "codex-oauth");
+        assert_eq!(saved.models[0].id, "existing");
+        let status = saved.last_model_fetch.unwrap();
+        assert_eq!(
+            status.status,
+            ModelFetchStatusKind::FailedKeptExisting,
+            "HTTP 200 malformed {body:?} is not credential rejection"
+        );
+        assert_eq!(status.source, ModelFetchSource::Live);
+        assert!(status.reason.is_some());
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unsafe_fallback_operational_ids_reject_with_and_without_consent() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    ctx.mutate_owner_vault_item(cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+        crate::auth::codex_oauth::CREDENTIAL_KEY,
+        Some(&serde_json::to_vec(&serde_json::json!({"access_token":"gpt-","refresh_token":"synthetic-r16-refresh","account_id":"synthetic-r16-account","expires_at":i64::MAX})).unwrap())
+    ).await.unwrap();
+    let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![
+        (200, "hello".into(), true),
+        (200, "hello".into(), true),
+    ])
+    .await;
+    seed(
+        &path,
+        "codex-oauth",
+        ProviderEntry {
+            url,
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            credential_ref: Some(crate::auth::codex_oauth::CREDENTIAL_KEY.into()),
+            models: vec![ModelEntry {
+                id: "existing".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let before = std::fs::read(global_provider_path("codex-oauth")).unwrap();
+    for consent in [false, true] {
+        let error = reject_fetch(
+            &ctx,
+            &workspace,
+            "codex-oauth",
+            Some(OnUnlistedModelsFetch::Remove),
+            consent,
+            HashMap::new(),
+        )
+        .await;
+        assert!(!serde_json::to_string(&error).unwrap().contains("gpt-"));
+        assert_eq!(
+            std::fs::read(global_provider_path("codex-oauth")).unwrap(),
+            before
+        );
+        assert_eq!(read_entry(&path, "codex-oauth").models[0].id, "existing");
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn unsafe_upstream_catalog_cannot_publish_an_opaque_replacement() {
+    const SECRET: &str = "synthetic-r16-token-collision-0042";
+    let literal = format!("~{}", "a".repeat(64));
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body=serde_json::json!({"data":[{"id":SECRET,"name":"private"},{"id":literal,"name":"literal"}]}).to_string();
+    let (url, server) =
+        crate::providers::provider_http::serve_test_bodies(vec![(200, body, true)]).await;
+    seed(
+        &path,
+        "local",
+        ProviderEntry {
+            url,
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            headers: vec![HeaderSpec {
+                name: "X-Private".into(),
+                value: "$R16_COLLISION".into(),
+            }],
+            ..Default::default()
+        },
+    );
+    let before = std::fs::read(global_provider_path("local")).unwrap();
+    let result = reject_fetch(
+        &ctx,
+        &workspace,
+        "local",
+        None,
+        false,
+        HashMap::from([("R16_COLLISION".into(), SECRET.into())]),
+    )
+    .await;
+    assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
+    assert_eq!(
+        std::fs::read(global_provider_path("local")).unwrap(),
+        before,
+        "token impersonation must fail before writing"
+    );
+    assert!(read_entry(&path, "local").models.is_empty());
+    server.await.unwrap();
+}
+
+#[test]
+fn final_response_identity_barrier_rejects_unsafe_ids_without_renaming() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home();
+    let mut store = crate::credentials::CredentialStore::open_default().unwrap();
+    const SECRET: &str = "synthetic-r16-unsafe-id";
+    store.set_named_secret("identity", SECRET);
+    let encoded = SECRET
+        .chars()
+        .map(|ch| format!("\\u{:04x}", ch as u32))
+        .collect::<String>();
+    let nested = format!("{{\"key\":\"{encoded}\"}}");
+    for (provider, encoded) in [(true, false), (false, false), (false, true)] {
+        let response = Response::ProviderModelsFetched {
+            results: vec![proto::ProviderModelFetchResult {
+                provider_id: if provider {
+                    "synthetic-r16-unsafe-id"
+                } else {
+                    "local"
+                }
+                .into(),
+                outcome: ProviderModelFetchOutcome::Models {
+                    models: proto::ProviderModelIdSummary {
+                        count: 2,
+                        ids: vec![
+                            if provider {
+                                "ordinary-first".into()
+                            } else if encoded {
+                                nested.clone()
+                            } else {
+                                SECRET.into()
+                            },
+                            "ordinary-second".into(),
+                        ],
+                    },
+                    catalog: ProviderModelCatalog::Live,
+                    kept: 2,
+                },
+                verification: None,
+            }],
+            config_generation: 0,
+        };
+        let error = scrub_provider_response(
+            response,
+            &ProvidersConfig::default(),
+            &store,
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        assert!(!error.message.contains("synthetic-r16-unsafe-id"));
+    }
+}
+
+#[tokio::test]
+async fn unsafe_deep_catalog_rejects_without_targets_and_without_writing() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let marker = cockpit_config::config::extended::RedactConfig::default().placeholder;
+    let other = marker.replace("COCKPIT", "[redacted]");
+    seed(
+        &path,
+        "local",
+        ProviderEntry {
+            auth: Some(AuthKind::None),
+            headers: vec![HeaderSpec {
+                name: "X-Private".into(),
+                value: "$R16_DEEP".into(),
+            }],
+            models: vec![
+                ModelEntry {
+                    id: marker,
+                    embeddings: Some(true),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: other.clone(),
+                    embeddings: Some(true),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    let before = std::fs::read(global_provider_path("local")).unwrap();
+    let error = provider_models_fetch(
+        &ctx,
+        &workspace.to_string_lossy(),
+        Some("local"),
+        None,
+        true,
+        None,
+        false,
+        HashMap::from([("R16_DEEP".into(), "COCKPIT".into())]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(!serde_json::to_string(&error).unwrap().contains("COCKPIT"));
+    assert_eq!(
+        std::fs::read(global_provider_path("local")).unwrap(),
+        before
+    );
+    assert_eq!(read_entry(&path, "local").models.len(), 2);
+}
+
+#[tokio::test]
+async fn catalog_identity_projection_preserves_owner_controls_and_native_capabilities() {
+    use crate::config::providers::{CapabilityStatus, WireApi};
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for secret in ["manual", "supported"] {
+        let body = serde_json::json!({"data":[
+            {"id":"live","name":secret,"tool_calling":true,"inputs":{"images":true}},
+            {"id":"{\"v\": 1}"},{"id":"{\"v\":1}"}
+        ]})
+        .to_string();
+        let (url, server) =
+            crate::providers::provider_http::serve_test_bodies(vec![(200, body, true)]).await;
+        let owner = ModelEntry {
+            id: "owner".into(),
+            manual: true,
+            favorite: true,
+            wire_api: WireApi::Responses,
+            ..Default::default()
+        };
+        seed(
+            &path,
+            "local",
+            ProviderEntry {
+                url,
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                headers: vec![HeaderSpec {
+                    name: "X-Private".into(),
+                    value: "$R16_SCHEMA".into(),
+                }],
+                models: vec![owner.clone()],
+                ..Default::default()
+            },
+        );
+        let result = fetch(
+            &ctx,
+            &workspace,
+            "local",
+            Some(OnUnlistedModelsFetch::Keep),
+            false,
+            HashMap::from([("R16_SCHEMA".into(), secret.into())]),
+        )
+        .await;
+        let ProviderModelFetchOutcome::Models { models, kept, .. } = result.outcome else {
+            panic!("credential equal to schema word {secret}: {result:?}");
+        };
+        assert_eq!(
+            models.count, 3,
+            "diagnostic JSON normalization must not drop distinct raw identity strings"
+        );
+        assert_eq!(kept, 3);
+        assert_eq!(
+            models.ids,
+            ["live", "{\"v\": 1}", "{\"v\":1}"],
+            "decoded diagnostics must not canonicalize distinct identity strings"
+        );
+        let saved = read_entry(&path, "local");
+        assert_eq!(saved.models.len(), 4);
+        assert_eq!(
+            serde_json::to_value(saved.models.last().unwrap()).unwrap(),
+            serde_json::to_value(&owner).unwrap(),
+            "identity projection must preserve every owner control"
+        );
+        let name = saved.models[0]
+            .name
+            .as_deref()
+            .expect("scrubbed upstream label");
+        assert!(
+            !name.contains(secret),
+            "free-form upstream text must still be scrubbed"
+        );
+        assert_eq!(
+            saved.models[0].capabilities.tool_calling,
+            CapabilityStatus::Supported
+        );
+        assert_eq!(
+            saved.models[0].capabilities.image_input,
+            CapabilityStatus::Supported
+        );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unusable_fallback_projection_cannot_replace_live_success_or_observed_auth_rejection() {
+    use crate::providers::models_fetch::{
+        self, FetchOutcome, ModelFetchFailureKind, ResolvedRequest,
+    };
+    use crate::providers::provider_http::{diagnostic_scope, scrub_catalog_models_with_table};
+    let (_env, _tmp, ctx, _state, _workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    ctx.mutate_owner_vault_item(cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+        crate::auth::codex_oauth::CREDENTIAL_KEY,
+        Some(&serde_json::to_vec(&serde_json::json!({"access_token":"synthetic-r16-real-auth","refresh_token":"synthetic-r16-refresh","account_id":"synthetic-r16-account","expires_at":i64::MAX})).unwrap())
+    ).await.unwrap();
+    let fallback = vec![ModelEntry {
+        id: "gpt-5.5".into(),
+        ..Default::default()
+    }];
+    let blocked =
+        crate::redact::RedactionTable::for_provider_credentials(vec!["gpt-".to_string()]).unwrap();
+    assert!(scrub_catalog_models_with_table(fallback, &blocked).is_err());
+    for status in [401, 403, 200] {
+        let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+            status,
+            r#"{"data":[{"id":"ordinary-live"}]}"#.into(),
+            true,
+        )])
+        .await;
+        let mut entry = ProviderEntry {
+            url: url.clone(),
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            credential_ref: Some(crate::auth::codex_oauth::CREDENTIAL_KEY.into()),
+            ..Default::default()
+        };
+        let store =
+            crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+        let resolved = ResolvedRequest {
+            base_url: url,
+            headers: vec![],
+            is_codex_credential: false,
+        };
+        let result = diagnostic_scope(
+            blocked.clone(),
+            models_fetch::fetch_models_for_provider_with_store(
+                "codex-oauth",
+                &entry,
+                &resolved,
+                std::time::Duration::from_secs(5),
+                Some(store),
+                |_| None,
+            ),
+        )
+        .await;
+        if status == 200 {
+            let FetchOutcome::Models { models, .. } =
+                result.expect("a usable live catalog must not validate an irrelevant fallback")
+            else {
+                panic!("expected live catalog");
+            };
+            assert_eq!(
+                models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["ordinary-live"]
+            );
+        } else {
+            let error = result.unwrap_err();
+            let kind = models_fetch::model_fetch_failure_kind(&error);
+            assert_eq!(
+                kind,
+                ModelFetchFailureKind::HttpStatus(reqwest::StatusCode::from_u16(status).unwrap()),
+                "fallback safety must not replace an observed authentication status"
+            );
+            entry
+                .mark_model_fetch_failed_kept_existing(error.to_string(), kind.persisted_failure());
+            seed(&path, "codex-oauth", entry);
+            assert_eq!(
+                read_entry(&path, "codex-oauth")
+                    .last_model_fetch
+                    .unwrap()
+                    .status,
+                crate::config::providers::ModelFetchStatusKind::AuthFailed
+            );
+        }
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn r17_unsafe_operational_ids_reject_every_decoded_form_before_any_write() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    const SECRET: &str = "gpt-";
+    let escaped = SECRET
+        .chars()
+        .map(|ch| format!("\\u{:04x}", ch as u32))
+        .collect::<String>();
+    let nested = format!("{{\"{escaped}\":\"value\"}}");
+    let nested_string = serde_json::to_string(&nested).unwrap();
+    for id in ["gpt-first".to_string(), nested, nested_string] {
+        for envelope in ["data", "models", "array"] {
+            let rows = serde_json::json!([{"id":id,"name":"first"},{"id":id,"name":"duplicate"},{"id":"[redacted]"},{"id":"other"}]);
+            let body = match envelope {
+                "data" => serde_json::json!({"data":rows}),
+                "models" => serde_json::json!({"models":rows}),
+                _ => rows,
+            }
+            .to_string();
+            let (url, server) =
+                crate::providers::provider_http::serve_test_bodies(vec![(200, body, true)]).await;
+            seed(
+                &path,
+                "local",
+                ProviderEntry {
+                    url,
+                    allow_insecure_http: true,
+                    auth: Some(AuthKind::None),
+                    headers: vec![HeaderSpec {
+                        name: "X-Private".into(),
+                        value: "$R17_KEY".into(),
+                    }],
+                    models: vec![ModelEntry {
+                        id: "existing".into(),
+                        manual: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let before = std::fs::read(global_provider_path("local")).unwrap();
+            let config_before = std::fs::read(&path).unwrap();
+            let error = reject_fetch(
+                &ctx,
+                &workspace,
+                "local",
+                Some(OnUnlistedModelsFetch::Remove),
+                true,
+                HashMap::from([("R17_KEY".into(), SECRET.into())]),
+            )
+            .await;
+            assert!(error.message.contains("unsafe operational model ID"));
+            assert!(!serde_json::to_string(&error).unwrap().contains(SECRET));
+            assert_eq!(
+                std::fs::read(global_provider_path("local")).unwrap(),
+                before
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                config_before,
+                "policy is also a write"
+            );
+            let saved = read_entry(&path, "local");
+            assert_eq!(saved.models.len(), 1);
+            assert_eq!(saved.models[0].id, "existing");
+            assert!(saved.models[0].manual);
+            assert!(saved.last_model_fetch.is_none());
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn r17_ordinary_fetch_save_and_each_deep_reentry_send_original_model_addresses() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let ids = vec![
+        "gpt-first".to_string(),
+        "gpt-second-模型\u{200d}\u{202e}".to_string(),
+    ];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let expected = ids.clone();
+    let server = tokio::spawn(async move {
+        let mut addressed = Vec::new();
+        for index in 0..4 {
+            let (mut socket, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("every remaining/re-entered target must actually be probed")
+                    .unwrap();
+            let mut request = Vec::new();
+            let (header_end, content_length) = loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 16384);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while request.len() < header_end + content_length {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 16384);
+            }
+            let (status, body) = if index == 0 {
+                assert!(request.starts_with(b"GET /v1/models "));
+                (200, serde_json::json!({"data":[{"id":expected[0],"name":"first"},{"id":expected[0],"name":"duplicate"},{"id":expected[1]}]}).to_string())
+            } else {
+                assert!(request.starts_with(b"POST /v1/chat/completions "));
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..header_end + content_length])
+                        .unwrap();
+                addressed.push(body["model"].as_str().unwrap().to_string());
+                (400, "maximum context length is 128000 tokens".into())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+        addressed
+    });
+    seed(
+        &path,
+        "local",
+        ProviderEntry {
+            url: format!("http://{address}/v1"),
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            wire_api: crate::config::providers::WireApi::Completions,
+            headers: vec![HeaderSpec {
+                name: "X-Private".into(),
+                value: "$R17_KEY".into(),
+            }],
+            ..Default::default()
+        },
+    );
+    let env = HashMap::from([("R17_KEY".into(), "ordinary-private-value".into())]);
+    let result = fetch(&ctx, &workspace, "local", None, false, env.clone()).await;
+    let ProviderModelFetchOutcome::Models { models, kept, .. } = result.outcome else {
+        panic!("{result:?}")
+    };
+    assert_eq!(models.ids, ids);
+    assert_eq!(models.count, 2);
+    assert_eq!(kept, 2);
+    assert_eq!(
+        read_entry(&path, "local").models[0].name.as_deref(),
+        Some("first")
+    );
+    // These are the targets captured before the first per-model operation,
+    // just as the running settings deep-fetch flow captures them.
+    let mut config = ProvidersConfig::default();
+    config
+        .providers
+        .insert("local".into(), read_entry(&path, "local"));
+    let targets = crate::providers::deepfetch::collect_deepfetch_targets(
+        &config,
+        &crate::providers::deepfetch::DeepfetchScope {
+            provider: Some("local".into()),
+            model: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(targets.len(), 2);
+    for target in targets.iter().chain(std::iter::once(&targets[1])) {
+        let response = provider_models_fetch(
+            &ctx,
+            &workspace.to_string_lossy(),
+            Some("local"),
+            Some(&target.model_id),
+            true,
+            None,
+            false,
+            env.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("ordinary-private-value")
+        );
+        let saved = read_entry(&path, "local");
+        assert_eq!(
+            saved
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(
+            saved
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+    assert_eq!(
+        server.await.unwrap(),
+        [ids[0].clone(), ids[1].clone(), ids[1].clone()]
+    );
+    let saved = read_entry(&path, "local");
+    assert!(
+        saved
+            .models
+            .iter()
+            .all(|model| model.capabilities.context_tokens == Some(128000))
+    );
+}
+
+#[tokio::test]
+async fn r17_unsafe_final_provider_identity_rejects_ordinary_write_with_exact_preimage() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    const ID: &str = "synthetic-r17-provider-identity";
+    let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+        200,
+        r#"{"data":[{"id":"live"}]}"#.into(),
+        true,
+    )])
+    .await;
+    seed(
+        &path,
+        ID,
+        ProviderEntry {
+            url,
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            headers: vec![HeaderSpec {
+                name: "X-Private".into(),
+                value: "$R17_KEY".into(),
+            }],
+            models: vec![ModelEntry {
+                id: "existing".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let before = std::fs::read(global_provider_path(ID)).unwrap();
+    let config_before = std::fs::read(&path).unwrap();
+    let error = reject_fetch(
+        &ctx,
+        &workspace,
+        ID,
+        Some(OnUnlistedModelsFetch::Keep),
+        false,
+        HashMap::from([("R17_KEY".into(), ID.into())]),
+    )
+    .await;
+    assert!(!serde_json::to_string(&error).unwrap().contains(ID));
+    assert_eq!(std::fs::read(global_provider_path(ID)).unwrap(), before);
+    assert_eq!(std::fs::read(&path).unwrap(), config_before);
+    let saved = read_entry(&path, ID);
+    assert_eq!(saved.models.len(), 1);
+    assert_eq!(saved.models[0].id, "existing");
+    assert!(saved.last_model_fetch.is_none());
+    server.await.unwrap();
+}

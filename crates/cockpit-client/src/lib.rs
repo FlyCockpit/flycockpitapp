@@ -1383,6 +1383,197 @@ impl DaemonClient {
     pub async fn request_with_timeout(
         &self,
         request: Request,
+        response_timeout: Duration,
+    ) -> Result<std::result::Result<Response, ErrorPayload>> {
+        let catalog_request = match &request {
+            Request::GetProviderCatalogSnapshot {
+                project_root,
+                provider_id,
+                snapshot_session_id,
+            } => Some((
+                project_root.clone(),
+                provider_id.clone(),
+                snapshot_session_id.clone(),
+            )),
+            _ => None,
+        };
+        let deadline = tokio::time::Instant::now() + response_timeout;
+        let mut response = self
+            .request_one_with_timeout(
+                request,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await?;
+        let Some((project_root, provider_id, snapshot_session_id)) = catalog_request else {
+            return self
+                .resolve_provider_catalog_readback(response, deadline)
+                .await;
+        };
+        let mut assembled = String::new();
+        let mut expected = None;
+        loop {
+            match response {
+                Ok(Response::ProviderCatalogPage {
+                    snapshot_digest,
+                    offset,
+                    total_bytes,
+                    json,
+                }) => {
+                    anyhow::ensure!(
+                        total_bytes <= proto::MAX_CONFIG_TRANSFER_BYTES
+                            && offset == assembled.len()
+                            && !json.is_empty()
+                            && json.len() <= proto::PROVIDER_CATALOG_PAGE_BYTES
+                            && offset
+                                .checked_add(json.len())
+                                .is_some_and(|end| end <= total_bytes),
+                        "invalid provider catalog page"
+                    );
+                    let identity = (snapshot_digest, total_bytes);
+                    if let Some(expected) = &expected {
+                        anyhow::ensure!(
+                            expected == &identity,
+                            "provider catalog changed during paged read; reload it"
+                        );
+                    } else {
+                        expected = Some(identity.clone());
+                    }
+                    assembled.push_str(&json);
+                    if assembled.len() == total_bytes {
+                        // sha2 is already a transport dependency.
+                        use sha2::Digest as _;
+                        let digest = sha2::Sha256::digest(assembled.as_bytes());
+                        let actual = digest
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>();
+                        anyhow::ensure!(
+                            actual == identity.0,
+                            "provider catalog page digest mismatch"
+                        );
+                        let snapshot: Response = serde_json::from_str(&assembled)?;
+                        anyhow::ensure!(
+                            matches!(&snapshot, Response::ProviderCatalogSnapshot {snapshot_session_id: actual, ..} if actual == &snapshot_session_id),
+                            "invalid assembled provider catalog snapshot"
+                        );
+                        return Ok(Ok(snapshot));
+                    }
+                    response = self
+                        .request_one_with_timeout(
+                            Request::GetProviderCatalogPage {
+                                project_root: project_root.clone(),
+                                provider_id: provider_id.clone(),
+                                snapshot_session_id: snapshot_session_id.clone(),
+                                offset: assembled.len().try_into()?,
+                            },
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await?;
+                }
+                Err(error) => return Ok(Err(error)),
+                other => {
+                    anyhow::ensure!(
+                        assembled.is_empty(),
+                        "provider catalog changed during paged read; reload it"
+                    );
+                    return Ok(other);
+                }
+            }
+        }
+    }
+
+    async fn resolve_provider_catalog_readback(
+        &self,
+        mut response: std::result::Result<Response, ErrorPayload>,
+        deadline: tokio::time::Instant,
+    ) -> Result<std::result::Result<Response, ErrorPayload>> {
+        if let Ok(Response::LocalOperationSettlement {
+            response: Some(nested),
+            ..
+        }) = &mut response
+        {
+            let resolved =
+                Box::pin(self.resolve_provider_catalog_readback(Ok((**nested).clone()), deadline))
+                    .await?;
+            match resolved {
+                Ok(value) => **nested = value,
+                Err(error) => return Ok(Err(error)),
+            }
+            return Ok(response);
+        }
+        let Ok(Response::ProviderMutationCommitted {
+            catalog_readback,
+            owner_root,
+            snapshot_session_id: receipt_snapshot_session_id,
+            layer_id,
+            result_revision,
+            config_generation,
+            config,
+            ..
+        }) = &mut response
+        else {
+            return Ok(response);
+        };
+        match catalog_readback {
+            proto::ProviderCatalogReadback::Inline => return Ok(response),
+            proto::ProviderCatalogReadback::Current { .. } => {
+                anyhow::bail!("daemon supplied unverified provider read-back authority")
+            }
+            proto::ProviderCatalogReadback::Required => {}
+        }
+        let nonce = receipt_snapshot_session_id.clone();
+        let loaded = tokio::time::timeout_at(
+            deadline,
+            Box::pin(self.request_with_timeout(
+                Request::GetProviderCatalogSnapshot {
+                    project_root: owner_root.clone(),
+                    provider_id: None,
+                    snapshot_session_id: nonce.clone(),
+                },
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )),
+        )
+        .await
+        .context("provider mutation committed; catalog read-back deadline exceeded")?
+        .context("provider mutation committed; catalog read-back failed")?;
+        let Response::ProviderCatalogSnapshot {
+            config: loaded,
+            snapshot_session_id,
+            layer_id: read_layer,
+            owner_root: read_root,
+            base_revision,
+            config_generation: read_generation,
+        } = loaded.map_err(|error| {
+            anyhow::anyhow!(
+                "provider mutation committed; catalog read-back rejected: {}",
+                error.message
+            )
+        })?
+        else {
+            anyhow::bail!("provider mutation committed; unexpected catalog read-back response")
+        };
+        anyhow::ensure!(
+            snapshot_session_id == nonce
+                && &read_root == owner_root
+                && &read_layer == layer_id
+                && read_generation >= *config_generation
+                && (read_generation > *config_generation || &base_revision == result_revision),
+            "provider mutation committed; catalog read-back authority mismatch"
+        );
+        *config = loaded;
+        *catalog_readback = proto::ProviderCatalogReadback::Current {
+            snapshot_session_id,
+            layer_id: read_layer,
+            owner_root: read_root,
+            base_revision,
+            config_generation: read_generation,
+        };
+        Ok(response)
+    }
+
+    async fn request_one_with_timeout(
+        &self,
+        request: Request,
         request_timeout: Duration,
     ) -> Result<std::result::Result<Response, ErrorPayload>> {
         let exchange = async {
@@ -3879,5 +4070,566 @@ mod tests {
             .await
             .expect("second connection");
         broker.await.expect("connection broker");
+    }
+}
+
+#[cfg(test)]
+mod catalog_page_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn catalog_pages_reassemble_complete_view_and_fail_closed_on_mixed_or_missing_pages() {
+        for fault in [
+            "none",
+            "digest",
+            "offset",
+            "truncated",
+            "changed",
+            "consistent_digest",
+            "corrupt",
+            "wrong_nonce",
+            "wrong_response",
+        ] {
+            let (requests, mut receive) = mpsc::channel::<InProcessRequest>(8);
+            let (_events, events) = mpsc::channel(8);
+            let client = DaemonClient::from_in_process(InProcessConnection { requests, events });
+            let config = proto::ProviderConfigView {
+                configuration_warnings: vec!["useful diagnostic 模型\"".repeat(40000)],
+                ..Default::default()
+            };
+            let expected = Response::ProviderCatalogSnapshot {
+                config,
+                snapshot_session_id: "paged-test".into(),
+                layer_id: "layer".into(),
+                owner_root: "/project".into(),
+                base_revision: "revision".into(),
+                config_generation: 42,
+            };
+            let mut json = serde_json::to_string(&expected).unwrap();
+            assert!(json.len() > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES);
+            let expected_json = json.clone();
+            if fault == "wrong_nonce" {
+                json = json.replace("paged-test", "wrong-test");
+            }
+            if fault == "wrong_response" {
+                let size = json.len();
+                json = serde_json::to_string(&Response::Ack).unwrap();
+                json.push_str(&" ".repeat(size - json.len()));
+            }
+            let digest = Sha256::digest(json.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let server = tokio::spawn(async move {
+                let mut count = 0;
+                while let Some(request) = receive.recv().await {
+                    let offset = match request.request {
+                        Request::GetProviderCatalogSnapshot { .. } => 0,
+                        Request::GetProviderCatalogPage { offset, .. } => {
+                            usize::try_from(offset).unwrap()
+                        }
+                        other => panic!("unexpected request: {other:?}"),
+                    };
+                    let mut end = (offset + proto::PROVIDER_CATALOG_PAGE_BYTES).min(json.len());
+                    while !json.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let response = if count > 0 && fault == "truncated" {
+                        Response::Ack
+                    } else {
+                        Response::ProviderCatalogPage {
+                            snapshot_digest: if (count > 0 && matches!(fault, "digest" | "changed"))
+                                || fault == "consistent_digest"
+                            {
+                                "f".repeat(64)
+                            } else {
+                                digest.clone()
+                            },
+                            offset: if count > 0 && fault == "offset" {
+                                offset + 1
+                            } else {
+                                offset
+                            },
+                            total_bytes: json.len(),
+                            json: if fault == "corrupt" && count == 0 {
+                                json[offset..end].replace("useful", "xxxxxx")
+                            } else {
+                                json[offset..end].to_string()
+                            },
+                        }
+                    };
+                    assert!(
+                        serde_json::to_vec(&response).unwrap().len()
+                            <= proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES
+                    );
+                    if request.reply.send(Ok(response)).is_err() {
+                        break;
+                    }
+                    count += 1;
+                }
+            });
+            let response = client
+                .request_ok(Request::GetProviderCatalogSnapshot {
+                    project_root: "/project".into(),
+                    provider_id: None,
+                    snapshot_session_id: "paged-test".into(),
+                })
+                .await;
+            if fault == "none" {
+                assert_eq!(
+                    serde_json::to_string(&response.unwrap()).unwrap(),
+                    expected_json
+                );
+            } else {
+                assert!(
+                    response.is_err(),
+                    "mixed/non-contiguous snapshot must not be adopted: {fault}"
+                );
+                let error = response.unwrap_err().to_string();
+                if matches!(fault, "consistent_digest" | "corrupt") {
+                    assert!(error.contains("page digest mismatch"), "{fault}: {error}");
+                }
+                if matches!(fault, "wrong_nonce" | "wrong_response") {
+                    assert!(
+                        error.contains("invalid assembled provider catalog snapshot"),
+                        "{fault}: {error}"
+                    );
+                }
+            }
+            drop(client);
+            server.await.unwrap();
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod provider_mutation_readback_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn provider_mutation_readback_reassembles_direct_and_settlement_catalogs_with_current_authority()
+     {
+        for settlement in [false, true] {
+            for fault in [
+                "none",
+                "newer",
+                "older",
+                "root",
+                "layer",
+                "revision",
+                "response",
+                "read_error",
+                "stalled",
+                "forged",
+            ] {
+                let (requests, mut receive) = mpsc::channel::<InProcessRequest>(8);
+                let (_events, events) = mpsc::channel(8);
+                let client =
+                    DaemonClient::from_in_process(InProcessConnection { requests, events });
+                let server = tokio::spawn(async move {
+                    let mut json = String::new();
+                    let mut digest = String::new();
+                    let mut calls = Vec::new();
+                    let mut held = Vec::new();
+                    while let Some(request) = receive.recv().await {
+                        calls.push(request.request.wire_tag().to_string());
+                        let response = match request.request {
+                            Request::ApplyProviderMutation { .. }
+                            | Request::GetLocalOperationSettlement { .. } => {
+                                let receipt = Response::ProviderMutationCommitted {
+                                    catalog_readback: if fault == "forged" {
+                                        proto::ProviderCatalogReadback::Current {
+                                            snapshot_session_id: "original".into(),
+                                            layer_id: "layer".into(),
+                                            owner_root: "/project".into(),
+                                            base_revision: "a".repeat(64),
+                                            config_generation: 10,
+                                        }
+                                    } else {
+                                        proto::ProviderCatalogReadback::Required
+                                    },
+                                    client_operation_id: "operation".into(),
+                                    snapshot_session_id: "original".into(),
+                                    layer_id: "layer".into(),
+                                    owner_root: "/project".into(),
+                                    mutation_intent_hash: "1".repeat(64),
+                                    upserted_provider_ids: vec!["p".into()],
+                                    consumed_revision: "0".repeat(64),
+                                    result_revision: "a".repeat(64),
+                                    config_generation: 10,
+                                    config: Default::default(),
+                                    status: proto::ConfigCommitStatus::Committed,
+                                    publication: proto::ConfigPublicationStatus::Published,
+                                };
+                                Ok(if settlement {
+                                    Response::LocalOperationSettlement {
+                                        client_operation_id: "operation".into(),
+                                        operation_kind: "apply_provider_mutation".into(),
+                                        request_hash: "1".repeat(64),
+                                        pending: false,
+                                        response: Some(Box::new(receipt)),
+                                        terminal_error: None,
+                                        terminal_cancelled: false,
+                                    }
+                                } else {
+                                    receipt
+                                })
+                            }
+                            Request::GetProviderCatalogSnapshot {
+                                snapshot_session_id,
+                                ..
+                            } => {
+                                if fault == "stalled" {
+                                    held.push(request.reply);
+                                    continue;
+                                }
+                                if fault == "response" {
+                                    Ok(Response::Ack)
+                                } else if fault == "read_error" {
+                                    Err(ErrorPayload {
+                                        code: proto::ErrorCode::Internal,
+                                        message: "read-back rejected".into(),
+                                    })
+                                } else {
+                                    let snapshot = Response::ProviderCatalogSnapshot {
+                                        config: proto::ProviderConfigView {
+                                            configuration_warnings: vec![
+                                                "useful quota 模型".repeat(50_000),
+                                            ],
+                                            ..Default::default()
+                                        },
+                                        snapshot_session_id,
+                                        layer_id: if fault == "layer" { "other" } else { "layer" }
+                                            .into(),
+                                        owner_root: if fault == "root" {
+                                            "/other"
+                                        } else {
+                                            "/project"
+                                        }
+                                        .into(),
+                                        base_revision: if matches!(fault, "revision" | "newer") {
+                                            "b"
+                                        } else {
+                                            "a"
+                                        }
+                                        .repeat(64),
+                                        config_generation: match fault {
+                                            "newer" => 11,
+                                            "older" => 9,
+                                            _ => 10,
+                                        },
+                                    };
+                                    json = serde_json::to_string(&snapshot).unwrap();
+                                    assert!(json.len() > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES);
+                                    digest = Sha256::digest(json.as_bytes())
+                                        .iter()
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect();
+                                    Ok(page(&json, &digest, 0))
+                                }
+                            }
+                            Request::GetProviderCatalogPage { offset, .. } => {
+                                Ok(page(&json, &digest, offset.try_into().unwrap()))
+                            }
+                            other => panic!("unexpected request {other:?}"),
+                        };
+                        if request.reply.send(response).is_err() {
+                            break;
+                        }
+                    }
+                    calls
+                });
+                let request = if settlement {
+                    Request::GetLocalOperationSettlement {
+                        client_operation_id: "operation".into(),
+                    }
+                } else {
+                    let mut entry = proto::ProviderEntryView {
+                        entry: Default::default(),
+                        headers: Vec::new(),
+                        credential_configured: false,
+                    }
+                    .editable_entry();
+                    entry.url = "https://example.test/v1".into();
+                    let mutation = proto::ProviderMutationBatch {
+                        upserts: vec![proto::ProviderMutationUpsert {
+                            provider_id: "p".into(),
+                            entry,
+                            header_secrets: Vec::new(),
+                            model_patch: None,
+                        }],
+                        deletes: Vec::new(),
+                        metadata: None,
+                    };
+                    Request::ApplyProviderMutation {
+                        snapshot_session_id: "original".into(),
+                        layer_id: "layer".into(),
+                        expected_revision: "0".repeat(64),
+                        client_operation_id: "operation".into(),
+                        mutation_intent_hash: mutation.sanitized_intent_hash().unwrap(),
+                        mutation,
+                    }
+                };
+                let result = if fault == "stalled" {
+                    client
+                        .request_with_timeout(request, Duration::from_millis(100))
+                        .await
+                        .and_then(|r| r.map_err(|e| anyhow::anyhow!(e.message)))
+                } else {
+                    client.request_ok(request).await
+                };
+                if matches!(fault, "none" | "newer") {
+                    let mut response = result.unwrap();
+                    if let Response::LocalOperationSettlement {
+                        response: Some(nested),
+                        ..
+                    } = response
+                    {
+                        response = *nested;
+                    }
+                    let Response::ProviderMutationCommitted {
+                        catalog_readback,
+                        config,
+                        result_revision,
+                        config_generation,
+                        ..
+                    } = response
+                    else {
+                        panic!("receipt")
+                    };
+                    assert_eq!(config_generation, 10, "commit generation remains truthful");
+                    assert_eq!(result_revision, "a".repeat(64));
+                    assert_eq!(
+                        config.configuration_warnings,
+                        vec!["useful quota 模型".repeat(50_000)]
+                    );
+                    let proto::ProviderCatalogReadback::Current {
+                        snapshot_session_id,
+                        base_revision,
+                        config_generation,
+                        ..
+                    } = catalog_readback
+                    else {
+                        panic!("verified current authority")
+                    };
+                    assert_eq!(
+                        snapshot_session_id, "original",
+                        "layer capability stays bound to its snapshot nonce"
+                    );
+                    assert_eq!(config_generation, if fault == "newer" { 11 } else { 10 });
+                    assert_eq!(
+                        base_revision,
+                        if fault == "newer" { "b" } else { "a" }.repeat(64)
+                    );
+                } else {
+                    let error = format!("{:#}", result.unwrap_err());
+                    if fault == "forged" {
+                        assert!(error.contains("unverified"), "{error}");
+                    } else {
+                        assert!(
+                            error.contains("committed")
+                                && (error.contains("authority mismatch")
+                                    || error.contains("read-back")),
+                            "{fault}: {error}"
+                        );
+                    }
+                    if fault == "stalled" {
+                        assert!(
+                            error.contains("deadline") || error.contains("timed out"),
+                            "pending read-back must hit its owned deadline: {error}"
+                        );
+                    }
+                }
+                drop(client);
+                let calls = server.await.unwrap();
+                if fault == "forged" {
+                    assert_eq!(
+                        calls.len(),
+                        1,
+                        "unverified server authority is rejected before a follow-up"
+                    );
+                } else {
+                    assert_eq!(calls[1], "get_provider_catalog_snapshot");
+                }
+                if matches!(fault, "none" | "newer") {
+                    assert!(
+                        calls
+                            .iter()
+                            .filter(|s| s.as_str() == "get_provider_catalog_page")
+                            .count()
+                            > 1
+                    );
+                }
+            }
+        }
+    }
+
+    fn page(json: &str, digest: &str, offset: usize) -> Response {
+        let mut end = (offset + proto::PROVIDER_CATALOG_PAGE_BYTES).min(json.len());
+        while !json.is_char_boundary(end) {
+            end -= 1;
+        }
+        Response::ProviderCatalogPage {
+            snapshot_digest: digest.into(),
+            offset,
+            total_bytes: json.len(),
+            json: json[offset..end].into(),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod chunk_cancellation_tests {
+    use super::*;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+    struct Observed {
+        io: tokio::io::DuplexStream,
+        saw_line: bool,
+        pending: Option<oneshot::Sender<()>>,
+    }
+    impl AsyncRead for Observed {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let result = Pin::new(&mut self.io).poll_read(cx, buf);
+            if matches!(result, Poll::Ready(Ok(()))) && buf.filled()[before..].contains(&b'\n') {
+                self.saw_line = true;
+            }
+            if result.is_pending()
+                && self.saw_line
+                && let Some(tx) = self.pending.take()
+            {
+                let _ = tx.send(());
+            }
+            result
+        }
+    }
+    impl AsyncWrite for Observed {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+    #[tokio::test]
+    async fn config_transport_outbound_request_preserves_partial_publication() {
+        let (left, mut right) = tokio::io::duplex(4096);
+        let (entered, waiting) = oneshot::channel();
+        let client = DaemonClient::from_proto(ProtoStream::new(Observed {
+            io: left,
+            saw_line: false,
+            pending: Some(entered),
+        }));
+        let env = Envelope::event(proto::Event::ConfigSnapshot {
+            snapshot: Box::new(proto::ConfigSnapshot {
+                session_id: Uuid::nil(),
+                generation: 42,
+                extended: Default::default(),
+                providers: proto::ProviderConfigView {
+                    configuration_warnings: vec!["ordinary config text ".repeat(60_000)],
+                    ..Default::default()
+                },
+            }),
+        });
+        let json = serde_json::to_vec(&env).unwrap();
+        assert!(json.len() > proto::MAX_NDJSON_FRAME_BYTES);
+        let digest = Sha256::digest(&json)
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect::<String>();
+        let frames=json.chunks(64*1024).enumerate().map(|(i,bytes)| {
+            let mut line=serde_json::to_vec(&serde_json::json!({"v":1,"kind":"config_chunk","digest":digest,"offset":i*64*1024,"total":json.len(),"data":base64::engine::general_purpose::STANDARD.encode(bytes)})).unwrap();
+            line.push(b'\n');line
+        }).collect::<Vec<_>>();
+        right.write_all(&frames[0]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("real receiver must be pending after consuming first config chunk")
+            .unwrap();
+        let requesting = client.clone();
+        let request = tokio::spawn(async move {
+            requesting
+                .request_with_timeout(Request::DaemonStatus, Duration::from_secs(5))
+                .await
+        });
+        let mut daemon = ProtoStream::new(right);
+        let outgoing = tokio::time::timeout(Duration::from_secs(3), daemon.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let RecvFrame::Envelope(outgoing) = outgoing else {
+            panic!("outbound request envelope required")
+        };
+        let Body::Request {
+            id,
+            request: outgoing_request,
+            ..
+        } = outgoing.body
+        else {
+            panic!("outbound request required")
+        };
+        assert!(
+            matches!(outgoing_request, Request::DaemonStatus),
+            "outbound branch must win while config transfer is pending"
+        );
+        for frame in frames.iter().skip(1) {
+            let line = String::from_utf8(frame[..frame.len() - 1].to_vec()).unwrap();
+            if daemon.send_raw_line(line).await.is_err() {
+                break;
+            }
+        }
+        let response_result = daemon.send(&Envelope::response(id, Response::Ack)).await;
+        let received = tokio::time::timeout(Duration::from_secs(3), client.next_event())
+            .await
+            .expect("publication must settle within test bound");
+        assert!(
+            matches!(received,Some(proto::Event::ConfigSnapshot {snapshot}) if snapshot.generation==42),
+            "complete config publication lost when outbound request cancelled partial recv"
+        );
+        assert!(
+            response_result.is_ok(),
+            "daemon can reply after publication"
+        );
+        assert!(
+            matches!(request.await.unwrap().unwrap().unwrap(), Response::Ack),
+            "interleaved outbound request completes"
+        );
+        let reentering = client.clone();
+        let next = tokio::spawn(async move { reentering.request_ok(Request::DaemonStatus).await });
+        let RecvFrame::Envelope(env) = daemon.recv().await.unwrap().unwrap() else {
+            panic!("next request")
+        };
+        let Body::Request { id, .. } = env.body else {
+            panic!("next request body")
+        };
+        daemon
+            .send(&Envelope::response(id, Response::Ack))
+            .await
+            .unwrap();
+        assert!(
+            matches!(next.await.unwrap().unwrap(), Response::Ack),
+            "connection remains usable after completed publication"
+        );
     }
 }

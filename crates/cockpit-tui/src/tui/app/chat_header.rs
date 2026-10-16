@@ -77,10 +77,30 @@ impl App {
         if self.busy || self.pending.is_some() {
             return HeaderSessionStatus::Working;
         }
+        if self.header_last_turn_failed() {
+            return HeaderSessionStatus::Failed;
+        }
         if self.header_has_settled_turn() {
             return HeaderSessionStatus::Done;
         }
         HeaderSessionStatus::Idle
+    }
+
+    /// The most recent conversation turn ended in a terminal inference
+    /// failure (#551): the session is not "done", it needs the user.
+    fn header_last_turn_failed(&self) -> bool {
+        self.history
+            .iter()
+            .rev()
+            .find(|entry| {
+                matches!(
+                    entry,
+                    HistoryEntry::User { .. }
+                        | HistoryEntry::Agent { .. }
+                        | HistoryEntry::InferenceError { .. }
+                )
+            })
+            .is_some_and(|entry| matches!(entry, HistoryEntry::InferenceError { .. }))
     }
 
     fn header_routing_status(&self) -> Option<String> {

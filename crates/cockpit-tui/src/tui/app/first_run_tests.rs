@@ -64,7 +64,7 @@ fn complete_detour_provider_verify(app: &mut App, provider_id: &str) {
         shell.present_verify(provider_id.to_string());
         shell.apply_provider_verification(
             provider_id,
-            crate::tui::onboarding::VerifyOutcome::Models(vec!["detour-model".into()]),
+            crate::tui::onboarding::VerifyOutcome::Models(vec!["detour-model".into()].into()),
             Some(detour_provider_settlement()),
         );
     }

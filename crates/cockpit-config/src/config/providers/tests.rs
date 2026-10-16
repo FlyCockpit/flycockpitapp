@@ -1090,6 +1090,10 @@ fn round_trips_a_provider_entry() {
             }],
             capabilities: Default::default(),
             provider_metadata: Default::default(),
+            models_replace: false,
+            model_field_patches: Vec::new(),
+            model_order: None,
+            model_membership: Default::default(),
             last_model_fetch: None,
         },
     );
@@ -3081,3 +3085,410 @@ fn resolve_text_embedded_recovery_three_tier_precedence() {
 mod model_defaults_and_capabilities;
 mod multimodal_capability;
 mod trust_mode_orthogonality;
+
+#[test]
+fn byte_bounded_placements_minimize_serialized_cost_for_unequal_escaped_ids() {
+    fn permutations(ids: &mut [String], start: usize, all: &mut Vec<Vec<String>>) {
+        if start == ids.len() {
+            all.push(ids.to_vec());
+        } else {
+            for i in start..ids.len() {
+                ids.swap(start, i);
+                permutations(ids, start + 1, all);
+                ids.swap(start, i);
+            }
+        }
+    }
+    let before = vec![
+        "long".repeat(40),
+        "s".into(),
+        "\\\"\n".repeat(32),
+        "é".repeat(30),
+        "z".into(),
+    ];
+    let mut orders = Vec::new();
+    permutations(&mut before.clone(), 0, &mut orders);
+    for after in orders {
+        let selected = ModelPlacement::between(&before, &after);
+        let mut applied = before.clone();
+        for placement in &selected {
+            placement.apply(&mut applied, true).unwrap();
+        }
+        assert_eq!(
+            applied, after,
+            "byte optimization preserves exact membership and order"
+        );
+        let mut minimum = usize::MAX;
+        for mask in 0..(1 << after.len()) {
+            let stable = after
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, id)| before.iter().position(|prior| prior == id).unwrap())
+                .collect::<Vec<_>>();
+            if !stable.windows(2).all(|pair| pair[0] < pair[1]) {
+                continue;
+            }
+            // Independent exhaustive oracle: enumerate insertion trees with
+            // every preceding anchor within a movable gap, and every operation
+            // schedule. The old oracle tested only the immediate predecessor.
+            fn enumerate(
+                before: &[String],
+                after: &[String],
+                mask: usize,
+                used: usize,
+                program: &mut Vec<ModelPlacement>,
+                minimum: &mut usize,
+            ) {
+                if used | mask == (1 << after.len()) - 1 {
+                    let mut actual = before.to_vec();
+                    for placement in program.iter() {
+                        placement.apply(&mut actual, true).unwrap();
+                    }
+                    if actual == after {
+                        *minimum = (*minimum).min(serde_json::to_vec(program).unwrap().len());
+                    }
+                    return;
+                }
+                for i in 0..after.len() {
+                    if (used | mask) & (1 << i) != 0 {
+                        continue;
+                    }
+                    let root = (0..i).rev().find(|prior| mask & (1 << prior) != 0);
+                    let anchors = root.map_or(0, |prior| prior + 1)..=i;
+                    for anchor in anchors {
+                        program.push(ModelPlacement {
+                            id: after[i].clone(),
+                            after: anchor.checked_sub(1).map(|prior| after[prior].clone()),
+                        });
+                        enumerate(before, after, mask, used | (1 << i), program, minimum);
+                        program.pop();
+                    }
+                }
+            }
+            enumerate(&before, &after, mask, 0, &mut Vec::new(), &mut minimum);
+        }
+        assert!(
+            serde_json::to_vec(&selected).unwrap().len() <= minimum,
+            "compare actual JSON bytes against every independently enumerated insertion tree; temporary anchors can be even cheaper"
+        );
+    }
+}
+
+fn assert_byte_bounded_placement_volume(rows: usize) {
+    let before = std::iter::once("a".to_owned())
+        .chain((0..rows).map(|i| format!("row-{i:05}")))
+        .collect::<Vec<_>>();
+    let mut after = before.clone();
+    after.rotate_left(1);
+    let program = ModelPlacement::between(&before, &after);
+    assert_eq!(program.len(), 1);
+    assert!(serde_json::to_vec(&program).unwrap().len() < 128);
+    let mut actual = before;
+    for placement in program {
+        placement.apply(&mut actual, true).unwrap();
+    }
+    assert_eq!(actual, after);
+}
+
+#[test]
+fn byte_bounded_placement_volume_100() {
+    assert_byte_bounded_placement_volume(100);
+}
+#[test]
+fn byte_bounded_placement_volume_1000() {
+    assert_byte_bounded_placement_volume(1000);
+}
+#[test]
+fn byte_bounded_placement_volume_10000() {
+    assert_byte_bounded_placement_volume(10000);
+}
+
+#[test]
+fn byte_bounded_placement_search_does_not_amplify_a_long_temporary_anchor() {
+    let long = "anchor".repeat(22 * 1024);
+    let mut before = (0..1000).map(|i| format!("row-{i:04}")).collect::<Vec<_>>();
+    before.push(long.clone());
+    let mut after = before.clone();
+    after.rotate_right(1);
+    let program = ModelPlacement::between(&before, &after);
+    assert_eq!(
+        program,
+        [ModelPlacement {
+            id: long,
+            after: None
+        }]
+    );
+    assert!(serde_json::to_vec(&program).unwrap().len() < MAX_AUTHORED_PROVIDER_ENTRY_BYTES);
+    let mut actual = before;
+    for placement in program {
+        placement.apply(&mut actual, true).unwrap();
+    }
+    assert_eq!(actual, after);
+}
+
+#[test]
+fn placement_admission_matches_independent_unique_move_state_graph() {
+    use std::cmp::Reverse;
+    use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+    // The oracle deliberately makes no final-order, anchor-forest or stationary
+    // subsequence assumption. Enumerate every permutation x used-ID mask.
+    let ids = [
+        "a".into(),
+        "B".repeat(80),
+        "c".into(),
+        "\\\"\n".repeat(25),
+        "e".into(),
+    ];
+    let mut distances = BTreeMap::from([((vec![0usize, 1, 2, 3, 4], 0u8), 2usize)]);
+    let mut queue = BinaryHeap::from([Reverse((2usize, vec![0usize, 1, 2, 3, 4], 0u8))]);
+    while let Some(Reverse((bytes, order, used))) = queue.pop() {
+        if distances[&(order.clone(), used)] != bytes {
+            continue;
+        }
+        for row in 0..ids.len() {
+            if used & (1 << row) != 0 {
+                continue;
+            }
+            for anchor in 0..=ids.len() {
+                if anchor == row {
+                    continue;
+                }
+                let mut next = order.clone();
+                next.remove(next.iter().position(|id| *id == row).unwrap());
+                let destination = if anchor == ids.len() {
+                    0
+                } else {
+                    next.iter().position(|id| *id == anchor).unwrap() + 1
+                };
+                next.insert(destination, row);
+                let operation = ModelPlacement {
+                    id: ids[row].clone(),
+                    after: (anchor < ids.len()).then(|| ids[anchor].clone()),
+                };
+                let cost = serde_json::to_vec(&operation).unwrap().len() + usize::from(used != 0);
+                let next_used = used | (1 << row);
+                let prior = distances
+                    .entry((next.clone(), next_used))
+                    .or_insert(usize::MAX);
+                if bytes + cost < *prior {
+                    *prior = bytes + cost;
+                    queue.push(Reverse((*prior, next, next_used)));
+                }
+            }
+        }
+    }
+    let orders = distances
+        .keys()
+        .map(|(order, _)| order.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(orders.len(), 120);
+    for order in orders {
+        let after = order
+            .iter()
+            .map(|&row| ids[row].clone())
+            .collect::<Vec<_>>();
+        for required_mask in 0u8..(1 << ids.len()) {
+            let minimum = distances
+                .iter()
+                .filter(|((candidate, used), _)| {
+                    *candidate == order && used & required_mask == required_mask
+                })
+                .map(|(_, bytes)| *bytes)
+                .min()
+                .unwrap();
+            let required = ids
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| required_mask & (1 << i) != 0)
+                .map(|(_, id)| id.as_str())
+                .collect();
+            let program = ModelPlacement::find_fitting(&ids, &after, &required, minimum, |_| {
+                Ok::<_, std::convert::Infallible>(true)
+            })
+            .unwrap()
+            .expect("every oracle-admitted schedule must be found");
+            assert_eq!(serde_json::to_vec(&program).unwrap().len(), minimum);
+            let mut actual = ids.to_vec();
+            let mut moved = BTreeSet::new();
+            for placement in &program {
+                assert!(moved.insert(placement.id.as_str()));
+                placement.apply(&mut actual, true).unwrap();
+            }
+            assert_eq!(actual, after);
+            assert!(required.is_subset(&moved));
+            assert!(
+                ModelPlacement::find_fitting(&ids, &after, &required, minimum - 1, |_| Ok::<
+                    _,
+                    std::convert::Infallible,
+                >(
+                    true
+                ))
+                .unwrap()
+                .is_none(),
+                "one byte below the independently computed minimum must reject"
+            );
+        }
+    }
+}
+
+#[test]
+fn placement_admission_finds_cyclic_handles_beyond_eager_inventory_size() {
+    let before = [
+        "u".into(),
+        "v".into(),
+        "w".into(),
+        "a".into(),
+        "B".repeat(900),
+        "c".into(),
+        "D".repeat(900),
+        "e".into(),
+        "F".repeat(900),
+    ];
+    let after = [0, 1, 2, 4, 3, 7, 6, 5, 8].map(|i| before[i].clone());
+    let budget = 70;
+    let program = ModelPlacement::find_fitting(
+        &before,
+        &after,
+        &std::collections::BTreeSet::new(),
+        budget,
+        |_| Ok::<_, std::convert::Infallible>(true),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(serde_json::to_vec(&program).unwrap().len(), budget);
+    let mut applied = before.to_vec();
+    for placement in program {
+        placement.apply(&mut applied, true).unwrap();
+    }
+    assert_eq!(applied, after);
+}
+
+#[test]
+fn placement_admission_many_cyclic_blocks_preserves_exact_order() {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    let mut feasible = Vec::new();
+    for block in 0..30 {
+        let rows = [
+            format!("a{block}"),
+            format!("B{block}{}", "b".repeat(900)),
+            format!("c{block}"),
+            format!("D{block}{}", "d".repeat(900)),
+            format!("e{block}"),
+            format!("F{block}{}", "f".repeat(900)),
+        ];
+        before.extend(rows.iter().cloned());
+        after.extend([1, 0, 4, 3, 2, 5].map(|i| rows[i].clone()));
+        feasible.extend(
+            [(0, 2), (2, 4), (4, 0)].map(|(row, anchor)| ModelPlacement {
+                id: rows[row].clone(),
+                after: Some(rows[anchor].clone()),
+            }),
+        );
+    }
+    let budget = serde_json::to_vec(&feasible).unwrap().len();
+    let mut applied = before.clone();
+    for placement in feasible {
+        placement.apply(&mut applied, true).unwrap();
+    }
+    assert_eq!(applied, after);
+    let program = ModelPlacement::find_fitting(
+        &before,
+        &after,
+        &std::collections::BTreeSet::new(),
+        budget,
+        |_| Ok::<_, std::convert::Infallible>(true),
+    )
+    .unwrap()
+    .expect("admit a fitting program across many independent cyclic gaps");
+    assert!(serde_json::to_vec(&program).unwrap().len() <= budget);
+    let mut applied = before;
+    for placement in program {
+        placement.apply(&mut applied, true).unwrap();
+    }
+    assert_eq!(applied, after);
+}
+
+#[test]
+fn placement_admission_raw_budget_rejects_unchanged_oversized_probe() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config.json");
+    std::fs::write(&config, "{}").unwrap();
+    std::fs::create_dir(temp.path().join("providers")).unwrap();
+    let mut entry = ProviderEntry {
+        url: "https://example.com/v1".into(),
+        ..Default::default()
+    };
+    entry.model_membership.placements.push(ModelPlacement {
+        id: String::new(),
+        after: None,
+    });
+    let mut raw = serde_json::to_value(&entry).unwrap();
+    raw["retained_unparsed_metadata"] =
+        serde_json::Value::String("x".repeat(MAX_AUTHORED_PROVIDER_ENTRY_BYTES));
+    let provider = temp.path().join("providers/p.json");
+    let bytes = serde_json::to_vec(&raw).unwrap();
+    assert!(bytes.len() > MAX_AUTHORED_PROVIDER_ENTRY_BYTES);
+    std::fs::write(&provider, &bytes).unwrap();
+    let doc = ConfigDoc::load(&config).unwrap();
+    let loaded = doc.providers().providers["p"].clone();
+    assert_eq!(
+        loaded.model_membership.placements,
+        entry.model_membership.placements
+    );
+    let error = doc
+        .provider_placement_byte_budget("p", &loaded)
+        .unwrap_err();
+    assert!(error.is::<ProviderWriteValidationError>(), "{error:#}");
+    assert_eq!(std::fs::read(provider).unwrap(), bytes);
+}
+
+#[test]
+fn placement_admission_cyclic_handles_after_ten_thousand_unchanged_rows_meets_rpc_budget() {
+    let prefix = (0..10_000)
+        .map(|i| format!("prefix-{i:05}"))
+        .collect::<Vec<_>>();
+    let changed = [
+        "a".into(),
+        "B".repeat(900),
+        "c".into(),
+        "D".repeat(900),
+        "e".into(),
+        "F".repeat(900),
+    ];
+    let before = prefix
+        .iter()
+        .cloned()
+        .chain(changed.iter().cloned())
+        .collect::<Vec<_>>();
+    let after = prefix
+        .into_iter()
+        .chain([1, 0, 4, 3, 2, 5].map(|i| changed[i].clone()))
+        .collect::<Vec<_>>();
+    let input = before.clone();
+    let target = after.clone();
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let program = ModelPlacement::find_fitting(
+            &input,
+            &target,
+            &std::collections::BTreeSet::new(),
+            70,
+            |_| Ok::<_, std::convert::Infallible>(true),
+        )
+        .unwrap();
+        let _ = send.send(program);
+    });
+    let program = receive
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("a fitting large-prefix program must finish inside the30-second owner RPC deadline")
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(serde_json::to_vec(&program).unwrap().len(), 70);
+    let mut applied = before;
+    for placement in program {
+        placement.apply(&mut applied, true).unwrap();
+    }
+    assert_eq!(applied, after);
+}

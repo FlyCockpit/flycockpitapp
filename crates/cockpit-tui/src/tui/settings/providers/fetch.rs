@@ -4,6 +4,8 @@ pub(in crate::tui::settings) struct FetchAllState {
     pub(in crate::tui::settings) providers: Vec<String>,
     pub(in crate::tui::settings) in_flight: Vec<FetchHandle>,
     pub(in crate::tui::settings) finished: Vec<FetchedSummary>,
+    pub(in crate::tui::settings) observations: Vec<super::super::auth::FetchObservation>,
+    pub(in crate::tui::settings) final_snapshot_pending: bool,
     pub(in crate::tui::settings) pre_fetch_models:
         std::collections::BTreeMap<String, Vec<ModelEntry>>,
     pub(in crate::tui::settings) policy_resolved: bool,
@@ -47,6 +49,8 @@ impl FetchAllState {
             providers: ids,
             in_flight,
             finished,
+            observations: Vec::new(),
+            final_snapshot_pending: false,
             pre_fetch_models,
             policy_resolved: false,
             cursor: 0,
@@ -55,9 +59,9 @@ impl FetchAllState {
         }
     }
 
-    /// True while at least one per-provider fetch is still running.
+    /// Remain busy until observations have an authoritative final snapshot.
     pub(in crate::tui::settings) fn is_fetching(&self) -> bool {
-        !self.in_flight.is_empty()
+        !self.in_flight.is_empty() || (self.final_snapshot_pending && !self.policy_resolved)
     }
 }
 
@@ -68,7 +72,7 @@ pub(in crate::tui::settings) struct FetchedSummary {
 
 enum FetchDegradedStatus {
     Unsupported,
-    Failed(String),
+    Failed(String, cockpit_config::providers::ModelFetchFailure),
 }
 
 pub(in crate::tui::settings) struct FetchOnePromptState {
@@ -84,7 +88,9 @@ pub(in crate::tui::settings) struct FetchOnePromptState {
 
 pub(in crate::tui::settings) struct FetchFallbackPromptState {
     pub(in crate::tui::settings) provider_id: String,
-    pub(in crate::tui::settings) models: Vec<ModelEntry>,
+    /// Size of the fallback catalog the daemon offers. Choosing it re-runs the
+    /// fetch with `allow_fallback` so the daemon applies it.
+    pub(in crate::tui::settings) fallback_count: u32,
     pub(in crate::tui::settings) catalog: ProviderModelCatalog,
     pub(in crate::tui::settings) reason: String,
     /// 0 = retry live, 1 = keep existing, 2 = use fallback, 3 = cancel.
@@ -93,50 +99,58 @@ pub(in crate::tui::settings) struct FetchFallbackPromptState {
 
 impl SettingsDialog {
     /// Poll the in-flight handles of an active all-providers refetch.
-    /// Each finished handle is removed from `in_flight` and recorded in
-    /// `finished`; model config is not mutated until the unlisted-model
-    /// policy is resolved. When `in_flight` empties, the aggregated
-    /// unlisted-models set is built so [`Self::render_fetch_all`] can show
-    /// the Keep/Remove prompt when needed.
-    /// A per-provider failure is just an `Err` summary — it never aborts
-    /// the others.
+    /// Retain each raw observation separately from snapshot authority. Once
+    /// every handle settles, acquire one final complete snapshot, then build
+    /// summaries and apply status/policy. Failed final reads keep observations
+    /// pending behind the ordinary Enter-to-reload editing gate.
     pub(in crate::tui::settings) fn drain_fetch_all(&mut self) {
         let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
             return;
         };
-        if s.in_flight.is_empty() {
-            if !s.finished.is_empty() && !s.policy_resolved {
-                self.finish_fetch_all_if_ready();
-            }
-            return;
-        }
-
-        let mut newly_done: Vec<FetchedSummary> = Vec::new();
+        let mut completed = Vec::new();
         s.in_flight.retain(|handle| match handle.take() {
-            Some(outcome) => {
-                newly_done.push(FetchedSummary {
-                    provider_id: handle.provider_id.clone(),
-                    outcome,
-                });
+            Some(completion) => {
+                completed.push(completion);
                 false
             }
             None => true,
         });
-        if newly_done.is_empty() {
+        for completion in completed {
+            // A failed snapshot disables edits but cannot replace the observed
+            // fetch result. Retain every result until the final read succeeds.
+            let _ = self.adopt_refreshed_provider_snapshot(completion.snapshot);
+            if let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() {
+                s.observations.push(completion.observation);
+            }
+        }
+        let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
+            return;
+        };
+        if !s.in_flight.is_empty() || s.policy_resolved {
             return;
         }
-
-        let all_done = {
-            let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
-                return;
-            };
-            s.finished.extend(newly_done);
-            s.in_flight.is_empty()
-        };
-
-        if all_done {
-            self.finish_fetch_all_if_ready();
+        if !s.final_snapshot_pending {
+            s.final_snapshot_pending = true;
+            // Always read after all handles settle; no per-handle snapshot is
+            // authoritative for the complete batch. Failed final reads retain
+            // the observations and the normal Enter-to-reload gate retries.
+            self.queue_provider_catalog(None);
         }
+        // The transport may settle the read inline. In both synchronous and
+        // asynchronous delivery, authority (not queueing) controls reduction.
+        if self.provider_catalog_reload_required || self.provider_edit_authority.is_none() {
+            return;
+        }
+        let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
+            return;
+        };
+        for observation in std::mem::take(&mut s.observations) {
+            s.finished.push(FetchedSummary {
+                provider_id: observation.provider_id.clone(),
+                outcome: observation.into_outcome(&self.cx.original_config),
+            });
+        }
+        self.finish_fetch_all_if_ready();
     }
 
     fn finish_fetch_all_if_ready(&mut self) {
@@ -167,7 +181,12 @@ impl SettingsDialog {
             self.apply_fetch_all_policy(merges, policy);
         }
         self.apply_fetch_all_degraded_statuses(degraded);
-        let _ = self.save_config();
+        // This reducer runs only after the final authoritative snapshot.
+        if let Err(error) = self.save_config() {
+            self.extended_warnings = vec![format!(
+                "could not save refreshed provider statuses: {error}"
+            )];
+        }
         if let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() {
             s.unlisted = if auto_policy.is_some() {
                 Vec::new()
@@ -188,11 +207,24 @@ impl SettingsDialog {
         )>,
         policy: ModelMergePolicy,
     ) {
-        for (provider_id, pre_fetch_models, remote, catalog) in merges {
+        for (provider_id, _pre_fetch_models, remote, catalog) in merges {
             if let Some(entry) = self.config.providers.get_mut(&provider_id) {
+                // A sibling refresh may have trimmed this provider since
+                // this summary was read. Only current authoritative entries
+                // can supply model data; old summaries select ids, not rows.
+                let current = entry
+                    .models
+                    .iter()
+                    .map(|model| (model.id.as_str(), model))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let remote = remote
+                    .iter()
+                    .filter_map(|model| current.get(model.id.as_str()).copied().cloned())
+                    .collect();
+                drop(current);
                 entry.models = merge_fetched_models_with_policy(
                     entry.effective_template(&provider_id),
-                    &pre_fetch_models,
+                    &entry.models,
                     remote,
                     policy,
                 );
@@ -210,8 +242,8 @@ impl SettingsDialog {
             };
             match status {
                 FetchDegradedStatus::Unsupported => entry.mark_model_fetch_unsupported(),
-                FetchDegradedStatus::Failed(reason) => {
-                    entry.mark_model_fetch_failed_kept_existing(reason)
+                FetchDegradedStatus::Failed(reason, failure) => {
+                    entry.mark_model_fetch_failed_kept_existing(reason, failure)
                 }
             }
         }
@@ -229,11 +261,24 @@ impl SettingsCx {
         )>,
         policy: ModelMergePolicy,
     ) {
-        for (provider_id, pre_fetch_models, remote, catalog) in merges {
+        for (provider_id, _pre_fetch_models, remote, catalog) in merges {
             if let Some(entry) = self.config.providers.get_mut(&provider_id) {
+                // A sibling refresh may have trimmed this provider since
+                // this summary was read. Only current authoritative entries
+                // can supply model data; old summaries select ids, not rows.
+                let current = entry
+                    .models
+                    .iter()
+                    .map(|model| (model.id.as_str(), model))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let remote = remote
+                    .iter()
+                    .filter_map(|model| current.get(model.id.as_str()).copied().cloned())
+                    .collect();
+                drop(current);
                 entry.models = merge_fetched_models_with_policy(
                     entry.effective_template(&provider_id),
-                    &pre_fetch_models,
+                    &entry.models,
                     remote,
                     policy,
                 );
@@ -357,10 +402,14 @@ pub(in crate::tui::settings) fn render_fetch_all_results(
 ) {
     for f in &s.finished {
         let (glyph, text, style) = match &f.outcome {
-            Ok(FetchOutcome::Models { models, catalog }) => (
+            Ok(FetchOutcome::Models {
+                models,
+                catalog,
+                trim_note,
+            }) => (
                 "✓",
                 format!(
-                    "{} — {} model(s){}",
+                    "{} — {} model(s){}{trim_note}",
                     f.provider_id,
                     models.len(),
                     provider_catalog_suffix(*catalog)
@@ -381,10 +430,19 @@ pub(in crate::tui::settings) fn render_fetch_all_results(
                 ),
                 red,
             ),
-            Ok(FetchOutcome::UnlistedModelsPreview { .. } | FetchOutcome::Error { .. }) => {
-                unreachable!("FetchHandle converts protocol-only outcomes into errors")
-            }
-            Err(e) => (
+            Ok(FetchOutcome::FallbackApplied {
+                models, catalog, ..
+            }) => (
+                "✓",
+                format!(
+                    "{} — {} model(s){}",
+                    f.provider_id,
+                    models.len(),
+                    provider_catalog_suffix(*catalog)
+                ),
+                green,
+            ),
+            Ok(FetchOutcome::Failed { reason: e, .. }) | Err(e) => (
                 "✗",
                 format!(
                     "{} — {}",
@@ -410,7 +468,11 @@ fn fetch_all_summary(s: &FetchAllState) -> String {
         .finished
         .iter()
         .filter(|f| {
-            f.outcome.is_err() || matches!(f.outcome, Ok(FetchOutcome::FallbackAvailable { .. }))
+            f.outcome.is_err()
+                || matches!(
+                    f.outcome,
+                    Ok(FetchOutcome::FallbackAvailable { .. } | FetchOutcome::Failed { .. })
+                )
         })
         .collect();
     let ok = total - failed.len();
@@ -419,7 +481,9 @@ fn fetch_all_summary(s: &FetchAllState) -> String {
     } else {
         let first = &failed[0];
         let reason = match &first.outcome {
-            Err(e) => redact_model_fetch_reason(e.as_str()),
+            Ok(FetchOutcome::Failed { reason: e, .. }) | Err(e) => {
+                redact_model_fetch_reason(e.as_str())
+            }
             Ok(FetchOutcome::FallbackAvailable { reason, .. }) => {
                 redact_model_fetch_reason(reason.as_str())
             }
@@ -444,7 +508,9 @@ fn fetch_all_merges(
     s.finished
         .iter()
         .filter_map(|summary| match &summary.outcome {
-            Ok(FetchOutcome::Models { models, catalog }) => Some((
+            Ok(FetchOutcome::Models {
+                models, catalog, ..
+            }) => Some((
                 summary.provider_id.clone(),
                 s.pre_fetch_models
                     .get(&summary.provider_id)
@@ -471,14 +537,23 @@ fn fetch_all_degraded_statuses(dialog: &SettingsDialog) -> Vec<(String, FetchDeg
             )),
             Ok(FetchOutcome::FallbackAvailable { reason, .. }) => Some((
                 summary.provider_id.clone(),
-                FetchDegradedStatus::Failed(redact_model_fetch_reason(reason.as_str())),
+                FetchDegradedStatus::Failed(
+                    redact_model_fetch_reason(reason.as_str()),
+                    cockpit_config::providers::ModelFetchFailure::Other,
+                ),
             )),
             Err(error) => Some((
                 summary.provider_id.clone(),
-                FetchDegradedStatus::Failed(redact_model_fetch_reason(error.as_str())),
+                FetchDegradedStatus::Failed(
+                    redact_model_fetch_reason(error.as_str()),
+                    cockpit_config::providers::ModelFetchFailure::Other,
+                ),
             )),
-            Ok(FetchOutcome::Models { .. }) => None,
-            Ok(FetchOutcome::UnlistedModelsPreview { .. } | FetchOutcome::Error { .. }) => None,
+            Ok(FetchOutcome::Failed { reason, failure }) => Some((
+                summary.provider_id.clone(),
+                FetchDegradedStatus::Failed(redact_model_fetch_reason(reason.as_str()), *failure),
+            )),
+            Ok(FetchOutcome::Models { .. } | FetchOutcome::FallbackApplied { .. }) => None,
         })
         .collect()
 }

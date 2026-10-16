@@ -122,11 +122,12 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
             }
         }
         let line = match result.outcome {
-            ProviderModelFetchOutcome::Models { models, .. } => {
+            ProviderModelFetchOutcome::Models { models, kept, .. } => {
                 format!(
-                    "{}: refreshed {} model(s)",
+                    "{}: refreshed {} model(s){}",
                     result.provider_id,
-                    models.len()
+                    models.count,
+                    cockpit_proto::catalog_trim_note(models.count, kept)
                 )
             }
             ProviderModelFetchOutcome::FallbackAvailable { reason, .. } if kept_fallback => {
@@ -145,7 +146,8 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
             ProviderModelFetchOutcome::Unsupported => {
                 format!("{}: no published /models endpoint", result.provider_id)
             }
-            ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted_count } => {
+            ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted } => {
+                let unlisted_count = unlisted.count;
                 failed += 1;
                 format!(
                     "{}: {} configured model(s) are absent from the fetched catalog; retry with --on-unlisted=keep or --on-unlisted=remove",

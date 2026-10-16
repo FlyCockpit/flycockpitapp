@@ -2844,3 +2844,37 @@ fn extended_local_and_remote_feature_gates_remain_independent() {
         );
     }
 }
+
+#[test]
+fn provider_batch_intent_and_terminal_receipt_byte_limits_are_independent() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
+        .unwrap();
+    let insert = |provider: &str, action: &str, entry: &str, terminal: Option<&str>| {
+        conn.execute(
+        "INSERT INTO provider_config_journals
+        (journal_id,owner_digest,client_operation_id,request_hash,fencing_generation,terminal_response_json,project_root,provider_id,action,config_path,consumed_revision,intended_revision,consumed_config_generation,intended_config_generation,entry_json,cleanup_named_json,cleanup_credential_json,created_at)
+        VALUES (lower(hex(randomblob(16))),CASE WHEN ?4 IS NOT NULL THEN 'owner' END,CASE WHEN ?4 IS NOT NULL THEN lower(hex(randomblob(16))) END,CASE WHEN ?4 IS NOT NULL THEN zeroblob(32) END,CASE WHEN ?4 IS NOT NULL THEN 1 END,?4,'/project',?1,?2,'/project/.cockpit/config.json',lower(hex(zeroblob(32))),lower(hex(zeroblob(32))),7,8,?3,'[]','[]',1)",rusqlite::params![provider,action,entry,terminal])
+    };
+    let json_bytes = |limit: usize| format!("{{\"pad\":\"{}\"}}", "x".repeat(limit - 10));
+    let single = 1024 * 1024;
+    assert!(insert("p", "save", &json_bytes(single), None).is_ok());
+    assert!(
+        insert("p", "save", &json_bytes(single + 1), None).is_err(),
+        "single-provider save cap stays 1 MiB"
+    );
+    let batch = 32 * 1024 * 1024;
+    assert!(
+        insert("__provider_batch__", "batch", &json_bytes(batch), None).is_ok(),
+        "complete private batch intent fits its declared bound"
+    );
+    assert!(
+        insert("__provider_batch__", "batch", &json_bytes(batch + 1), None).is_err(),
+        "batch intent remains bounded"
+    );
+    assert!(insert("p", "save", "{}", Some(&json_bytes(single))).is_ok());
+    assert!(
+        insert("p", "save", "{}", Some(&json_bytes(single + 1))).is_err(),
+        "terminal receipts stay 1 MiB"
+    );
+}

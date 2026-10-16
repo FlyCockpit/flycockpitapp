@@ -2763,6 +2763,7 @@ pub(crate) async fn run_turn(
                     emit_inference_error_ui: emit_inference_error_ui && !display_error_emitted,
                     goal_provenance,
                     tx,
+                    redact: model.session_redact_table(),
                 },
                 &e,
             )

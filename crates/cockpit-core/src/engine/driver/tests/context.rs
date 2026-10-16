@@ -3063,7 +3063,9 @@ async fn sealed_value_survives_completed_compaction() {
         .unwrap()
         .expect("persisted redaction after seal");
     // Production installation path: driver + agent models + scheduler tables.
-    driver.set_redaction_table(std::sync::Arc::new(persisted));
+    driver
+        .set_redaction_table(std::sync::Arc::new(persisted))
+        .unwrap();
     assert!(
         !driver.redact.scrub(literal).contains(literal),
         "live driver redaction table must scrub the sealed literal before compaction"
@@ -3126,13 +3128,15 @@ async fn sealed_value_survives_compaction_and_resume() {
         )
         .await
         .unwrap();
-    driver.set_redaction_table(std::sync::Arc::new(
-        driver
-            .session
-            .persisted_redaction_table()
-            .unwrap()
-            .expect("persisted after seal"),
-    ));
+    driver
+        .set_redaction_table(std::sync::Arc::new(
+            driver
+                .session
+                .persisted_redaction_table()
+                .unwrap()
+                .expect("persisted after seal"),
+        ))
+        .unwrap();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     driver.do_compact_with_source(&tx, "manual").await;
     drop(tx);

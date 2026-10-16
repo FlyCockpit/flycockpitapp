@@ -1199,7 +1199,7 @@ fn init_tracing(
     drain_logs_on_exit: bool,
     safe_interactive_shell: bool,
 ) -> Option<TracingGuard> {
-    use tracing_subscriber::{EnvFilter, fmt};
+    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
     let filter = match level {
         Some(l) => EnvFilter::try_new(l).unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -1217,6 +1217,8 @@ fn init_tracing(
             .with_env_filter(filter)
             .with_ansi(false)
             .with_writer(log.clone())
+            .finish()
+            .with(provider_library_deny_gate())
             .init();
         return Some(TracingGuard::Deferred {
             _guard: DeferredInteractiveLogGuard { log },
@@ -1227,6 +1229,8 @@ fn init_tracing(
         fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
+            .finish()
+            .with(provider_library_deny_gate())
             .init();
         return None;
     }
@@ -1242,6 +1246,8 @@ fn init_tracing(
                 .with_env_filter(filter)
                 .with_ansi(false)
                 .with_writer(writer)
+                .finish()
+                .with(provider_library_deny_gate())
                 .init();
             Some(TracingGuard::Worker { _guard: guard })
         }
@@ -1249,10 +1255,22 @@ fn init_tracing(
             fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::sink)
+                .finish()
+                .with(provider_library_deny_gate())
                 .init();
             None
         }
     }
+}
+
+/// Provider-library events can contain complete upstream bodies. This global
+/// metadata gate is ANDed with the operator's EnvFilter, independently of its
+/// directive specificity, spans, or field selectors, before every sink.
+fn provider_library_deny_gate<S: tracing::Subscriber>() -> impl tracing_subscriber::Layer<S> {
+    tracing_subscriber::filter::filter_fn(|metadata| {
+        let target = metadata.target();
+        target != "rig_core" && !target.starts_with("rig_core::")
+    })
 }
 
 /// Owns the installed tracing sink for a command.  Interactive sessions use
@@ -2318,5 +2336,106 @@ mod tests {
             !victim.join("cockpit.log").exists(),
             "no log file may be created inside the victim"
         );
+    }
+
+    #[test]
+    fn provider_http_error_does_not_leak_into_persistent_log() {
+        use futures::StreamExt;
+        use rig::client::CompletionClient;
+        use rig::completion::CompletionModel;
+        use std::io::{Read, Write};
+        use tracing_subscriber::layer::SubscriberExt;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 16384];
+            let read = socket.read(&mut request).unwrap();
+            assert!(read > 0);
+            let body = r#"{"error":{"message":"RAW_PROVIDER_BODY_SENTINEL known/session-key/+fragment-0042","code":"invalid_api_key"}}"#;
+            write!(socket, "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let log_dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let (writer, guard) = NonBlockingLog::start(log_dir.clone(), true).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("rig_core::providers::internal::sse_transport=trace,warn")
+            .with_ansi(false)
+            .with_writer(writer)
+            .finish()
+            .with(provider_library_deny_gate());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let client = rig::providers::openai::CompletionsClient::builder()
+                    .api_key("synthetic-key").base_url(format!("http://{address}/v1")).build().unwrap();
+                let model = client.completion_model("model");
+                let mut stream = model.completion_request("hello").stream().await.unwrap();
+                let error = stream.next().await.expect("provider error").expect_err("400 fails");
+                assert!(error.to_string().contains("RAW_PROVIDER_BODY_SENTINEL"));
+                tracing::warn!(target: "cockpit_core::engine", status = 400, "classified provider failure");
+            });
+        });
+        server.join().unwrap();
+        drop(guard);
+        let logged = std::fs::read_to_string(log_dir.join("cockpit.log")).unwrap();
+        assert!(!logged.contains("RAW_PROVIDER_BODY_SENTINEL"), "{logged}");
+        assert!(logged.contains("classified provider failure"), "{logged}");
+    }
+
+    /// Review C8: the provider library's raw-body diagnostics never reach a
+    /// Cockpit log sink, even when the operator's filter asks for them.
+    #[test]
+    fn provider_library_diagnostics_never_reach_log_sinks() {
+        use tracing_subscriber::layer::SubscriberExt;
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for base in [
+            "warn",
+            "rig_core=trace,warn",
+            "trace",
+            "rig_core::providers::internal::sse_transport=trace,warn",
+            "rig_core::providers=trace,warn",
+            "trace,[request{body}]=trace",
+        ] {
+            let capture = Capture::default();
+            let writer = capture.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(base))
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish()
+                .with(provider_library_deny_gate());
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::error!(
+                    target: "rig_core::providers::internal::sse_transport",
+                    body = "{\"error\":\"RAW_PROVIDER_BODY_SENTINEL\"}",
+                    "SSE error"
+                );
+                tracing::error!(target: "cockpit_core::engine", "cockpit failure recorded");
+            });
+            let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                !logged.contains("RAW_PROVIDER_BODY_SENTINEL"),
+                "{base}: provider body reached the log: {logged}"
+            );
+            assert!(
+                logged.contains("cockpit failure recorded"),
+                "{base}: {logged}"
+            );
+        }
     }
 }

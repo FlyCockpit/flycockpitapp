@@ -103,7 +103,38 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "provider_metadata",
     "last_model_fetch",
     "usage_probe",
+    "model_field_patches",
+    "model_order",
+    "model_membership",
 ];
+
+/// Canonical JSON budget for one authored provider layer, shared by raw
+/// writers and daemon edit ingress. Composition does not consume this budget.
+pub const MAX_AUTHORED_PROVIDER_ENTRY_BYTES: usize = 256 * 1024;
+
+/// Expected validation failures from the common prospective/durable serializer.
+/// Keep these typed through anyhow contexts so RPCs can distinguish quota
+/// rejection (before writing) from an actual filesystem or serialization fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderWriteValidationError {
+    AuthoredEntryTooLarge,
+    DocumentTooLarge,
+}
+
+impl std::fmt::Display for ProviderWriteValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AuthoredEntryTooLarge => {
+                "authored provider entry exceeds maximum length; no provider configuration was written"
+            }
+            Self::DocumentTooLarge => {
+                "serialized provider/config layer exceeds the readable byte limit; no provider configuration was written"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ProviderWriteValidationError {}
 
 const MODEL_WIZARD_MODEL_FIELD_KEYS: &[&str] = &[
     "trust",
@@ -676,6 +707,30 @@ pub struct ProviderEntry {
     /// providers that never pin it stay clean.
     #[serde(default, skip_serializing_if = "ThinkingParams::is_empty")]
     pub thinking_params: ThinkingParams,
+
+    /// This layer owns a complete catalog, including deliberate removals and
+    /// budget trimming. Partial hand-authored model overlays still merge by ID.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub models_replace: bool,
+
+    /// Sparse edits over this layer's merged model rows. Settings saves retain
+    /// inherited fields in their owning layers instead of copying composed rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_field_patches: Vec<ModelEntryFieldPatch>,
+
+    /// Explicit complete membership/order after applying this layer's edits.
+    /// `Some([])` removes all inherited models; absence preserves merge-by-ID.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_model_order"
+    )]
+    pub model_order: Option<Vec<String>>,
+
+    /// Sparse membership intent for large composed catalogs. Tombstones prevent
+    /// inherited deletions from returning; placements never copy inherited rows.
+    #[serde(default, skip_serializing_if = "ModelMembershipPatch::is_empty")]
+    pub model_membership: ModelMembershipPatch,
 
     /// Cached model list. Populated by `/fetch-models` (or the wizard).
     #[serde(default)]
@@ -1328,6 +1383,973 @@ where
     Ok(value)
 }
 
+/// An owned field edit or complete image for one model. Unchanged composed
+/// values never need to fit an edit request or be copied into the editing layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEntryFieldPatch {
+    pub id: String,
+    /// A newly inserted/full-replacement row owns its complete image, including
+    /// absence of fields that a hidden lower row with this ID might contain.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub replace: bool,
+    #[serde(deserialize_with = "deserialize_model_field_set")]
+    pub set: BTreeMap<String, Value>,
+    #[serde(deserialize_with = "deserialize_model_field_remove")]
+    pub remove: Vec<String>,
+}
+
+/// Move an existing row after an ID, or to the beginning when `after` is absent.
+/// Missing rows in a later lower-layer refresh are never recreated by a move.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelPlacement {
+    pub id: String,
+    pub after: Option<String>,
+}
+
+impl ModelPlacement {
+    pub fn apply(&self, order: &mut Vec<String>, strict: bool) -> Result<()> {
+        anyhow::ensure!(
+            self.after.as_ref() != Some(&self.id),
+            "model order placement refers to itself"
+        );
+        let Some(index) = order.iter().position(|id| id == &self.id) else {
+            anyhow::ensure!(!strict, "model order placement has no existing row");
+            return Ok(());
+        };
+        let destination = match &self.after {
+            None => 0,
+            Some(anchor) => match order.iter().position(|id| id == anchor) {
+                Some(anchor_index) => anchor_index + usize::from(anchor_index < index),
+                None => {
+                    anyhow::ensure!(!strict, "model order placement has no existing anchor");
+                    order.len() - 1
+                }
+            },
+        };
+        let id = order.remove(index);
+        order.insert(destination, id);
+        Ok(())
+    }
+
+    /// Compare insertion forests with schedules that can use temporary
+    /// anchors. Once a row is placed, its order relative to every stationary
+    /// or already placed row is final; not-yet-placed rows can still serve as
+    /// cheap anchors and move away later.
+    pub fn between(before: &[String], after: &[String]) -> Vec<Self> {
+        if before == after || after.is_empty() {
+            return Vec::new();
+        }
+        let framing = Self::framing_bytes();
+        let indexes = after
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect::<BTreeMap<_, _>>();
+        let initial = before.iter().map(|id| indexes[id]).collect::<Vec<_>>();
+        let costs = after
+            .iter()
+            .map(|id| serde_json::to_vec(id).expect("string serializes").len())
+            .collect::<Vec<_>>();
+        let row_weighted = Self::row_weighted_pins(&initial, &costs);
+        let anchor_cost = costs.iter().copied().min().unwrap_or(4).min(4);
+        let lower_bound = row_weighted
+            .iter()
+            .map(|index| costs[*index] + framing + 1 + anchor_cost)
+            .sum::<usize>();
+        // Even an arbitrary placement program must move the complement of a
+        // common subsequence and pay these ID/framing bytes. If that alone is
+        // oversized, skip the forest search; the caller can still choose full
+        // order, whose framing is smaller, or reject the exact charged edit.
+        if lower_bound > MAX_AUTHORED_PROVIDER_ENTRY_BYTES {
+            let pinned = row_weighted
+                .iter()
+                .map(|index| after[*index].as_str())
+                .collect();
+            return Self::for_pinned_order(after, &pinned);
+        }
+        let mut best =
+            Self::insertion_forest_between(before, after, &std::collections::BTreeSet::new());
+        let mut best_bytes = serde_json::to_vec(&best)
+            .expect("placements serialize")
+            .len();
+        let pinned = best
+            .iter()
+            .map(|placement| indexes[&placement.id])
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut pin_sets = vec![pinned];
+        if !pin_sets.contains(&row_weighted) {
+            pin_sets.push(row_weighted);
+        }
+        for pinned in pin_sets {
+            let desired = pinned.iter().copied().collect::<Vec<_>>();
+            let mut by_cost = desired.clone();
+            by_cost.sort_by_key(|index| (costs[*index], *index));
+            let schedules = [
+                desired.clone(),
+                desired.into_iter().rev().collect(),
+                by_cost.clone(),
+                by_cost.into_iter().rev().collect(),
+            ];
+            for schedule in schedules {
+                for allow_scaffolds in [false, true] {
+                    let mut pending = std::collections::VecDeque::from(schedule.clone());
+                    let mut current = initial.clone();
+                    let mut fixed = (0..after.len())
+                        .filter(|index| !pinned.contains(index))
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let mut placed = vec![false; after.len()];
+                    let mut program = Vec::with_capacity(pinned.len());
+                    let mut program_bytes = 2usize;
+                    let mut exceeded = false;
+                    while let Some(row) = pending.pop_front() {
+                        let source = current
+                            .iter()
+                            .position(|id| *id == row)
+                            .expect("existing row");
+                        current.remove(source);
+                        let anchor = loop {
+                            let predecessor = fixed.range(..row).next_back();
+                            let successor = fixed.range(row..).next().copied();
+                            let start = predecessor.map_or(0, |id| {
+                                current
+                                    .iter()
+                                    .position(|candidate| candidate == id)
+                                    .expect("fixed predecessor")
+                                    + 1
+                            });
+                            let end = successor.map_or(current.len(), |id| {
+                                current
+                                    .iter()
+                                    .position(|candidate| *candidate == id)
+                                    .expect("fixed successor")
+                            });
+                            let mut anchor = start.checked_sub(1);
+                            let mut anchor_cost = anchor.map_or(4, |index| costs[current[index]]);
+                            for (index, id) in current.iter().enumerate().take(end).skip(start) {
+                                if costs[*id] < anchor_cost {
+                                    anchor = Some(index);
+                                    anchor_cost = costs[*id];
+                                }
+                            }
+                            // A stationary successor can be a cheap temporary
+                            // handle, then move back after this row. Keep each
+                            // ID single-use: an already placed row stays fixed.
+                            if allow_scaffolds
+                                && let Some(successor) = successor
+                                && !placed[successor]
+                                && costs[successor] < anchor_cost
+                            {
+                                fixed.remove(&successor);
+                                pending.push_back(successor);
+                                continue;
+                            }
+                            break anchor;
+                        };
+                        // Charge prefixes before cloning long anchor strings.
+                        // A prefix already as large as the incumbent cannot win.
+                        let operation_bytes = framing
+                            + costs[row]
+                            + anchor.map_or(4, |index| costs[current[index]])
+                            + usize::from(!program.is_empty());
+                        if program_bytes.saturating_add(operation_bytes) >= best_bytes {
+                            exceeded = true;
+                            break;
+                        }
+                        program_bytes += operation_bytes;
+                        program.push(Self {
+                            id: after[row].clone(),
+                            after: anchor.map(|index| after[current[index]].clone()),
+                        });
+                        current.insert(anchor.map_or(0, |index| index + 1), row);
+                        fixed.insert(row);
+                        placed[row] = true;
+                    }
+                    if exceeded {
+                        continue;
+                    }
+                    let bytes = serde_json::to_vec(&program)
+                        .expect("placements serialize")
+                        .len();
+                    if bytes < best_bytes {
+                        best = program;
+                        best_bytes = bytes;
+                    }
+                }
+            }
+        }
+        Self::refine_small_program(before, after, &std::collections::BTreeSet::new(), best)
+    }
+
+    /// Choose an insertion forest or temporary-anchor program while retaining every required
+    /// durable pin. Request encodings need not determine new durable pins.
+    pub fn between_with_pins(
+        before: &[String],
+        after: &[String],
+        required: &std::collections::BTreeSet<&str>,
+    ) -> Vec<Self> {
+        let indexes = after
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| required.contains(id.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        let program = Self::insertion_forest_between(before, after, &indexes);
+        Self::refine_small_program(before, after, required, program)
+    }
+
+    // Eagerly optimize small inventories. Large inventories keep the fast
+    // forest/schedule incumbent; admission uses find_fitting with the actual
+    // remaining byte budget, without this eager-optimization size threshold.
+    fn refine_small_program(
+        before: &[String],
+        after: &[String],
+        required: &std::collections::BTreeSet<&str>,
+        mut program: Vec<Self>,
+    ) -> Vec<Self> {
+        if after.len() <= 8 {
+            loop {
+                let bytes = serde_json::to_vec(&program)
+                    .expect("placements serialize")
+                    .len();
+                let found = Self::find_fitting(before, after, required, bytes - 1, |_| {
+                    Ok::<_, std::convert::Infallible>(true)
+                })
+                .expect("infallible acceptance");
+                let Some(better) = found else { break };
+                program = better;
+            }
+        }
+        program
+    }
+
+    /// Exhaustive, byte-bounded admission of unique-ID move programs, including
+    /// cyclic temporary handles and required no-op pins. No schedule, pin-set,
+    /// row-count or search-node limit can turn a fitting program into rejection.
+    /// The caller supplies the real request/raw-layer budget and validates each
+    /// final candidate. Fast encodings should be tried first.
+    ///
+    /// A moved row can never move again: its relative order with every other
+    /// moved row must already be final. Prune only that necessary condition,
+    /// exact prefix bytes, and a weighted common-subsequence lower bound on
+    /// remaining moves. Iterative DFS retains O(n) search state (plus ID bytes),
+    /// rather than a permutation frontier or catalog-sized recursion stack.
+    /// Worst-case search time is exponential; it is used only after fast
+    /// candidates fail the actual budget, or to refine small inventories.
+    pub fn find_fitting<E>(
+        before: &[String],
+        after: &[String],
+        required: &std::collections::BTreeSet<&str>,
+        max_bytes: usize,
+        mut accept: impl FnMut(&[Self]) -> std::result::Result<bool, E>,
+    ) -> std::result::Result<Option<Vec<Self>>, E> {
+        let ranks = after
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect::<BTreeMap<_, _>>();
+        if ranks.len() != after.len() || before.len() != after.len() {
+            return Ok(None);
+        }
+        let Some(mut current) = before
+            .iter()
+            .map(|id| ranks.get(id).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        if current
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != after.len()
+        {
+            return Ok(None);
+        }
+        let costs = after
+            .iter()
+            .map(|id| serde_json::to_vec(id).expect("string serializes").len())
+            .collect::<Vec<_>>();
+        let required = after
+            .iter()
+            .map(|id| required.contains(id.as_str()))
+            .collect::<Vec<_>>();
+        let anchor_floor = costs.iter().copied().min().unwrap_or(4).min(4);
+        let minimum = costs
+            .iter()
+            .map(|cost| cost + Self::framing_bytes() + anchor_floor + 1)
+            .collect::<Vec<_>>();
+        // Required pins already consume these bytes in EVERY program. A row
+        // whose additional minimum cost exceeds the budget must remain
+        // stationary. This is a proof, never a heuristic choice of pin set.
+        let required_bytes = minimum
+            .iter()
+            .zip(&required)
+            .filter(|(_, required)| **required)
+            .map(|(bytes, _)| bytes)
+            .sum::<usize>();
+        let mut stationary = minimum
+            .iter()
+            .zip(&required)
+            .map(|(bytes, required)| {
+                !required
+                    && 1usize.saturating_add(required_bytes).saturating_add(*bytes) > max_bytes
+            })
+            .collect::<Vec<_>>();
+        let unused = vec![false; after.len()];
+        let floor = Self::remaining_move_floor(&current, &unused, &stationary, &required, &costs);
+        if 1usize.saturating_add(floor).max(2) > max_bytes {
+            return Ok(None);
+        }
+        // Only expensive rows inside the changed span can make these extra
+        // proofs useful. Do not rescan a catalog-sized unchanged prefix for
+        // every optional row before trying its few cheap temporary handles.
+        if let (Some(first), Some(last)) = (
+            current
+                .iter()
+                .enumerate()
+                .position(|(index, row)| index != *row),
+            current
+                .iter()
+                .enumerate()
+                .rposition(|(index, row)| index != *row),
+        ) {
+            let slack = max_bytes.saturating_sub(1usize.saturating_add(floor));
+            for (row, &is_required) in required.iter().enumerate().take(last + 1).skip(first) {
+                if is_required || stationary[row] || minimum[row] <= slack {
+                    continue;
+                }
+                let mut constrained = required.clone();
+                constrained[row] = true;
+                let floor = Self::remaining_move_floor(
+                    &current,
+                    &unused,
+                    &stationary,
+                    &constrained,
+                    &costs,
+                );
+                if 1usize.saturating_add(floor) > max_bytes {
+                    stationary[row] = true;
+                }
+            }
+        }
+        let mut rows = (0..after.len()).collect::<Vec<_>>();
+        rows.sort_by_key(|&row| (costs[row], row));
+        // Try cheap handles before scanning a potentially huge unchanged
+        // prefix. Candidate ordering changes no admissible schedule or bound.
+        let mut anchors = std::iter::once(None)
+            .chain((0..after.len()).map(Some))
+            .collect::<Vec<_>>();
+        anchors.sort_by_key(|anchor| (anchor.map_or(4, |row| costs[row]), *anchor));
+        let mut used = vec![false; after.len()];
+        let mut program = Vec::new();
+        struct Frame {
+            cursor: usize,
+            bytes: usize,
+            undo: Option<(usize, usize)>,
+        }
+        let mut stack = vec![Frame {
+            cursor: 0,
+            bytes: 2,
+            undo: None,
+        }];
+        while let Some(frame) = stack.last_mut() {
+            if frame.cursor == 0 {
+                let remaining =
+                    Self::remaining_move_floor(&current, &used, &stationary, &required, &costs);
+                let floor = frame
+                    .bytes
+                    .saturating_add(remaining)
+                    .saturating_sub(usize::from(program.is_empty() && remaining > 0));
+                if floor > max_bytes {
+                    frame.cursor = rows.len() * (rows.len() + 1);
+                } else if current.iter().copied().eq(0..after.len())
+                    && required
+                        .iter()
+                        .zip(&used)
+                        .all(|(required, used)| !required || *used)
+                    && accept(&program)?
+                {
+                    return Ok(Some(program));
+                }
+            }
+            if frame.cursor == rows.len() * (rows.len() + 1) {
+                let frame = stack.pop().expect("existing frame");
+                if let Some((row, source)) = frame.undo {
+                    let destination = current.iter().position(|&id| id == row).expect("moved row");
+                    current.remove(destination);
+                    current.insert(source, row);
+                    used[row] = false;
+                    program.pop();
+                }
+                continue;
+            }
+            let row = rows[frame.cursor / (rows.len() + 1)];
+            let anchor = anchors[frame.cursor % anchors.len()];
+            frame.cursor += 1;
+            if used[row] || stationary[row] {
+                frame.cursor = frame.cursor.div_ceil(rows.len() + 1) * (rows.len() + 1);
+                continue;
+            }
+            if anchor == Some(row) {
+                continue;
+            }
+            let bytes = frame.bytes
+                + Self::framing_bytes()
+                + costs[row]
+                + anchor.map_or(4, |id| costs[id])
+                + usize::from(!program.is_empty());
+            if bytes > max_bytes {
+                continue;
+            }
+            let source = current
+                .iter()
+                .position(|&id| id == row)
+                .expect("existing row");
+            let destination = anchor.map_or(0, |id| {
+                let index = current
+                    .iter()
+                    .position(|&candidate| candidate == id)
+                    .expect("existing anchor");
+                index + usize::from(index < source)
+            });
+            if source == destination && !required[row] {
+                continue;
+            }
+            current.remove(source);
+            current.insert(destination, row);
+            used[row] = true;
+            let mut previous = None;
+            let mut valid = true;
+            for &id in current.iter().filter(|&&id| used[id]) {
+                if previous.is_some_and(|prior| prior > id) {
+                    valid = false;
+                    break;
+                }
+                previous = Some(id);
+            }
+            if valid {
+                program.push(Self {
+                    id: after[row].clone(),
+                    after: anchor.map(|id| after[id].clone()),
+                });
+                stack.push(Frame {
+                    cursor: 0,
+                    bytes,
+                    undo: Some((row, source)),
+                });
+            } else {
+                current.remove(destination);
+                current.insert(source, row);
+                used[row] = false;
+            }
+        }
+        Ok(None)
+    }
+
+    fn remaining_move_floor(
+        current: &[usize],
+        used: &[bool],
+        stationary: &[bool],
+        required: &[bool],
+        costs: &[usize],
+    ) -> usize {
+        let fixed = used
+            .iter()
+            .zip(stationary)
+            .map(|(used, stationary)| *used || *stationary)
+            .collect::<Vec<_>>();
+        let mut previous = None;
+        let mut gaps = vec![[(usize::MAX, usize::MAX); 2]];
+        for &row in current {
+            if fixed[row] {
+                if previous.is_some_and(|prior| prior > row) {
+                    return usize::MAX;
+                }
+                previous = Some(row);
+                gaps.push([(usize::MAX, usize::MAX); 2]);
+            } else {
+                let cheapest = gaps.last_mut().expect("current gap");
+                let candidate = (costs[row], row);
+                if candidate < cheapest[0] {
+                    cheapest[1] = cheapest[0];
+                    cheapest[0] = candidate;
+                } else if candidate < cheapest[1] {
+                    cheapest[1] = candidate;
+                }
+            }
+        }
+        // A future anchor is either still unmoved in this physical gap, or has
+        // already moved to a final position before this row in the target gap.
+        // Null is possible only before every fixed row. This also accounts for
+        // cyclic handles: a still-unmoved anchor may have a LATER target rank.
+        let mut minimum = vec![0usize; current.len()];
+        let mut gap = 0;
+        let mut predecessor_cost = 4;
+        let mut future_cost = usize::MAX;
+        let mut total = 0;
+        for (row, &cost) in costs.iter().enumerate() {
+            if fixed[row] {
+                gap += 1;
+                predecessor_cost = cost;
+                future_cost = usize::MAX;
+            } else {
+                let cheapest = gaps[gap];
+                let current_cost = if cheapest[0].1 == row {
+                    cheapest[1].0
+                } else {
+                    cheapest[0].0
+                };
+                let anchor = predecessor_cost.min(current_cost).min(future_cost);
+                minimum[row] = cost + Self::framing_bytes() + anchor + 1;
+                total += minimum[row];
+                future_cost = future_cost.min(cost);
+            }
+        }
+        // Rows that never move form a common subsequence containing every
+        // already fixed row and excluding outstanding required pins. A bonus
+        // greater than all optional weights forces all fixed rows into its LIS.
+        let bonus = total + 1;
+        let mut prefixes = vec![0usize; current.len() + 1];
+        let mut best = 0;
+        let mut fixed_count = 0;
+        for &row in current {
+            if required[row] && !used[row] {
+                continue;
+            }
+            let weight = if fixed[row] {
+                fixed_count += 1;
+                bonus
+            } else {
+                minimum[row]
+            };
+            let mut prior = 0;
+            let mut slot = row;
+            while slot > 0 {
+                prior = prior.max(prefixes[slot]);
+                slot &= slot - 1;
+            }
+            let candidate = prior + weight;
+            best = best.max(candidate);
+            slot = row + 1;
+            while slot < prefixes.len() {
+                prefixes[slot] = prefixes[slot].max(candidate);
+                slot += slot & slot.wrapping_neg();
+            }
+        }
+        total - (best - fixed_count * bonus)
+    }
+
+    fn framing_bytes() -> usize {
+        serde_json::to_vec(&Self {
+            id: String::new(),
+            after: None,
+        })
+        .expect("placement serializes")
+        .len()
+            - 2
+            - 4
+    }
+
+    // Temporary anchors can change which rows are cheapest to move. Keep a
+    // second common subsequence weighted without desired-predecessor costs.
+    fn row_weighted_pins(initial: &[usize], costs: &[usize]) -> std::collections::BTreeSet<usize> {
+        let mut positions = vec![0; initial.len()];
+        for (position, &index) in initial.iter().enumerate() {
+            positions[index] = position;
+        }
+        let anchor_cost = costs.iter().copied().min().unwrap_or(4).min(4);
+        let framing = Self::framing_bytes() + 1;
+        let mut prefixes = vec![(0usize, None); initial.len() + 1];
+        let mut previous = vec![None; initial.len()];
+        for (index, &cost) in costs.iter().enumerate() {
+            let mut best = (0, None);
+            let mut slot = positions[index];
+            while slot > 0 {
+                if prefixes[slot].0 > best.0 {
+                    best = prefixes[slot];
+                }
+                slot &= slot - 1;
+            }
+            previous[index] = best.1;
+            let candidate = (best.0 + cost + framing + anchor_cost, Some(index));
+            slot = positions[index] + 1;
+            while slot < prefixes.len() {
+                if candidate.0 > prefixes[slot].0 {
+                    prefixes[slot] = candidate;
+                }
+                slot += slot & slot.wrapping_neg();
+            }
+        }
+        let mut best = (0, None);
+        let mut slot = initial.len();
+        while slot > 0 {
+            if prefixes[slot].0 > best.0 {
+                best = prefixes[slot];
+            }
+            slot &= slot - 1;
+        }
+        let mut stable = std::collections::BTreeSet::new();
+        let mut cursor = best.1;
+        while let Some(index) = cursor {
+            stable.insert(index);
+            cursor = previous[index];
+        }
+        (0..initial.len())
+            .filter(|index| !stable.contains(index))
+            .collect()
+    }
+
+    /// Minimize serialized bytes over insertion forests and stable common
+    /// subsequences. Each movable gap can repeat any preceding anchor in that
+    /// gap; reverse prepends and non-immediate anchors are ordinary candidates.
+    fn insertion_forest_between(
+        before: &[String],
+        after: &[String],
+        required: &std::collections::BTreeSet<usize>,
+    ) -> Vec<Self> {
+        if before == after && required.is_empty() {
+            return Vec::new();
+        }
+        let positions = before
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect::<BTreeMap<_, _>>();
+        let ranks = after.iter().map(|id| positions[id]).collect::<Vec<_>>();
+        let costs = after
+            .iter()
+            .map(|id| serde_json::to_vec(id).expect("string serializes").len())
+            .collect::<Vec<_>>();
+        // A state keeps its last stationary row. Extending its movable gap
+        // charges the moved ID and cheapest preceding anchor, including JSON
+        // escaping and the comma. Stabilizing a row is possible exactly when
+        // its original position follows the previous stationary row.
+        // State zero is the virtual start anchor, serialized as null.
+        let overhead = Self::framing_bytes() + 1;
+        let mut states = vec![(0usize, 0usize, 4usize)];
+        let mut remaining = ranks
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut previous = Vec::with_capacity(after.len());
+        for (index, (&position, &cost)) in ranks.iter().zip(&costs).enumerate() {
+            let mut best = (usize::MAX, 0);
+            for &(state, bytes, _) in &states {
+                if !required.contains(&index)
+                    && (state == 0 || ranks[state - 1] < position)
+                    && bytes < best.0
+                {
+                    best = (bytes, state);
+                }
+            }
+            previous.push(best.1);
+            for (_, bytes, anchor) in &mut states {
+                *bytes += overhead + cost + *anchor;
+                *anchor = (*anchor).min(cost);
+            }
+            if !required.contains(&index) {
+                states.push((index + 1, best.0, cost));
+            }
+            remaining.remove(&position);
+            // States with the same next remaining original position have the
+            // same eligibility for EVERY future stationary row. Within that
+            // class, a cheaper state with a cheaper anchor dominates forever.
+            // This avoids quadratic scans of a long otherwise unchanged prefix
+            // when one cheap row is moved across a large catalog.
+            let bucket = |state: usize| {
+                if state == 0 {
+                    remaining.first().copied()
+                } else {
+                    remaining
+                        .range((
+                            std::ops::Bound::Excluded(ranks[state - 1]),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .copied()
+                }
+                .unwrap_or(usize::MAX)
+            };
+            let mut choices = BTreeMap::<(usize, usize), (usize, usize)>::new();
+            for &(state, bytes, anchor) in &states {
+                let choice = choices
+                    .entry((bucket(state), anchor))
+                    .or_insert((bytes, state));
+                if bytes < choice.0 {
+                    *choice = (bytes, state);
+                }
+            }
+            let mut keep = std::collections::BTreeSet::new();
+            let mut prior_bucket = None;
+            let mut least_bytes = usize::MAX;
+            for ((bucket, _), (bytes, state)) in choices {
+                if prior_bucket != Some(bucket) {
+                    least_bytes = usize::MAX;
+                    prior_bucket = Some(bucket);
+                }
+                if bytes < least_bytes {
+                    keep.insert(state);
+                    least_bytes = bytes;
+                }
+            }
+            states.retain(|(state, _, _)| keep.contains(state));
+        }
+        let mut state = states
+            .iter()
+            .min_by_key(|(_, bytes, _)| *bytes)
+            .expect("start state")
+            .0;
+        let mut stable = std::collections::BTreeSet::new();
+        while state != 0 {
+            stable.insert(after[state - 1].as_str());
+            state = previous[state - 1];
+        }
+        let pinned = after
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !stable.contains(id))
+            .collect();
+        Self::for_pinned_order(after, &pinned)
+    }
+
+    /// Re-encode every specified pin without removing any of them. Each gap
+    /// between unpinned rows forms an ordered insertion tree. A row can use the
+    /// cheapest preceding anchor in that gap, and siblings are inserted in
+    /// reverse order. This includes repeated prepends and non-immediate anchors.
+    /// Work/storage are linear in the order and its serialized ID bytes, aside
+    /// from the pin-set lookups. No recursion grows with a provider catalog.
+    pub fn for_pinned_order(
+        order: &[String],
+        pinned: &std::collections::BTreeSet<&str>,
+    ) -> Vec<Self> {
+        if pinned.is_empty() {
+            return Vec::new();
+        }
+        let costs = order
+            .iter()
+            .map(|id| serde_json::to_vec(id).expect("string serializes").len())
+            .collect::<Vec<_>>();
+        let mut placements = Vec::with_capacity(pinned.len());
+        let mut start = 0;
+        while start < order.len() {
+            if !pinned.contains(order[start].as_str()) {
+                start += 1;
+                continue;
+            }
+            let mut end = start + 1;
+            while end < order.len() && pinned.contains(order[end].as_str()) {
+                end += 1;
+            }
+            // Node zero is the stationary predecessor (or the beginning).
+            let root = start.checked_sub(1);
+            let mut cheapest = 0;
+            let mut cheapest_cost = root.map_or(4, |index| costs[index]);
+            let mut children = vec![Vec::new(); end - start + 1];
+            let mut parents = vec![0; end - start];
+            for (index, &cost) in costs.iter().enumerate().take(end).skip(start) {
+                let node = index - start + 1;
+                parents[node - 1] = cheapest;
+                children[cheapest].push(node);
+                if cost < cheapest_cost {
+                    cheapest = node;
+                    cheapest_cost = cost;
+                }
+            }
+            let mut pending = std::mem::take(&mut children[0]);
+            while let Some(node) = pending.pop() {
+                let parent = parents[node - 1];
+                placements.push(Self {
+                    id: order[start + node - 1].clone(),
+                    after: if parent == 0 {
+                        root.map(|index| order[index].clone())
+                    } else {
+                        Some(order[start + parent - 1].clone())
+                    },
+                });
+                pending.append(&mut children[node]);
+            }
+            start = end;
+        }
+        placements
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(try_from = "RawModelMembershipPatch")]
+pub struct ModelMembershipPatch {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deletes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placements: Vec<ModelPlacement>,
+}
+
+#[derive(Deserialize)]
+struct RawModelMembershipPatch {
+    #[serde(default)]
+    deletes: Vec<String>,
+    #[serde(default)]
+    placements: Vec<ModelPlacement>,
+}
+
+impl TryFrom<RawModelMembershipPatch> for ModelMembershipPatch {
+    type Error = &'static str;
+    fn try_from(raw: RawModelMembershipPatch) -> std::result::Result<Self, Self::Error> {
+        let deletes = raw
+            .deletes
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let placements = raw
+            .placements
+            .iter()
+            .map(|p| &p.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if deletes.len() != raw.deletes.len()
+            || placements.len() != raw.placements.len()
+            || raw
+                .placements
+                .iter()
+                .any(|p| deletes.contains(&p.id) || p.after.as_ref() == Some(&p.id))
+        {
+            return Err("invalid model membership operations");
+        }
+        Ok(Self {
+            deletes: raw.deletes,
+            placements: raw.placements,
+        })
+    }
+}
+
+impl ModelMembershipPatch {
+    pub fn is_empty(&self) -> bool {
+        self.deletes.is_empty() && self.placements.is_empty()
+    }
+}
+
+fn deserialize_model_order<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error> {
+    let order = Option::<Vec<String>>::deserialize(deserializer)?;
+    if let Some(order) = &order {
+        let ids = order.iter().collect::<std::collections::BTreeSet<_>>();
+        if ids.len() != order.len() {
+            return Err(serde::de::Error::custom(
+                "model order contains duplicate ids",
+            ));
+        }
+    }
+    Ok(order)
+}
+
+fn deserialize_model_field_set<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, Value>, D::Error> {
+    let set = BTreeMap::<String, Value>::deserialize(deserializer)?;
+    if set.contains_key("id") {
+        return Err(serde::de::Error::custom(
+            "model field patch cannot change id",
+        ));
+    }
+    Ok(set)
+}
+
+fn deserialize_model_field_remove<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    let remove = Vec::<String>::deserialize(deserializer)?;
+    if remove.iter().any(|key| key == "id") {
+        return Err(serde::de::Error::custom(
+            "model field patch cannot remove id",
+        ));
+    }
+    Ok(remove)
+}
+
+impl ModelEntryFieldPatch {
+    pub fn between(before: &ModelEntry, after: &ModelEntry) -> Result<Self> {
+        anyhow::ensure!(before.id == after.id, "model field patch cannot change id");
+        let before = serde_json::to_value(before)?;
+        let after = serde_json::to_value(after)?;
+        let before = before.as_object().expect("model is an object");
+        let after = after.as_object().expect("model is an object");
+        Ok(Self {
+            id: after["id"].as_str().expect("model id").into(),
+            replace: false,
+            set: after
+                .iter()
+                .filter(|(key, value)| before.get(*key) != Some(*value))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            remove: before
+                .keys()
+                .filter(|key| !after.contains_key(*key))
+                .cloned()
+                .collect(),
+        })
+    }
+
+    pub fn apply_value(&self, model: &mut Value) -> Result<()> {
+        anyhow::ensure!(
+            model.get("id").and_then(Value::as_str) == Some(self.id.as_str())
+                && !self.set.contains_key("id")
+                && !self.remove.iter().any(|key| key == "id"),
+            "model field patch identity mismatch"
+        );
+        if self.replace {
+            *model = serde_json::json!({"id": self.id});
+        }
+        let object = model.as_object_mut().expect("model id requires an object");
+        for key in &self.remove {
+            object.remove(key);
+        }
+        for (key, value) in &self.set {
+            object.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+
+    /// Evict touched values from the authored row before storing the field
+    /// delta. An owned large value must have one durable copy, not old + new.
+    pub fn evict_authored_fields(&self, model: &mut ModelEntry) -> Result<()> {
+        anyhow::ensure!(model.id == self.id, "model field patch identity mismatch");
+        let mut raw = serde_json::to_value(&*model)?;
+        let object = raw.as_object_mut().expect("model is an object");
+        for key in self.set.keys().chain(self.remove.iter()) {
+            object.remove(key);
+        }
+        *model = serde_json::from_value(raw)?;
+        Ok(())
+    }
+
+    pub fn replacement(model: &ModelEntry) -> Result<Self> {
+        let baseline = ModelEntry {
+            id: model.id.clone(),
+            ..Default::default()
+        };
+        let mut patch = Self::between(&baseline, model)?;
+        patch.replace = true;
+        Ok(patch)
+    }
+
+    /// Compose a later owner edit without retaining overwritten values.
+    pub fn extend(&mut self, next: &Self) {
+        if next.replace {
+            *self = next.clone();
+            return;
+        }
+        for key in &next.remove {
+            self.set.remove(key);
+            if !self.remove.contains(key) {
+                self.remove.push(key.clone());
+            }
+        }
+        for (key, value) in &next.set {
+            self.remove.retain(|old| old != key);
+            self.set.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
@@ -1939,6 +2961,13 @@ pub enum ModelFetchStatusKind {
     AuthFailed,
 }
 
+/// Evidence supplied by the fetch owner, never inferred from diagnostic prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFetchFailure {
+    CredentialsRejected,
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelFetchSource {
@@ -2083,6 +3112,15 @@ pub enum ModelMergePolicy {
     RemoveUnlisted,
 }
 
+/// Normalize a fetched catalog after credential scrubbing. The first row for
+/// each exact model ID wins; distinct IDs retain their upstream order.
+/// Use this before counting, previewing or persisting a fetched inventory.
+pub fn coalesce_fetched_models(mut models: Vec<ModelEntry>) -> Vec<ModelEntry> {
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|model| seen.insert(model.id.clone()));
+    models
+}
+
 /// Merge a freshly-fetched `/models` list into an existing model list,
 /// preserving manually-added entries.
 ///
@@ -2118,7 +3156,7 @@ pub fn merge_fetched_models_with_policy(
     policy: ModelMergePolicy,
 ) -> Vec<ModelEntry> {
     let mut merged = Vec::new();
-    for mut m in fetched {
+    for mut m in coalesce_fetched_models(fetched) {
         if let Some(prev) = existing.iter().find(|e| e.id == m.id) {
             preserve_model_overrides(prev, &mut m);
         } else {
@@ -2413,12 +3451,14 @@ impl ProviderEntry {
         });
     }
 
-    pub fn mark_model_fetch_failed_kept_existing(&mut self, reason: impl Into<String>) {
-        let reason = reason.into();
-        let status = if is_model_fetch_auth_failure(&reason) {
-            ModelFetchStatusKind::AuthFailed
-        } else {
-            ModelFetchStatusKind::FailedKeptExisting
+    pub fn mark_model_fetch_failed_kept_existing(
+        &mut self,
+        reason: impl Into<String>,
+        failure: ModelFetchFailure,
+    ) {
+        let status = match failure {
+            ModelFetchFailure::CredentialsRejected => ModelFetchStatusKind::AuthFailed,
+            ModelFetchFailure::Other => ModelFetchStatusKind::FailedKeptExisting,
         };
         self.last_model_fetch = Some(ModelFetchStatus {
             status,
@@ -2427,17 +3467,6 @@ impl ProviderEntry {
             reason: Some(redact_model_fetch_reason(reason)),
         });
     }
-}
-
-fn is_model_fetch_auth_failure(reason: &str) -> bool {
-    let lower = reason.to_ascii_lowercase();
-    lower.contains(" returned 401")
-        || lower.contains(" returned 403")
-        || lower.contains("credentials rejected")
-        || lower.contains("subscription auth")
-        || lower.contains("authorization for provider")
-        || lower.contains("requires an official github token")
-        || lower.contains("missing chatgpt-account-id")
 }
 
 pub fn redact_model_fetch_reason(reason: impl Into<String>) -> String {

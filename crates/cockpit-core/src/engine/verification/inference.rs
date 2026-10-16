@@ -352,6 +352,7 @@ async fn journaled_verification_inference(
                     emit_inference_error_ui: false,
                     goal_provenance: None,
                     tx: &tx,
+                    redact: input.model.session_redact_table(),
                 },
                 &error,
             )

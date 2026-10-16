@@ -7,7 +7,7 @@
 //! Layout:
 //!
 //! ```text
-//! { "v": 10, "kind": "req"|"res"|"evt"|"err", ... }
+//! { "v": 1, "kind": "req"|"res"|"evt"|"err", ... }
 //! ```
 //!
 //! - **`req`** — client → daemon. Carries a uuid `id` the daemon
@@ -22,14 +22,18 @@
 //!
 //! The schema version (`v`) sits on every envelope so a future bump
 //! can be detected on a per-line basis without buffering. Clients
-//! refuse envelopes whose `v` is outside the supported range.
+//! require an exact `v` match. Large config publications use bounded
+//! `config_chunk` transport frames, reassembled with a size cap, digest and
+//! deadline before a complete envelope is delivered.
 
 pub mod acp;
 pub mod agent_authoring;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod capability_ceiling;
+mod config_frames;
 pub mod config_management;
+pub use config_frames::MAX_CONFIG_TRANSFER_BYTES;
 #[cfg(feature = "remote")]
 pub mod es256;
 pub use acp::{
@@ -123,8 +127,8 @@ pub use onboarding::{
     encode_sensitive_onboarding_intent, encode_sensitive_onboarding_response,
 };
 pub use provider_management::{
-    ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
-    ProviderMutationUpsert, ProviderSecretValue,
+    ProviderCatalogReadback, ProviderLayerMetadataPatch, ProviderModelPatch, ProviderMutationBatch,
+    ProviderMutationDelete, ProviderMutationUpsert, ProviderSecretValue,
 };
 pub mod session_setup;
 pub use session_setup::{
@@ -178,6 +182,10 @@ pub mod wire_scalar;
 
 /// Payload ceiling for latency-sensitive local daemon RPC responses.
 pub const MAX_INTERACTIVE_RPC_PAYLOAD_BYTES: usize = 512 * 1024;
+
+/// UTF-8 source bytes per catalog page. JSON escaping costs at most six bytes
+/// per byte, leaving envelope space inside the fixed interactive wire limit.
+pub const PROVIDER_CATALOG_PAGE_BYTES: usize = 64 * 1024;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -518,23 +526,158 @@ pub struct ProviderEntryView {
     pub credential_configured: bool,
 }
 
+/// Marker used when an owner edits a redacted provider header without
+/// replacing its daemon-owned value.
+pub const PRESERVED_PROVIDER_HEADER_VALUE: &str = "********";
+
+impl ProviderEntryView {
+    /// Complete editable view with daemon-owned header values preserved.
+    /// Catalog-backed settings derive bounded model deltas from this view.
+    pub fn editable_entry(&self) -> cockpit_config::providers::ProviderEntry {
+        let mut entry = self.entry.clone();
+        entry.headers = self
+            .headers
+            .iter()
+            .map(|header| cockpit_config::providers::HeaderSpec {
+                name: header.name.clone(),
+                value: PRESERVED_PROVIDER_HEADER_VALUE.to_string(),
+            })
+            .collect();
+        entry
+    }
+}
+
+/// Total model-id bytes one [`Response::ProviderModelsFetched`] may carry
+/// across all of its results. A model fetch response is a *summary* of the
+/// catalog the daemon persisted, never the catalog itself: the daemon is the
+/// only merge/persist authority, and clients that need full model entries
+/// re-read them through `GetProviderCatalogSnapshot`. Exact counts always
+/// travel; only the id preview is bounded, so the response stays far below
+/// [`MAX_INTERACTIVE_RPC_PAYLOAD_BYTES`] for any catalog size (#545).
+pub const MAX_PROVIDER_MODEL_SUMMARY_ID_BYTES: usize = 128 * 1024;
+
+/// Bounded summary of a list of model ids: the exact `count` plus the leading
+/// ids in catalog order. `ids.len() < count` means the preview was truncated
+/// to keep the response inside its payload budget.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderModelIdSummary {
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<String>,
+}
+
+impl ProviderModelIdSummary {
+    /// Summarize `ids`, charging each previewed id (plus its JSON framing)
+    /// against the shared response `budget`. Counting never stops; the
+    /// preview stops at the first id that no longer fits.
+    pub fn bounded<I, S>(ids: I, budget: &mut usize) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut summary = Self::default();
+        let mut previewing = true;
+        for id in ids {
+            summary.count = summary.count.saturating_add(1);
+            if !previewing {
+                continue;
+            }
+            let id = id.into();
+            // Charge the actual escaped JSON string plus its separator.
+            let cost = serde_json::to_vec(&id)
+                .expect("string serializes")
+                .len()
+                .saturating_add(1);
+            if cost > *budget {
+                previewing = false;
+                continue;
+            }
+            *budget -= cost;
+            summary.ids.push(id);
+        }
+        summary
+    }
+
+    /// Number of ids counted but not previewed.
+    pub fn omitted(&self) -> u32 {
+        self.count
+            .saturating_sub(u32::try_from(self.ids.len()).unwrap_or(u32::MAX))
+    }
+}
+
+#[cfg(test)]
+mod provider_model_id_summary_tests {
+    use super::*;
+
+    /// The preview is bounded by the shared budget for any id length or
+    /// script, ids are never sliced, and the count stays exact (#545).
+    #[test]
+    fn preview_is_budgeted_whole_ids_with_exact_count() {
+        let long = "m".repeat(200_000);
+        let ids = vec![
+            "ascii/model".to_string(),
+            "模型/中文-模型".to_string(),
+            long.clone(),
+            "after-long".to_string(),
+        ];
+        let mut budget = 1024;
+        let summary = ProviderModelIdSummary::bounded(ids.clone(), &mut budget);
+        assert_eq!(summary.count, 4);
+        assert_eq!(
+            summary.ids,
+            ids[..2].to_vec(),
+            "preview stops at the first misfit"
+        );
+        assert_eq!(summary.omitted(), 2);
+        let mut shared = MAX_PROVIDER_MODEL_SUMMARY_ID_BYTES;
+        let many = (0..100_000).map(|index| format!("vendor/model-{index}"));
+        let first = ProviderModelIdSummary::bounded(many, &mut shared);
+        let second = ProviderModelIdSummary::bounded(vec!["x".to_string()], &mut shared);
+        assert_eq!(first.count, 100_000);
+        let encoded = serde_json::to_vec(&(first, second)).unwrap();
+        assert!(encoded.len() <= MAX_PROVIDER_MODEL_SUMMARY_ID_BYTES + 64);
+    }
+}
+
+/// User-facing suffix for a refresh whose catalog the daemon trimmed to stay
+/// readable through the bounded provider snapshot (`kept < fetched`). Empty
+/// otherwise. One spelling for every client.
+pub fn catalog_trim_note(fetched: u32, kept: u32) -> String {
+    if kept < fetched {
+        format!(
+            " — only {kept} of {fetched} saved: the catalog was trimmed to fit Cockpit's provider snapshot limit"
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Secret-free provider model discovery result returned by the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProviderModelFetchOutcome {
+    /// The live catalog was fetched and durably merged by the daemon.
+    /// `models` summarizes the fetched upstream list.
     Models {
-        models: Vec<cockpit_config::config::providers::ModelEntry>,
+        models: ProviderModelIdSummary,
         catalog: cockpit_config::config::providers::ProviderModelCatalog,
+        /// How many of the fetched models the daemon persisted. Smaller than
+        /// `models.count` when the catalog was trimmed to stay readable
+        /// through the bounded provider snapshot; clients must say so.
+        kept: u32,
     },
+    /// The live fetch failed and a fallback catalog is available. It was
+    /// persisted only when the request set `allow_fallback`.
     FallbackAvailable {
-        models: Vec<cockpit_config::config::providers::ModelEntry>,
+        models: ProviderModelIdSummary,
         catalog: cockpit_config::config::providers::ProviderModelCatalog,
         reason: String,
     },
     /// The effective unlisted-model policy is `ask` and the fetched catalog
     /// would drop one or more configured models.  This is a no-write preview:
-    /// callers must retry explicitly with `keep` or `remove`.
+    /// callers must retry explicitly with `keep` or `remove`. `unlisted`
+    /// names the configured models absent from the fetched catalog.
     UnlistedModelsPreview {
-        unlisted_count: u32,
+        unlisted: ProviderModelIdSummary,
     },
     Unsupported,
     Error {
@@ -549,11 +692,25 @@ pub enum ProviderModelFetchOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProviderModelVerification {
     NoEndpoint,
-    Unauthorized { status: u16 },
+    Unauthorized {
+        status: u16,
+    },
     NotFound,
-    HttpStatus { status: u16, snippet: String },
-    Network { message: String },
-    Parse { message: String },
+    HttpStatus {
+        status: u16,
+        snippet: String,
+    },
+    Network {
+        message: String,
+    },
+    Parse {
+        message: String,
+    },
+    /// The catalog could not be stored within the provider snapshot limit
+    /// even without newly fetched models. Nothing was persisted.
+    CatalogTooLarge {
+        message: String,
+    },
 }
 
 /// One provider result from a daemon-owned catalog refresh.  The request can
@@ -1419,8 +1576,10 @@ pub const MAX_OWNER_PROVIDER_URL_BYTES: usize = 8 * 1024;
 pub const MAX_OWNER_PROVIDER_MODEL_ID_BYTES: usize = 1024;
 pub const MAX_OWNER_PROJECT_ROOT_BYTES: usize = 16 * 1024;
 pub const MAX_OWNER_ORG_ID_BYTES: usize = 256;
-/// Maximum canonical JSON size accepted for one provider configuration entry.
-pub const MAX_OWNER_PROVIDER_ENTRY_BYTES: usize = 256 * 1024;
+/// Maximum canonical JSON size for one provider edit: a full replacement,
+/// or entry metadata together with its revision-bound model delta.
+pub const MAX_OWNER_PROVIDER_ENTRY_BYTES: usize =
+    cockpit_config::config::providers::MAX_AUTHORED_PROVIDER_ENTRY_BYTES;
 /// Maximum canonical JSON size accepted for one MCP config patch, secret
 /// envelope, or agent-scope MCP server payload. Kept below the 512 KiB
 /// remote interactive-lane cap, including JSON envelope overhead.
@@ -1964,8 +2123,9 @@ pub const COMPLETE_MCP_OAUTH_RECEIPT_LABEL: &str = "complete_mcp_oauth_receipt_v
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction, Request,
-    RunInvocationOptions, SealedActionDeclaration, UsageKind, UserMessageOrigin,
+    ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction,
+    MAX_OWNER_WIRE_IDENTIFIER_BYTES, Request, RunInvocationOptions, SealedActionDeclaration,
+    UsageKind, UserMessageOrigin,
 };
 #[cfg(feature = "remote")]
 pub use request::{
@@ -4073,6 +4233,7 @@ pub enum InterruptRaiseReason {
 /// `Body` variants differ per direction.
 pub struct ProtoStream<S> {
     framed: Framed<S, LinesCodec>,
+    config_receiver: config_frames::Receiver,
 }
 
 impl<S> ProtoStream<S>
@@ -4081,6 +4242,7 @@ where
 {
     pub fn new(stream: S) -> Self {
         Self {
+            config_receiver: Default::default(),
             framed: Framed::new(
                 stream,
                 LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
@@ -4089,20 +4251,26 @@ where
     }
 
     pub fn into_split(self) -> (ProtoReadHalf<ReadHalf<S>>, ProtoWriteHalf<WriteHalf<S>>) {
-        let (read, write) = tokio::io::split(self.framed.into_inner());
+        let parts = self.framed.into_parts();
+        let (read, write) = tokio::io::split(parts.io);
+        let mut reader = FramedRead::new(
+            read,
+            LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
+        );
+        reader.read_buffer_mut().extend_from_slice(&parts.read_buf);
+        let mut writer = FramedWrite::new(
+            write,
+            LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
+        );
+        writer
+            .write_buffer_mut()
+            .extend_from_slice(&parts.write_buf);
         (
             ProtoReadHalf {
-                framed: FramedRead::new(
-                    read,
-                    LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
-                ),
+                config_receiver: self.config_receiver,
+                framed: reader,
             },
-            ProtoWriteHalf {
-                framed: FramedWrite::new(
-                    write,
-                    LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
-                ),
-            },
+            ProtoWriteHalf { framed: writer },
         )
     }
 
@@ -4113,11 +4281,7 @@ where
         let mut env = env.clone();
         env.v = PROTOCOL_VERSION;
         let line = serde_json::to_string(&env).context("serializing envelope")?;
-        self.framed
-            .send(line)
-            .await
-            .map_err(codec_error)
-            .context("writing envelope")?;
+        config_frames::send(&mut self.framed, &env, line).await?;
         Ok(())
     }
 
@@ -4131,7 +4295,7 @@ where
     }
 
     pub async fn recv(&mut self) -> Result<Option<RecvFrame>> {
-        recv_frame(&mut self.framed).await
+        recv_frame(&mut self.framed, &mut self.config_receiver).await
     }
 
     pub async fn recv_raw_line(&mut self) -> Result<Option<String>> {
@@ -4141,6 +4305,7 @@ where
 
 pub struct ProtoReadHalf<R> {
     framed: FramedRead<R, LinesCodec>,
+    config_receiver: config_frames::Receiver,
 }
 
 impl<R> ProtoReadHalf<R>
@@ -4151,7 +4316,7 @@ where
     /// returns `Err` on framing failure (frame too large, invalid UTF-8)
     /// or JSON/header deserialization failure.
     pub async fn recv(&mut self) -> Result<Option<RecvFrame>> {
-        recv_frame(&mut self.framed).await
+        recv_frame(&mut self.framed, &mut self.config_receiver).await
     }
 }
 
@@ -4170,11 +4335,7 @@ where
         let mut env = env.clone();
         env.v = PROTOCOL_VERSION;
         let line = serde_json::to_string(&env).context("serializing envelope")?;
-        self.framed
-            .send(line)
-            .await
-            .map_err(codec_error)
-            .context("writing envelope")?;
+        config_frames::send(&mut self.framed, &env, line).await?;
         Ok(())
     }
 
@@ -4199,15 +4360,16 @@ where
     }
 }
 
-async fn recv_frame<T>(framed: &mut T) -> Result<Option<RecvFrame>>
+async fn recv_frame<T>(
+    framed: &mut T,
+    receiver: &mut config_frames::Receiver,
+) -> Result<Option<RecvFrame>>
 where
     T: futures::Stream<Item = std::result::Result<String, LinesCodecError>> + Unpin,
 {
-    match recv_raw_line(framed).await? {
+    match receiver.receive(framed).await? {
         None => Ok(None),
-        Some(line) => {
-            let value: serde_json::Value =
-                serde_json::from_str(&line).context("deserializing envelope")?;
+        Some((value, chunked)) => {
             let v = value
                 .get("v")
                 .and_then(serde_json::Value::as_u64)
@@ -4239,6 +4401,10 @@ where
                 return Ok(Some(RecvFrame::Unknown { v, kind, tag, id }));
             }
             let env: Envelope = serde_json::from_value(value).context("deserializing envelope")?;
+            anyhow::ensure!(
+                !chunked || config_frames::eligible(&env),
+                "chunked envelope is not a configuration publication"
+            );
             if envelope_contains_unknown(&env) {
                 return Ok(Some(RecvFrame::Unknown { v, kind, tag, id }));
             }
@@ -4413,22 +4579,35 @@ mod proto_fixture_tests {
             "{file_name} must contain exactly one full-shape fixture per {tag} variant"
         );
 
+        let mut failures = Vec::new();
         for (kind, value) in fixtures {
-            assert_eq!(
-                value.get(tag).and_then(Value::as_str),
-                Some(kind.as_str()),
-                "{file_name}:{kind} must carry its serde tag"
-            );
-            let parsed: T = serde_json::from_value(value.clone())
-                .unwrap_or_else(|error| panic!("deserialize {file_name}:{kind}: {error}"));
-            let serialized = serde_json::to_value(parsed)
-                .unwrap_or_else(|error| panic!("serialize {file_name}:{kind}: {error}"));
-            assert_eq!(
-                canonical(serialized),
-                canonical(value),
-                "{file_name}:{kind} must round-trip byte-equivalent after canonicalization"
-            );
+            // Retain every assertion and report all stale shapes in one run.
+            // A caught fixture failure still fails the enclosing test below.
+            if std::panic::catch_unwind(|| {
+                assert_eq!(
+                    value.get(tag).and_then(Value::as_str),
+                    Some(kind.as_str()),
+                    "{file_name}:{kind} must carry its serde tag"
+                );
+                let parsed: T = serde_json::from_value(value.clone())
+                    .unwrap_or_else(|error| panic!("deserialize {file_name}:{kind}: {error}"));
+                let serialized = serde_json::to_value(parsed)
+                    .unwrap_or_else(|error| panic!("serialize {file_name}:{kind}: {error}"));
+                assert_eq!(
+                    canonical(serialized),
+                    canonical(value),
+                    "{file_name}:{kind} must round-trip byte-equivalent after canonicalization"
+                );
+            })
+            .is_err()
+            {
+                failures.push(kind);
+            }
         }
+        assert!(
+            failures.is_empty(),
+            "{file_name} failed fixtures: {failures:?}"
+        );
     }
 
     fn assert_fixture_wire_tags<T>(

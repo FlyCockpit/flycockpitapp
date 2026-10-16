@@ -3018,32 +3018,43 @@ impl Driver {
         agent: &Arc<Agent>,
         providers: &crate::config::providers::ProvidersConfig,
         table: Arc<RedactionTable>,
-    ) -> Arc<Agent> {
+    ) -> anyhow::Result<Arc<Agent>> {
         let mut refreshed = (**agent).clone();
         let mut model = (*refreshed.model).clone();
-        model.set_redact_table_for_config(providers, table);
+        model.set_redact_table_for_config(providers, table)?;
         refreshed.model = Arc::new(model);
-        Arc::new(refreshed)
+        Ok(Arc::new(refreshed))
     }
 
-    fn set_redaction_table(&mut self, table: Arc<RedactionTable>) {
-        self.redact = table.clone();
+    fn set_redaction_table(&mut self, table: Arc<RedactionTable>) -> anyhow::Result<()> {
         let providers = self.live_providers_config().ok();
         let Some(providers) = providers.as_ref() else {
             tracing::warn!("providers config unavailable while refreshing redaction table");
-            self.schedule.set_redaction_table(table);
-            return;
+            anyhow::bail!("providers config unavailable while refreshing redaction table");
         };
-        for frame in &mut self.stack {
-            frame.agent =
-                Self::refresh_agent_model_redaction(&frame.agent, providers, table.clone());
+        let agents = self
+            .stack
+            .iter()
+            .map(|frame| {
+                Self::refresh_agent_model_redaction(&frame.agent, providers, table.clone())
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let model_override = self
+            .model_override
+            .as_ref()
+            .map(|model| {
+                let mut refreshed = (**model).clone();
+                refreshed.set_redact_table_for_config(providers, table.clone())?;
+                Ok::<_, anyhow::Error>(Arc::new(refreshed))
+            })
+            .transpose()?;
+        for (frame, agent) in self.stack.iter_mut().zip(agents) {
+            frame.agent = agent;
         }
-        if let Some(model) = &mut self.model_override {
-            let mut refreshed = (**model).clone();
-            refreshed.set_redact_table_for_config(providers, table.clone());
-            *model = Arc::new(refreshed);
-        }
+        self.model_override = model_override;
+        self.redact = table.clone();
         self.schedule.set_redaction_table(table);
+        Ok(())
     }
 
     fn active_frame_index(&self) -> Option<usize> {
@@ -3702,7 +3713,7 @@ impl Driver {
                             .await;
                     }
                 }
-                self.set_redaction_table(table);
+                self.set_redaction_table(table)?;
                 Ok(())
             }
             Err(error) => Self::refuse_unredacted_send(tx, error).await,
@@ -7582,7 +7593,10 @@ impl Driver {
                 if scan_ssh_keys.is_some() {
                     self.redaction_scan_ssh_keys_override = scan_ssh_keys;
                 }
-                self.set_redaction_table(table);
+                if let Err(error) = self.set_redaction_table(table) {
+                    self.cancel_handle().cancel_all_session_work();
+                    let _ = Self::refuse_unredacted_send(tx, error).await;
+                }
             }
             DriverControl::SetTandemModels { targets } => {
                 // Replace the in-memory tandem (shadow) set. Empty disables the
@@ -8614,11 +8628,16 @@ impl Driver {
         {
             tracing::warn!(error = %e, "record failed_turn_recovery event failed");
         }
-        let _ = tx
-            .send(TurnEvent::Notice {
-                text: "inference failed; type `continue` to retry the same turn from the stored recovery record".to_string(),
-            })
-            .await;
+        // Offer `continue` only when an unchanged retry can succeed. For a
+        // rejected key, unknown model, or invalid request the inline error
+        // carries the provider's reason and the TUI's guidance instead.
+        if crate::engine::retry::failure_retryable_unchanged(&failure.class, provider_status) {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: "inference failed; type `continue` to retry the same turn from the stored recovery record".to_string(),
+                })
+                .await;
+        }
     }
 
     async fn goal_continue_progress_since(&self, anchor_seq: i64) -> bool {

@@ -257,7 +257,7 @@ async fn prepare_generator_candidate<'ctx>(
     };
     let mut generator_model = generator_model.as_ref().clone();
     generator_model
-        .set_redact_table_for_config(&input.ctx.config.providers(), input.ctx.redact.clone());
+        .set_redact_table_for_config(&input.ctx.config.providers(), input.ctx.redact.clone())?;
     let (include_linked, last_n) = match effective.recipe() {
         VerificationRecipe::Inherit => (false, crate::agents::DEFAULT_CLEAN_ROOM_LAST_N_READS),
         VerificationRecipe::CleanRoom {

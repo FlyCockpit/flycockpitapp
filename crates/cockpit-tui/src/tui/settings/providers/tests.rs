@@ -302,7 +302,9 @@ fn break_config_saving(dialog: &SettingsDialog) {
 }
 
 fn load_provider(path: &std::path::Path, id: &str) -> ProviderEntry {
-    ConfigDoc::load(path).unwrap().providers().providers[id].clone()
+    // Authored layers may store only sparse field/membership intent. Assert
+    // the independently resolved persisted image, as catalog consumers do.
+    ConfigDoc::load_effective_from_paths(&[path.to_path_buf()]).providers[id].clone()
 }
 
 fn replaced_provider(nav: &Nav) -> &ProvidersPage {
@@ -627,6 +629,7 @@ fn pointer_xai_entitlement_renders_dispatches_and_persists() {
             ProviderRowEditorAction::SettingSave,
         ));
         click_rendered_provider_action(&mut fresh, &save_action);
+        fresh.settle_test_effects();
         let saved = load_provider(&fresh.config_path, "grok-oauth");
         let capability = if model_scope {
             &saved
@@ -1550,6 +1553,8 @@ fn prompt_fixture(kind: PromptFixture) -> (tempfile::TempDir, SettingsDialog) {
     let entry = dialog.config.providers["p"].clone();
     dialog.page = super::super::providers_page(match kind {
         PromptFixture::FetchAll => ProvidersPage::FetchAll(FetchAllState {
+            observations: Vec::new(),
+            final_snapshot_pending: false,
             providers: vec!["p".into()],
             in_flight: Vec::new(),
             finished: Vec::new(),
@@ -1571,7 +1576,7 @@ fn prompt_fixture(kind: PromptFixture) -> (tempfile::TempDir, SettingsDialog) {
         PromptFixture::FetchFallback => {
             ProvidersPage::FetchFallbackPrompt(FetchFallbackPromptState {
                 provider_id: "p".into(),
-                models: vec![model("fallback", false)],
+                fallback_count: 1,
                 catalog: ProviderModelCatalog::CodexFallback,
                 reason: "live catalog unavailable".into(),
                 cursor: 0,
@@ -5073,10 +5078,21 @@ fn deep_fetch_success_refreshes_cached_and_parent_provider_entry() {
 
     let mut state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
     state.set_running_for_test();
-    state.finish_with_config_for_test(
+    let snapshot = runtime.block_on(async {
+        let client = crate::tui::settings::settings_daemon_client(
+            &crate::tui::settings::test_lifecycle_client(),
+        )
+        .await
+        .unwrap();
+        super::super::auth::provider_snapshot(&client, &tmp.path().display().to_string())
+            .await
+            .unwrap()
+    });
+    let expected_revision = snapshot.authority.base_revision.clone();
+    state.finish_with_snapshot_for_test(
         Ok("deep fetch complete: refreshed".into()),
         Vec::new(),
-        &persisted,
+        snapshot,
     );
     let stale_parent = EditState::new("p".into(), dialog.config.providers["p"].clone());
     dialog.set_test_page(Page::Providers(ProvidersPage::DeepFetch {
@@ -5084,6 +5100,14 @@ fn deep_fetch_success_refreshes_cached_and_parent_provider_entry() {
         parent: Box::new(stale_parent),
     }));
     dialog.tick();
+    assert_eq!(
+        dialog
+            .provider_edit_authority
+            .as_ref()
+            .unwrap()
+            .base_revision,
+        expected_revision
+    );
 
     assert!(
         dialog.config.providers["p"]
@@ -5218,6 +5242,8 @@ fn fetch_all_prompt_remove_drops_only_non_manual_unlisted_models() {
         ..Default::default()
     });
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        observations: Vec::new(),
+        final_snapshot_pending: false,
         providers: vec!["p".to_string()],
         in_flight: Vec::new(),
         finished: vec![FetchedSummary {
@@ -5225,6 +5251,7 @@ fn fetch_all_prompt_remove_drops_only_non_manual_unlisted_models() {
             outcome: Ok(FetchOutcome::Models {
                 models: vec![model("current", false)],
                 catalog: ProviderModelCatalog::Live,
+                trim_note: String::new(),
             }),
         }],
         pre_fetch_models: [(
@@ -5268,6 +5295,8 @@ fn fetch_all_stored_remove_applies_without_prompt() {
     let (_tmp, mut dialog) =
         dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Remove)));
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        observations: Vec::new(),
+        final_snapshot_pending: false,
         providers: vec!["p".to_string()],
         in_flight: Vec::new(),
         finished: vec![FetchedSummary {
@@ -5275,6 +5304,7 @@ fn fetch_all_stored_remove_applies_without_prompt() {
             outcome: Ok(FetchOutcome::Models {
                 models: vec![model("current", false)],
                 catalog: ProviderModelCatalog::Live,
+                trim_note: String::new(),
             }),
         }],
         pre_fetch_models: [(
@@ -5290,6 +5320,7 @@ fn fetch_all_stored_remove_applies_without_prompt() {
     })));
 
     dialog.drain_fetch_all();
+    dialog.settle_test_effects();
 
     let state = match dialog.test_page() {
         TestPageRef::Providers(ProvidersPage::FetchAll(s)) => s,
@@ -5309,6 +5340,8 @@ fn fetch_all_stored_keep_applies_without_prompt() {
     let (_tmp, mut dialog) =
         dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        observations: Vec::new(),
+        final_snapshot_pending: false,
         providers: vec!["p".to_string()],
         in_flight: Vec::new(),
         finished: vec![FetchedSummary {
@@ -5316,6 +5349,7 @@ fn fetch_all_stored_keep_applies_without_prompt() {
             outcome: Ok(FetchOutcome::Models {
                 models: vec![model("current", false)],
                 catalog: ProviderModelCatalog::Live,
+                trim_note: String::new(),
             }),
         }],
         pre_fetch_models: [(
@@ -5331,6 +5365,7 @@ fn fetch_all_stored_keep_applies_without_prompt() {
     })));
 
     dialog.drain_fetch_all();
+    dialog.settle_test_effects();
 
     let ids: Vec<&str> = dialog.config.providers["p"]
         .models
@@ -5416,6 +5451,8 @@ fn fetch_one_prompt_save_failure_surfaces() {
 fn fetch_all_save_failure_surfaces() {
     let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        observations: Vec::new(),
+        final_snapshot_pending: false,
         providers: vec!["p".to_string()],
         in_flight: Vec::new(),
         finished: vec![FetchedSummary {
@@ -5423,6 +5460,7 @@ fn fetch_all_save_failure_surfaces() {
             outcome: Ok(FetchOutcome::Models {
                 models: vec![model("current", false)],
                 catalog: ProviderModelCatalog::Live,
+                trim_note: String::new(),
             }),
         }],
         pre_fetch_models: [(
@@ -5961,6 +5999,7 @@ fn refetch_result_preserves_staged_favorite() {
         Ok(FetchOutcome::Models {
             models: vec![model("new", false)],
             catalog: ProviderModelCatalog::Live,
+            trim_note: String::new(),
         }),
     );
     let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
@@ -5995,6 +6034,7 @@ fn refetch_result_marks_codex_fallback_catalog_active() {
         Ok(FetchOutcome::Models {
             models: vec![model("gpt-5.5", false)],
             catalog: ProviderModelCatalog::CodexFallback,
+            trim_note: String::new(),
         }),
     );
 
@@ -6028,7 +6068,7 @@ fn refetch_result_with_fallback_available_opens_explicit_prompt() {
     dialog.apply_fetch_result(
         "p",
         Ok(FetchOutcome::FallbackAvailable {
-            models: vec![model("fallback", false)],
+            fallback_count: 1,
             catalog: ProviderModelCatalog::CodexFallback,
             reason:
                 "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
@@ -6073,6 +6113,7 @@ fn onboarding_live_validation_refreshes_authority_before_final_settlement() {
         Ok(FetchOutcome::Models {
             models: vec![model("live", false)],
             catalog: ProviderModelCatalog::Live,
+            trim_note: String::new(),
         }),
     );
     dialog.settle_test_effects();
@@ -6116,7 +6157,7 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
     dialog.apply_fetch_result(
         "p",
         Ok(FetchOutcome::FallbackAvailable {
-            models: vec![model("fallback", false)],
+            fallback_count: 1,
             catalog: ProviderModelCatalog::CodexFallback,
             reason:
                 "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
@@ -6162,7 +6203,7 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
     dialog.apply_fetch_result(
         "p",
         Ok(FetchOutcome::FallbackAvailable {
-            models: vec![model("fallback", false)],
+            fallback_count: 1,
             catalog: ProviderModelCatalog::CodexFallback,
             reason: "offline".into(),
         }),
@@ -6200,9 +6241,10 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
                     .is_some_and(|message| message.contains("Asking the daemon"))
     ));
 
+    // The offline continuation allowed the fallback: the daemon applied it.
     dialog.apply_fetch_result(
         "p",
-        Ok(FetchOutcome::FallbackAvailable {
+        Ok(FetchOutcome::FallbackApplied {
             models: vec![model("fallback", false)],
             catalog: ProviderModelCatalog::CodexFallback,
             reason: "offline".into(),
@@ -6258,7 +6300,7 @@ fn onboarding_does_not_offer_unpersisted_builtin_fallback() {
     dialog.apply_fetch_result(
         "p",
         Ok(FetchOutcome::FallbackAvailable {
-            models: vec![model("builtin-only", false)],
+            fallback_count: 1,
             catalog: ProviderModelCatalog::CodexFallback,
             reason: "network unavailable".into(),
         }),
@@ -6283,7 +6325,7 @@ fn fetch_fallback_prompt_use_fallback_records_degraded_status() {
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchFallbackPrompt(
         FetchFallbackPromptState {
             provider_id: "p".to_string(),
-            models: vec![model("fallback", false)],
+            fallback_count: 1,
             catalog: ProviderModelCatalog::CodexFallback,
             reason:
                 "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
@@ -6298,10 +6340,32 @@ fn fetch_fallback_prompt_use_fallback_records_degraded_status() {
         else {
             panic!("expected fallback prompt");
         };
+        // Choosing the fallback re-runs the daemon fetch with
+        // `allow_fallback`; the daemon owns and persists the fallback catalog.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
         cx.handle_fetch_fallback_prompt_key(press(KeyCode::Enter), state)
     };
 
-    assert!(matches!(replaced_provider(&nav), ProvidersPage::Edit(_)));
+    let ProvidersPage::Edit(edit) = replaced_provider(&nav) else {
+        panic!("expected the provider editor");
+    };
+    assert!(edit.fetch.is_some(), "the fallback fetch is in flight");
+    let edit = EditState::new("p".into(), dialog.config.providers["p"].clone());
+    dialog.set_test_page(Page::Providers(ProvidersPage::Edit(edit)));
+    dialog.apply_fetch_result(
+        "p",
+        Ok(FetchOutcome::FallbackApplied {
+            models: vec![model("fallback", false)],
+            catalog: ProviderModelCatalog::CodexFallback,
+            reason:
+                "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
+                    .into(),
+        }),
+    );
     let provider = &dialog.config.providers["p"];
     assert_eq!(provider.model_catalog, ProviderModelCatalog::CodexFallback);
     assert_eq!(
@@ -6418,6 +6482,7 @@ fn apply_fetch_result_save_failure_surfaces() {
         Ok(FetchOutcome::Models {
             models: vec![model("new", false)],
             catalog: ProviderModelCatalog::Live,
+            trim_note: String::new(),
         }),
     );
 
@@ -8094,4 +8159,4399 @@ fn pointer_confirmation_cleanup_keeps_committed_oauth_copy_and_copilot_setup() {
         state.operation.is_pending(),
         "the committed Copilot setup operation must stay in flight"
     );
+}
+
+#[test]
+fn refresh_adopts_authority_then_saves_without_reconstructing_trimmed_models() {
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 16384];
+            let read = socket.read(&mut request).unwrap();
+            assert!(read > 0);
+            let body = serde_json::json!({"data":(0..5000).map(|i| serde_json::json!({"id":format!("vendor/model-{i:04}-long-name"),"name":"a long display name ".repeat(8),"context_length":131072})).collect::<Vec<_>>()}).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+        config.providers.get_mut("p").unwrap().url = format!("http://{address}/v1");
+        config.providers.get_mut("p").unwrap().allow_insecure_http = true;
+        config.providers.get_mut("p").unwrap().auth = Some(AuthKind::None);
+        config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .push(model("manual-only", true));
+        // Refresh the same existing ids with larger metadata so the daemon
+        // must trim old rows. Copying a pre-fetch bag back would fail below.
+        config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .extend((0..5000).map(|i| ModelEntry {
+                id: format!("vendor/model-{i:04}-long-name"),
+                ..Default::default()
+            }));
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        let before = dialog
+            .provider_edit_authority
+            .as_ref()
+            .unwrap()
+            .config_generation;
+        let mut editor = EditState::new("p".into(), dialog.config.providers["p"].clone());
+        editor.entry.favorite = Some(true); // staged owner intent survives adoption
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(editor)));
+        let handle = FetchHandle::spawn(
+            crate::tui::settings::test_lifecycle_client(),
+            "p".into(),
+            dialog.config.providers["p"].clone(),
+            root.clone(),
+        );
+        let completion = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if let Some(result) = handle.take() {
+                        break result;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap()
+        });
+        server.join().unwrap();
+        let expected = completion.snapshot.as_ref().unwrap().config.providers["p"]
+            .entry
+            .models
+            .clone();
+        assert!(expected.len() < 5000 && !expected.is_empty());
+        assert!(
+            !expected
+                .iter()
+                .any(|m| m.id == "vendor/model-4999-long-name"),
+            "an existing row must actually be trimmed"
+        );
+        assert!(expected.iter().any(|m| m.id == "manual-only" && m.manual));
+        dialog
+            .adopt_refreshed_provider_snapshot(completion.snapshot)
+            .unwrap();
+        dialog.sync_refreshed_provider_editor();
+        assert!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .config_generation
+                > before
+        );
+        let outcome = completion.observation.into_outcome(&dialog.original_config);
+        dialog.apply_fetch_result("p", outcome);
+        dialog.settle_test_effects();
+        let Some(ProvidersPage::Edit(editor)) = dialog.page.downcast_mut::<ProvidersPage>() else {
+            panic!("editor");
+        };
+        assert_eq!(editor.entry.favorite, Some(true));
+        assert_eq!(editor.entry.models.len(), expected.len());
+        let entry = (*editor.entry).clone();
+        dialog.config.providers.insert("p".into(), entry);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let saved = load_provider(&tmp.path().join(".cockpit/config.json"), "p");
+        assert_eq!(saved.favorite, Some(true));
+        assert_eq!(
+            serde_json::to_value(&saved.models).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "save must not recreate entries omitted by the daemon"
+        );
+
+        // A real failed snapshot read cannot leave the editor usable.
+        let mcp_path = tmp.path().join(".cockpit/mcp.json");
+        std::fs::write(&mcp_path, "[").unwrap();
+        let failed = runtime.block_on(super::super::auth::provider_snapshot(&client, &root));
+        assert!(failed.is_err());
+        assert!(dialog.adopt_refreshed_provider_snapshot(failed).is_err());
+        assert!(dialog.provider_edit_authority.is_none());
+        assert!(dialog.provider_catalog_reload_required);
+        assert!(dialog.save_config().is_err());
+        assert!(!dialog.handle_key(press(KeyCode::Char('f'))));
+        assert_eq!(
+            load_provider(&tmp.path().join(".cockpit/config.json"), "p").favorite,
+            Some(true)
+        );
+        std::fs::write(&mcp_path, "{}").unwrap();
+        let recovered = runtime.block_on(super::super::auth::provider_snapshot(&client, &root));
+        dialog.adopt_refreshed_provider_snapshot(recovered).unwrap();
+        dialog.sync_refreshed_provider_editor();
+        assert!(!dialog.provider_catalog_reload_required);
+        assert!(dialog.provider_edit_authority.is_some());
+    });
+}
+
+#[test]
+fn fetch_all_final_snapshot_precedes_editable_status_save() {
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+        let mut servers = Vec::new();
+        let seed = config.providers["p"].clone();
+        for id in ["p", "sibling"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let id_owned = id.to_string();
+            servers.push(std::thread::spawn(move || {
+                let (mut socket, _)=listener.accept().unwrap();
+                let mut request=[0;16384];let read = socket.read(&mut request).unwrap(); assert!(read > 0);
+                let body=serde_json::json!({"data":[{"id":format!("{id_owned}/fetched")}]}).to_string();
+                write!(socket,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }));
+            let mut entry = seed.clone();
+            entry.url = format!("http://{address}/v1");
+            entry.allow_insecure_http = true;
+            entry.auth = Some(AuthKind::None);
+            entry.models.push(model("manual-only", true));
+            config.providers.insert(id.into(), entry);
+        }
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        let all = FetchAllState::spawn(
+            crate::tui::settings::test_lifecycle_client(),
+            &dialog.config,
+            root.clone(),
+        );
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(all)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            dialog.tick();
+            dialog.settle_test_effects();
+            let finished = matches!(dialog.page.downcast_ref::<ProvidersPage>(),Some(ProvidersPage::FetchAll(state)) if state.in_flight.is_empty() && state.policy_resolved);
+            if finished
+                && !dialog.authority_operation_pending()
+                && !dialog.provider_catalog_reload_required
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fetch-all failed to adopt final authority: {:?}",
+                dialog.extended_warnings
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
+        let final_snapshot = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .config_generation,
+            final_snapshot.authority.config_generation
+        );
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .base_revision,
+            final_snapshot.authority.base_revision
+        );
+        for id in ["p", "sibling"] {
+            assert!(
+                dialog.config.providers[id]
+                    .models
+                    .iter()
+                    .any(|m| m.id == "manual-only" && m.manual)
+            );
+            assert!(
+                dialog.config.providers[id]
+                    .models
+                    .iter()
+                    .any(|m| m.id == format!("{id}/fetched"))
+            );
+        }
+        dialog.config.providers.get_mut("sibling").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        assert_eq!(
+            load_provider(&tmp.path().join(".cockpit/config.json"), "sibling").favorite,
+            Some(true)
+        );
+    });
+}
+
+#[test]
+fn fetch_all_stale_summary_cannot_restore_trimmed_rows_or_metadata() {
+    let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+    let entry = config.providers.get_mut("p").unwrap();
+    entry.models = vec![
+        ModelEntry {
+            id: "current".into(),
+            context_length: Some(4242),
+            ..Default::default()
+        },
+        model("manual-only", true),
+    ];
+    let (_tmp, mut dialog) = dialog_with_config(config);
+    dialog.cx.apply_fetch_all_policy(
+        vec![(
+            "p".into(),
+            vec![model("trimmed", false)],
+            vec![
+                model("trimmed", false),
+                ModelEntry {
+                    id: "current".into(),
+                    context_length: Some(1),
+                    ..Default::default()
+                },
+            ],
+            ProviderModelCatalog::Live,
+        )],
+        ModelMergePolicy::KeepUnlisted,
+    );
+    let models = &dialog.config.providers["p"].models;
+    assert!(!models.iter().any(|m| m.id == "trimmed"));
+    assert_eq!(
+        models
+            .iter()
+            .find(|m| m.id == "current")
+            .unwrap()
+            .context_length,
+        Some(4242)
+    );
+    assert!(models.iter().any(|m| m.id == "manual-only" && m.manual));
+}
+
+#[test]
+fn refetch_rebase_keeps_explicit_model_intent_without_restoring_unchanged_trimmed_rows() {
+    let baseline = provider_with_models(vec![
+        model("unchanged-trimmed", false),
+        model("edited", false),
+    ]);
+    let mut staged = baseline.clone();
+    staged.models[1].favorite = true;
+    let fresh = provider_with_models(vec![model("new-server-model", false)]);
+    let rebased = super::super::rebase_provider_entry(&baseline, &staged, &fresh);
+    assert!(!rebased.models.iter().any(|m| m.id == "unchanged-trimmed"));
+    assert!(
+        rebased
+            .models
+            .iter()
+            .any(|m| m.id == "edited" && m.favorite)
+    );
+    assert!(rebased.models.iter().any(|m| m.id == "new-server-model"));
+    let fresh = provider_with_models(vec![ModelEntry {
+        id: "edited".into(),
+        context_length: Some(4242),
+        ..Default::default()
+    }]);
+    let rebased = super::super::rebase_provider_entry(&baseline, &staged, &fresh);
+    assert_eq!(rebased.models.len(), 1);
+    assert!(rebased.models[0].favorite);
+    assert_eq!(rebased.models[0].context_length, Some(4242));
+}
+
+/// C4: a real daemon RPC is pending in provider I/O when Esc arrives. The
+/// successful commit must be read back and adopted before editing resumes;
+/// cancellation alone must prevent dispatch of the second target.
+#[test]
+fn pending_daemon_deep_success_after_escape_adopts_current_snapshot() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = stop.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut entered = Some(entered);
+            while !stop_server.load(Ordering::Acquire) {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(socket) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                // Accepted sockets inherit O_NONBLOCK on macOS. The listener
+                // stays nonblocking for shutdown, but request reads must wait.
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = [0; 16384];
+                let read = socket.read(&mut request).unwrap();
+                assert!(read > 0);
+                if let Some(entered) = entered.take() {
+                    entered.send(()).unwrap();
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }
+                write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}").unwrap();
+            }
+        });
+        let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+        let entry = config.providers.get_mut("p").unwrap();
+        entry.url = format!("http://{address}/v1");
+        entry.allow_insecure_http = true;
+        entry.auth = Some(AuthKind::None);
+        entry.models = vec![model("a", false), model("b", false)];
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let old_generation = initial.authority.config_generation;
+        let old_revision = initial.authority.base_revision.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        let progress = Arc::new(Mutex::new(deepfetch::DeepFetchProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls = Mutex::new(Vec::new());
+        let targets =
+            ["a", "b"].map(
+                |model_id| cockpit_core::providers::deepfetch::DeepfetchTarget {
+                    provider_id: "p".into(),
+                    model_id: model_id.into(),
+                    explicit_wire_api: WireApi::Completions,
+                    inherited_wire_api: WireApi::Completions,
+                    supported_wire_apis: Vec::new(),
+                    automatic_wire_api: WireApi::Completions,
+                    direct_model_scope: true,
+                },
+            );
+        runtime.block_on(async {
+            let work = deepfetch::deep_fetch_with(|request: cockpit_proto::Request| {
+                calls.lock().unwrap().push(request.wire_tag().to_string());
+                let client = &client;
+                async move {client.request_ok(request).await.map_err(|error| error.to_string())}
+            }, &root, "p", &targets, &progress, &cancel);
+            tokio::pin!(work);
+            tokio::select! {
+                _ = waiting => {},
+                result = &mut work => panic!("provider I/O must remain pending until Esc: {result:?}"),
+            }
+            cancel.store(true, Ordering::Release);
+            assert_eq!(progress.lock().unwrap().completed, 0);
+            release.send(()).unwrap();
+            let status = tokio::time::timeout(std::time::Duration::from_secs(20), work).await.unwrap().unwrap();
+            assert!(status.contains("cancelled"), "{status}");
+        });
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["fetch_provider_models", "get_provider_catalog_snapshot"]
+        );
+        let state = progress.lock().unwrap();
+        assert_eq!(state.completed, 1);
+        let snapshot = state
+            .config
+            .clone()
+            .expect("read-back after successful pending RPC");
+        assert!(snapshot.authority.config_generation > old_generation);
+        assert_ne!(snapshot.authority.base_revision, old_revision);
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.authority.base_revision,
+            snapshot.authority.base_revision
+        );
+        assert_eq!(
+            serde_json::to_value(&current.config.providers).unwrap(),
+            serde_json::to_value(&snapshot.config.providers).unwrap()
+        );
+        let generation = snapshot.authority.config_generation;
+        let revision = snapshot.authority.base_revision.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(snapshot))
+            .unwrap();
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .config_generation,
+            generation
+        );
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .base_revision,
+            revision
+        );
+    });
+}
+
+/// C4 transport inverse: a real client timeout drops the pending reply receiver;
+/// the real daemon commits after the provider is released and read-back adopts it.
+#[test]
+fn pending_daemon_deep_lost_reply_after_escape_reads_committed_snapshot() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = stop.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut entered = Some(entered);
+            while !stop_server.load(Ordering::Acquire) {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(socket) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                // Accepted sockets inherit O_NONBLOCK on macOS. The listener
+                // stays nonblocking for shutdown, but request reads must wait.
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = [0; 16384];
+                let read = socket.read(&mut request).unwrap();
+                assert!(read > 0);
+                if let Some(entered) = entered.take() {
+                    entered.send(()).unwrap();
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }
+                write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}").unwrap();
+            }
+        });
+        let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+        let entry = config.providers.get_mut("p").unwrap();
+        entry.url = format!("http://{address}/v1");
+        entry.allow_insecure_http = true;
+        entry.auth = Some(AuthKind::None);
+        entry.models = vec![model("a", false), model("b", false)];
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let old_generation = initial.authority.config_generation;
+        let old_revision = initial.authority.base_revision.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        let progress = Arc::new(Mutex::new(deepfetch::DeepFetchProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls = Mutex::new(Vec::new());
+        let lost_reply = tokio::sync::Notify::new();
+        let targets =
+            ["a", "b"].map(
+                |model_id| cockpit_core::providers::deepfetch::DeepfetchTarget {
+                    provider_id: "p".into(),
+                    model_id: model_id.into(),
+                    explicit_wire_api: WireApi::Completions,
+                    inherited_wire_api: WireApi::Completions,
+                    supported_wire_apis: Vec::new(),
+                    automatic_wire_api: WireApi::Completions,
+                    direct_model_scope: true,
+                },
+            );
+        runtime.block_on(async {
+            let work = deepfetch::deep_fetch_with(|request: cockpit_proto::Request| {
+                calls.lock().unwrap().push(request.wire_tag().to_string());
+                let client = &client;
+                let lost_reply = &lost_reply;
+                async move {
+                    if matches!(request, cockpit_proto::Request::FetchProviderModels { .. }) {
+                        // The production client drops its reply receiver on timeout.
+                        // The daemon still owns the pending request and its commit.
+                        let result = client.request_with_timeout(request, std::time::Duration::from_secs(1)).await;
+                        let error = result.expect_err("provider I/O must outlive the client reply deadline");
+                        assert!(error.to_string().contains("request timed out"), "{error}");
+                        lost_reply.notify_one();
+                        Err(error.to_string())
+                    } else {
+                        client.request_ok(request).await.map_err(|error| error.to_string())
+                    }
+                }
+            }, &root, "p", &targets, &progress, &cancel);
+            tokio::pin!(work);
+            tokio::select! {
+                _ = waiting => {},
+                result = &mut work => panic!("provider I/O must remain pending until Esc: {result:?}"),
+            }
+            cancel.store(true, Ordering::Release);
+            assert_eq!(progress.lock().unwrap().completed, 0);
+            tokio::select! {
+                _ = lost_reply.notified() => {},
+                result = &mut work => panic!("read-back must wait behind the daemon's pending commit: {result:?}"),
+            }
+            assert_eq!(progress.lock().unwrap().completed, 0);
+            release.send(()).unwrap();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(20), work).await.unwrap().unwrap_err();
+            assert!(error.contains("request timed out"), "{error}");
+        });
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["fetch_provider_models", "get_provider_catalog_snapshot"]
+        );
+        let state = progress.lock().unwrap();
+        assert_eq!(
+            state.completed, 0,
+            "the committed operation had no acknowledged reply"
+        );
+        let snapshot = state
+            .config
+            .clone()
+            .expect("read-back after the daemon committed despite a lost reply");
+        assert!(snapshot.authority.config_generation > old_generation);
+        assert_ne!(snapshot.authority.base_revision, old_revision);
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.authority.base_revision,
+            snapshot.authority.base_revision
+        );
+        assert_eq!(
+            serde_json::to_value(&current.config.providers).unwrap(),
+            serde_json::to_value(&snapshot.config.providers).unwrap()
+        );
+        let generation = snapshot.authority.config_generation;
+        let revision = snapshot.authority.base_revision.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(snapshot))
+            .unwrap();
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .config_generation,
+            generation
+        );
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .base_revision,
+            revision
+        );
+    });
+}
+
+#[test]
+fn global_refresh_composed_overlay_remains_editable_through_real_settings_save() {
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
+            let mut buf = [0; 8192];
+            assert!(socket.read(&mut buf).unwrap() > 0);
+            let body =
+                serde_json::json!({"data":[{"id":"g","name":"global quota ".repeat(15*1024)}]})
+                    .to_string();
+            write!(socket,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+        });
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut global_config = ProvidersConfig::default();
+        global_config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: url.clone(),
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: vec![model("g", false)],
+                ..Default::default()
+            },
+        );
+        ConfigDoc::load(&global)
+            .unwrap()
+            .write(&global_config)
+            .unwrap();
+        let mut config = ProvidersConfig::default();
+        let authored = ModelEntry {
+            id: "l".into(),
+            name: Some("local authored ".repeat(12 * 1024)),
+            manual: true,
+            favorite: true,
+            ..Default::default()
+        };
+        config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url,
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: vec![authored.clone()],
+                ..Default::default()
+            },
+        );
+        for i in 0..4 {
+            config.providers.insert(
+                format!("sibling-{i}"),
+                ProviderEntry {
+                    url: "http://localhost:1/v1".into(),
+                    auth: Some(AuthKind::None),
+                    models: vec![ModelEntry {
+                        id: format!("sibling-{i}"),
+                        name: Some("s".repeat(180 * 1024)),
+                        manual: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("models_replace");
+        raw["authored_extension"] = serde_json::json!({"keep":"workspace sentinel"});
+        std::fs::write(&provider_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            initial.config.providers["p"].entry.models.len(),
+            2,
+            "unmarked authored overlay keeps inherited membership"
+        );
+        let result = runtime
+            .block_on(
+                client.request_ok(cockpit_proto::Request::FetchProviderModels {
+                    project_root: global.parent().unwrap().display().to_string(),
+                    provider_id: Some("p".into()),
+                    model_id: None,
+                    deep: false,
+                    on_unlisted: Some(OnUnlistedModelsFetch::Keep),
+                    allow_fallback: false,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            cockpit_proto::Response::ProviderModelsFetched { .. }
+        ));
+        server.join().unwrap();
+        let refreshed = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let expected = refreshed.config.providers["p"].entry.models.clone();
+        assert_eq!(expected.len(), 2);
+        assert_eq!(
+            serde_json::to_value(expected.iter().find(|m| m.id == "l").unwrap()).unwrap(),
+            serde_json::to_value(&authored).unwrap()
+        );
+        assert!(
+            serde_json::to_vec(&refreshed.config.providers["p"].entry)
+                .unwrap()
+                .len()
+                > cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES,
+            "fixture must exceed full-entry ingress cap"
+        );
+        assert!(
+            serde_json::to_vec(&refreshed.config.providers)
+                .unwrap()
+                .len()
+                > cockpit_proto::MAX_NDJSON_FRAME_BYTES,
+            "fixture must exceed one config event frame"
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(refreshed))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        assert!(
+            !dialog.provider_catalog_reload_required,
+            "save must adopt current authority: {:?}",
+            dialog.extended_warnings
+        );
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(current.config.providers["p"].entry.favorite, Some(true));
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "ordinary metadata edit preserves complete composed inventory"
+        );
+        assert_eq!(current.config.providers.len(), 5, "siblings remain intact");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert_eq!(saved["authored_extension"]["keep"], "workspace sentinel");
+        // A per-model favorite edit uses a bounded delta too, preserving the other large row.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog
+            .config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .iter_mut()
+            .find(|m| m.id == "g")
+            .unwrap()
+            .favorite = true;
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(current.config.providers["p"].entry.models.len(), 2);
+        assert!(
+            current.config.providers["p"]
+                .entry
+                .models
+                .iter()
+                .all(|m| m.favorite)
+        );
+        let mut expected_order = current.config.providers["p"]
+            .entry
+            .models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        expected_order.reverse();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog
+            .config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .reverse();
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"]
+                .entry
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect::<Vec<_>>(),
+            expected_order,
+            "ordinary settings preserves explicit row order"
+        );
+        let mut entry = current.config.providers["p"].entry.clone();
+        entry.name = Some("receipt-bound provider edit".into());
+        let save = super::super::ProviderSavePlan {
+            provider_id: "p".into(),
+            model_patch: Some(
+                cockpit_proto::ProviderModelPatch::between(
+                    &current.config.providers["p"].entry.models,
+                    &entry.models,
+                )
+                .unwrap(),
+            ),
+            header_secrets: vec![None; entry.headers.len()],
+            entry,
+        };
+        let saves = vec![save];
+        let intent = super::super::provider_plan_intent_hash(&saves, &[], &None).unwrap();
+        let authority = current.authority;
+        let work = super::super::SettingsDaemonEffectWork::ProviderMutation(
+            super::super::ProviderMutationPlan {
+                snapshot_session_id: authority.snapshot_session_id,
+                layer_id: authority.layer_id,
+                owner_root: authority.owner_root,
+                expected_revision: authority.base_revision,
+                client_operation_id: uuid::Uuid::new_v4().to_string(),
+                mutation_intent_hash: intent,
+                saves,
+                deletes: Vec::new(),
+                metadata: None,
+            },
+        );
+        let result = runtime
+            .block_on(super::super::execute_settings_daemon_work(
+                work,
+                crate::tui::settings::test_lifecycle_client(),
+            ))
+            .expect("production worker must accept a complete, matching delta receipt");
+        assert!(
+            result.response.is_ok(),
+            "production receipt gate: {:?}",
+            result.response
+        );
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"].entry.name.as_deref(),
+            Some("receipt-bound provider edit")
+        );
+        assert_eq!(current.config.providers["p"].entry.models.len(), 2);
+        // These plans have no provider upsert. The existing large inventory
+        // must stay paged for ordinary policy and deletion saves as well.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.on_unlisted_models_fetch = Some(OnUnlistedModelsFetch::Ask);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.on_unlisted_models_fetch,
+            Some(OnUnlistedModelsFetch::Ask),
+            "metadata-only save retains paged readability: {:?}",
+            dialog.extended_warnings
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.remove("sibling-3");
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            !current.config.providers.contains_key("sibling-3"),
+            "deletion-only save retains paged readability: {:?}",
+            dialog.extended_warnings
+        );
+        assert_eq!(current.config.providers["p"].entry.models.len(), 2);
+    });
+}
+
+// A fetched global field and an authored workspace field compose on the same ID.
+#[test]
+fn global_refresh_same_row_composition_remains_editable_through_settings() {
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
+            let mut buf = [0; 8192];
+            assert!(socket.read(&mut buf).unwrap() > 0);
+            let body =
+                serde_json::json!({"data":[{"id":"g","name":"global quota ".repeat(15*1024)}]})
+                    .to_string();
+            write!(socket,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+        });
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut global_config = ProvidersConfig::default();
+        global_config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: url.clone(),
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: vec![model("g", false)],
+                ..Default::default()
+            },
+        );
+        ConfigDoc::load(&global)
+            .unwrap()
+            .write(&global_config)
+            .unwrap();
+        let mut config = ProvidersConfig::default();
+        let mut authored = ModelEntry {
+            id: "g".into(),
+            favorite: true,
+            ..Default::default()
+        };
+        authored.extra.insert(
+            "owner_note".into(),
+            serde_json::json!("owner note ".repeat(16 * 1024)),
+        );
+        config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url,
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: vec![authored],
+                ..Default::default()
+            },
+        );
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("models_replace");
+        std::fs::write(&provider_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            serde_json::to_vec(&initial.config.providers["p"].entry.models[0])
+                .unwrap()
+                .len()
+                < cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        // A legitimate metadata save works before the global directory grows.
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let before = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(before.config.providers["p"].entry.favorite, Some(true));
+        // Restore partial authored semantics, which are explicitly supported.
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("models_replace");
+        std::fs::write(&provider_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        runtime
+            .block_on(
+                client.request_ok(cockpit_proto::Request::FetchProviderModels {
+                    project_root: global.parent().unwrap().display().to_string(),
+                    provider_id: Some("p".into()),
+                    model_id: None,
+                    deep: false,
+                    on_unlisted: Some(OnUnlistedModelsFetch::Keep),
+                    allow_fallback: false,
+                }),
+            )
+            .unwrap();
+        server.join().unwrap();
+        let refreshed = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let row = &refreshed.config.providers["p"].entry.models[0];
+        let row_bytes = serde_json::to_vec(row).unwrap().len();
+        assert!(
+            row_bytes > cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES,
+            "same-row composition must exceed the delta cap: {row_bytes}"
+        );
+        assert!(row.extra.contains_key("owner_note"));
+        assert!(row.name.as_ref().unwrap().contains("global quota"));
+        let expected = refreshed.config.providers["p"].entry.models.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(refreshed))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(false);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"].entry.favorite,
+            Some(false),
+            "same-row global growth stranded a previously editable provider; warnings={:?}",
+            dialog.extended_warnings
+        );
+        assert!(
+            !dialog.provider_catalog_reload_required,
+            "current authority adopted"
+        );
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        // Editing this oversized row must not send a whole-row upsert, nor
+        // duplicate its inherited name into the workspace's durable file.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models[0].favorite = false;
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let row = &current.config.providers["p"].entry.models[0];
+        assert!(
+            !row.favorite,
+            "per-model favorite applied on composed row: {:?}",
+            dialog.extended_warnings
+        );
+        assert_eq!(row.name, expected[0].name);
+        assert_eq!(row.extra, expected[0].extra);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert!(
+            saved["models"][0].get("name").is_none(),
+            "inherited name stays in its owner layer"
+        );
+        assert_eq!(
+            saved["model_field_patches"][0]["remove"],
+            serde_json::json!(["favorite"])
+        );
+        // Subsequent settings saves must load the authored patch (not lose it
+        // by expanding a single layer); complete empty membership is explicit.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().name = Some("still editable".into());
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(!current.config.providers["p"].entry.models[0].favorite);
+        assert_eq!(
+            current.config.providers["p"].entry.name.as_deref(),
+            Some("still editable")
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models.clear();
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            current.config.providers["p"].entry.models.is_empty(),
+            "empty inventory cannot resurrect inherited row"
+        );
+    });
+}
+
+// A one-row delete must remain bounded after real global catalog growth.
+#[test]
+fn composed_long_id_membership_delete_remains_editable() {
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    struct InspectingEffect(Arc<Mutex<Vec<cockpit_proto::ProviderModelPatch>>>);
+    impl super::super::SettingsDaemonEffect for InspectingEffect {
+        fn request(
+            &self,
+            request: cockpit_proto::Request,
+        ) -> Result<cockpit_proto::Response, String> {
+            if let cockpit_proto::Request::ApplyProviderMutation { mutation, .. } = &request {
+                for upsert in &mutation.upserts {
+                    self.0.lock().unwrap().push(
+                        upsert
+                            .model_patch
+                            .clone()
+                            .expect("existing provider uses delta"),
+                    );
+                }
+            }
+            super::super::SettingsDaemonEffect::request(&InProcessSettingsDaemonEffect, request)
+        }
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    super::super::with_settings_daemon_effect(Arc::new(InspectingEffect(observed.clone())), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let ids = |prefix: &str| {
+            (0..1100)
+                .map(|i| format!("{prefix}-{i:04}-{}", "x".repeat(135)))
+                .collect::<Vec<_>>()
+        };
+        let global_ids = ids("global");
+        let local_ids = ids("local");
+        let body = serde_json::json!({"data":global_ids.iter().map(|id|serde_json::json!({"id":id})).collect::<Vec<_>>()}).to_string();
+        let extra_id = format!("new-global-{}", "z".repeat(135));
+        let next_body = serde_json::json!({"data":global_ids.iter().chain(std::iter::once(&extra_id)).map(|id|serde_json::json!({"id":id})).collect::<Vec<_>>()}).to_string();
+        let server = std::thread::spawn(move || {
+            for body in [body, next_body] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                    .unwrap();
+                let mut buf = [0; 8192];
+                assert!(socket.read(&mut buf).unwrap() > 0);
+                write!(socket,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut global_config = ProvidersConfig::default();
+        global_config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: url.clone(),
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: vec![model("seed", false)],
+                ..Default::default()
+            },
+        );
+        ConfigDoc::load(&global)
+            .unwrap()
+            .write(&global_config)
+            .unwrap();
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url,
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: local_ids
+                    .iter()
+                    .map(|id| ModelEntry {
+                        id: id.clone(),
+                        manual: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            serde_json::to_vec(&config.providers["p"]).unwrap().len()
+                < cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES,
+            "authored layer starts editable"
+        );
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("models_replace");
+        std::fs::write(&provider_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        runtime
+            .block_on(
+                client.request_ok(cockpit_proto::Request::FetchProviderModels {
+                    project_root: global.parent().unwrap().display().to_string(),
+                    provider_id: Some("p".into()),
+                    model_id: None,
+                    deep: false,
+                    on_unlisted: Some(OnUnlistedModelsFetch::Keep),
+                    allow_fallback: false,
+                }),
+            )
+            .unwrap();
+        let refreshed = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let before = refreshed.config.providers["p"].entry.models.clone();
+        assert!(
+            global_ids
+                .iter()
+                .all(|id| before.iter().any(|row| &row.id == id)),
+            "legitimate fetched global rows retained"
+        );
+        assert!(
+            local_ids
+                .iter()
+                .all(|id| before.iter().any(|row| &row.id == id)),
+            "manual owner rows retained"
+        );
+        let mut after = before.clone();
+        after.retain(|row| row.id != global_ids[0]);
+        assert_eq!(before.len() - after.len(), 1);
+        let patch = cockpit_proto::ProviderModelPatch::between(&before, &after).unwrap();
+        assert_eq!(patch.deletes, [global_ids[0].clone()]);
+        assert!(
+            patch.upserts.is_empty() && patch.updates.is_empty(),
+            "only one existing row deletion"
+        );
+        assert!(
+            serde_json::to_vec(&after.iter().map(|row| &row.id).collect::<Vec<_>>())
+                .unwrap()
+                .len()
+                > cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES,
+            "unchanged ID sequence exceeds mutation ingress"
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(refreshed))
+            .unwrap();
+        // Metadata remains editable before the one-row membership mutation.
+        dialog.config.providers.get_mut("p").unwrap().name = Some("reviewer metadata edit".into());
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"].entry.name.as_deref(),
+            Some("reviewer metadata edit")
+        );
+        let metadata_patch = observed.lock().unwrap().last().unwrap().clone();
+        assert!(
+            metadata_patch.order.is_none()
+                && metadata_patch.moves.is_empty()
+                && !metadata_patch.clear
+        );
+        assert!(
+            metadata_patch.deletes.is_empty()
+                && metadata_patch.upserts.is_empty()
+                && metadata_patch.updates.is_empty()
+        );
+        let encoded = serde_json::to_value(metadata_patch).unwrap();
+        assert!(
+            encoded.get("order").is_none()
+                && encoded.get("moves").is_none()
+                && encoded.get("clear").is_none(),
+            "metadata-only save omits membership intent"
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models = after.clone();
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            !current.config.providers["p"]
+                .entry
+                .models
+                .iter()
+                .any(|row| row.id == global_ids[0]),
+            "single model deletion stranded by complete composed ID order; warnings={:?}",
+            dialog.extended_warnings
+        );
+        assert_eq!(
+            current.config.providers["p"].entry.models.len(),
+            before.len() - 1
+        );
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&after).unwrap(),
+            "deletion preserves every untouched row and exact order"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert!(
+            saved.get("model_order").is_none(),
+            "large membership stays sparse durably"
+        );
+        assert_eq!(
+            saved["model_membership"]["deletes"],
+            serde_json::json!([global_ids[0]])
+        );
+        assert_eq!(
+            saved["models"].as_array().unwrap().len(),
+            local_ids.len(),
+            "unchanged inherited ownership stays global"
+        );
+
+        // A second real global refresh must retain the deletion and admit a
+        // newly inherited long ID without silently dropping any other row.
+        runtime
+            .block_on(
+                client.request_ok(cockpit_proto::Request::FetchProviderModels {
+                    project_root: global.parent().unwrap().display().to_string(),
+                    provider_id: Some("p".into()),
+                    model_id: None,
+                    deep: false,
+                    on_unlisted: Some(OnUnlistedModelsFetch::Keep),
+                    allow_fallback: false,
+                }),
+            )
+            .unwrap();
+        server.join().unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let mut expected_ids = before
+            .iter()
+            .filter(|row| row.id != global_ids[0])
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        expected_ids.insert(global_ids.len() - 1, extra_id.clone());
+        assert_eq!(
+            current.config.providers["p"]
+                .entry
+                .models
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids,
+            "deleted inherited row stays gone after refresh; new inherited ID remains visible"
+        );
+
+        // Reorder two long inherited IDs through the actual settings producer.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog
+            .config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .swap(0, 1);
+        expected_ids.swap(0, 1);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"]
+                .entry
+                .models
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids,
+            "sparse reorder retains complete exact order"
+        );
+
+        // Re-add the deleted inherited long ID as a new authored row, including
+        // its replacement semantics over a hidden lower-layer image.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        let added = ModelEntry {
+            id: global_ids[0].clone(),
+            manual: true,
+            name: Some("owner replacement".into()),
+            ..Default::default()
+        };
+        dialog
+            .config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .insert(1, added.clone());
+        expected_ids.insert(1, added.id.clone());
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"]
+                .entry
+                .models
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids,
+            "single long-ID addition preserves every sibling"
+        );
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models[1]).unwrap(),
+            serde_json::to_value(&added).unwrap(),
+            "hidden-ID addition is a fresh replacement"
+        );
+
+        // Delete the anchor of an earlier placement. Cumulative placements
+        // must be rebased rather than reorder rows around a vanished anchor.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog
+            .config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .remove(0);
+        expected_ids.remove(0);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"]
+                .entry
+                .models
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids,
+            "repeated sparse operations retain order when an anchor is deleted"
+        );
+
+        // A digest mismatch at actual mutation dispatch writes nothing even
+        // with an otherwise current layer capability and intent identity.
+        let file_before = std::fs::read(&provider_path).unwrap();
+        let mut stale_patch = cockpit_proto::ProviderModelPatch::between(&before, &after).unwrap();
+        stale_patch.base_digest = "00".repeat(32);
+        let mut entry = current.config.providers["p"].entry.clone();
+        entry.models.clear();
+        let mutation = cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "p".into(),
+                header_secrets: vec![None; entry.headers.len()],
+                entry,
+                model_patch: Some(stale_patch),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        };
+        let intent = mutation.sanitized_intent_hash().unwrap();
+        let authority = &current.authority;
+        let error = runtime
+            .block_on(
+                client.request_ok(cockpit_proto::Request::ApplyProviderMutation {
+                    snapshot_session_id: authority.snapshot_session_id.clone(),
+                    layer_id: authority.layer_id.clone(),
+                    expected_revision: authority.base_revision.clone(),
+                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    mutation_intent_hash: intent,
+                    mutation,
+                }),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("inventory changed"), "{error}");
+        assert_eq!(
+            std::fs::read(&provider_path).unwrap(),
+            file_before,
+            "stale digest writes nothing"
+        );
+        let latest = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            latest.authority.base_revision,
+            current.authority.base_revision
+        );
+        assert_eq!(
+            latest.authority.config_generation,
+            current.authority.config_generation
+        );
+
+        // Empty membership uses constant-size intent, removes every inherited
+        // row and stays empty on subsequent read/metadata saves.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(latest))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models.clear();
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            current.config.providers["p"].entry.models.is_empty(),
+            "empty membership removes all inherited rows"
+        );
+        assert!(observed.lock().unwrap().last().unwrap().clear);
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(current.config.providers["p"].entry.models.is_empty());
+        assert_eq!(current.config.providers["p"].entry.favorite, Some(true));
+    });
+}
+
+#[test]
+fn sparse_membership_save_rejects_oversized_single_authored_layer_without_writes() {
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: "https://example.com/v1".into(),
+                auth: Some(AuthKind::None),
+                models: vec![ModelEntry {
+                    id: "owner".into(),
+                    name: Some("x".repeat(240 * 1024)),
+                    manual: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let revision = initial.authority.base_revision.clone();
+        let generation = initial.authority.config_generation;
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let config_before = std::fs::read(&config_path).unwrap();
+        let provider_before = std::fs::read(&provider_path).unwrap();
+        dialog
+            .config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .push(ModelEntry {
+                id: "new".into(),
+                name: Some("y".repeat(32 * 1024)),
+                manual: true,
+                ..Default::default()
+            });
+        let delta = cockpit_proto::ProviderModelPatch::between(
+            &dialog.original_config.providers["p"].models,
+            &dialog.config.providers["p"].models,
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_vec(&delta).unwrap().len()
+                < cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES,
+            "delta alone fits; authored total must still be bounded"
+        );
+        let error = dialog.save_config().unwrap_err();
+        assert!(error.contains("authored provider entry exceeds"), "{error}");
+        dialog.settle_test_effects();
+        assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+        assert_eq!(std::fs::read(&provider_path).unwrap(), provider_before);
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(current.authority.base_revision, revision);
+        assert_eq!(current.authority.config_generation, generation);
+        assert_eq!(current.config.providers["p"].entry.models.len(), 1);
+        // Assert the typed failure at the actual client/daemon RPC boundary,
+        // in addition to the ordinary settings error projection above.
+        let mut entry = dialog.config.providers["p"].clone();
+        entry.models.clear();
+        let mutation = cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "p".into(),
+                header_secrets: vec![None; entry.headers.len()],
+                entry,
+                model_patch: Some(delta),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        };
+        let intent = mutation.sanitized_intent_hash().unwrap();
+        let authority = current.authority;
+        let error = runtime
+            .block_on(
+                client.request(cockpit_proto::Request::ApplyProviderMutation {
+                    snapshot_session_id: authority.snapshot_session_id,
+                    layer_id: authority.layer_id,
+                    expected_revision: authority.base_revision,
+                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    mutation_intent_hash: intent,
+                    mutation,
+                }),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, cockpit_proto::ErrorCode::BadRequest);
+        assert!(
+            error.message.contains("authored provider entry exceeds"),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+        assert_eq!(std::fs::read(&provider_path).unwrap(), provider_before);
+        let unchanged = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(unchanged.authority.base_revision, revision);
+        assert_eq!(unchanged.authority.config_generation, generation);
+    });
+}
+
+#[derive(Clone, Copy)]
+enum ByteBoundedReorderCase {
+    BoundedRotation,
+    FullOrder,
+    WeightedSparse,
+    AccumulatedAuthored,
+    TemporaryAnchor,
+    TemporaryScaffold,
+    OverlappingPin,
+    ExistingPinsOnly,
+    ExistingPinsWithNewMove,
+}
+
+#[test]
+fn byte_bounded_reorder_301_bounded_ids_rotation_through_actual_settings() {
+    assert_byte_bounded_reorder_through_actual_settings(ByteBoundedReorderCase::BoundedRotation);
+}
+
+#[test]
+fn byte_bounded_reorder_full_order_over_16k_through_actual_settings() {
+    assert_byte_bounded_reorder_through_actual_settings(ByteBoundedReorderCase::FullOrder);
+}
+
+#[test]
+fn byte_bounded_reorder_weighted_sparse_through_actual_settings() {
+    assert_byte_bounded_reorder_through_actual_settings(ByteBoundedReorderCase::WeightedSparse);
+}
+
+#[test]
+fn byte_bounded_reorder_accumulated_authored_selects_fitting_full_order() {
+    assert_byte_bounded_reorder_through_actual_settings(
+        ByteBoundedReorderCase::AccumulatedAuthored,
+    );
+}
+
+#[test]
+fn byte_bounded_reorder_non_immediate_temporary_anchor_through_actual_settings() {
+    assert_byte_bounded_reorder_through_actual_settings(ByteBoundedReorderCase::TemporaryAnchor);
+}
+
+#[test]
+fn byte_bounded_reorder_temporary_scaffold_retains_prior_pins_through_actual_settings() {
+    assert_byte_bounded_reorder_through_actual_settings(ByteBoundedReorderCase::TemporaryScaffold);
+}
+
+#[test]
+fn byte_bounded_reorder_overlapping_pin_checks_actual_composition_through_settings() {
+    assert_byte_bounded_reorder_through_actual_settings(ByteBoundedReorderCase::OverlappingPin);
+}
+
+#[test]
+fn byte_bounded_reorder_reuses_authored_pins_without_pinning_request_encoding() {
+    assert_byte_bounded_reorder_through_actual_settings(ByteBoundedReorderCase::ExistingPinsOnly);
+}
+
+#[test]
+fn byte_bounded_reorder_required_pins_and_new_moves_share_authored_budget() {
+    assert_byte_bounded_reorder_through_actual_settings(
+        ByteBoundedReorderCase::ExistingPinsWithNewMove,
+    );
+}
+
+fn assert_byte_bounded_reorder_through_actual_settings(case: ByteBoundedReorderCase) {
+    use cockpit_config::config::providers::ModelPlacement;
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cap = cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES;
+        let entry = |models| ProviderEntry {
+            url: "https://example.com/v1".into(),
+            auth: Some(AuthKind::None),
+            models,
+            ..Default::default()
+        };
+        let (mut global_ids, local_ids) = match case {
+            ByteBoundedReorderCase::ExistingPinsWithNewMove => (
+                vec![
+                    format!("a-{}", "x".repeat(900)),
+                    "b".into(),
+                    format!("c-{}", "x".repeat(900)),
+                    "d".into(),
+                    format!("e-{}", "x".repeat(900)),
+                ],
+                Vec::new(),
+            ),
+            ByteBoundedReorderCase::ExistingPinsOnly => (
+                vec![
+                    format!("a-{}", "x".repeat(900)),
+                    "b".into(),
+                    format!("d-{}", "x".repeat(900)),
+                ],
+                Vec::new(),
+            ),
+            ByteBoundedReorderCase::OverlappingPin => {
+                (vec!["a".into(), "b".repeat(900), "c".into()], Vec::new())
+            }
+            ByteBoundedReorderCase::TemporaryScaffold => (
+                vec!["x".into(), "a".into(), "b".repeat(900), "c".into()],
+                Vec::new(),
+            ),
+            ByteBoundedReorderCase::TemporaryAnchor => (
+                vec!["a".into(), "b".repeat(900), "c".into(), "d".repeat(900)],
+                Vec::new(),
+            ),
+            ByteBoundedReorderCase::WeightedSparse => (
+                vec![format!("a-{}", "a".repeat(135 * 1024)), "short".into()],
+                vec![format!("b-{}", "b".repeat(135 * 1024))],
+            ),
+            _ => {
+                let ids = (0..150)
+                    .map(|i| format!("a{i:03}-{}", "x".repeat(900)))
+                    .chain((0..151).map(|i| format!("b{i:03}")))
+                    .collect::<Vec<_>>();
+                assert!(
+                    ids.iter()
+                        .all(|id| id.len() <= cockpit_proto::MAX_OWNER_PROVIDER_MODEL_ID_BYTES)
+                );
+                (ids, Vec::new())
+            }
+        };
+        if matches!(case, ByteBoundedReorderCase::AccumulatedAuthored) {
+            let last_long_rows = global_ids.drain(148..150).collect::<Vec<_>>();
+            global_ids.extend(last_long_rows);
+        }
+        let rows = |ids: &[String]| {
+            ids.iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let mut row = model(id, false);
+                    row.name = Some(format!("image-{i}"));
+                    row.favorite = i % 3 == 0;
+                    row
+                })
+                .collect::<Vec<_>>()
+        };
+        let global_entry = entry(rows(&global_ids));
+        assert!(serde_json::to_vec(&global_entry).unwrap().len() < cap);
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut source = ProvidersConfig::default();
+        source.providers.insert("p".into(), global_entry);
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let mut owner_entry = entry(Vec::new());
+        if matches!(case, ByteBoundedReorderCase::AccumulatedAuthored) {
+            // Retained explicit pins fit initially. A tiny additional move
+            // exceeds the accumulated sparse budget, while full order fits.
+            let pinned = global_ids
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 300)
+                .map(|(_, id)| id.as_str())
+                .collect();
+            owner_entry.model_membership.placements =
+                ModelPlacement::for_pinned_order(&global_ids, &pinned);
+            owner_entry.name = Some(String::new());
+            let overhead = serde_json::to_vec(&owner_entry).unwrap().len();
+            owner_entry.name = Some("n".repeat(cap - overhead - 512));
+        }
+        if matches!(case, ByteBoundedReorderCase::TemporaryAnchor) {
+            owner_entry.name = Some(String::new());
+            let overhead = serde_json::to_vec(&owner_entry).unwrap().len();
+            owner_entry.name = Some("n".repeat(cap - overhead - 1200));
+        }
+        if matches!(case, ByteBoundedReorderCase::TemporaryScaffold) {
+            owner_entry
+                .model_membership
+                .placements
+                .push(ModelPlacement {
+                    id: "x".into(),
+                    after: None,
+                });
+            owner_entry.name = Some(String::new());
+            let overhead = serde_json::to_vec(&owner_entry).unwrap().len();
+            owner_entry.name = Some("n".repeat(cap - overhead - 500));
+        }
+        if matches!(case, ByteBoundedReorderCase::OverlappingPin) {
+            owner_entry
+                .model_membership
+                .placements
+                .push(ModelPlacement {
+                    id: "a".into(),
+                    after: None,
+                });
+            owner_entry.name = Some(String::new());
+            let overhead = serde_json::to_vec(&owner_entry).unwrap().len();
+            owner_entry.name = Some("n".repeat(cap - overhead - 500));
+        }
+        if matches!(
+            case,
+            ByteBoundedReorderCase::ExistingPinsOnly
+                | ByteBoundedReorderCase::ExistingPinsWithNewMove
+        ) {
+            owner_entry
+                .model_membership
+                .placements
+                .push(ModelPlacement {
+                    id: global_ids[0].clone(),
+                    after: None,
+                });
+            owner_entry.favorite = Some(true);
+            owner_entry.name = Some(String::new());
+            let overhead = serde_json::to_vec(&owner_entry).unwrap().len();
+            let margin = if matches!(case, ByteBoundedReorderCase::ExistingPinsOnly) {
+                8
+            } else {
+                35
+            };
+            owner_entry.name = Some("n".repeat(cap - overhead - margin));
+        }
+        let mut owner = ProvidersConfig::default();
+        owner.providers.insert("p".into(), owner_entry);
+        let (tmp, mut dialog) = dialog_with_config(owner);
+        if !local_ids.is_empty() {
+            let local_dir = cockpit_config::config::dirs::local_config_dir_for(tmp.path()).unwrap();
+            std::fs::create_dir_all(local_dir.join("providers")).unwrap();
+            std::fs::write(local_dir.join("config.json"), "{}").unwrap();
+            let local_entry = entry(rows(&local_ids));
+            assert!(serde_json::to_vec(&local_entry).unwrap().len() < cap);
+            std::fs::write(
+                local_dir.join("providers/p.json"),
+                serde_json::to_vec(&local_entry).unwrap(),
+            )
+            .unwrap();
+        }
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let before = current.config.providers["p"].entry.models.clone();
+        assert!(
+            before
+                .iter()
+                .map(|row| &row.id)
+                .eq(global_ids.iter().chain(&local_ids))
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(!matches!(
+            case,
+            ByteBoundedReorderCase::ExistingPinsOnly
+                | ByteBoundedReorderCase::ExistingPinsWithNewMove
+        ));
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"].entry.favorite,
+            Some(!matches!(
+                case,
+                ByteBoundedReorderCase::ExistingPinsOnly
+                    | ByteBoundedReorderCase::ExistingPinsWithNewMove
+            ))
+        );
+        let mut after = before.clone();
+        match case {
+            ByteBoundedReorderCase::BoundedRotation => after.rotate_left(150),
+            ByteBoundedReorderCase::FullOrder => after.reverse(),
+            ByteBoundedReorderCase::WeightedSparse => after.rotate_left(1),
+            ByteBoundedReorderCase::AccumulatedAuthored => after.swap(299, 300),
+            ByteBoundedReorderCase::ExistingPinsWithNewMove => {
+                after = [1, 0, 3, 2, 4].map(|i| before[i].clone()).to_vec();
+            }
+            ByteBoundedReorderCase::ExistingPinsOnly => after.swap(0, 1),
+            ByteBoundedReorderCase::OverlappingPin => {
+                after = [1, 0, 2].map(|i| before[i].clone()).to_vec();
+            }
+            ByteBoundedReorderCase::TemporaryScaffold => {
+                after = [0, 2, 1, 3].map(|i| before[i].clone()).to_vec();
+            }
+            ByteBoundedReorderCase::TemporaryAnchor => {
+                after = [1, 0, 3, 2].map(|i| before[i].clone()).to_vec();
+            }
+        }
+        let patch = cockpit_proto::ProviderModelPatch::between(&before, &after).unwrap();
+        let mut metadata = current.config.providers["p"].entry.clone();
+        metadata.models.clear();
+        let authored_before = ConfigDoc::load(&tmp.path().join(".cockpit/config.json"))
+            .unwrap()
+            .providers()
+            .providers["p"]
+            .clone();
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        if !matches!(case, ByteBoundedReorderCase::AccumulatedAuthored) {
+            // The old count-based encoding is a valid reorder but exceeds
+            // complete ingress. Its rejection must have no partial effect.
+            let mut oversized = patch.clone();
+            oversized.order = None;
+            oversized.moves = match case {
+                ByteBoundedReorderCase::WeightedSparse => vec![ModelPlacement {
+                    id: global_ids[0].clone(),
+                    after: Some(local_ids[0].clone()),
+                }],
+                ByteBoundedReorderCase::ExistingPinsWithNewMove => vec![
+                    ModelPlacement {
+                        id: global_ids[0].clone(),
+                        after: Some("b".into()),
+                    },
+                    ModelPlacement {
+                        id: global_ids[2].clone(),
+                        after: Some("d".into()),
+                    },
+                ],
+                ByteBoundedReorderCase::ExistingPinsOnly => vec![
+                    ModelPlacement {
+                        id: global_ids[0].clone(),
+                        after: Some(global_ids[2].clone()),
+                    },
+                    ModelPlacement {
+                        id: global_ids[1].clone(),
+                        after: None,
+                    },
+                    ModelPlacement {
+                        id: global_ids[2].clone(),
+                        after: Some(global_ids[0].clone()),
+                    },
+                ],
+                ByteBoundedReorderCase::OverlappingPin => vec![ModelPlacement {
+                    id: global_ids[0].clone(),
+                    after: Some(global_ids[1].clone()),
+                }],
+                ByteBoundedReorderCase::TemporaryScaffold => vec![ModelPlacement {
+                    id: global_ids[1].clone(),
+                    after: Some(global_ids[2].clone()),
+                }],
+                ByteBoundedReorderCase::TemporaryAnchor => vec![
+                    ModelPlacement {
+                        id: global_ids[0].clone(),
+                        after: Some(global_ids[1].clone()),
+                    },
+                    ModelPlacement {
+                        id: global_ids[2].clone(),
+                        after: Some(global_ids[3].clone()),
+                    },
+                ],
+                ByteBoundedReorderCase::FullOrder => after
+                    .iter()
+                    .enumerate()
+                    .take(after.len() - 1)
+                    .map(|(i, row)| ModelPlacement {
+                        id: row.id.clone(),
+                        after: i.checked_sub(1).map(|prior| after[prior].id.clone()),
+                    })
+                    .collect(),
+                _ => after
+                    .iter()
+                    .enumerate()
+                    .skip(151)
+                    .map(|(i, row)| ModelPlacement {
+                        id: row.id.clone(),
+                        after: Some(after[i - 1].id.clone()),
+                    })
+                    .collect(),
+            };
+            let mut applied = before.clone();
+            oversized.apply(&mut applied).unwrap();
+            assert_eq!(
+                serde_json::to_value(&applied).unwrap(),
+                serde_json::to_value(&after).unwrap()
+            );
+            assert!(
+                serde_json::to_vec(&(&metadata, Some(&oversized)))
+                    .unwrap()
+                    .len()
+                    > cap
+            );
+            let file_before = std::fs::read(&provider_path).unwrap();
+            let config_before = std::fs::read(&config_path).unwrap();
+            let mutation = cockpit_proto::ProviderMutationBatch {
+                upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                    provider_id: "p".into(),
+                    header_secrets: vec![None; metadata.headers.len()],
+                    entry: metadata.clone(),
+                    model_patch: Some(oversized),
+                }],
+                deletes: Vec::new(),
+                metadata: None,
+            };
+            let authority = &current.authority;
+            let intent = mutation.sanitized_intent_hash().unwrap();
+            let error = runtime
+                .block_on(
+                    client.request(cockpit_proto::Request::ApplyProviderMutation {
+                        snapshot_session_id: authority.snapshot_session_id.clone(),
+                        layer_id: authority.layer_id.clone(),
+                        expected_revision: authority.base_revision.clone(),
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
+                        mutation_intent_hash: intent,
+                        mutation,
+                    }),
+                )
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, cockpit_proto::ErrorCode::BadRequest);
+            assert!(
+                error
+                    .message
+                    .contains("provider entry exceeds maximum length")
+            );
+            assert_eq!(std::fs::read(&provider_path).unwrap(), file_before);
+            assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+            let unchanged = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            assert_eq!(
+                unchanged.authority.base_revision,
+                current.authority.base_revision
+            );
+            assert_eq!(
+                unchanged.authority.config_generation,
+                current.authority.config_generation
+            );
+            assert_eq!(
+                serde_json::to_value(&unchanged.config.providers["p"].entry.models).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+        }
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models = after.clone();
+        dialog
+            .save_config()
+            .expect("ordinary settings save must select a fitting encoding");
+        dialog.settle_test_effects();
+        assert!(
+            serde_json::to_vec(&(&metadata, Some(&patch)))
+                .unwrap()
+                .len()
+                <= cap,
+            "complete ordinary metadata + delta must fit ingress"
+        );
+        match case {
+            ByteBoundedReorderCase::BoundedRotation => {}
+            ByteBoundedReorderCase::FullOrder => {
+                assert!(
+                    serde_json::to_vec(patch.order.as_ref().unwrap())
+                        .unwrap()
+                        .len()
+                        > 16 * 1024
+                );
+                assert!(patch.moves.is_empty());
+            }
+            ByteBoundedReorderCase::WeightedSparse => {
+                assert!(patch.order.is_none());
+                assert_eq!(
+                    patch.moves,
+                    vec![
+                        ModelPlacement {
+                            id: local_ids[0].clone(),
+                            after: None
+                        },
+                        ModelPlacement {
+                            id: "short".into(),
+                            after: None
+                        },
+                    ],
+                    "two cheaper moves beat one move containing both huge IDs"
+                );
+            }
+            ByteBoundedReorderCase::TemporaryScaffold | ByteBoundedReorderCase::OverlappingPin => {
+                assert!(patch.order.is_none());
+                assert_eq!(
+                    patch.moves,
+                    vec![
+                        ModelPlacement {
+                            id: "a".into(),
+                            after: Some("c".into())
+                        },
+                        ModelPlacement {
+                            id: "c".into(),
+                            after: Some("a".into())
+                        },
+                    ],
+                    "an otherwise stationary row can provide a cheap temporary handle"
+                );
+            }
+            ByteBoundedReorderCase::TemporaryAnchor => {
+                assert!(patch.order.is_none());
+                assert_eq!(
+                    patch.moves,
+                    vec![
+                        ModelPlacement {
+                            id: global_ids[0].clone(),
+                            after: Some(global_ids[2].clone())
+                        },
+                        ModelPlacement {
+                            id: global_ids[2].clone(),
+                            after: Some(global_ids[3].clone())
+                        },
+                    ],
+                    "a temporary anchor can end up after the row it initially anchored"
+                );
+            }
+            ByteBoundedReorderCase::ExistingPinsWithNewMove => {
+                assert!(patch.order.is_none());
+                assert_eq!(
+                    patch.moves,
+                    [
+                        ModelPlacement {
+                            id: "d".into(),
+                            after: Some("b".into())
+                        },
+                        ModelPlacement {
+                            id: "b".into(),
+                            after: None
+                        },
+                    ]
+                );
+            }
+            ByteBoundedReorderCase::ExistingPinsOnly => {
+                assert!(patch.order.is_none());
+                assert_eq!(
+                    patch.moves,
+                    [ModelPlacement {
+                        id: "b".into(),
+                        after: None
+                    }]
+                );
+                let mut forced = authored_before.clone();
+                forced.model_membership.placements = vec![
+                    ModelPlacement {
+                        id: "b".into(),
+                        after: None,
+                    },
+                    ModelPlacement {
+                        id: global_ids[0].clone(),
+                        after: Some("b".into()),
+                    },
+                ];
+                let mut fitting = authored_before.clone();
+                fitting.model_membership.placements = vec![ModelPlacement {
+                    id: global_ids[0].clone(),
+                    after: Some("b".into()),
+                }];
+                let doc = ConfigDoc::load(&config_path).unwrap();
+                assert!(
+                    doc.validate_provider_write("p", &forced)
+                        .unwrap_err()
+                        .is::<cockpit_config::config::providers::ProviderWriteValidationError>()
+                );
+                doc.validate_provider_write("p", &fitting).unwrap();
+            }
+            ByteBoundedReorderCase::AccumulatedAuthored => {
+                assert!(patch.order.is_none());
+                let mut sparse = authored_before.clone();
+                patch.apply_to_layer(&before, &mut sparse).unwrap();
+                assert!(
+                    serde_json::to_vec(&sparse).unwrap().len() > cap,
+                    "request fits but accumulated sparse intent does not"
+                );
+            }
+        }
+        let actual = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&after).unwrap(),
+            "independent daemon read preserves every row image and exact order"
+        );
+        let durable: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert!(serde_json::to_vec(&durable).unwrap().len() <= cap);
+        if matches!(case, ByteBoundedReorderCase::ExistingPinsWithNewMove) {
+            let authored =
+                ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+            assert!(authored.model_order.is_none());
+            assert_eq!(
+                authored.model_membership.placements,
+                [
+                    ModelPlacement {
+                        id: "d".into(),
+                        after: Some("b".into())
+                    },
+                    ModelPlacement {
+                        id: global_ids[0].clone(),
+                        after: Some("b".into())
+                    },
+                ],
+                "keep the old pin plus the needed new pin, without pinning a request-only move"
+            );
+        }
+        if matches!(case, ByteBoundedReorderCase::ExistingPinsOnly) {
+            let authored =
+                ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+            assert!(authored.model_order.is_none());
+            assert_eq!(
+                authored.model_membership.placements,
+                [ModelPlacement {
+                    id: global_ids[0].clone(),
+                    after: Some("b".into())
+                }],
+                "retain the prior pin and select durable intent independently of request encoding"
+            );
+        }
+        if matches!(
+            case,
+            ByteBoundedReorderCase::TemporaryScaffold | ByteBoundedReorderCase::OverlappingPin
+        ) {
+            let durable = ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+            assert!(durable.model_order.is_none());
+            assert_eq!(
+                durable
+                    .model_membership
+                    .placements
+                    .iter()
+                    .map(|p| p.id.as_str())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                if matches!(case, ByteBoundedReorderCase::OverlappingPin) {
+                    std::collections::BTreeSet::from(["a", "c"])
+                } else {
+                    std::collections::BTreeSet::from(["x", "a", "c"])
+                },
+                "every old pin and every incoming pin survives"
+            );
+            let pins_before = durable.model_membership.placements.clone();
+            dialog
+                .adopt_refreshed_provider_snapshot(Ok(actual))
+                .unwrap();
+            dialog.config.providers.get_mut("p").unwrap().favorite = Some(false);
+            dialog
+                .save_config()
+                .expect("metadata must preserve a non-idempotent durable program");
+            dialog.settle_test_effects();
+            let reentered = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&reentered.config.providers["p"].entry.models).unwrap(),
+                serde_json::to_value(&after).unwrap()
+            );
+            assert_eq!(reentered.config.providers["p"].entry.favorite, Some(false));
+            let retained =
+                ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+            assert_eq!(
+                retained.model_membership.placements, pins_before,
+                "metadata must neither reapply nor normalize existing pins"
+            );
+        }
+        if matches!(case, ByteBoundedReorderCase::AccumulatedAuthored) {
+            assert!(
+                durable.get("model_order").is_some(),
+                "final authored budget selects the fitting complete order"
+            );
+        }
+    });
+}
+
+#[test]
+fn byte_bounded_reorder_two_long_bounded_blocks_through_actual_settings() {
+    assert_two_long_bounded_blocks_save(false);
+}
+
+#[test]
+fn byte_bounded_reorder_two_long_bounded_blocks_accepts_alternate_rpc() {
+    assert_two_long_bounded_blocks_save(true);
+}
+
+fn assert_two_long_bounded_blocks_save(alternate_rpc: bool) {
+    use cockpit_config::config::providers::ModelPlacement;
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cap = cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES;
+        let rows = |prefix: char| {
+            (0..150)
+                .map(|i| {
+                    let mut row = model(&format!("{prefix}{i:03}-{}", "x".repeat(900)), false);
+                    row.name = Some(format!("{prefix}-independent-image-{i}"));
+                    row.favorite = i % 7 == 0;
+                    row
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = rows('a');
+        let second = rows('b');
+        let entry = |models| ProviderEntry {
+            url: "https://example.com/v1".into(),
+            auth: Some(AuthKind::None),
+            models,
+            ..Default::default()
+        };
+        for row in first.iter().chain(&second) {
+            assert_eq!(row.id.len(), 905);
+            assert!(row.id.len() <= cockpit_proto::MAX_OWNER_PROVIDER_MODEL_ID_BYTES);
+        }
+        let global_entry = entry(first.clone());
+        let local_entry = entry(second.clone());
+        for layer in [&global_entry, &local_entry] {
+            assert!(serde_json::to_vec(layer).unwrap().len() < cap);
+        }
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut global_config = ProvidersConfig::default();
+        global_config.providers.insert("p".into(), global_entry);
+        ConfigDoc::load(&global)
+            .unwrap()
+            .write(&global_config)
+            .unwrap();
+        let mut owner = ProvidersConfig::default();
+        owner.providers.insert("p".into(), entry(Vec::new()));
+        let (tmp, mut dialog) = dialog_with_config(owner);
+        let local_dir = cockpit_config::config::dirs::local_config_dir_for(tmp.path()).unwrap();
+        std::fs::create_dir_all(local_dir.join("providers")).unwrap();
+        std::fs::write(local_dir.join("config.json"), "{}").unwrap();
+        std::fs::write(
+            local_dir.join("providers/p.json"),
+            serde_json::to_vec(&local_entry).unwrap(),
+        )
+        .unwrap();
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let before = first.iter().chain(&second).cloned().collect::<Vec<_>>();
+        assert!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap()
+                == serde_json::to_value(&before).unwrap(),
+            "exact independently built initial images"
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().name =
+            Some("bounded block metadata save".into());
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"].entry.name.as_deref(),
+            Some("bounded block metadata save")
+        );
+        let after = second.iter().chain(&first).cloned().collect::<Vec<_>>();
+        let automatic = cockpit_proto::ProviderModelPatch::between(&before, &after).unwrap();
+        let mut alternate = automatic.clone();
+        alternate.order = None;
+        alternate.moves = second
+            .iter()
+            .rev()
+            .map(|row| ModelPlacement {
+                id: row.id.clone(),
+                after: None,
+            })
+            .collect();
+        for patch in [&automatic, &alternate] {
+            let mut applied = before.clone();
+            patch.apply(&mut applied).unwrap();
+            assert_eq!(
+                serde_json::to_value(&applied).unwrap(),
+                serde_json::to_value(&after).unwrap()
+            );
+        }
+        let mut metadata = current.config.providers["p"].entry.clone();
+        metadata.models.clear();
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let doc = ConfigDoc::load(&config_path).unwrap();
+        let authored = doc.providers().providers["p"].clone();
+        let paths = [
+            global.clone(),
+            global.parent().unwrap().join("providers/p.json"),
+            local_dir.join("config.json"),
+            local_dir.join("providers/p.json"),
+            config_path.clone(),
+            provider_path.clone(),
+        ];
+        let raw_before = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let revision = current.authority.base_revision.clone();
+        let generation = current.authority.config_generation;
+        let request = |patch, authority: super::super::ProviderEditAuthority| {
+            let mutation = cockpit_proto::ProviderMutationBatch {
+                upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                    provider_id: "p".into(),
+                    header_secrets: vec![None; metadata.headers.len()],
+                    entry: metadata.clone(),
+                    model_patch: Some(patch),
+                }],
+                deletes: Vec::new(),
+                metadata: None,
+            };
+            let intent = mutation.sanitized_intent_hash().unwrap();
+            runtime
+                .block_on(
+                    client.request(cockpit_proto::Request::ApplyProviderMutation {
+                        snapshot_session_id: authority.snapshot_session_id,
+                        layer_id: authority.layer_id,
+                        expected_revision: authority.base_revision,
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
+                        mutation_intent_hash: intent,
+                        mutation,
+                    }),
+                )
+                .unwrap()
+        };
+        // A valid but expensive predecessor form still rejects before writes.
+        let mut oversized = alternate.clone();
+        oversized.moves = first
+            .iter()
+            .enumerate()
+            .map(|(i, row)| ModelPlacement {
+                id: row.id.clone(),
+                after: Some(if i == 0 {
+                    second.last().unwrap().id.clone()
+                } else {
+                    first[i - 1].id.clone()
+                }),
+            })
+            .collect();
+        let mut applied = before.clone();
+        oversized.apply(&mut applied).unwrap();
+        assert_eq!(
+            serde_json::to_value(&applied).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        assert!(
+            serde_json::to_vec(&(&metadata, Some(&oversized)))
+                .unwrap()
+                .len()
+                > cap
+        );
+        let error = request(oversized, current.authority.clone()).unwrap_err();
+        assert_eq!(error.code, cockpit_proto::ErrorCode::BadRequest);
+        assert!(
+            error
+                .message
+                .contains("provider entry exceeds maximum length"),
+            "{error:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .zip(&raw_before)
+                .all(|(path, raw)| std::fs::read(path).unwrap() == *raw)
+        );
+        let unchanged = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(unchanged.authority.base_revision, revision);
+        assert_eq!(unchanged.authority.config_generation, generation);
+        assert_eq!(
+            serde_json::to_value(&unchanged.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        if alternate_rpc {
+            request(alternate.clone(), unchanged.authority).expect("valid alternate RPC must save");
+        } else {
+            dialog
+                .adopt_refreshed_provider_snapshot(Ok(unchanged))
+                .unwrap();
+            dialog.config.providers.get_mut("p").unwrap().models = after.clone();
+            dialog
+                .save_config()
+                .expect("ordinary settings must save fitting block rotation");
+            dialog.settle_test_effects();
+        }
+        for patch in [&automatic, &alternate] {
+            assert!(
+                serde_json::to_vec(&(&metadata, Some(patch))).unwrap().len() < cap,
+                "complete metadata + delta must fit ingress"
+            );
+        }
+        for patch in [&automatic, &alternate] {
+            let mut normalized = authored.clone();
+            patch.apply_to_layer(&before, &mut normalized).unwrap();
+            doc.validate_provider_write("p", &normalized).unwrap();
+            assert!(
+                serde_json::to_vec(&normalized).unwrap().len() < cap,
+                "durable normalization must retain a fitting representation"
+            );
+        }
+        let actual = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&after).unwrap(),
+            "fresh daemon read equals every independent expected image/order"
+        );
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert!(serde_json::to_vec(&raw).unwrap().len() < cap);
+        let durable = ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+        assert!(
+            durable.models.is_empty() && durable.model_field_patches.is_empty(),
+            "reorder must retain source ownership"
+        );
+    });
+}
+
+#[test]
+fn byte_bounded_reorder_fitting_wrong_underlying_program_rejects_without_writes() {
+    use cockpit_config::config::{WorkspaceConfigLayerSnapshot, providers::ModelPlacement};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cap = cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES;
+        let prefixes = (0..20)
+            .map(|i| format!("x{i}-{}", "p".repeat(500)))
+            .collect::<Vec<_>>();
+        let before = prefixes
+            .iter()
+            .chain(["a".to_owned(), "b".repeat(900), "c".to_owned()].iter())
+            .enumerate()
+            .map(|(i, id)| {
+                let mut row = model(id, false);
+                row.name = Some(format!("independent-{i}"));
+                row
+            })
+            .collect::<Vec<_>>();
+        let mut raw_rows = before.clone();
+        raw_rows.swap(20, 21);
+        let lower = ProviderEntry {
+            url: "https://example.com/v1".into(),
+            auth: Some(AuthKind::None),
+            models: raw_rows,
+            ..Default::default()
+        };
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut source = ProvidersConfig::default();
+        source.providers.insert("p".into(), lower.clone());
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let mut owner = ProviderEntry {
+            url: lower.url.clone(),
+            auth: Some(AuthKind::None),
+            ..Default::default()
+        };
+        owner.model_membership.placements.push(ModelPlacement {
+            id: "a".into(),
+            after: None,
+        });
+        owner
+            .model_membership
+            .placements
+            .extend(prefixes.iter().rev().map(|id| ModelPlacement {
+                id: id.clone(),
+                after: None,
+            }));
+        let mut config = ProvidersConfig::default();
+        config.providers.insert("p".into(), owner);
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let mut after = before[..20].to_vec();
+        after.extend([before[22].clone(), before[20].clone(), before[21].clone()]);
+        let patch = cockpit_proto::ProviderModelPatch::between(&before, &after).unwrap();
+        assert!(patch.order.is_none());
+        assert_eq!(
+            patch.moves,
+            vec![
+                ModelPlacement {
+                    id: "c".into(),
+                    after: Some("a".into())
+                },
+                ModelPlacement {
+                    id: "a".into(),
+                    after: Some("c".into())
+                }
+            ]
+        );
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let doc = ConfigDoc::load(&config_path).unwrap();
+        let authored = doc.providers().providers["p"].clone();
+        let mut canonical = authored.clone();
+        patch.apply_to_layer(&before, &mut canonical).unwrap();
+        let mut wrong = canonical.clone();
+        wrong.model_membership.placements = patch.moves.clone();
+        wrong
+            .model_membership
+            .placements
+            .extend(prefixes.iter().rev().map(|id| ModelPlacement {
+                id: id.clone(),
+                after: None,
+            }));
+        let snapshot = |entry: &ProviderEntry| WorkspaceConfigLayerSnapshot {
+            origin: None,
+            project_root: None,
+            config_json: None,
+            provider_files: vec![("p".into(), serde_json::to_vec(entry).unwrap())],
+            effective_default_artifact_digest: None,
+            digest: "layer".into(),
+        };
+        let wrong_read = ConfigDoc::providers_from_workspace_layer_snapshots(&[
+            snapshot(&lower),
+            snapshot(&wrong),
+        ])
+        .unwrap();
+        assert_ne!(
+            serde_json::to_value(&wrong_read.providers["p"].models).unwrap(),
+            serde_json::to_value(&after).unwrap(),
+            "valid effective-inventory operations are not necessarily valid when old authoring is replaced"
+        );
+        // Find the real raw-writer boundary; don't assume typed JSON and retained raw bytes have the same overhead.
+        let (mut lo, mut hi) = (0, cap);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            wrong.name = Some("n".repeat(mid));
+            match doc.validate_provider_write("p", &wrong) {
+                Ok(()) => lo = mid,
+                Err(error) => {
+                    assert!(
+                        error
+                            .is::<cockpit_config::config::providers::ProviderWriteValidationError>(
+                            ),
+                        "{error:#}"
+                    );
+                    hi = mid - 1;
+                }
+            }
+        }
+        wrong.name = Some("n".repeat(lo));
+        canonical.name = wrong.name.clone();
+        doc.validate_provider_write("p", &wrong).unwrap();
+        assert!(
+            doc.validate_provider_write("p", &canonical)
+                .unwrap_err()
+                .is::<cockpit_config::config::providers::ProviderWriteValidationError>()
+        );
+        let mut full = wrong.clone();
+        full.model_membership = Default::default();
+        full.model_order = Some(after.iter().map(|row| row.id.clone()).collect());
+        assert!(
+            doc.validate_provider_write("p", &full)
+                .unwrap_err()
+                .is::<cockpit_config::config::providers::ProviderWriteValidationError>()
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().name = wrong.name.clone();
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let revision = current.authority.base_revision.clone();
+        let generation = current.authority.config_generation;
+        let mut metadata = current.config.providers["p"].entry.clone();
+        metadata.models.clear();
+        assert!(
+            serde_json::to_vec(&(&metadata, Some(&patch)))
+                .unwrap()
+                .len()
+                < cap
+        );
+        let authority = current.authority.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        let paths = [
+            config_path,
+            provider_path,
+            global.clone(),
+            global.parent().unwrap().join("providers/p.json"),
+        ];
+        let files = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        dialog.config.providers.get_mut("p").unwrap().models = after;
+        assert!(
+            dialog.save_config().is_err(),
+            "a fitting authoring program with wrong real composition must reject"
+        );
+        dialog.settle_test_effects();
+        let mutation = cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "p".into(),
+                header_secrets: vec![None; metadata.headers.len()],
+                entry: metadata,
+                model_patch: Some(patch),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        };
+        let intent = mutation.sanitized_intent_hash().unwrap();
+        let error = runtime
+            .block_on(
+                client.request(cockpit_proto::Request::ApplyProviderMutation {
+                    snapshot_session_id: authority.snapshot_session_id,
+                    layer_id: authority.layer_id,
+                    expected_revision: authority.base_revision,
+                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    mutation_intent_hash: intent,
+                    mutation,
+                }),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, cockpit_proto::ErrorCode::BadRequest);
+        assert!(
+            error.message.contains("authored provider entry exceeds"),
+            "{error:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .zip(&files)
+                .all(|(path, raw)| std::fs::read(path).unwrap() == *raw)
+        );
+        let unchanged = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(unchanged.authority.base_revision, revision);
+        assert_eq!(unchanged.authority.config_generation, generation);
+        assert_eq!(
+            serde_json::to_value(&unchanged.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+    });
+}
+
+#[test]
+fn reviewer_r9_unrelated_deletion_preserves_fitting_temporary_pin_program() {
+    assert_temporary_pin_transition(TemporaryPinTransition::Delete, 0, 130);
+}
+
+#[test]
+fn temporary_pin_program_delete_with_512_byte_authored_margin() {
+    assert_temporary_pin_transition(TemporaryPinTransition::Delete, 0, 512);
+}
+
+#[derive(Clone, Copy)]
+enum TemporaryPinTransition {
+    Delete,
+    Add,
+    ReplaceHidden,
+    Reorder,
+}
+
+#[test]
+fn temporary_pin_program_add_preserves_prior_intent() {
+    assert_temporary_pin_transition(TemporaryPinTransition::Add, 0, 768);
+}
+
+#[test]
+fn temporary_pin_program_hidden_replacement_preserves_prior_intent() {
+    assert_temporary_pin_transition(TemporaryPinTransition::ReplaceHidden, 0, 768);
+}
+
+#[test]
+fn temporary_pin_program_reorder_preserves_prior_intent() {
+    assert_temporary_pin_transition(TemporaryPinTransition::Reorder, 0, 768);
+}
+
+#[test]
+fn temporary_pin_program_add_beyond_eager_inventory_preserves_prior_intent() {
+    assert_temporary_pin_transition(TemporaryPinTransition::Add, 3, 768);
+}
+
+fn assert_temporary_pin_transition(
+    transition: TemporaryPinTransition,
+    prefix_count: usize,
+    authored_margin: usize,
+) {
+    use cockpit_config::config::providers::ModelPlacement;
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cap = cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES;
+        let mut ids = vec![
+            "a".into(),
+            "B".repeat(900),
+            "c".into(),
+            "D".repeat(900),
+            "e".into(),
+            "F".repeat(900),
+            "x".into(),
+            "gone".into(),
+            "hidden".into(),
+        ];
+        if matches!(transition, TemporaryPinTransition::Delete) {
+            ids.pop();
+        }
+        ids.splice(0..0, (0..prefix_count).map(|i| format!("prefix-{i}")));
+        let rows = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut row = model(id, false);
+                row.name = Some(format!("transition-image-{i}"));
+                row.favorite = i % 2 == 0;
+                row
+            })
+            .collect::<Vec<_>>();
+        let entry = |models| ProviderEntry {
+            url: "https://example.com/v1".into(),
+            auth: Some(AuthKind::None),
+            models,
+            ..Default::default()
+        };
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut source = ProvidersConfig::default();
+        source.providers.insert("p".into(), entry(rows.clone()));
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let mut owner_entry = entry(Vec::new());
+        let pins = vec![
+            ModelPlacement {
+                id: "a".into(),
+                after: Some("c".into()),
+            },
+            ModelPlacement {
+                id: "c".into(),
+                after: Some("e".into()),
+            },
+            ModelPlacement {
+                id: "e".into(),
+                after: Some("a".into()),
+            },
+        ];
+        owner_entry.model_membership.placements = pins.clone();
+        owner_entry.model_membership.deletes =
+            if matches!(transition, TemporaryPinTransition::Delete) {
+                vec!["gone".into()]
+            } else {
+                vec!["gone".into(), "hidden".into()]
+            };
+        owner_entry.name = Some(String::new());
+        let overhead = serde_json::to_vec(&owner_entry).unwrap().len();
+        owner_entry.name = Some("n".repeat(cap - overhead - authored_margin));
+        let mut owner = ProvidersConfig::default();
+        owner.providers.insert("p".into(), owner_entry);
+        let (tmp, mut dialog) = dialog_with_config(owner);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let before = rows[..prefix_count]
+            .iter()
+            .cloned()
+            .chain([1, 0, 4, 3, 2, 5, 6].map(|i| rows[prefix_count + i].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        let mut after = before.clone();
+        match transition {
+            TemporaryPinTransition::Delete => {
+                after.pop();
+            }
+            TemporaryPinTransition::Add | TemporaryPinTransition::ReplaceHidden => {
+                let mut replacement = model(
+                    if matches!(transition, TemporaryPinTransition::Add) {
+                        "new"
+                    } else {
+                        "hidden"
+                    },
+                    true,
+                );
+                replacement.name = Some("complete new image".into());
+                replacement.favorite = true;
+                after.push(replacement);
+            }
+            TemporaryPinTransition::Reorder => {
+                after = rows[..prefix_count]
+                    .iter()
+                    .cloned()
+                    .chain([1, 4, 3, 0, 2, 5, 6].map(|i| rows[prefix_count + i].clone()))
+                    .collect();
+            }
+        }
+        let mut metadata = current.config.providers["p"].entry.clone();
+        metadata.models.clear();
+        let patch =
+            cockpit_proto::ProviderModelPatch::between_for_entry(&before, &after, &metadata)
+                .unwrap();
+        assert!(
+            serde_json::to_vec(&(&metadata, Some(&patch)))
+                .unwrap()
+                .len()
+                <= cap
+        );
+        if matches!(transition, TemporaryPinTransition::Delete) {
+            assert!(patch.moves.is_empty() && patch.order.is_none());
+            assert_eq!(patch.deletes, ["x"]);
+        }
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let initial = ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+        if matches!(transition, TemporaryPinTransition::Delete) {
+            let mut feasible = initial.clone();
+            feasible.model_membership.deletes.push("x".into());
+            ConfigDoc::load(&config_path)
+                .unwrap()
+                .validate_provider_write("p", &feasible)
+                .unwrap();
+            assert_eq!(feasible.model_membership.placements, pins);
+            assert_eq!(
+                serde_json::to_vec(&initial).unwrap().len(),
+                cap - authored_margin
+            );
+            if authored_margin == 130 {
+                assert_eq!(serde_json::to_vec(&metadata).unwrap().len(), 261_890);
+                assert_eq!(serde_json::to_vec(&patch).unwrap().len(), 111);
+                assert_eq!(
+                    serde_json::to_vec(&(&metadata, Some(&patch)))
+                        .unwrap()
+                        .len(),
+                    262_004
+                );
+                assert_eq!(serde_json::to_vec(&initial).unwrap().len(), 262_014);
+                assert_eq!(serde_json::to_vec(&feasible).unwrap().len(), 262_018);
+            }
+        }
+        let sources = [
+            global.clone(),
+            global.parent().unwrap().join("providers/p.json"),
+        ];
+        let source_bytes = sources
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models = after.clone();
+        dialog
+            .save_config()
+            .expect("a fitting durable temporary-pin transition must save");
+        dialog.settle_test_effects();
+        let actual = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        let durable = ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+        assert!(
+            durable.models.is_empty(),
+            "inherited images must stay in their source layer"
+        );
+        assert!(
+            durable.model_order.is_none(),
+            "full order does not fit this fixture"
+        );
+        assert!(durable.model_membership.deletes.contains(&"gone".into()));
+        assert_eq!(
+            durable.model_membership.deletes.contains(&"hidden".into()),
+            !matches!(
+                transition,
+                TemporaryPinTransition::ReplaceHidden | TemporaryPinTransition::Delete
+            )
+        );
+        let durable_pins = durable
+            .model_membership
+            .placements
+            .iter()
+            .map(|pin| pin.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            ["a", "c", "e"].iter().all(|id| durable_pins.contains(id)),
+            "no prior pin may be discarded"
+        );
+        if matches!(transition, TemporaryPinTransition::Delete) {
+            assert_eq!(
+                durable.model_membership.placements, pins,
+                "unrelated deletion must retain the existing program verbatim"
+            );
+            assert!(durable.model_membership.deletes.contains(&"x".into()));
+        }
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert!(serde_json::to_vec(&raw).unwrap().len() <= cap);
+        assert!(
+            sources
+                .iter()
+                .zip(&source_bytes)
+                .all(|(path, bytes)| std::fs::read(path).unwrap() == *bytes)
+        );
+        // Re-entry must preserve the selected non-idempotent program verbatim.
+        let durable_pins = durable.model_membership.placements.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(actual))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let actual = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        assert_eq!(
+            ConfigDoc::load(&config_path).unwrap().providers().providers["p"]
+                .model_membership
+                .placements,
+            durable_pins
+        );
+    });
+}
+
+#[test]
+fn reviewer_r9_three_short_temporary_handles_select_fitting_program() {
+    assert_three_short_handles(false, 64);
+}
+
+#[test]
+fn temporary_pin_three_short_handles_with_320_byte_request_margin() {
+    assert_three_short_handles(false, 320);
+}
+
+#[test]
+fn temporary_pin_three_short_handles_accepts_alternate_rpc() {
+    assert_three_short_handles(true, 320);
+}
+
+#[test]
+fn temporary_pin_three_short_handles_accepts_alternate_rpc_at_64_byte_margin() {
+    assert_three_short_handles(true, 64);
+}
+
+fn assert_three_short_handles(alternate_rpc: bool, request_margin: usize) {
+    use cockpit_config::config::providers::ModelPlacement;
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cap = cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES;
+        let ids = [
+            "a".into(),
+            "B".repeat(900),
+            "c".into(),
+            "D".repeat(900),
+            "e".into(),
+            "F".repeat(900),
+        ];
+        let rows = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut row = model(id, false);
+                row.name = Some(format!("reviewer-image-{i}"));
+                row.favorite = i % 2 == 0;
+                row
+            })
+            .collect::<Vec<_>>();
+        let entry = |models| ProviderEntry {
+            url: "https://example.com/v1".into(),
+            auth: Some(AuthKind::None),
+            models,
+            ..Default::default()
+        };
+        let after = [1, 0, 4, 3, 2, 5].map(|i| rows[i].clone()).to_vec();
+        let mut alternate = cockpit_proto::ProviderModelPatch::between(&rows, &after).unwrap();
+        alternate.order = None;
+        alternate.moves = vec![
+            ModelPlacement {
+                id: "a".into(),
+                after: Some("c".into()),
+            },
+            ModelPlacement {
+                id: "c".into(),
+                after: Some("e".into()),
+            },
+            ModelPlacement {
+                id: "e".into(),
+                after: Some("a".into()),
+            },
+        ];
+        let mut applied = rows.clone();
+        alternate.apply(&mut applied).unwrap();
+        assert_eq!(
+            serde_json::to_value(&applied).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        let mut owner_entry = entry(Vec::new());
+        owner_entry.name = Some(String::new());
+        let empty_bytes = serde_json::to_vec(&(&owner_entry, Some(&alternate)))
+            .unwrap()
+            .len();
+        owner_entry.name = Some("n".repeat(cap - empty_bytes - request_margin));
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut source = ProvidersConfig::default();
+        source.providers.insert("p".into(), entry(rows.clone()));
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let mut owner = ProvidersConfig::default();
+        owner.providers.insert("p".into(), owner_entry);
+        let (tmp, mut dialog) = dialog_with_config(owner);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&rows).unwrap()
+        );
+        let automatic = cockpit_proto::ProviderModelPatch::between(&rows, &after).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&automatic.moves).unwrap().len(),
+            70,
+            "the cyclic three-handle producer must select the compact program"
+        );
+        let mut metadata = current.config.providers["p"].entry.clone();
+        metadata.models.clear();
+        let selected_bytes = serde_json::to_vec(&(&metadata, Some(&automatic)))
+            .unwrap()
+            .len();
+        let alternate_bytes = serde_json::to_vec(&(&metadata, Some(&alternate)))
+            .unwrap()
+            .len();
+        assert!(alternate_bytes <= cap);
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let mut feasible =
+            ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+        alternate.apply_to_layer(&rows, &mut feasible).unwrap();
+        ConfigDoc::load(&config_path)
+            .unwrap()
+            .validate_provider_write("p", &feasible)
+            .unwrap();
+        let feasible_bytes = serde_json::to_vec(&feasible).unwrap().len();
+        assert_eq!(alternate_bytes, cap - request_margin);
+        if request_margin == 64 {
+            assert_eq!(serde_json::to_vec(&metadata).unwrap().len(), 261_890);
+            assert_eq!(serde_json::to_vec(&automatic).unwrap().len(), 187);
+            assert_eq!(selected_bytes, 262_080);
+            assert_eq!(feasible_bytes, 261_995);
+        }
+        let files = [
+            global.clone(),
+            global.parent().unwrap().join("providers/p.json"),
+            config_path,
+            provider_path.clone(),
+        ];
+        let raw = files
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect::<Vec<_>>();
+        let revision = current.authority.base_revision.clone();
+        let generation = current.authority.config_generation;
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models = after.clone();
+        let ordinary = if alternate_rpc {
+            let mutation = cockpit_proto::ProviderMutationBatch {
+                upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                    provider_id: "p".into(),
+                    header_secrets: vec![None; metadata.headers.len()],
+                    entry: metadata.clone(),
+                    model_patch: Some(alternate.clone()),
+                }],
+                deletes: Vec::new(),
+                metadata: None,
+            };
+            let intent = mutation.sanitized_intent_hash().unwrap();
+            let authority = dialog.provider_edit_authority.clone().unwrap();
+            runtime
+                .block_on(
+                    client.request(cockpit_proto::Request::ApplyProviderMutation {
+                        snapshot_session_id: authority.snapshot_session_id,
+                        layer_id: authority.layer_id,
+                        expected_revision: authority.base_revision,
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
+                        mutation_intent_hash: intent,
+                        mutation,
+                    }),
+                )
+                .unwrap()
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        } else {
+            dialog.save_config()
+        };
+        dialog.settle_test_effects();
+        assert!(
+            ordinary.is_ok(),
+            "ordinary selection strands a fitting three-handle encoding: {ordinary:?}"
+        );
+        let observed = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        eprintln!(
+            "r9 three handles: selected tuple={selected_bytes}, alternate tuple={alternate_bytes}, feasible authored={feasible_bytes}, cap={cap}; ordinary={ordinary:?}"
+        );
+        assert!(
+            files[..2]
+                .iter()
+                .zip(&raw[..2])
+                .all(|(path, bytes)| std::fs::read(path).unwrap() == *bytes)
+        );
+        assert_ne!(observed.authority.base_revision, revision);
+        assert!(observed.authority.config_generation > generation);
+        assert_eq!(
+            serde_json::to_value(&observed.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        let durable: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert!(serde_json::to_vec(&durable).unwrap().len() <= cap);
+        assert!(
+            ordinary.is_ok(),
+            "ordinary selection strands a fitting three-handle encoding: {ordinary:?}"
+        );
+    });
+}
+
+#[derive(Clone, Copy)]
+enum MembershipCapacityEdit {
+    Clear,
+    Reorder,
+    Delete,
+    Add,
+    ReplaceHidden,
+}
+
+#[test]
+fn membership_capacity_clear_preserves_complete_exclusion_intent() {
+    assert_membership_capacity_transition(MembershipCapacityEdit::Clear);
+}
+#[test]
+fn membership_capacity_reorder_preserves_complete_exclusion_intent() {
+    assert_membership_capacity_transition(MembershipCapacityEdit::Reorder);
+}
+#[test]
+fn membership_capacity_delete_preserves_complete_exclusion_intent() {
+    assert_membership_capacity_transition(MembershipCapacityEdit::Delete);
+}
+#[test]
+fn membership_capacity_add_preserves_complete_exclusion_intent() {
+    assert_membership_capacity_transition(MembershipCapacityEdit::Add);
+}
+#[test]
+fn membership_capacity_hidden_replacement_preserves_complete_exclusion_intent() {
+    assert_membership_capacity_transition(MembershipCapacityEdit::ReplaceHidden);
+}
+
+fn assert_membership_capacity_transition(edit: MembershipCapacityEdit) {
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cap = cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES;
+        let hidden = (0..250)
+            .map(|i| format!("gone-{i:03}-{}", "x".repeat(900)))
+            .collect::<Vec<_>>();
+        let mut rows = ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                let mut row = model(id, false);
+                row.name = Some(format!("visible-{id}"));
+                row
+            })
+            .collect::<Vec<_>>();
+        rows.extend(hidden.iter().map(|id| {
+            let mut row = model(id, false);
+            row.name = Some("old hidden image".into());
+            row.favorite = true;
+            row
+        }));
+        let entry = |models| ProviderEntry {
+            url: "https://example.com/v1".into(),
+            auth: Some(AuthKind::None),
+            models,
+            ..Default::default()
+        };
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut source = ProvidersConfig::default();
+        source.providers.insert("p".into(), entry(rows.clone()));
+        assert!(serde_json::to_vec(&source.providers["p"]).unwrap().len() < cap);
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let mut owner = entry(Vec::new());
+        owner.model_membership.deletes = hidden.clone();
+        if matches!(edit, MembershipCapacityEdit::Clear) {
+            owner.model_membership.placements =
+                vec![cockpit_config::config::providers::ModelPlacement {
+                    id: "a".into(),
+                    after: None,
+                }];
+        }
+        owner.name = Some(String::new());
+        let overhead = serde_json::to_vec(&owner).unwrap().len();
+        owner.name = Some("n".repeat(cap - overhead - 1));
+        let mut config = ProvidersConfig::default();
+        config.providers.insert("p".into(), owner);
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let before = rows[..2].to_vec();
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        let after = match edit {
+            MembershipCapacityEdit::Clear => Vec::new(),
+            MembershipCapacityEdit::Reorder => vec![before[1].clone(), before[0].clone()],
+            MembershipCapacityEdit::Delete => vec![before[1].clone()],
+            MembershipCapacityEdit::Add | MembershipCapacityEdit::ReplaceHidden => {
+                let mut after = before.clone();
+                let mut row = model(
+                    if matches!(edit, MembershipCapacityEdit::Add) {
+                        "new-owned"
+                    } else {
+                        &hidden[0]
+                    },
+                    true,
+                );
+                row.name = Some("complete replacement image".into());
+                after.push(row);
+                after
+            }
+        };
+        let mut metadata = current.config.providers["p"].entry.clone();
+        metadata.models.clear();
+        let patch =
+            cockpit_proto::ProviderModelPatch::between_for_entry(&before, &after, &metadata)
+                .unwrap();
+        assert!(
+            serde_json::to_vec(&(&metadata, Some(&patch)))
+                .unwrap()
+                .len()
+                <= cap
+        );
+        assert!(serde_json::to_vec(&metadata).unwrap().len() + 256 <= cap);
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let doc = ConfigDoc::load(&config_path).unwrap();
+        let initial = doc.providers().providers["p"].clone();
+        assert!(serde_json::to_vec(&initial).unwrap().len() > cap - 32);
+        // Independently charge the feasible complete-membership encoding.
+        let mut feasible = initial;
+        patch.apply_to_layer(&before, &mut feasible).unwrap();
+        feasible.model_order = Some(after.iter().map(|row| row.id.clone()).collect());
+        feasible.model_membership = Default::default();
+        doc.validate_provider_write("p", &feasible).unwrap();
+        let sources = [
+            global.clone(),
+            global.parent().unwrap().join("providers/p.json"),
+        ];
+        let bytes = sources
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models = after.clone();
+        dialog
+            .save_config()
+            .expect("admit fitting complete membership instead of duplicating tombstone authority");
+        dialog.settle_test_effects();
+        let actual = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        assert!(
+            sources
+                .iter()
+                .zip(&bytes)
+                .all(|(path, bytes)| std::fs::read(path).unwrap() == *bytes)
+        );
+        let durable = ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+        assert_eq!(
+            durable.model_order,
+            Some(after.iter().map(|row| row.id.clone()).collect())
+        );
+        assert!(
+            durable.model_membership.deletes.is_empty(),
+            "complete order carries the exclusion authority"
+        );
+        assert!(durable.model_membership.placements.is_empty());
+        assert_eq!(
+            durable.models_replace,
+            matches!(edit, MembershipCapacityEdit::Clear)
+        );
+        // A real later lower-layer refresh cannot resurrect any tombstone or
+        // append a row outside the owner's complete membership authority.
+        source
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .push(model("new-inherited", false));
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let refreshed = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&refreshed.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(refreshed))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let reentered = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&reentered.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+    });
+}
+
+#[test]
+fn membership_capacity_clear_uses_only_replacement_when_both_directives_do_not_fit() {
+    assert_minimal_clear_capacity(true);
+}
+#[test]
+fn membership_capacity_clear_uses_only_order_when_replacement_does_not_fit() {
+    assert_minimal_clear_capacity(false);
+}
+
+fn assert_minimal_clear_capacity(replacement: bool) {
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cap = cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES;
+        let entry = |models| ProviderEntry {
+            url: "https://example.com/v1".into(),
+            auth: Some(AuthKind::None),
+            models,
+            ..Default::default()
+        };
+        let before = vec![model("a", false)];
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut source = ProvidersConfig::default();
+        source.providers.insert("p".into(), entry(before.clone()));
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let owner = entry(Vec::new());
+        let patch = cockpit_proto::ProviderModelPatch::between(&before, &[]).unwrap();
+        let mut redundant = owner.clone();
+        patch.apply_to_layer(&before, &mut redundant).unwrap();
+        let mut feasible = redundant.clone();
+        if replacement {
+            feasible.model_order = None;
+        } else {
+            feasible.models_replace = false;
+        }
+        let headroom = serde_json::to_vec(&feasible).unwrap().len()
+            - serde_json::to_vec(&owner).unwrap().len();
+        assert!(
+            serde_json::to_vec(&redundant).unwrap().len()
+                - serde_json::to_vec(&owner).unwrap().len()
+                > headroom
+        );
+        let mut config = ProvidersConfig::default();
+        config.providers.insert("p".into(), owner);
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let provider = tmp.path().join(".cockpit/providers/p.json");
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider).unwrap()).unwrap();
+        raw["retained_capacity"] = serde_json::Value::String(String::new());
+        let overhead = serde_json::to_vec(&raw).unwrap().len();
+        let retained = "n".repeat(cap - overhead - headroom);
+        raw["retained_capacity"] = serde_json::Value::String(retained.clone());
+        std::fs::write(&provider, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let doc = ConfigDoc::load(&config_path).unwrap();
+        doc.validate_provider_write("p", &feasible).unwrap();
+        assert!(
+            doc.validate_provider_write("p", &redundant)
+                .unwrap_err()
+                .is::<cockpit_config::config::providers::ProviderWriteValidationError>()
+        );
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models.clear();
+        dialog
+            .save_config()
+            .expect("admit the fitting individual empty-membership directive");
+        dialog.settle_test_effects();
+        let actual = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(actual.config.providers["p"].entry.models.is_empty());
+        let authored = ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+        assert_eq!(authored.models_replace, replacement);
+        assert_eq!(
+            authored.model_order,
+            if replacement { None } else { Some(Vec::new()) }
+        );
+        let durable: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider).unwrap()).unwrap();
+        assert_eq!(durable["retained_capacity"], retained);
+        assert!(serde_json::to_vec(&durable).unwrap().len() <= cap);
+        source
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .push(model("new-inherited", false));
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let refreshed = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            refreshed.config.providers["p"].entry.models.is_empty(),
+            "empty membership remains authoritative after lower refresh"
+        );
+    });
+}
+
+#[test]
+fn clear_exact_request_margin_through_ordinary_settings() {
+    assert_clear_exact_request_margin(false, false);
+}
+
+#[test]
+fn clear_exact_request_margin_through_independent_clear_only_rpc() {
+    assert_clear_exact_request_margin(true, false);
+}
+
+#[test]
+fn clear_exact_request_margin_rejects_oversized_owner_through_settings() {
+    assert_clear_exact_request_margin(false, true);
+}
+
+#[test]
+fn clear_exact_request_margin_rejects_oversized_owner_through_rpc() {
+    assert_clear_exact_request_margin(true, true);
+}
+
+fn assert_clear_exact_request_margin(alternate_rpc: bool, authored_overflow: bool) {
+    use sha2::{Digest, Sha256};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cap = cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES;
+        // The six-row C3 source/owner premise, with exactly 120 more ASCII
+        // name bytes than its 261890-byte metadata and a requested empty image.
+        let ids = [
+            "a".into(),
+            "B".repeat(900),
+            "c".into(),
+            "D".repeat(900),
+            "e".into(),
+            "F".repeat(900),
+        ];
+        let rows = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut row = model(id, false);
+                row.name = Some(format!("reviewer-image-{i}"));
+                row.favorite = i % 2 == 0;
+                row
+            })
+            .collect::<Vec<_>>();
+        let entry = |models| ProviderEntry {
+            url: "https://example.com/v1".into(),
+            auth: Some(AuthKind::None),
+            models,
+            ..Default::default()
+        };
+        let mut owner_entry = entry(Vec::new());
+        owner_entry.name = Some(String::new());
+        let overhead = serde_json::to_vec(&owner_entry).unwrap().len();
+        owner_entry.name = Some("n".repeat(261_890 - overhead + 120));
+        assert_eq!(serde_json::to_vec(&owner_entry).unwrap().len(), 262_010);
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut source = ProvidersConfig::default();
+        source.providers.insert("p".into(), entry(rows.clone()));
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let mut owner = ProvidersConfig::default();
+        owner.providers.insert("p".into(), owner_entry.clone());
+        let (tmp, mut dialog) = dialog_with_config(owner);
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert_eq!(raw, serde_json::to_value(&owner_entry).unwrap());
+        if authored_overflow {
+            // Start with a legal raw owner, but leave only 16 bytes for clear.
+            // Even the smallest durable directive (17) must fail closed.
+            raw["retained_capacity"] = json!("");
+            let overhead = serde_json::to_vec(&raw).unwrap().len();
+            raw["retained_capacity"] = json!("x".repeat(cap - overhead - 16));
+            assert_eq!(serde_json::to_vec(&raw).unwrap().len(), cap - 16);
+            std::fs::write(&provider_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        }
+        let doc = ConfigDoc::load(&config_path).unwrap();
+        let mut replacement = owner_entry.clone();
+        replacement.models_replace = true;
+        let mut ordered = owner_entry.clone();
+        ordered.model_order = Some(Vec::new());
+        assert_eq!(serde_json::to_vec(&replacement).unwrap().len(), 262_032);
+        assert_eq!(serde_json::to_vec(&ordered).unwrap().len(), 262_027);
+        for candidate in [&replacement, &ordered] {
+            let result = doc.validate_provider_write("p", candidate);
+            if authored_overflow {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .is::<cockpit_config::config::providers::ProviderWriteValidationError>()
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+        replacement.model_order = Some(Vec::new());
+        assert_eq!(serde_json::to_vec(&replacement).unwrap().len(), 262_049);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&rows).unwrap()
+        );
+        let mut metadata = current.config.providers["p"].entry.clone();
+        metadata.models.clear();
+        assert_eq!(
+            serde_json::to_value(&metadata).unwrap(),
+            serde_json::to_value(&owner_entry).unwrap()
+        );
+        assert_eq!(serde_json::to_vec(&metadata).unwrap().len(), 262_010);
+        // Independent construction: neither shared patch builder chooses the
+        // control request's clear/order fields or computes its base digest.
+        let clear_only = cockpit_proto::ProviderModelPatch {
+            base_digest: Sha256::digest(serde_json::to_vec(&rows).unwrap())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            upserts: Vec::new(),
+            updates: Vec::new(),
+            deletes: Vec::new(),
+            order: None,
+            moves: Vec::new(),
+            clear: true,
+        };
+        let mut redundant = clear_only.clone();
+        redundant.order = Some(Vec::new());
+        assert_eq!(serde_json::to_vec(&clear_only).unwrap().len(), 121);
+        assert_eq!(serde_json::to_vec(&redundant).unwrap().len(), 132);
+        assert_eq!(
+            serde_json::to_vec(&(&metadata, Some(&clear_only)))
+                .unwrap()
+                .len(),
+            262_134
+        );
+        assert_eq!(
+            serde_json::to_vec(&(&metadata, Some(&redundant)))
+                .unwrap()
+                .len(),
+            cap + 1
+        );
+        let sources = [
+            global.clone(),
+            global.parent().unwrap().join("providers/p.json"),
+            config_path.clone(),
+        ];
+        let source_bytes = sources
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let owner_bytes = std::fs::read(&provider_path).unwrap();
+        let revision = current.authority.base_revision.clone();
+        let generation = current.authority.config_generation;
+        let authority = current.authority.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models.clear();
+        let result = if alternate_rpc {
+            let mutation = cockpit_proto::ProviderMutationBatch {
+                upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                    provider_id: "p".into(),
+                    entry: metadata,
+                    header_secrets: Vec::new(),
+                    model_patch: Some(clear_only),
+                }],
+                deletes: Vec::new(),
+                metadata: None,
+            };
+            let intent = mutation.sanitized_intent_hash().unwrap();
+            runtime
+                .block_on(
+                    client.request(cockpit_proto::Request::ApplyProviderMutation {
+                        snapshot_session_id: authority.snapshot_session_id,
+                        layer_id: authority.layer_id,
+                        expected_revision: authority.base_revision,
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
+                        mutation_intent_hash: intent,
+                        mutation,
+                    }),
+                )
+                .unwrap()
+                .map(|_| ())
+                .map_err(|error| {
+                    assert_eq!(error.code, cockpit_proto::ErrorCode::BadRequest);
+                    error.message
+                })
+        } else {
+            dialog.save_config()
+        };
+        dialog.settle_test_effects();
+        if authored_overflow {
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("authored provider entry exceeds")
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "ordinary clear strands a fitting empty encoding: {result:?}"
+            );
+        }
+        let observed = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            sources
+                .iter()
+                .zip(&source_bytes)
+                .all(|(path, bytes)| std::fs::read(path).unwrap() == *bytes)
+        );
+        if authored_overflow {
+            assert_eq!(std::fs::read(&provider_path).unwrap(), owner_bytes);
+            assert_eq!(observed.authority.base_revision, revision);
+            assert_eq!(observed.authority.config_generation, generation);
+            assert_eq!(
+                serde_json::to_value(&observed.config.providers["p"].entry.models).unwrap(),
+                serde_json::to_value(&rows).unwrap()
+            );
+        } else {
+            assert_ne!(observed.authority.base_revision, revision);
+            assert!(observed.authority.config_generation > generation);
+            let mut expected = owner_entry.clone();
+            expected.models_replace = true;
+            assert_eq!(
+                serde_json::to_value(&observed.config.providers["p"].entry).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            expected.model_order = Some(Vec::new());
+            let authored =
+                ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+            assert_eq!(
+                serde_json::to_value(&authored).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            let durable: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+            assert_eq!(durable, serde_json::to_value(&expected).unwrap());
+            assert_eq!(serde_json::to_vec(&durable).unwrap().len(), 262_049);
+            let durable_bytes = std::fs::read(&provider_path).unwrap();
+            // Reload after a real lower-layer addition; exclusion is durable.
+            source
+                .providers
+                .get_mut("p")
+                .unwrap()
+                .models
+                .push(model("new-inherited", false));
+            ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+            let refreshed = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            expected.model_order = None;
+            assert_eq!(
+                serde_json::to_value(&refreshed.config.providers["p"].entry).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(std::fs::read(&provider_path).unwrap(), durable_bytes);
+        }
+    });
+}
+
+#[test]
+fn ordinary_failed_fetch_persists_observed_auth_category_without_prose_classification() {
+    use cockpit_config::providers::{ModelFetchFailure, ModelFetchStatusKind};
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        for (status, body, expected) in [
+            (401, "hello", ModelFetchStatusKind::AuthFailed),
+            (403, "hello", ModelFetchStatusKind::AuthFailed),
+            (
+                200,
+                "credentials rejected returned 401 subscription auth",
+                ModelFetchStatusKind::FailedKeptExisting,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 16384];
+                assert!(socket.read(&mut request).unwrap() > 0);
+                write!(socket,"HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            });
+            let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+            let entry = config.providers.get_mut("p").unwrap();
+            entry.url = format!("http://{address}/v1");
+            entry.allow_insecure_http = true;
+            entry.auth = Some(AuthKind::None);
+            entry.mark_model_fetch_failed_kept_existing(
+                "previous attempt rejected credentials",
+                ModelFetchFailure::CredentialsRejected,
+            );
+            let (tmp, mut dialog) = dialog_with_config(config);
+            let root = tmp.path().display().to_string();
+            let client = runtime
+                .block_on(crate::tui::settings::settings_daemon_client(
+                    &crate::tui::settings::test_lifecycle_client(),
+                ))
+                .unwrap();
+            let initial = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            dialog
+                .adopt_refreshed_provider_snapshot(Ok(initial))
+                .unwrap();
+            let entry = dialog.config.providers["p"].clone();
+            dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+                "p".into(),
+                entry.clone(),
+            ))));
+            let handle = FetchHandle::spawn(
+                crate::tui::settings::test_lifecycle_client(),
+                "p".into(),
+                entry,
+                root,
+            );
+            let completion = runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    loop {
+                        if let Some(completion) = handle.take() {
+                            break completion;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap()
+            });
+            server.join().unwrap();
+            let expected_failure = if status == 200 {
+                ModelFetchFailure::Other
+            } else {
+                ModelFetchFailure::CredentialsRejected
+            };
+            dialog
+                .adopt_refreshed_provider_snapshot(completion.snapshot)
+                .unwrap();
+            let outcome = completion.observation.into_outcome(&dialog.original_config);
+            assert!(
+                matches!(&outcome, Ok(FetchOutcome::Failed {failure,..}) if *failure == expected_failure)
+            );
+            dialog.apply_fetch_result("p", outcome);
+            dialog.flush_request_daemon_effects_for_test();
+            let saved = load_provider(&tmp.path().join(".cockpit/config.json"), "p");
+            assert_eq!(
+                saved.last_model_fetch.unwrap().status,
+                expected,
+                "observed HTTP {status}, body {body:?}"
+            );
+            assert_eq!(
+                saved
+                    .models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["stale", "current"]
+            );
+        }
+    });
+}
+
+#[test]
+fn ordinary_fetch_all_persists_each_observed_failure_after_final_snapshot() {
+    use cockpit_config::providers::{ModelFetchFailure, ModelFetchStatusKind};
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+        let base = config.providers["p"].clone();
+        config.providers.clear();
+        let mut servers = Vec::new();
+        for (id, status, body) in [
+            ("auth", 401, "hello"),
+            ("parse", 200, "credentials rejected returned 403"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            servers.push(std::thread::spawn(move || {
+                let (mut socket,_)=listener.accept().unwrap();
+                let mut request=[0;16384];assert!(socket.read(&mut request).unwrap()>0);
+                write!(socket,"HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }));
+            let mut entry = base.clone();
+            entry.url = format!("http://{address}/v1");
+            entry.allow_insecure_http = true;
+            entry.auth = Some(AuthKind::None);
+            entry.mark_model_fetch_failed_kept_existing(
+                "previous rejected credentials",
+                ModelFetchFailure::CredentialsRejected,
+            );
+            config.providers.insert(id.into(), entry);
+        }
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        assert!(dialog.config.providers.contains_key("auth"));
+        assert!(dialog.config.providers.contains_key("parse"));
+        let all = FetchAllState::spawn(
+            crate::tui::settings::test_lifecycle_client(),
+            &dialog.config,
+            tmp.path().display().to_string(),
+        );
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(all)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            dialog.tick();
+            dialog.settle_test_effects();
+            let done = matches!(dialog.page.downcast_ref::<ProvidersPage>(),Some(ProvidersPage::FetchAll(state)) if state.in_flight.is_empty()&&state.policy_resolved);
+            if done
+                && !dialog.authority_operation_pending()
+                && !dialog.provider_catalog_reload_required
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed fetch-all did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
+        for (id, expected) in [
+            ("auth", ModelFetchStatusKind::AuthFailed),
+            ("parse", ModelFetchStatusKind::FailedKeptExisting),
+        ] {
+            let saved = load_provider(&tmp.path().join(".cockpit/config.json"), id);
+            assert_eq!(
+                saved.last_model_fetch.unwrap().status,
+                expected,
+                "{id} persisted category after final read-back"
+            );
+            assert_eq!(
+                saved
+                    .models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["stale", "current"]
+            );
+        }
+    });
+}
+
+/// Real HTTP observations and a real daemon snapshot failure: malformed MCP
+/// input prevents edit authority from being constructed without preventing the
+/// provider fetch itself. Recover the file only after both read-back attempts
+/// fail, then use the ordinary Enter reload/save path and independent disk read.
+fn r17_readback_recovery_preserves_fetch_observations(fetch_all: bool) {
+    use cockpit_config::providers::{ModelFetchFailure, ModelFetchStatusKind};
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cases = [
+            ("auth401", 401, "hello", ModelFetchStatusKind::AuthFailed),
+            ("auth403", 403, "hello", ModelFetchStatusKind::AuthFailed),
+            (
+                "parse",
+                200,
+                "credentials rejected returned 401 subscription auth",
+                ModelFetchStatusKind::FailedKeptExisting,
+            ),
+            (
+                "other",
+                418,
+                "credentials rejected returned 403",
+                ModelFetchStatusKind::FailedKeptExisting,
+            ),
+        ];
+        // Fetch-all owns several observations at once; single-provider owns
+        // exactly one and exercises the same matrix in separate ordinary flows.
+        let batches = if fetch_all {
+            vec![cases.to_vec()]
+        } else {
+            cases.into_iter().map(|case| vec![case]).collect()
+        };
+        for batch in batches {
+            let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+            let base = config.providers.remove("p").unwrap();
+            let mut servers = Vec::new();
+            for (id, status, body, _) in &batch {
+                let (status, body) = (*status, *body);
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                servers.push(std::thread::spawn(move || {
+                    listener.set_nonblocking(true).unwrap();
+                    let deadline = std::time::Instant::now()+std::time::Duration::from_secs(10);
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket,_))=>break socket,
+                            Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{
+                                assert!(std::time::Instant::now()<deadline,"fetch never reached real HTTP");
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            },
+                            Err(error)=>panic!("accept: {error}"),
+                        }
+                    };
+                    socket.set_nonblocking(false).unwrap();
+                    socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                    let mut request = [0;16384];
+                    assert!(socket.read(&mut request).unwrap()>0);
+                    write!(socket,"HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+                }));
+                let mut entry = base.clone();
+                entry.url = format!("http://{address}/v1");
+                entry.allow_insecure_http = true;
+                entry.auth = Some(AuthKind::None);
+                // Prior auth status must not contaminate a later non-auth
+                // observation even when authority has to be recovered.
+                entry.mark_model_fetch_failed_kept_existing(
+                    "previous rejection",
+                    ModelFetchFailure::CredentialsRejected,
+                );
+                config.providers.insert((*id).into(), entry);
+            }
+            let (tmp, mut dialog) = dialog_with_config(config);
+            let root = tmp.path().display().to_string();
+            let client = runtime
+                .block_on(crate::tui::settings::settings_daemon_client(
+                    &crate::tui::settings::test_lifecycle_client(),
+                ))
+                .unwrap();
+            let initial = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            dialog
+                .adopt_refreshed_provider_snapshot(Ok(initial))
+                .unwrap();
+            let before = ConfigDoc::load(&tmp.path().join(".cockpit/config.json"))
+                .unwrap()
+                .providers();
+            let mcp_path = tmp.path().join(".cockpit/mcp.json");
+            std::fs::write(&mcp_path, "[").unwrap();
+            let handles = if fetch_all {
+                let all = FetchAllState::spawn(
+                    crate::tui::settings::test_lifecycle_client(),
+                    &dialog.config,
+                    root,
+                );
+                let handles = all.in_flight.clone();
+                dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(all)));
+                handles
+            } else {
+                let id = batch[0].0;
+                let entry = dialog.config.providers[id].clone();
+                let handle = FetchHandle::spawn(
+                    crate::tui::settings::test_lifecycle_client(),
+                    id.into(),
+                    entry.clone(),
+                    root,
+                );
+                let mut editor = EditState::new(id.into(), entry);
+                editor.fetch = Some(handle.clone());
+                dialog.set_test_page(Page::Providers(ProvidersPage::Edit(editor)));
+                vec![handle]
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let done = handles.iter().all(|handle| {
+                    matches!(
+                        &*handle.state.lock().unwrap(),
+                        super::super::auth::FetchState::Done(_)
+                    )
+                });
+                if done {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "HTTP/read-back did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            for handle in &handles {
+                let guard = handle.state.lock().unwrap();
+                let super::super::auth::FetchState::Done(completion) = &*guard else {
+                    panic!("not done")
+                };
+                assert!(
+                    completion.snapshot.is_err(),
+                    "fixture must fail the actual per-handle snapshot"
+                );
+            }
+            for server in servers {
+                server.join().unwrap();
+            }
+            dialog.tick();
+            assert!(dialog.provider_edit_authority.is_none());
+            assert!(dialog.provider_catalog_reload_required);
+            assert!(
+                dialog.save_config().is_err(),
+                "observation is not edit authority"
+            );
+            if fetch_all {
+                let Some(ProvidersPage::FetchAll(state)) =
+                    dialog.page.downcast_ref::<ProvidersPage>()
+                else {
+                    panic!("fetch-all")
+                };
+                assert_eq!(state.observations.len(), batch.len());
+                assert!(
+                    state.is_fetching(),
+                    "recovery cannot show a completed fetch"
+                );
+                assert!(!state.policy_resolved);
+            } else {
+                assert!(
+                    dialog.pending_fetch_observation.is_some(),
+                    "single fetch observation must survive consumption"
+                );
+            }
+            // The final snapshot also fails once. Neither completion may
+            // discard or persist the pending observations while authority is absent.
+            dialog.flush_request_daemon_effects_for_test();
+            assert!(dialog.provider_catalog_reload_required);
+            assert!(dialog.provider_edit_authority.is_none());
+            assert_eq!(
+                serde_json::to_value(
+                    ConfigDoc::load(&tmp.path().join(".cockpit/config.json"))
+                        .unwrap()
+                        .providers()
+                )
+                .unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            std::fs::write(&mcp_path, "{}").unwrap();
+            assert!(!dialog.handle_key(press(KeyCode::Enter)));
+            dialog.settle_test_effects();
+            dialog.tick();
+            dialog.settle_test_effects();
+            assert!(dialog.provider_edit_authority.is_some());
+            assert!(!dialog.provider_catalog_reload_required);
+            assert!(dialog.pending_fetch_observation.is_none());
+            for (id, status, _, expected) in &batch {
+                let saved = load_provider(&tmp.path().join(".cockpit/config.json"), id);
+                let marker = saved.last_model_fetch.as_ref().unwrap();
+                assert_eq!(
+                    marker.status, *expected,
+                    "{id}: observed HTTP {status} must survive failed read-back"
+                );
+                assert_ne!(marker.reason.as_deref(), Some("previous rejection"));
+                assert!(
+                    !marker
+                        .reason
+                        .as_deref()
+                        .unwrap()
+                        .contains("reading the refreshed catalog failed")
+                );
+                assert_eq!(
+                    saved
+                        .models
+                        .iter()
+                        .map(|model| model.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["stale", "current"]
+                );
+            }
+            let saved_once = batch
+                .iter()
+                .map(|(id, _, _, _)| {
+                    let path = cockpit_config::providers::provider_file_path_for_config(
+                        &tmp.path().join(".cockpit/config.json"),
+                        id,
+                    )
+                    .unwrap();
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect::<Vec<_>>();
+            dialog.tick();
+            dialog.settle_test_effects();
+            for (path, bytes) in saved_once {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    bytes,
+                    "a consumed observation must not save twice"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn r17_fetch_all_recovers_typed_observations_after_failed_readbacks() {
+    r17_readback_recovery_preserves_fetch_observations(true);
+}
+
+#[test]
+fn r17_single_fetch_recovers_typed_observations_after_failed_readbacks() {
+    r17_readback_recovery_preserves_fetch_observations(false);
 }

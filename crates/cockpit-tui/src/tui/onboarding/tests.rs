@@ -1603,14 +1603,59 @@ fn verify_renders_each_daemon_failure_class_with_retry() {
             VerifyOutcome::Parse("invalid model JSON".into()),
             "Couldn't parse the model list",
         ),
+        (
+            VerifyOutcome::Daemon {
+                code: "bad_request".into(),
+                message: "provider response exceeds the interactive payload limit".into(),
+            },
+            "Cockpit couldn't run the check",
+        ),
+        (
+            VerifyOutcome::DaemonUnreachable("connection refused".into()),
+            "Couldn't reach the Cockpit daemon",
+        ),
+        (
+            VerifyOutcome::Failed("provider mutation rejected".into()),
+            "Couldn't verify the provider",
+        ),
     ] {
+        // Only a provider-network failure may blame the user's network
+        // (#545: a daemon `bad_request` used to read "check your network").
+        let network = matches!(outcome, VerifyOutcome::Network(_));
         let mut shell = shell_at(OnboardingStage::Provider);
         shell.present_verify("fake".into());
         shell.apply_provider_verification("fake", outcome, None);
         let rendered = render_string(&mut shell, 80, 24, &engine);
         assert!(rendered.contains(expected), "{rendered}");
         assert!(rendered.contains("[ Retry ]"), "{rendered}");
+        assert_eq!(
+            rendered.contains("Check your network connection"),
+            network,
+            "{rendered}"
+        );
     }
+}
+
+/// #545: a large catalog arrives as a bounded preview plus the exact total;
+/// the verify list says how many were not previewed.
+#[test]
+fn verify_success_shows_total_and_truncated_preview() {
+    let engine = Dialog::None;
+    let mut shell = shell_at(OnboardingStage::Provider);
+    shell.present_verify("openrouter".into());
+    shell.apply_provider_verification(
+        "openrouter",
+        VerifyOutcome::Models(crate::tui::onboarding::ModelList {
+            ids: vec!["vendor/model-a".into(), "vendor/model-b".into()],
+            total: 462,
+            kept: 462,
+        }),
+        None,
+    );
+    let rendered = render_string(&mut shell, 100, 30, &engine);
+    assert!(rendered.contains("462 model(s) available"), "{rendered}");
+    assert!(rendered.contains("vendor/model-a"), "{rendered}");
+    assert!(rendered.contains("…and 460 more"), "{rendered}");
 }
 
 #[test]
@@ -1622,7 +1667,7 @@ fn verify_add_another_keeps_provider_stage_during_completion_detour() {
     shell.present_verify("openai".into());
     shell.apply_provider_verification(
         "openai",
-        VerifyOutcome::Models(vec!["gpt-4o".into()]),
+        VerifyOutcome::Models(vec!["gpt-4o".into()].into()),
         Some(ProviderSettlementEvidence {
             operation_id: "op".into(),
             mutation_intent_hash: "00".repeat(32),

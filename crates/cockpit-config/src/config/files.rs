@@ -2418,12 +2418,38 @@ fn open_private_lock_file_at(
     file_name: &std::ffi::OsStr,
     display_path: &Path,
 ) -> Result<std::fs::File> {
-    let file = open_file_at_nofollow(
-        parent,
-        file_name,
-        libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        0o600,
-    )
+    // Darwin can return ENOENT from openat(O_CREAT) when another opener
+    // locks the newly created leaf concurrently. Open existing leaves without
+    // O_CREAT; exclusive creation turns the competing create into EEXIST.
+    // Every attempt stays relative to the held directory and no-follows the
+    // leaf. Bound churn rather than spinning past a caller's lock deadline.
+    let file = (|| {
+        let flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        for _ in 0..8 {
+            match open_file_at_nofollow(parent, file_name, flags, 0) {
+                Ok(file) => return Ok(file),
+                Err(error) if root_cause_is_not_found(&error) => {}
+                Err(error) => return Err(error),
+            }
+            match open_file_at_nofollow(
+                parent,
+                file_name,
+                flags | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            ) {
+                Ok(file) => return Ok(file),
+                Err(error)
+                    if error
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|source| {
+                            source.kind() == std::io::ErrorKind::AlreadyExists
+                        }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        anyhow::bail!("config mutation lock leaf kept changing while opening")
+    })()
     .with_context(|| format!("opening config mutation lock {}", display_path.display()))?;
     chmod_file_private(&file).with_context(|| format!("chmod 0600 {}", display_path.display()))?;
     Ok(file)
@@ -4402,6 +4428,114 @@ mod mutation_lock_tests {
             !target.exists(),
             "locking must not create or replace the config leaf itself"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_lock_leaf_openers_serialize_across_all_acquisition_paths() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = std::fs::canonicalize(temp.path()).unwrap();
+        let target = directory_path.join("config.json");
+        let in_critical = Arc::new(AtomicUsize::new(0));
+        for round in 0..32 {
+            let barrier = Arc::new(Barrier::new(2));
+            let handles = (0..2)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let target = target.clone();
+                    let directory_path = directory_path.clone();
+                    let in_critical = in_critical.clone();
+                    std::thread::spawn(move || {
+                        let directory =
+                            super::open_directory_handle_nofollow(&directory_path).unwrap();
+                        barrier.wait();
+                        let guard = match round % 4 {
+                            0 => super::ConfigMutationLock::acquire(&target).unwrap(),
+                            1 => super::ConfigMutationLock::acquire_retained(
+                                &directory,
+                                &target,
+                                &directory_path,
+                            )
+                            .unwrap(),
+                            2 => super::ConfigMutationLock::acquire_until(
+                                &target,
+                                std::time::Instant::now() + Duration::from_secs(2),
+                            )
+                            .unwrap()
+                            .expect("fresh lock deadline"),
+                            _ => super::ConfigMutationLock::acquire_retained_cancellable(
+                                &directory,
+                                &target,
+                                &directory_path,
+                                &AtomicBool::new(false),
+                            )
+                            .unwrap(),
+                        };
+                        assert_eq!(
+                            in_critical.fetch_add(1, Ordering::SeqCst),
+                            0,
+                            "exclusive mutation ownership"
+                        );
+                        std::thread::yield_now();
+                        assert_eq!(in_critical.fetch_sub(1, Ordering::SeqCst), 1);
+                        drop(guard);
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            assert_eq!(in_critical.load(Ordering::SeqCst), 0);
+            std::fs::remove_file(directory_path.join(super::mutation_lock_leaf(&target))).unwrap();
+        }
+        assert!(
+            !target.exists(),
+            "locking must not create the config itself"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_leaf_openers_reject_symlinks_without_touching_the_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(temp.path()).unwrap();
+        let target = directory.join("config.json");
+        let outside = directory.join("outside");
+        std::fs::write(&outside, "unchanged").unwrap();
+        let before = std::fs::metadata(&outside).unwrap();
+        let leaf = directory.join(super::mutation_lock_leaf(&target));
+        std::os::unix::fs::symlink(&outside, &leaf).unwrap();
+        assert!(super::ConfigMutationLock::acquire(&target).is_err());
+        let held = super::open_directory_handle_nofollow(&directory).unwrap();
+        assert!(super::ConfigMutationLock::acquire_retained(&held, &target, &directory).is_err());
+        assert!(
+            super::ConfigMutationLock::acquire_until(
+                &target,
+                std::time::Instant::now() + Duration::from_secs(1)
+            )
+            .is_err()
+        );
+        assert!(
+            super::ConfigMutationLock::acquire_retained_cancellable(
+                &held,
+                &target,
+                &directory,
+                &std::sync::atomic::AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode(),
+            before.permissions().mode()
+        );
+        assert!(leaf.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!target.exists());
     }
 
     #[test]

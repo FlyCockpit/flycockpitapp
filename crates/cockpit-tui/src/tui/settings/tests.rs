@@ -66,6 +66,7 @@ fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
     assert!(!format!("{payload:?}").contains(sentinel));
 
     let save = ProviderSavePlan {
+        model_patch: None,
         provider_id: "example".into(),
         entry: ProviderEntry::default(),
         header_secrets: vec![Some(cockpit_proto::ProviderSecretValue::new(
@@ -723,6 +724,7 @@ fn fetch_all_unlisted_picks_only_drifted_ids() {
             },
         ],
         catalog: cockpit_config::providers::ProviderModelCatalog::Live,
+        trim_note: String::new(),
     };
     let (unlisted, prompt) =
         fetch_all_unlisted_dialog(&cfg, vec![("p1".into(), Ok(remote_outcome))], None);
@@ -737,6 +739,7 @@ fn fetch_all_unlisted_skips_prompt_when_user_has_chosen() {
     let remote_outcome = FetchOutcome::Models {
         models: vec![],
         catalog: cockpit_config::providers::ProviderModelCatalog::Live,
+        trim_note: String::new(),
     };
     let (_unlisted, prompt) = fetch_all_unlisted_dialog(
         &cfg,
@@ -6835,9 +6838,9 @@ fn models_esc_persists_edits() {
         panic!("not on Models page");
     }
     d.handle_key(press(KeyCode::Esc));
-    let reloaded = cockpit_config::providers::ConfigDoc::load(&d.config_path)
-        .unwrap()
-        .providers();
+    let reloaded = cockpit_config::providers::ConfigDoc::load_effective_from_paths(
+        std::slice::from_ref(&d.config_path),
+    );
     let entry = reloaded.providers.get("vendor").unwrap();
     assert_eq!(entry.models.len(), 1, "model edit persisted on Esc");
     assert_eq!(entry.models[0].id, "m-new");

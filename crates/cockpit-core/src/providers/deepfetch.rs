@@ -354,10 +354,11 @@ async fn send_probe(
     if status == StatusCode::TOO_MANY_REQUESTS
         && let Some(delay) = retry_after_delay(response.headers())
     {
+        drop(response);
         tokio::time::sleep(delay).await;
         return send_probe_once(base_url, headers, endpoint, model_id, max_tokens, timeout).await;
     }
-    probe_http_error(response).await
+    probe_http_error(response, headers).await
 }
 
 async fn send_probe_once(
@@ -388,12 +389,16 @@ async fn send_probe_once(
     if response.status().is_success() {
         return Ok(ProbeRawOutcome::Works);
     }
-    probe_http_error(response).await
+    probe_http_error(response, headers).await
 }
 
-async fn probe_http_error(response: reqwest::Response) -> Result<ProbeRawOutcome> {
+async fn probe_http_error(
+    response: reqwest::Response,
+    headers: &[ResolvedHeader],
+) -> Result<ProbeRawOutcome> {
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = super::provider_http::read_body_limited(response, "deep fetch").await?;
+    let body = super::provider_http::diagnostic_body(&body, headers);
     Ok(ProbeRawOutcome::HttpError(ProbeHttpError {
         status: status.as_u16(),
         body,
@@ -824,6 +829,60 @@ pub(crate) fn parse_context_limit(message: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn deep_consumed_bodies_are_limited_on_initial_and_retry_errors() {
+        for chunked in [false, true] {
+            for retry in [false, true] {
+                let mut responses = Vec::new();
+                if retry {
+                    responses.push((429, "ignored status-only body".into(), true));
+                }
+                responses.push((
+                    400,
+                    "x".repeat(crate::providers::models_fetch::MAX_PROVIDER_RESPONSE_BYTES + 1),
+                    chunked,
+                ));
+                let (url, server) =
+                    crate::providers::provider_http::serve_test_bodies(responses).await;
+                let error = super::send_probe(
+                    &url,
+                    &[],
+                    super::ProbeEndpoint::Completions,
+                    "model",
+                    1,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("exceeded 8388608 byte limit"),
+                    "retry={retry}, chunked={chunked}: {error:#}"
+                );
+                server.await.unwrap();
+            }
+        }
+        let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+            400,
+            "small useful diagnostic".into(),
+            true,
+        )])
+        .await;
+        let result = super::send_probe(
+            &url,
+            &[],
+            super::ProbeEndpoint::Completions,
+            "model",
+            1,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, super::ProbeRawOutcome::HttpError(super::ProbeHttpError { body, .. }) if body == "small useful diagnostic")
+        );
+        server.await.unwrap();
+    }
+
     use super::*;
 
     struct RecordingClient {

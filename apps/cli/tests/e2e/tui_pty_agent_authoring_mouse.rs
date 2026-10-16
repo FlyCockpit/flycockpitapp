@@ -54,17 +54,14 @@ fn spawn_loopback_models_provider() -> (String, Arc<AtomicBool>) {
 }
 
 fn unset_trust_confirm_label(screen: &str) -> String {
-    const PREFIX: &str = "Confirm ";
-    const SUFFIX: &str = " as unset";
+    const SUFFIX: &str = " · untrusted by default";
     for line in screen.lines() {
-        let Some(start) = line.find(PREFIX) else {
+        let Some((_, rest)) = line.split_once('○') else {
             continue;
         };
-        let rest = &line[start..];
-        let Some(end) = rest.find(SUFFIX) else {
-            continue;
-        };
-        return rest[..end + SUFFIX.len()].to_string();
+        if let Some(end) = rest.find(SUFFIX) {
+            return rest[..end + SUFFIX.len()].trim().to_string();
+        }
     }
     panic!("expected unset trust confirm row on screen:\n{screen}");
 }

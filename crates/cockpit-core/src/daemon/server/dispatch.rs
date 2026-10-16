@@ -25104,9 +25104,10 @@ pub(super) async fn provider_models_fetch(
                 Err(error) => {
                     let message =
                         redact_provider_response_text(&error.to_string(), &store, &config, &env);
-                    verification = Some(categorize_provider_model_fetch_error(&anyhow::anyhow!(
-                        message.clone()
-                    )));
+                    // Keep the error's typed cause for classification, while
+                    // exposing only the fully scrubbed outer diagnostic.
+                    let safe_error = error.context(message.clone());
+                    verification = Some(categorize_provider_model_fetch_error(&safe_error));
                     crate::daemon::proto::ProviderModelFetchOutcome::Error { message }
                 }
             };
@@ -25391,22 +25392,31 @@ pub(super) fn enforce_persisted_catalog_budget(
 pub(super) fn categorize_provider_model_fetch_error(
     error: &anyhow::Error,
 ) -> crate::daemon::proto::ProviderModelVerification {
+    let message = crate::config::providers::redact_model_fetch_reason(error.to_string());
+    let lower = message.to_ascii_lowercase();
     if let Some(auth_error) = error.downcast_ref::<crate::providers::auth_check::AuthCheckError>() {
         match auth_error {
-            crate::providers::auth_check::AuthCheckError::CredentialsRejected(message) => {
-                let status = provider_http_status(&message.to_ascii_lowercase()).unwrap_or(401);
+            crate::providers::auth_check::AuthCheckError::CredentialsRejected(_) => {
+                let status = provider_http_status(&lower).unwrap_or(401);
                 return crate::daemon::proto::ProviderModelVerification::Unauthorized { status };
             }
-            crate::providers::auth_check::AuthCheckError::Network(message) => {
+            crate::providers::auth_check::AuthCheckError::Network(_) => {
                 return crate::daemon::proto::ProviderModelVerification::Network {
-                    message: bounded_provider_model_error(message),
+                    message: bounded_provider_model_error(&message),
                 };
             }
             crate::providers::auth_check::AuthCheckError::Other(_) => {}
         }
     }
-    let message = crate::config::providers::redact_model_fetch_reason(error.to_string());
-    let lower = message.to_ascii_lowercase();
+    // Transport context (e.g. GET <url>) must not hide reqwest's typed
+    // connection/timeout failure behind the generic HTTP fallback.
+    if let Some(transport) = error.downcast_ref::<reqwest::Error>()
+        && (transport.is_connect() || transport.is_timeout() || transport.is_request())
+    {
+        return crate::daemon::proto::ProviderModelVerification::Network {
+            message: bounded_provider_model_error(&message),
+        };
+    }
     let status = provider_http_status(&lower);
     if let Some(401) = status {
         return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 401 };
@@ -25785,13 +25795,10 @@ fn provider_response_credential_table(
     config: &crate::config::providers::ProvidersConfig,
     env: &std::collections::HashMap<String, String>,
 ) -> std::result::Result<crate::redact::RedactionTable, ErrorPayload> {
-    let mut table = crate::redact::RedactionTable::empty();
-    for value in provider_response_secret_values(store, config, env) {
-        table = table
-            .with_forced_literal(value, "provider credential".into())
-            .map_err(internal)?;
-    }
-    Ok(table)
+    crate::redact::RedactionTable::for_provider_credentials(provider_response_secret_values(
+        store, config, env,
+    ))
+    .map_err(internal)
 }
 
 /// Provider APIs can reflect credentials in error, quota, and even catalog

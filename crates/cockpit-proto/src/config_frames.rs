@@ -11,7 +11,6 @@ const TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 const KIND: &str = "config_chunk";
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Chunk {
     v: u32,
     kind: String,
@@ -178,6 +177,22 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_transport_chunk_fields_are_forward_open_and_known_fields_stay_typed() {
+        let mut value = serde_json::json!({
+            "v": PROTOCOL_VERSION, "kind": KIND, "digest": "digest",
+            "offset": 0, "total": 1, "data": "eA==", "future_metadata": {"hint": true}
+        });
+        let chunk: Chunk = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(chunk.v, PROTOCOL_VERSION);
+        assert_eq!(chunk.kind, KIND);
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(chunk.total, 1);
+        assert_eq!(chunk.data, "eA==");
+        value["offset"] = serde_json::json!("invalid");
+        assert!(serde_json::from_value::<Chunk>(value).is_err());
+    }
 
     fn large_event() -> Envelope {
         Envelope::event(Event::ConfigSnapshot {

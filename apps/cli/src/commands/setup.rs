@@ -623,7 +623,12 @@ fn provider_view_matches_entry(
     expected.url = cockpit_proto::redact_url_for_owner_view(&expected.url);
     expected.credential_ref = None;
     expected.headers.clear();
-    serde_json::to_value(expected).ok() == serde_json::to_value(&view.entry).ok()
+    // A full save persists a replacement directive. Receipts describe the
+    // effective inventory; its authoring representation is daemon-owned.
+    let mut actual = view.entry.clone();
+    expected.models_replace = false;
+    actual.models_replace = false;
+    serde_json::to_value(expected).ok() == serde_json::to_value(actual).ok()
         && view.headers.len() == expected_headers.len()
         && view
             .headers
@@ -2047,6 +2052,42 @@ mod tests {
             "{}",
             io.output
         );
+    }
+
+    #[test]
+    fn provider_receipt_matches_effective_content_and_rejects_other_changes() {
+        use cockpit_config::providers::{CapabilityStatus, ModelEntry, ProviderEntry};
+        let expected = ProviderEntry {
+            url: "https://api.example.test/v1".into(),
+            models: vec![ModelEntry {
+                id: "exact-model".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut view = cockpit_proto::ProviderEntryView {
+            entry: expected.clone(),
+            headers: Vec::new(),
+            credential_configured: false,
+        };
+        view.entry.models_replace = true;
+        assert!(provider_view_matches_entry(&view, &expected));
+        for changed in 0..4 {
+            let mut wrong = view.clone();
+            match changed {
+                0 => wrong.entry.url = "https://different.example.test/v1".into(),
+                1 => wrong.entry.models[0].id = "different-model".into(),
+                2 => {
+                    wrong.entry.capabilities.client_side_tools.status = CapabilityStatus::Supported
+                }
+                _ => wrong.headers.push(cockpit_proto::ProviderHeaderView {
+                    name: "Authorization".into(),
+                    value: "********".into(),
+                    redacted: true,
+                }),
+            }
+            assert!(!provider_view_matches_entry(&wrong, &expected));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

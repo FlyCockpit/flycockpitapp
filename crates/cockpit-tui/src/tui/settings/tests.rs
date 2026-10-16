@@ -6838,9 +6838,9 @@ fn models_esc_persists_edits() {
         panic!("not on Models page");
     }
     d.handle_key(press(KeyCode::Esc));
-    let reloaded = cockpit_config::providers::ConfigDoc::load(&d.config_path)
-        .unwrap()
-        .providers();
+    let reloaded = cockpit_config::providers::ConfigDoc::load_effective_from_paths(
+        std::slice::from_ref(&d.config_path),
+    );
     let entry = reloaded.providers.get("vendor").unwrap();
     assert_eq!(entry.models.len(), 1, "model edit persisted on Esc");
     assert_eq!(entry.models[0].id, "m-new");

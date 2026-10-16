@@ -598,12 +598,9 @@ pub(super) fn build_anthropic_model_with_can_delegate(
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
-    let client_credentials = Arc::new(
-        crate::providers::provider_http::with_diagnostic_credentials(
-            RedactionTable::empty(),
-            &resolved.headers,
-        )?,
-    );
+    let client_credentials = Arc::new(crate::providers::provider_http::diagnostic_credentials(
+        &resolved.headers,
+    )?);
     let session_redact = Arc::new(session_redact.union(&client_credentials)?);
 
     let x_api_key = resolved
@@ -779,12 +776,9 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
-    let client_credentials = Arc::new(
-        crate::providers::provider_http::with_diagnostic_credentials(
-            RedactionTable::empty(),
-            &resolved.headers,
-        )?,
-    );
+    let client_credentials = Arc::new(crate::providers::provider_http::diagnostic_credentials(
+        &resolved.headers,
+    )?);
     let session_redact = Arc::new(session_redact.union(&client_credentials)?);
 
     let access_token = resolved
@@ -1021,12 +1015,9 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
-    let client_credentials = Arc::new(
-        crate::providers::provider_http::with_diagnostic_credentials(
-            RedactionTable::empty(),
-            &resolved.headers,
-        )?,
-    );
+    let client_credentials = Arc::new(crate::providers::provider_http::diagnostic_credentials(
+        &resolved.headers,
+    )?);
     let session_redact = Arc::new(session_redact.union(&client_credentials)?);
 
     let resolved_wire_api = if wire_api.is_auto() {

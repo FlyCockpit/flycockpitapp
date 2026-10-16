@@ -102,9 +102,17 @@ pub(crate) fn authorization_payload(value: &str) -> Option<&str> {
 /// transformed. Directory diagnostics and every inference client constructor
 /// use this same boundary, including authorization payloads and private headers.
 pub(crate) fn with_diagnostic_credentials(
-    mut table: crate::redact::RedactionTable,
+    table: crate::redact::RedactionTable,
     headers: &[super::models_fetch::ResolvedHeader],
 ) -> Result<crate::redact::RedactionTable> {
+    table.union(&diagnostic_credentials(headers)?)
+}
+
+/// Exact outbound credential coverage, without claiming ambient coverage.
+pub(crate) fn diagnostic_credentials(
+    headers: &[super::models_fetch::ResolvedHeader],
+) -> Result<crate::redact::RedactionTable> {
+    let mut values = Vec::new();
     for header in headers {
         if public_header_literal(&header.name, &header.value) {
             continue;
@@ -123,15 +131,10 @@ pub(crate) fn with_diagnostic_credentials(
                     "provider request credential is below the safe diagnostic coverage length"
                 );
             }
-            table = table
-                .with_forced_literal(
-                    value.to_string(),
-                    "$secret:provider request credential".into(),
-                )
-                .map_err(|_| anyhow::anyhow!("provider request credential coverage unavailable"))?;
+            values.push(value.to_string());
         }
     }
-    Ok(table)
+    crate::redact::RedactionTable::for_provider_credentials(values)
 }
 
 fn scrub_diagnostic_value(value: &mut serde_json::Value, table: &crate::redact::RedactionTable) {
@@ -166,10 +169,10 @@ pub(crate) fn diagnostic_value(
     value: &mut serde_json::Value,
     headers: &[super::models_fetch::ResolvedHeader],
 ) -> Result<()> {
-    let table = DIAGNOSTIC_CREDENTIALS
-        .try_with(Clone::clone)
-        .unwrap_or_else(|_| crate::redact::RedactionTable::empty());
-    let table = with_diagnostic_credentials(table, headers)?;
+    let table = match DIAGNOSTIC_CREDENTIALS.try_with(Clone::clone) {
+        Ok(table) => with_diagnostic_credentials(table, headers)?,
+        Err(_) => diagnostic_credentials(headers)?,
+    };
     scrub_diagnostic_value(value, &table);
     Ok(())
 }
@@ -182,9 +185,13 @@ pub(crate) fn diagnostic_body(
     raw: &str,
     headers: &[super::models_fetch::ResolvedHeader],
 ) -> String {
-    let table = DIAGNOSTIC_CREDENTIALS
-        .try_with(Clone::clone)
-        .unwrap_or_else(|_| crate::redact::RedactionTable::empty());
+    let table = match DIAGNOSTIC_CREDENTIALS.try_with(Clone::clone) {
+        Ok(table) => table,
+        Err(_) => match diagnostic_credentials(headers) {
+            Ok(table) => table,
+            Err(_) => return "[provider diagnostic omitted]".into(),
+        },
+    };
     diagnostic_body_with_table(raw, headers, table)
 }
 

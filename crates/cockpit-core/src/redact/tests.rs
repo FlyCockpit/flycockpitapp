@@ -3606,3 +3606,22 @@ fn ssh_collector_skips_an_entry_removed_before_it_is_read() {
             .any(|(value, _)| value.contains("removal-race-key-2b9e"))
     );
 }
+
+#[test]
+fn provider_credential_tables_are_enforced_unbound_and_fail_closed_at_the_floor() {
+    let empty = RedactionTable::for_provider_credentials(Vec::new()).unwrap();
+    assert!(empty.is_empty());
+    assert!(!empty.disabled());
+    assert!(empty.coverage_binding().is_none());
+    assert_eq!(empty.scrub("ordinary model id"), "ordinary model id");
+    let secret = "provider-fixture-credential";
+    let table = RedactionTable::for_provider_credentials(vec![secret.into()]).unwrap();
+    assert!(!table.disabled());
+    assert!(table.coverage_binding().is_none());
+    assert!(!table.scrub(secret).contains(secret));
+    let matches = super::match_sensitive_literals(&table, secret);
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].source, super::SourceClass::Credential);
+    assert!(RedactionTable::for_provider_credentials(vec!["abc".into()]).is_err());
+    assert!(RedactionTable::for_provider_credentials(vec![secret.into(), "abc".into()]).is_err());
+}

@@ -302,7 +302,9 @@ fn break_config_saving(dialog: &SettingsDialog) {
 }
 
 fn load_provider(path: &std::path::Path, id: &str) -> ProviderEntry {
-    ConfigDoc::load(path).unwrap().providers().providers[id].clone()
+    // Authored layers may store only sparse field/membership intent. Assert
+    // the independently resolved persisted image, as catalog consumers do.
+    ConfigDoc::load_effective_from_paths(&[path.to_path_buf()]).providers[id].clone()
 }
 
 fn replaced_provider(nav: &Nav) -> &ProvidersPage {
@@ -627,6 +629,7 @@ fn pointer_xai_entitlement_renders_dispatches_and_persists() {
             ProviderRowEditorAction::SettingSave,
         ));
         click_rendered_provider_action(&mut fresh, &save_action);
+        fresh.settle_test_effects();
         let saved = load_provider(&fresh.config_path, "grok-oauth");
         let capability = if model_scope {
             &saved
@@ -8297,6 +8300,7 @@ fn fetch_all_final_snapshot_precedes_editable_status_save() {
     super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
         let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
         let mut servers = Vec::new();
+        let seed = config.providers["p"].clone();
         for id in ["p", "sibling"] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -8307,7 +8311,7 @@ fn fetch_all_final_snapshot_precedes_editable_status_save() {
                 let body=serde_json::json!({"data":[{"id":format!("{id_owned}/fetched")}]}).to_string();
                 write!(socket,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
             }));
-            let mut entry = config.providers["p"].clone();
+            let mut entry = seed.clone();
             entry.url = format!("http://{address}/v1");
             entry.allow_insecure_http = true;
             entry.auth = Some(AuthKind::None);

@@ -801,8 +801,7 @@ mod tests {
     #[test]
     fn user_facing_error_scrubs_masks_and_fails_closed() {
         const KNOWN: &str = "known-session-secret-value-1234567890";
-        const UNKNOWN_KEY: &str =
-            "opaque_token_fixture_0123456789abcdef0123456789abcdef01234567";
+        const UNKNOWN_KEY: &str = "opaque_token_fixture_0123456789abcdef0123456789abcdef01234567";
         let table = crate::redact::RedactionTable::empty()
             .with_forced_literal(KNOWN.to_string(), "test".into())
             .unwrap();

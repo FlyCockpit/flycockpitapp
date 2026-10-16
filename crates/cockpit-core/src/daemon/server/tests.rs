@@ -32851,6 +32851,30 @@ fn provider_verification_errors_are_categorized_and_bounded_for_daemon_clients()
     assert!(snippet.ends_with('…'));
 }
 
+#[test]
+fn provider_verification_typed_causes_use_only_the_scrubbed_diagnostic() {
+    use crate::daemon::proto::ProviderModelVerification;
+    use crate::providers::auth_check::AuthCheckError;
+    let network = anyhow::Error::new(AuthCheckError::Network(
+        "private-credential-diagnostic".into(),
+    ))
+    .context("safe connection context");
+    assert_eq!(
+        super::dispatch::categorize_provider_model_fetch_error(&network),
+        ProviderModelVerification::Network {
+            message: "safe connection context".into()
+        },
+    );
+    let rejected = anyhow::Error::new(AuthCheckError::CredentialsRejected(
+        "private-credential-diagnostic".into(),
+    ))
+    .context("provider returned HTTP 403: scrubbed");
+    assert_eq!(
+        super::dispatch::categorize_provider_model_fetch_error(&rejected),
+        ProviderModelVerification::Unauthorized { status: 403 },
+    );
+}
+
 async fn one_shot_models_response(status: u16, reason: &str, body: &str) -> String {
     use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::TcpListener};
 

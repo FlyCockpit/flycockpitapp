@@ -1476,6 +1476,35 @@ impl ConfigDoc {
         Ok(())
     }
 
+    /// Remaining canonical bytes for a nonempty placement vector in this
+    /// exact raw write. Retained unknown fields use the same patching as the
+    /// writer. This is a search bound only; candidates still require complete
+    /// raw validation (including pretty-document size) before publication.
+    pub fn provider_placement_byte_budget(&self, id: &str, entry: &ProviderEntry) -> Result<usize> {
+        let mut probe = entry.clone();
+        probe.model_membership.placements = vec![super::ModelPlacement {
+            id: String::new(),
+            after: None,
+        }];
+        let original = self.providers();
+        let original_entry = original.providers.get(id);
+        let original_raw = original_entry
+            .map(|entry| serialize_json_object(entry, "provider"))
+            .transpose()?;
+        let raw = self.provider_raw_for_write(
+            id,
+            original_entry,
+            serialize_json_object(&probe, "provider")?,
+            original_raw.as_ref(),
+        )?;
+        // The probe can equal an already oversized raw layer. Charge it even
+        // when the ordinary unchanged-write fast path skipped serialization.
+        readable_provider_bytes(&raw)?;
+        let framing = serde_json::to_vec(&raw)?.len()
+            - serde_json::to_vec(&probe.model_membership.placements)?.len();
+        Ok(super::MAX_AUTHORED_PROVIDER_ENTRY_BYTES - framing)
+    }
+
     fn provider_raw_for_write(
         &self,
         id: &str,

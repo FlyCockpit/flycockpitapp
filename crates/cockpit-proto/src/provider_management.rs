@@ -185,6 +185,54 @@ impl ProviderModelPatch {
         Ok(patch)
     }
 
+    /// Ordinary producers charge metadata and model intent together. If the
+    /// fast representation does not fit, search all unique-ID move schedules
+    /// against the remaining request bytes before reporting an oversized edit.
+    pub fn between_for_entry(
+        before: &[cockpit_config::config::providers::ModelEntry],
+        after: &[cockpit_config::config::providers::ModelEntry],
+        entry: &cockpit_config::config::providers::ProviderEntry,
+    ) -> Result<Self, serde_json::Error> {
+        let patch = Self::between(before, after)?;
+        let mut metadata = entry.clone();
+        metadata.models.clear();
+        if serde_json::to_vec(&(&metadata, Some(&patch)))?.len()
+            <= crate::MAX_OWNER_PROVIDER_ENTRY_BYTES
+            || patch.clear
+        {
+            return Ok(patch);
+        }
+        let order = after.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        let next = order.iter().collect::<std::collections::BTreeSet<_>>();
+        let mut baseline = before
+            .iter()
+            .filter(|row| next.contains(&row.id))
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        baseline.extend(patch.upserts.iter().map(|row| row.id.clone()));
+        let mut sparse = patch.clone();
+        sparse.order = None;
+        sparse.moves = vec![cockpit_config::config::providers::ModelPlacement {
+            id: String::new(),
+            after: None,
+        }];
+        let framing = serde_json::to_vec(&(&metadata, Some(&sparse)))?.len()
+            - serde_json::to_vec(&sparse.moves)?.len();
+        if let Some(budget) = crate::MAX_OWNER_PROVIDER_ENTRY_BYTES.checked_sub(framing)
+            && let Some(moves) = cockpit_config::config::providers::ModelPlacement::find_fitting(
+                &baseline,
+                &order,
+                &std::collections::BTreeSet::new(),
+                budget,
+                |_| Ok::<_, serde_json::Error>(true),
+            )?
+        {
+            sparse.moves = moves;
+            return Ok(sparse);
+        }
+        Ok(patch)
+    }
+
     /// Preserve this layer's authored rows/edits while recording only the
     /// changes over the complete, revision-bound effective inventory.
     pub fn apply_to_layer(
@@ -247,8 +295,26 @@ impl ProviderModelPatch {
                 && (!self.deletes.is_empty() || !self.upserts.is_empty() || !self.moves.is_empty()))
         {
             layer.model_order = Some(after.iter().map(|row| row.id.clone()).collect());
-            layer.model_membership = Default::default();
-        } else if !self.deletes.is_empty() || !self.upserts.is_empty() || !self.moves.is_empty() {
+            layer.model_membership.placements.clear();
+            let next = after
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            layer.model_membership.deletes = layer
+                .model_membership
+                .deletes
+                .iter()
+                .chain(&self.deletes)
+                .filter(|id| !self.clear && !next.contains(id.as_str()))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        } else if !self.deletes.is_empty()
+            || !self.upserts.is_empty()
+            || !self.moves.is_empty()
+            || self.updates.iter().any(|update| update.replace)
+        {
             let next_ids = after
                 .iter()
                 .map(|row| row.id.as_str())
@@ -260,6 +326,12 @@ impl ProviderModelPatch {
                 .map(|p| p.id.as_str())
                 .chain(self.moves.iter().map(|p| p.id.as_str()))
                 .chain(self.upserts.iter().map(|row| row.id.as_str()))
+                .chain(
+                    self.updates
+                        .iter()
+                        .filter(|update| update.replace)
+                        .map(|update| update.id.as_str()),
+                )
                 .collect::<std::collections::BTreeSet<_>>();
             let order = after.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
             let mut placements =
@@ -268,8 +340,9 @@ impl ProviderModelPatch {
             // forests. On a fresh sparse layer this admits ANY incoming anchor
             // schedule. On an existing layer, disjoint pure-order programs can
             // be concatenated exactly without discarding previous pins. A
-            // deletion/replacement can invalidate old anchors, so those edits
-            // use the complete surviving-pin normalization above.
+            // deletion touching a prior pin/anchor can invalidate the program.
+            // Unrelated deletions commute with it and must not destroy a
+            // fitting temporary-handle schedule.
             let old_pins = layer
                 .model_membership
                 .placements
@@ -277,8 +350,10 @@ impl ProviderModelPatch {
                 .map(|p| p.id.as_str())
                 .collect::<std::collections::BTreeSet<_>>();
             let can_append = old_pins.is_empty()
-                || (self.deletes.is_empty()
-                    && self.moves.iter().all(|p| !old_pins.contains(p.id.as_str())));
+                || (layer.model_membership.placements.iter().all(|p| {
+                    !self.deletes.contains(&p.id)
+                        && !p.after.as_ref().is_some_and(|id| self.deletes.contains(id))
+                }) && self.moves.iter().all(|p| !old_pins.contains(p.id.as_str())));
             if can_append
                 && self.upserts.is_empty()
                 && !self.updates.iter().any(|update| update.replace)
@@ -1281,5 +1356,188 @@ pub enum ProviderCatalogReadback {
 impl ProviderCatalogReadback {
     pub fn is_inline(&self) -> bool {
         matches!(self, Self::Inline)
+    }
+}
+
+#[cfg(test)]
+mod request_budget_tests {
+    use super::*;
+    use cockpit_config::config::providers::{ModelEntry, ProviderEntry};
+
+    #[test]
+    fn model_patch_complete_request_budget_searches_beyond_eager_inventory_size() {
+        let ids: [String; 9] = [
+            "u".into(),
+            "v".into(),
+            "w".into(),
+            "a".into(),
+            "B".repeat(900),
+            "c".into(),
+            "D".repeat(900),
+            "e".into(),
+            "F".repeat(900),
+        ];
+        let before = ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| ModelEntry {
+                id,
+                name: Some(format!("whole-image-{i}")),
+                favorite: i % 2 == 0,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let after = [0, 1, 2, 4, 3, 7, 6, 5, 8].map(|i| before[i].clone());
+        let fast = ProviderModelPatch::between(&before, &after).unwrap();
+        let mut metadata = ProviderEntry {
+            name: Some(String::new()),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&(&metadata, Some(&fast))).unwrap().len();
+        metadata.name = Some("n".repeat(crate::MAX_OWNER_PROVIDER_ENTRY_BYTES - bytes + 200));
+        assert!(
+            serde_json::to_vec(&(&metadata, Some(&fast))).unwrap().len()
+                > crate::MAX_OWNER_PROVIDER_ENTRY_BYTES
+        );
+        let fitting = ProviderModelPatch::between_for_entry(&before, &after, &metadata).unwrap();
+        assert!(
+            serde_json::to_vec(&(&metadata, Some(&fitting)))
+                .unwrap()
+                .len()
+                <= crate::MAX_OWNER_PROVIDER_ENTRY_BYTES
+        );
+        let mut actual = before;
+        fitting.apply(&mut actual).unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod durable_full_order_tests {
+    use super::*;
+    use cockpit_config::config::{
+        WorkspaceConfigLayerSnapshot,
+        providers::{ConfigDoc, ModelEntry, ModelPlacement, ProviderEntry},
+    };
+
+    #[test]
+    fn model_patch_full_order_retains_tombstones_and_surviving_pin_authority() {
+        let rows = ["a", "b", "c", "gone"].map(|id| ModelEntry {
+            id: id.into(),
+            name: Some(format!("image-{id}")),
+            ..Default::default()
+        });
+        let after = [rows[2].clone(), rows[0].clone()];
+        let mut patch = ProviderModelPatch::between(&rows[..3], &after).unwrap();
+        patch.order = Some(after.iter().map(|row| row.id.clone()).collect());
+        patch.moves.clear();
+        let lower = ProviderEntry {
+            models: rows.to_vec(),
+            ..Default::default()
+        };
+        let mut layer = ProviderEntry::default();
+        layer.model_membership.deletes.push("gone".into());
+        layer.model_membership.placements.push(ModelPlacement {
+            id: "a".into(),
+            after: None,
+        });
+        patch.apply_to_layer(&rows[..3], &mut layer).unwrap();
+        assert_eq!(layer.model_membership.deletes, ["b", "gone"]);
+        assert_eq!(layer.model_order, Some(vec!["c".into(), "a".into()]));
+        let snapshot = |entry: &ProviderEntry| WorkspaceConfigLayerSnapshot {
+            origin: None,
+            project_root: None,
+            config_json: None,
+            provider_files: vec![("p".into(), serde_json::to_vec(entry).unwrap())],
+            effective_default_artifact_digest: None,
+            digest: "layer".into(),
+        };
+        let read = ConfigDoc::providers_from_workspace_layer_snapshots(&[
+            snapshot(&lower),
+            snapshot(&layer),
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&read.providers["p"].models).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod large_prefix_admission_tests {
+    use super::*;
+    use cockpit_config::config::providers::{ModelEntry, ProviderEntry};
+
+    #[test]
+    fn model_patch_complete_request_budget_large_unchanged_prefix_meets_rpc_deadline() {
+        let ids = (0..10_000)
+            .map(|i| format!("prefix-{i:05}"))
+            .chain([
+                "a".into(),
+                "B".repeat(900),
+                "c".into(),
+                "D".repeat(900),
+                "e".into(),
+                "F".repeat(900),
+            ])
+            .collect::<Vec<_>>();
+        let before = ids
+            .into_iter()
+            .map(|id| ModelEntry {
+                id,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let source = ProviderEntry {
+            models: before.clone(),
+            ..Default::default()
+        };
+        assert!(serde_json::to_vec(&source).unwrap().len() < crate::MAX_OWNER_PROVIDER_ENTRY_BYTES);
+        let after = before[..10_000]
+            .iter()
+            .cloned()
+            .chain([1, 0, 4, 3, 2, 5].map(|i| before[10_000 + i].clone()))
+            .collect::<Vec<_>>();
+        let fast = ProviderModelPatch::between(&before, &after).unwrap();
+        let mut metadata = ProviderEntry {
+            name: Some(String::new()),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&(&metadata, Some(&fast))).unwrap().len();
+        metadata.name = Some("n".repeat(crate::MAX_OWNER_PROVIDER_ENTRY_BYTES - bytes + 200));
+        assert!(
+            serde_json::to_vec(&(&metadata, Some(&fast))).unwrap().len()
+                > crate::MAX_OWNER_PROVIDER_ENTRY_BYTES
+        );
+        let input = before.clone();
+        let target = after.clone();
+        let header = metadata.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ =
+                send.send(ProviderModelPatch::between_for_entry(&input, &target, &header).unwrap());
+        });
+        let patch = receive
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect(
+                "a fitting complete request must finish inside the30-second owner RPC deadline",
+            );
+        worker.join().unwrap();
+        assert!(
+            serde_json::to_vec(&(&metadata, Some(&patch)))
+                .unwrap()
+                .len()
+                <= crate::MAX_OWNER_PROVIDER_ENTRY_BYTES
+        );
+        let mut applied = before;
+        patch.apply(&mut applied).unwrap();
+        assert_eq!(
+            serde_json::to_value(applied).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
     }
 }

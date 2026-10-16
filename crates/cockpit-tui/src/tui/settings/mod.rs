@@ -9846,7 +9846,7 @@ impl SettingsCx {
                     })
                     .collect::<Vec<_>>();
                 let model_patch = self.original_config.providers.get(provider_id).map(|original| {
-                    cockpit_proto::ProviderModelPatch::between(&original.models, &entry.models)
+                    cockpit_proto::ProviderModelPatch::between_for_entry(&original.models, &entry.models, entry)
                         .expect("model entries serialize")
                 });
                 Some(ProviderSavePlan {

@@ -1578,23 +1578,366 @@ impl ModelPlacement {
                 }
             }
         }
-        best
+        Self::refine_small_program(before, after, &std::collections::BTreeSet::new(), best)
     }
 
-    /// Choose the cheapest insertion forest while retaining every required
+    /// Choose an insertion forest or temporary-anchor program while retaining every required
     /// durable pin. Request encodings need not determine new durable pins.
     pub fn between_with_pins(
         before: &[String],
         after: &[String],
         required: &std::collections::BTreeSet<&str>,
     ) -> Vec<Self> {
-        let required = after
+        let indexes = after
             .iter()
             .enumerate()
             .filter(|(_, id)| required.contains(id.as_str()))
             .map(|(index, _)| index)
             .collect();
-        Self::insertion_forest_between(before, after, &required)
+        let program = Self::insertion_forest_between(before, after, &indexes);
+        Self::refine_small_program(before, after, required, program)
+    }
+
+    // Eagerly optimize small inventories. Large inventories keep the fast
+    // forest/schedule incumbent; admission uses find_fitting with the actual
+    // remaining byte budget, without this eager-optimization size threshold.
+    fn refine_small_program(
+        before: &[String],
+        after: &[String],
+        required: &std::collections::BTreeSet<&str>,
+        mut program: Vec<Self>,
+    ) -> Vec<Self> {
+        if after.len() <= 8 {
+            loop {
+                let bytes = serde_json::to_vec(&program)
+                    .expect("placements serialize")
+                    .len();
+                let found = Self::find_fitting(before, after, required, bytes - 1, |_| {
+                    Ok::<_, std::convert::Infallible>(true)
+                })
+                .expect("infallible acceptance");
+                let Some(better) = found else { break };
+                program = better;
+            }
+        }
+        program
+    }
+
+    /// Exhaustive, byte-bounded admission of unique-ID move programs, including
+    /// cyclic temporary handles and required no-op pins. No schedule, pin-set,
+    /// row-count or search-node limit can turn a fitting program into rejection.
+    /// The caller supplies the real request/raw-layer budget and validates each
+    /// final candidate. Fast encodings should be tried first.
+    ///
+    /// A moved row can never move again: its relative order with every other
+    /// moved row must already be final. Prune only that necessary condition,
+    /// exact prefix bytes, and a weighted common-subsequence lower bound on
+    /// remaining moves. Iterative DFS retains O(n) search state (plus ID bytes),
+    /// rather than a permutation frontier or catalog-sized recursion stack.
+    /// Worst-case search time is exponential; it is used only after fast
+    /// candidates fail the actual budget, or to refine small inventories.
+    pub fn find_fitting<E>(
+        before: &[String],
+        after: &[String],
+        required: &std::collections::BTreeSet<&str>,
+        max_bytes: usize,
+        mut accept: impl FnMut(&[Self]) -> std::result::Result<bool, E>,
+    ) -> std::result::Result<Option<Vec<Self>>, E> {
+        let ranks = after
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect::<BTreeMap<_, _>>();
+        if ranks.len() != after.len() || before.len() != after.len() {
+            return Ok(None);
+        }
+        let Some(mut current) = before
+            .iter()
+            .map(|id| ranks.get(id).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        if current
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != after.len()
+        {
+            return Ok(None);
+        }
+        let costs = after
+            .iter()
+            .map(|id| serde_json::to_vec(id).expect("string serializes").len())
+            .collect::<Vec<_>>();
+        let required = after
+            .iter()
+            .map(|id| required.contains(id.as_str()))
+            .collect::<Vec<_>>();
+        let anchor_floor = costs.iter().copied().min().unwrap_or(4).min(4);
+        let minimum = costs
+            .iter()
+            .map(|cost| cost + Self::framing_bytes() + anchor_floor + 1)
+            .collect::<Vec<_>>();
+        // Required pins already consume these bytes in EVERY program. A row
+        // whose additional minimum cost exceeds the budget must remain
+        // stationary. This is a proof, never a heuristic choice of pin set.
+        let required_bytes = minimum
+            .iter()
+            .zip(&required)
+            .filter(|(_, required)| **required)
+            .map(|(bytes, _)| bytes)
+            .sum::<usize>();
+        let mut stationary = minimum
+            .iter()
+            .zip(&required)
+            .map(|(bytes, required)| {
+                !required
+                    && 1usize.saturating_add(required_bytes).saturating_add(*bytes) > max_bytes
+            })
+            .collect::<Vec<_>>();
+        let unused = vec![false; after.len()];
+        let floor = Self::remaining_move_floor(&current, &unused, &stationary, &required, &costs);
+        if 1usize.saturating_add(floor).max(2) > max_bytes {
+            return Ok(None);
+        }
+        // Only expensive rows inside the changed span can make these extra
+        // proofs useful. Do not rescan a catalog-sized unchanged prefix for
+        // every optional row before trying its few cheap temporary handles.
+        if let (Some(first), Some(last)) = (
+            current
+                .iter()
+                .enumerate()
+                .position(|(index, row)| index != *row),
+            current
+                .iter()
+                .enumerate()
+                .rposition(|(index, row)| index != *row),
+        ) {
+            let slack = max_bytes.saturating_sub(1usize.saturating_add(floor));
+            for (row, &is_required) in required.iter().enumerate().take(last + 1).skip(first) {
+                if is_required || stationary[row] || minimum[row] <= slack {
+                    continue;
+                }
+                let mut constrained = required.clone();
+                constrained[row] = true;
+                let floor = Self::remaining_move_floor(
+                    &current,
+                    &unused,
+                    &stationary,
+                    &constrained,
+                    &costs,
+                );
+                if 1usize.saturating_add(floor) > max_bytes {
+                    stationary[row] = true;
+                }
+            }
+        }
+        let mut rows = (0..after.len()).collect::<Vec<_>>();
+        rows.sort_by_key(|&row| (costs[row], row));
+        // Try cheap handles before scanning a potentially huge unchanged
+        // prefix. Candidate ordering changes no admissible schedule or bound.
+        let mut anchors = std::iter::once(None)
+            .chain((0..after.len()).map(Some))
+            .collect::<Vec<_>>();
+        anchors.sort_by_key(|anchor| (anchor.map_or(4, |row| costs[row]), *anchor));
+        let mut used = vec![false; after.len()];
+        let mut program = Vec::new();
+        struct Frame {
+            cursor: usize,
+            bytes: usize,
+            undo: Option<(usize, usize)>,
+        }
+        let mut stack = vec![Frame {
+            cursor: 0,
+            bytes: 2,
+            undo: None,
+        }];
+        while let Some(frame) = stack.last_mut() {
+            if frame.cursor == 0 {
+                let remaining =
+                    Self::remaining_move_floor(&current, &used, &stationary, &required, &costs);
+                let floor = frame
+                    .bytes
+                    .saturating_add(remaining)
+                    .saturating_sub(usize::from(program.is_empty() && remaining > 0));
+                if floor > max_bytes {
+                    frame.cursor = rows.len() * (rows.len() + 1);
+                } else if current.iter().copied().eq(0..after.len())
+                    && required
+                        .iter()
+                        .zip(&used)
+                        .all(|(required, used)| !required || *used)
+                    && accept(&program)?
+                {
+                    return Ok(Some(program));
+                }
+            }
+            if frame.cursor == rows.len() * (rows.len() + 1) {
+                let frame = stack.pop().expect("existing frame");
+                if let Some((row, source)) = frame.undo {
+                    let destination = current.iter().position(|&id| id == row).expect("moved row");
+                    current.remove(destination);
+                    current.insert(source, row);
+                    used[row] = false;
+                    program.pop();
+                }
+                continue;
+            }
+            let row = rows[frame.cursor / (rows.len() + 1)];
+            let anchor = anchors[frame.cursor % anchors.len()];
+            frame.cursor += 1;
+            if used[row] || stationary[row] {
+                frame.cursor = frame.cursor.div_ceil(rows.len() + 1) * (rows.len() + 1);
+                continue;
+            }
+            if anchor == Some(row) {
+                continue;
+            }
+            let bytes = frame.bytes
+                + Self::framing_bytes()
+                + costs[row]
+                + anchor.map_or(4, |id| costs[id])
+                + usize::from(!program.is_empty());
+            if bytes > max_bytes {
+                continue;
+            }
+            let source = current
+                .iter()
+                .position(|&id| id == row)
+                .expect("existing row");
+            let destination = anchor.map_or(0, |id| {
+                let index = current
+                    .iter()
+                    .position(|&candidate| candidate == id)
+                    .expect("existing anchor");
+                index + usize::from(index < source)
+            });
+            if source == destination && !required[row] {
+                continue;
+            }
+            current.remove(source);
+            current.insert(destination, row);
+            used[row] = true;
+            let mut previous = None;
+            let mut valid = true;
+            for &id in current.iter().filter(|&&id| used[id]) {
+                if previous.is_some_and(|prior| prior > id) {
+                    valid = false;
+                    break;
+                }
+                previous = Some(id);
+            }
+            if valid {
+                program.push(Self {
+                    id: after[row].clone(),
+                    after: anchor.map(|id| after[id].clone()),
+                });
+                stack.push(Frame {
+                    cursor: 0,
+                    bytes,
+                    undo: Some((row, source)),
+                });
+            } else {
+                current.remove(destination);
+                current.insert(source, row);
+                used[row] = false;
+            }
+        }
+        Ok(None)
+    }
+
+    fn remaining_move_floor(
+        current: &[usize],
+        used: &[bool],
+        stationary: &[bool],
+        required: &[bool],
+        costs: &[usize],
+    ) -> usize {
+        let fixed = used
+            .iter()
+            .zip(stationary)
+            .map(|(used, stationary)| *used || *stationary)
+            .collect::<Vec<_>>();
+        let mut previous = None;
+        let mut gaps = vec![[(usize::MAX, usize::MAX); 2]];
+        for &row in current {
+            if fixed[row] {
+                if previous.is_some_and(|prior| prior > row) {
+                    return usize::MAX;
+                }
+                previous = Some(row);
+                gaps.push([(usize::MAX, usize::MAX); 2]);
+            } else {
+                let cheapest = gaps.last_mut().expect("current gap");
+                let candidate = (costs[row], row);
+                if candidate < cheapest[0] {
+                    cheapest[1] = cheapest[0];
+                    cheapest[0] = candidate;
+                } else if candidate < cheapest[1] {
+                    cheapest[1] = candidate;
+                }
+            }
+        }
+        // A future anchor is either still unmoved in this physical gap, or has
+        // already moved to a final position before this row in the target gap.
+        // Null is possible only before every fixed row. This also accounts for
+        // cyclic handles: a still-unmoved anchor may have a LATER target rank.
+        let mut minimum = vec![0usize; current.len()];
+        let mut gap = 0;
+        let mut predecessor_cost = 4;
+        let mut future_cost = usize::MAX;
+        let mut total = 0;
+        for (row, &cost) in costs.iter().enumerate() {
+            if fixed[row] {
+                gap += 1;
+                predecessor_cost = cost;
+                future_cost = usize::MAX;
+            } else {
+                let cheapest = gaps[gap];
+                let current_cost = if cheapest[0].1 == row {
+                    cheapest[1].0
+                } else {
+                    cheapest[0].0
+                };
+                let anchor = predecessor_cost.min(current_cost).min(future_cost);
+                minimum[row] = cost + Self::framing_bytes() + anchor + 1;
+                total += minimum[row];
+                future_cost = future_cost.min(cost);
+            }
+        }
+        // Rows that never move form a common subsequence containing every
+        // already fixed row and excluding outstanding required pins. A bonus
+        // greater than all optional weights forces all fixed rows into its LIS.
+        let bonus = total + 1;
+        let mut prefixes = vec![0usize; current.len() + 1];
+        let mut best = 0;
+        let mut fixed_count = 0;
+        for &row in current {
+            if required[row] && !used[row] {
+                continue;
+            }
+            let weight = if fixed[row] {
+                fixed_count += 1;
+                bonus
+            } else {
+                minimum[row]
+            };
+            let mut prior = 0;
+            let mut slot = row;
+            while slot > 0 {
+                prior = prior.max(prefixes[slot]);
+                slot &= slot - 1;
+            }
+            let candidate = prior + weight;
+            best = best.max(candidate);
+            slot = row + 1;
+            while slot < prefixes.len() {
+                prefixes[slot] = prefixes[slot].max(candidate);
+                slot += slot & slot.wrapping_neg();
+            }
+        }
+        total - (best - fixed_count * bonus)
     }
 
     fn framing_bytes() -> usize {

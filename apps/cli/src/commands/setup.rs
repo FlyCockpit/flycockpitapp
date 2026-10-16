@@ -736,8 +736,11 @@ async fn apply_model_wizard_via_daemon(
         return Ok((false, false, None));
     }
     let expected_entry = entry.clone();
-    let model_patch =
-        cockpit_proto::ProviderModelPatch::between(&provider_view.entry.models, &entry.models)?;
+    let model_patch = cockpit_proto::ProviderModelPatch::between_for_entry(
+        &provider_view.entry.models,
+        &entry.models,
+        &entry,
+    )?;
     entry.models.clear();
     let mutation = cockpit_proto::ProviderMutationBatch {
         upserts: model_changed

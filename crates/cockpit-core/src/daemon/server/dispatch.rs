@@ -22480,64 +22480,46 @@ fn fit_provider_model_authoring(
     effective: &crate::config::providers::ProvidersConfig,
     authored: &crate::config::providers::ProvidersConfig,
 ) -> std::result::Result<(), ErrorPayload> {
-    let error = match doc.validate_provider_write(provider_id, entry) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-    let Some(patch) = patch.filter(|patch| {
-        error.is::<crate::config::providers::ProviderWriteValidationError>()
-            && patch.order.is_none()
-            && !patch.clear
-            && (!patch.moves.is_empty() || !patch.deletes.is_empty() || !patch.upserts.is_empty())
-    }) else {
-        return Err(provider_write_error(error));
+    let Some(patch) = patch else {
+        return doc
+            .validate_provider_write(provider_id, entry)
+            .map_err(provider_write_error);
     };
     let before = &effective.providers[provider_id].models;
     let mut after = before.clone();
     patch.apply(&mut after).map_err(bad_request)?;
-    if entry.model_order.is_none() && !patch.moves.is_empty() {
-        let order = after.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-        let required_pins = authored
-            .providers
-            .get(provider_id)
-            .into_iter()
-            .flat_map(|layer| {
-                layer
-                    .model_membership
-                    .placements
-                    .iter()
-                    .map(|placement| placement.id.as_str())
-            })
-            .chain(patch.upserts.iter().map(|row| row.id.as_str()))
-            .chain(
-                patch
-                    .updates
-                    .iter()
-                    .filter(|update| update.replace)
-                    .map(|update| update.id.as_str()),
-            )
-            .collect::<std::collections::BTreeSet<_>>();
-        if !required_pins.is_empty() {
-            // Choose durable placement intent independently of the request
-            // encoding, while retaining every previous pin and new/replaced row.
-            let next = order.iter().collect::<std::collections::BTreeSet<_>>();
-            let mut baseline = before
-                .iter()
-                .filter(|row| next.contains(&row.id))
-                .map(|row| row.id.clone())
-                .collect::<Vec<_>>();
-            let surviving = baseline
-                .iter()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>();
-            baseline.extend(order.iter().filter(|id| !surviving.contains(*id)).cloned());
+    let original_error = match doc.validate_provider_write(provider_id, entry) {
+        Ok(()) => {
+            if provider_model_authoring_candidate(
+                &readback,
+                doc,
+                provider_id,
+                entry.clone(),
+                &after,
+                authored,
+            )?
+            .is_some()
+            {
+                return Ok(());
+            }
+            None
+        }
+        Err(error) if error.is::<crate::config::providers::ProviderWriteValidationError>() => {
+            Some(error)
+        }
+        Err(error) => return Err(provider_write_error(error)),
+    };
+    // Metadata-only re-entry preserves even a non-idempotent authored program.
+    // Order/membership/image edits may choose another representation, but every
+    // candidate must retain surviving durable pins and exact raw composition.
+    if patch.clear {
+        // Empty replacement and empty complete order each exclude every lower
+        // row, including future refreshes. Try the individual constant-size
+        // forms if charging both redundant directives exhausted raw headroom.
+        for (models_replace, model_order) in [(true, None), (false, Some(Vec::new()))] {
             let mut candidate = entry.clone();
-            candidate.model_membership.placements =
-                crate::config::providers::ModelPlacement::between_with_pins(
-                    &baseline,
-                    &order,
-                    &required_pins,
-                );
+            candidate.models_replace = models_replace;
+            candidate.model_order = model_order;
             if let Some(candidate) = provider_model_authoring_candidate(
                 &readback,
                 doc,
@@ -22550,23 +22532,110 @@ fn fit_provider_model_authoring(
                 return Ok(());
             }
         }
-        // An incoming program may reuse previous pins or temporary anchors.
-        // Retain every surviving pin, then test the program against the REAL
-        // lower layers. Its correctness cannot be inferred from replaying it
-        // over the already composed effective inventory a second time.
+        return Err(original_error.map(provider_write_error).unwrap_or_else(|| bad_request("provider model authoring changed the effective inventory; no configuration was written")));
+    }
+    if patch.order.is_none()
+        && patch.moves.is_empty()
+        && patch.deletes.is_empty()
+        && patch.upserts.is_empty()
+        && patch.updates.is_empty()
+    {
+        return Err(original_error.map(provider_write_error).unwrap_or_else(|| bad_request("provider model authoring changed the effective inventory; no configuration was written")));
+    }
+    let order = after.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let prior = authored.providers.get(provider_id);
+    let required_pins = prior
+        .into_iter()
+        .flat_map(|layer| {
+            layer
+                .model_membership
+                .placements
+                .iter()
+                .map(|placement| placement.id.as_str())
+                .chain(layer.model_order.iter().flatten().map(String::as_str))
+        })
+        .chain(patch.upserts.iter().map(|row| row.id.as_str()))
+        .chain(
+            patch
+                .updates
+                .iter()
+                .filter(|update| update.replace)
+                .map(|update| update.id.as_str()),
+        )
+        .filter(|id| order.iter().any(|next| next == id))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut sparse = entry.clone();
+    sparse.model_order = None;
+    sparse.model_membership.placements.clear();
+    let mut unplaced = authored.clone();
+    unplaced
+        .providers
+        .insert(provider_id.into(), sparse.clone());
+    // Reconstruct the actual order BEFORE this layer's placements. Replaying
+    // incoming operations over the already composed inventory is insufficient.
+    let baseline = match doc.validate_provider_write(provider_id, &sparse) {
+        Ok(()) => {
+            let config = catalog_config_after_layer_writes(
+                readback.ctx,
+                readback.cwd,
+                readback.trust_policy,
+                &std::collections::BTreeMap::from([(doc.path.clone(), unplaced)]),
+            )?;
+            Some(
+                config
+                    .providers
+                    .get(provider_id)
+                    .ok_or_else(|| bad_request("provider inventory changed; reload before saving"))?
+                    .models
+                    .clone(),
+            )
+        }
+        Err(error) if error.is::<crate::config::providers::ProviderWriteValidationError>() => None,
+        Err(error) => return Err(provider_write_error(error)),
+    };
+    if let Some(baseline) = &baseline {
+        let baseline_order = baseline
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        if baseline_order
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            == order.iter().collect()
+            && baseline_order.len() == order.len()
+        {
+            sparse.model_membership.placements =
+                crate::config::providers::ModelPlacement::between_with_pins(
+                    &baseline_order,
+                    &order,
+                    &required_pins,
+                );
+            if let Some(candidate) = provider_model_authoring_candidate(
+                &readback,
+                doc,
+                provider_id,
+                sparse.clone(),
+                &after,
+                authored,
+            )? {
+                *entry = candidate;
+                return Ok(());
+            }
+        }
+    }
+    if !patch.moves.is_empty() {
         let incoming = patch
             .moves
             .iter()
             .map(|placement| placement.id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        let retained = entry
-            .model_membership
-            .placements
+        let retained = required_pins
             .iter()
-            .map(|placement| placement.id.as_str())
+            .copied()
             .filter(|id| !incoming.contains(id))
             .collect();
-        let mut candidate = entry.clone();
+        let mut candidate = sparse.clone();
         candidate.model_membership.placements = patch.moves.clone();
         candidate.model_membership.placements.extend(
             crate::config::providers::ModelPlacement::for_pinned_order(&order, &retained),
@@ -22584,13 +22653,9 @@ fn fit_provider_model_authoring(
         }
     }
     let mut full = patch.clone();
-    full.order = Some(after.iter().map(|row| row.id.clone()).collect());
+    full.order = Some(order.clone());
     full.moves.clear();
-    let mut layer = authored
-        .providers
-        .get(provider_id)
-        .cloned()
-        .unwrap_or_default();
+    let mut layer = prior.cloned().unwrap_or_default();
     full.apply_to_layer(before, &mut layer)
         .map_err(bad_request)?;
     let mut candidate = entry.clone();
@@ -22599,10 +22664,75 @@ fn fit_provider_model_authoring(
     candidate.model_field_patches = layer.model_field_patches;
     candidate.model_order = layer.model_order;
     candidate.model_membership = layer.model_membership;
-    doc.validate_provider_write(provider_id, &candidate)
-        .map_err(provider_write_error)?;
-    *entry = candidate;
-    Ok(())
+    if let Some(candidate) = provider_model_authoring_candidate(
+        &readback,
+        doc,
+        provider_id,
+        candidate.clone(),
+        &after,
+        authored,
+    )? {
+        *entry = candidate;
+        return Ok(());
+    }
+    // Complete order already excludes every ID outside `after`, including
+    // all inherited tombstones. When their duplicate literal representation
+    // exhausts the raw budget, retain the complete exclusion/pin authority in
+    // model_order instead. Actual image/order read-back remains mandatory.
+    if !candidate.model_membership.deletes.is_empty() {
+        candidate.model_membership.deletes.clear();
+        if let Some(candidate) = provider_model_authoring_candidate(
+            &readback,
+            doc,
+            provider_id,
+            candidate,
+            &after,
+            authored,
+        )? {
+            *entry = candidate;
+            return Ok(());
+        }
+    }
+    if let Some(baseline) = baseline {
+        let baseline_order = baseline
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        // The raw budget includes retained unknown metadata. Candidate read-back
+        // remains mandatory even after exact schedule search: order alone is
+        // insufficient to prove complete row images or layered composition.
+        match doc.provider_placement_byte_budget(provider_id, &sparse) {
+            Ok(budget) => {
+                let mut accepted = None;
+                crate::config::providers::ModelPlacement::find_fitting(
+                    &baseline_order,
+                    &order,
+                    &required_pins,
+                    budget,
+                    |program| {
+                        let mut candidate = sparse.clone();
+                        candidate.model_membership.placements = program.to_vec();
+                        accepted = provider_model_authoring_candidate(
+                            &readback,
+                            doc,
+                            provider_id,
+                            candidate,
+                            &after,
+                            authored,
+                        )?;
+                        Ok::<_, ErrorPayload>(accepted.is_some())
+                    },
+                )?;
+                if let Some(candidate) = accepted {
+                    *entry = candidate;
+                    return Ok(());
+                }
+            }
+            Err(error) if error.is::<crate::config::providers::ProviderWriteValidationError>() => {}
+            Err(error) => return Err(provider_write_error(error)),
+        }
+    }
+    Err(original_error.map(provider_write_error).unwrap_or_else(|| bad_request("provider model authoring cannot preserve the effective inventory within the authored entry limit; no configuration was written")))
 }
 
 async fn ensure_catalog_candidate_readable(

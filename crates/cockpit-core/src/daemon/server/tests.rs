@@ -46582,7 +46582,34 @@ async fn catalog_writes_check_complete_read_contract() {
             },
         );
         std::fs::write(&path, "{}").unwrap();
-        ConfigDoc::load(&path).unwrap().write(&config).unwrap();
+        let providers_dir = path.parent().unwrap().join("providers");
+        if providers_dir.exists() {
+            std::fs::remove_dir_all(&providers_dir).unwrap();
+        }
+        if branch == "live" {
+            ConfigDoc::load(&path).unwrap().write(&config).unwrap();
+        } else {
+            assert!(
+                serde_json::to_vec(&config.providers[id]).unwrap().len()
+                    > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES,
+                "fixture must exercise a pre-existing over-limit catalog"
+            );
+            // Seed legacy state directly: new authored writes correctly reject
+            // it before the fetch/trim boundary this test needs to exercise.
+            std::fs::create_dir_all(&providers_dir).unwrap();
+            for (provider_id, entry) in &config.providers {
+                std::fs::write(
+                    global_provider_path(provider_id),
+                    serde_json::to_vec(entry).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(ConfigDoc::load(&path).unwrap().providers().providers).unwrap(),
+            serde_json::to_value(&config.providers).unwrap(),
+            "{branch}: complete fixture image must reach the fetch"
+        );
         let response = provider_models_fetch(
             &ctx,
             &root,
@@ -46664,8 +46691,29 @@ async fn catalog_protected_overflow_rejects_without_writing() {
             ..Default::default()
         },
     );
-    ConfigDoc::load(&path).unwrap().write(&config).unwrap();
+    assert!(
+        serde_json::to_vec(&config.providers["local"])
+            .unwrap()
+            .len()
+            > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
+    );
+    // This is a pre-existing legacy catalog, not an oversized new write.
+    // Bypass only fixture authoring so the real fetch must reject without writes.
+    let provider_path = global_provider_path("local");
+    std::fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &provider_path,
+        serde_json::to_vec(&config.providers["local"]).unwrap(),
+    )
+    .unwrap();
     let before = std::fs::read(&path).unwrap();
+    let before_provider = std::fs::read(&provider_path).unwrap();
+    let before_effective =
+        serde_json::to_value(ConfigDoc::load(&path).unwrap().providers().providers).unwrap();
+    assert_eq!(
+        before_effective,
+        serde_json::to_value(&config.providers).unwrap()
+    );
     let error = provider_models_fetch(
         &ctx,
         &workspace.to_string_lossy(),
@@ -46678,15 +46726,17 @@ async fn catalog_protected_overflow_rejects_without_writing() {
     )
     .await
     .unwrap_err();
+    assert_eq!(error.code, ErrorCode::BadRequest);
     assert!(
         error.message.contains("no catalog was written"),
         "{}",
         error.message
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(std::fs::read(&provider_path).unwrap(), before_provider);
     assert_eq!(
         serde_json::to_value(ConfigDoc::load(&path).unwrap().providers().providers).unwrap(),
-        serde_json::to_value(&config.providers).unwrap()
+        before_effective
     );
     server.await.unwrap();
 }

@@ -22422,11 +22422,57 @@ fn catalog_config_after_layer_writes(
         .map_err(provider_write_error)
 }
 
+struct ProviderAuthoringReadback<'a> {
+    ctx: &'a DaemonContext,
+    cwd: &'a std::path::Path,
+    trust_policy: &'a crate::config::trust::WorkspaceTrustPolicy,
+}
+
+fn provider_model_authoring_candidate(
+    readback: &ProviderAuthoringReadback<'_>,
+    doc: &crate::config::providers::ConfigDoc,
+    provider_id: &str,
+    candidate: crate::config::providers::ProviderEntry,
+    expected: &[crate::config::providers::ModelEntry],
+    authored: &crate::config::providers::ProvidersConfig,
+) -> std::result::Result<Option<crate::config::providers::ProviderEntry>, ErrorPayload> {
+    match doc.validate_provider_write(provider_id, &candidate) {
+        Ok(()) => {}
+        Err(error) if error.is::<crate::config::providers::ProviderWriteValidationError>() => {
+            return Ok(None);
+        }
+        Err(error) => return Err(provider_write_error(error)),
+    }
+    let mut layer = authored.clone();
+    layer
+        .providers
+        .insert(provider_id.into(), candidate.clone());
+    let composed = catalog_config_after_layer_writes(
+        readback.ctx,
+        readback.cwd,
+        readback.trust_policy,
+        &std::collections::BTreeMap::from([(doc.path.clone(), layer)]),
+    )?;
+    let observed = &composed
+        .providers
+        .get(provider_id)
+        .ok_or_else(|| bad_request("provider inventory changed; reload before saving"))?
+        .models;
+    if serde_json::to_vec(observed).map_err(internal)?
+        == serde_json::to_vec(expected).map_err(internal)?
+    {
+        Ok(Some(candidate))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Request-byte minimization cannot see accumulated authored intent or raw
-/// unknown fields. Check the actual final layer too. If retaining sparse pins
-/// exceeds its quota, a complete order can still fit without dropping any old
-/// pin/tombstone authority. Never compact by silently unpinning previous moves.
+/// unknown fields. Check the actual final layer too: reuse prior pins or a
+/// raw-equivalent incoming program before trying full order. Every candidate
+/// retains prior pin/tombstone authority. Never silently unpin previous moves.
 fn fit_provider_model_authoring(
+    readback: ProviderAuthoringReadback<'_>,
     doc: &crate::config::providers::ConfigDoc,
     provider_id: &str,
     entry: &mut crate::config::providers::ProviderEntry,
@@ -22449,6 +22495,94 @@ fn fit_provider_model_authoring(
     let before = &effective.providers[provider_id].models;
     let mut after = before.clone();
     patch.apply(&mut after).map_err(bad_request)?;
+    if entry.model_order.is_none() && !patch.moves.is_empty() {
+        let order = after.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        let required_pins = authored
+            .providers
+            .get(provider_id)
+            .into_iter()
+            .flat_map(|layer| {
+                layer
+                    .model_membership
+                    .placements
+                    .iter()
+                    .map(|placement| placement.id.as_str())
+            })
+            .chain(patch.upserts.iter().map(|row| row.id.as_str()))
+            .chain(
+                patch
+                    .updates
+                    .iter()
+                    .filter(|update| update.replace)
+                    .map(|update| update.id.as_str()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        if !required_pins.is_empty() {
+            // Choose durable placement intent independently of the request
+            // encoding, while retaining every previous pin and new/replaced row.
+            let next = order.iter().collect::<std::collections::BTreeSet<_>>();
+            let mut baseline = before
+                .iter()
+                .filter(|row| next.contains(&row.id))
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>();
+            let surviving = baseline
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            baseline.extend(order.iter().filter(|id| !surviving.contains(*id)).cloned());
+            let mut candidate = entry.clone();
+            candidate.model_membership.placements =
+                crate::config::providers::ModelPlacement::between_with_pins(
+                    &baseline,
+                    &order,
+                    &required_pins,
+                );
+            if let Some(candidate) = provider_model_authoring_candidate(
+                &readback,
+                doc,
+                provider_id,
+                candidate,
+                &after,
+                authored,
+            )? {
+                *entry = candidate;
+                return Ok(());
+            }
+        }
+        // An incoming program may reuse previous pins or temporary anchors.
+        // Retain every surviving pin, then test the program against the REAL
+        // lower layers. Its correctness cannot be inferred from replaying it
+        // over the already composed effective inventory a second time.
+        let incoming = patch
+            .moves
+            .iter()
+            .map(|placement| placement.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let retained = entry
+            .model_membership
+            .placements
+            .iter()
+            .map(|placement| placement.id.as_str())
+            .filter(|id| !incoming.contains(id))
+            .collect();
+        let mut candidate = entry.clone();
+        candidate.model_membership.placements = patch.moves.clone();
+        candidate.model_membership.placements.extend(
+            crate::config::providers::ModelPlacement::for_pinned_order(&order, &retained),
+        );
+        if let Some(candidate) = provider_model_authoring_candidate(
+            &readback,
+            doc,
+            provider_id,
+            candidate,
+            &after,
+            authored,
+        )? {
+            *entry = candidate;
+            return Ok(());
+        }
+    }
     let mut full = patch.clone();
     full.order = Some(after.iter().map(|row| row.id.clone()).collect());
     full.moves.clear();
@@ -23994,6 +24128,11 @@ async fn stage_and_recover_provider_batch(
             upsert.entry.model_membership = Default::default();
         }
         fit_provider_model_authoring(
+            ProviderAuthoringReadback {
+                ctx,
+                cwd: &cwd,
+                trust_policy: &trust_policy,
+            },
             &doc,
             &upsert.provider_id,
             &mut upsert.entry,

@@ -3129,21 +3129,100 @@ fn byte_bounded_placements_minimize_serialized_cost_for_unequal_escaped_ids() {
             if !stable.windows(2).all(|pair| pair[0] < pair[1]) {
                 continue;
             }
-            let candidate = after
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| mask & (1 << i) == 0)
-                .map(|(i, id)| ModelPlacement {
-                    id: id.clone(),
-                    after: i.checked_sub(1).map(|prior| after[prior].clone()),
-                })
-                .collect::<Vec<_>>();
-            minimum = minimum.min(serde_json::to_vec(&candidate).unwrap().len());
+            // Independent exhaustive oracle: enumerate insertion trees with
+            // every preceding anchor within a movable gap, and every operation
+            // schedule. The old oracle tested only the immediate predecessor.
+            fn enumerate(
+                before: &[String],
+                after: &[String],
+                mask: usize,
+                used: usize,
+                program: &mut Vec<ModelPlacement>,
+                minimum: &mut usize,
+            ) {
+                if used | mask == (1 << after.len()) - 1 {
+                    let mut actual = before.to_vec();
+                    for placement in program.iter() {
+                        placement.apply(&mut actual, true).unwrap();
+                    }
+                    if actual == after {
+                        *minimum = (*minimum).min(serde_json::to_vec(program).unwrap().len());
+                    }
+                    return;
+                }
+                for i in 0..after.len() {
+                    if (used | mask) & (1 << i) != 0 {
+                        continue;
+                    }
+                    let root = (0..i).rev().find(|prior| mask & (1 << prior) != 0);
+                    let anchors = root.map_or(0, |prior| prior + 1)..=i;
+                    for anchor in anchors {
+                        program.push(ModelPlacement {
+                            id: after[i].clone(),
+                            after: anchor.checked_sub(1).map(|prior| after[prior].clone()),
+                        });
+                        enumerate(before, after, mask, used | (1 << i), program, minimum);
+                        program.pop();
+                    }
+                }
+            }
+            enumerate(&before, &after, mask, 0, &mut Vec::new(), &mut minimum);
         }
-        assert_eq!(
-            serde_json::to_vec(&selected).unwrap().len(),
-            minimum,
-            "compare actual JSON bytes, including escaping, anchors, separators and null"
+        assert!(
+            serde_json::to_vec(&selected).unwrap().len() <= minimum,
+            "compare actual JSON bytes against every independently enumerated insertion tree; temporary anchors can be even cheaper"
         );
     }
+}
+
+fn assert_byte_bounded_placement_volume(rows: usize) {
+    let before = std::iter::once("a".to_owned())
+        .chain((0..rows).map(|i| format!("row-{i:05}")))
+        .collect::<Vec<_>>();
+    let mut after = before.clone();
+    after.rotate_left(1);
+    let program = ModelPlacement::between(&before, &after);
+    assert_eq!(program.len(), 1);
+    assert!(serde_json::to_vec(&program).unwrap().len() < 128);
+    let mut actual = before;
+    for placement in program {
+        placement.apply(&mut actual, true).unwrap();
+    }
+    assert_eq!(actual, after);
+}
+
+#[test]
+fn byte_bounded_placement_volume_100() {
+    assert_byte_bounded_placement_volume(100);
+}
+#[test]
+fn byte_bounded_placement_volume_1000() {
+    assert_byte_bounded_placement_volume(1000);
+}
+#[test]
+fn byte_bounded_placement_volume_10000() {
+    assert_byte_bounded_placement_volume(10000);
+}
+
+#[test]
+fn byte_bounded_placement_search_does_not_amplify_a_long_temporary_anchor() {
+    let long = "anchor".repeat(22 * 1024);
+    let mut before = (0..1000).map(|i| format!("row-{i:04}")).collect::<Vec<_>>();
+    before.push(long.clone());
+    let mut after = before.clone();
+    after.rotate_right(1);
+    let program = ModelPlacement::between(&before, &after);
+    assert_eq!(
+        program,
+        [ModelPlacement {
+            id: long,
+            after: None
+        }]
+    );
+    assert!(serde_json::to_vec(&program).unwrap().len() < MAX_AUTHORED_PROVIDER_ENTRY_BYTES);
+    let mut actual = before;
+    for placement in program {
+        placement.apply(&mut actual, true).unwrap();
+    }
+    assert_eq!(actual, after);
 }

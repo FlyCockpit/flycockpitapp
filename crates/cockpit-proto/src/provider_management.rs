@@ -261,17 +261,40 @@ impl ProviderModelPatch {
                 .chain(self.moves.iter().map(|p| p.id.as_str()))
                 .chain(self.upserts.iter().map(|row| row.id.as_str()))
                 .collect::<std::collections::BTreeSet<_>>();
-            let placements = after
+            let order = after.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+            let mut placements =
+                cockpit_config::config::providers::ModelPlacement::for_pinned_order(&order, &moved);
+            // Preserve validated programs as well as canonical insertion
+            // forests. On a fresh sparse layer this admits ANY incoming anchor
+            // schedule. On an existing layer, disjoint pure-order programs can
+            // be concatenated exactly without discarding previous pins. A
+            // deletion/replacement can invalidate old anchors, so those edits
+            // use the complete surviving-pin normalization above.
+            let old_pins = layer
+                .model_membership
+                .placements
                 .iter()
-                .enumerate()
-                .filter(|(_, row)| moved.contains(row.id.as_str()))
-                .map(
-                    |(i, row)| cockpit_config::config::providers::ModelPlacement {
-                        id: row.id.clone(),
-                        after: i.checked_sub(1).map(|prior| after[prior].id.clone()),
-                    },
-                )
-                .collect();
+                .map(|p| p.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let can_append = old_pins.is_empty()
+                || (self.deletes.is_empty()
+                    && self.moves.iter().all(|p| !old_pins.contains(p.id.as_str())));
+            if can_append
+                && self.upserts.is_empty()
+                && !self.updates.iter().any(|update| update.replace)
+            {
+                let mut program = layer.model_membership.placements.clone();
+                program.extend(self.moves.iter().cloned());
+                if serde_json::to_vec(&program)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    <= serde_json::to_vec(&placements)
+                        .map_err(|error| error.to_string())?
+                        .len()
+                {
+                    placements = program;
+                }
+            }
             let deletes = layer
                 .model_membership
                 .deletes
@@ -1043,6 +1066,146 @@ mod model_patch_tests {
             serde_json::to_value(actual).unwrap(),
             serde_json::to_value(rotated).unwrap()
         );
+    }
+
+    #[test]
+    fn model_patch_non_immediate_program_preserves_tombstones_and_existing_pins() {
+        use cockpit_config::config::{
+            WorkspaceConfigLayerSnapshot,
+            providers::{ConfigDoc, ModelPlacement, ProviderEntry},
+        };
+        let ids = ["a".into(), "b".repeat(900), "c".into(), "d".repeat(900)];
+        let rows = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| ModelEntry {
+                id: id.clone(),
+                name: Some(format!("independent-{i}")),
+                favorite: i % 2 == 0,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let snapshot = |entry: &ProviderEntry| WorkspaceConfigLayerSnapshot {
+            origin: None,
+            project_root: None,
+            config_json: None,
+            provider_files: vec![("p".into(), serde_json::to_vec(entry).unwrap())],
+            effective_default_artifact_digest: None,
+            digest: "layer".into(),
+        };
+        let mut lower = ProviderEntry {
+            models: rows.clone(),
+            ..Default::default()
+        };
+        lower.models.push(ModelEntry {
+            id: "deleted-inherited".into(),
+            ..Default::default()
+        });
+        let mut layer = ProviderEntry::default();
+        layer
+            .model_membership
+            .deletes
+            .push("deleted-inherited".into());
+        let after = [1, 0, 3, 2].map(|i| rows[i].clone());
+        let mut patch = ProviderModelPatch::between(&rows, &after).unwrap();
+        patch.order = None;
+        // `c` is a temporary cheap anchor: its final position is AFTER `a`.
+        // Rewriting this as `a after b` duplicates the long inherited b ID.
+        patch.moves = vec![
+            ModelPlacement {
+                id: ids[0].clone(),
+                after: Some(ids[2].clone()),
+            },
+            ModelPlacement {
+                id: ids[2].clone(),
+                after: Some(ids[3].clone()),
+            },
+        ];
+        let mut applied = rows.clone();
+        patch.apply(&mut applied).unwrap();
+        assert_eq!(
+            serde_json::to_value(&applied).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        patch.apply_to_layer(&rows, &mut layer).unwrap();
+        assert_eq!(
+            layer.model_membership.placements, patch.moves,
+            "retain a smaller valid non-immediate program"
+        );
+        assert_eq!(layer.model_membership.deletes, ["deleted-inherited"]);
+        let merged = ConfigDoc::providers_from_workspace_layer_snapshots(&[
+            snapshot(&lower),
+            snapshot(&layer),
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&merged.providers["p"].models).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        let mut next = after.to_vec();
+        next.rotate_left(1);
+        let next_patch = ProviderModelPatch::between(&after, &next).unwrap();
+        let previous_pins = layer
+            .model_membership
+            .placements
+            .iter()
+            .map(|p| p.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        next_patch.apply_to_layer(&after, &mut layer).unwrap();
+        assert!(layer.model_order.is_none());
+        let actual_pins = layer
+            .model_membership
+            .placements
+            .iter()
+            .map(|p| p.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            previous_pins.is_subset(&actual_pins),
+            "never discard old pins"
+        );
+        assert_eq!(layer.model_membership.deletes, ["deleted-inherited"]);
+        let merged = ConfigDoc::providers_from_workspace_layer_snapshots(&[
+            snapshot(&lower),
+            snapshot(&layer),
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&merged.providers["p"].models).unwrap(),
+            serde_json::to_value(&next).unwrap()
+        );
+        assert!(layer.models.is_empty() && layer.model_field_patches.is_empty());
+    }
+
+    #[test]
+    fn byte_bounded_large_reverse_selects_fitting_full_order_after_sparse_lower_bound() {
+        let before = (0..10_000)
+            .map(|i| ModelEntry {
+                id: format!("row-{i:05}"),
+                name: Some(format!("image-{i}")),
+                favorite: i % 7 == 0,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut after = before.clone();
+        after.reverse();
+        let patch = ProviderModelPatch::between(&before, &after).unwrap();
+        assert!(patch.upserts.is_empty() && patch.updates.is_empty() && patch.moves.is_empty());
+        assert_eq!(
+            patch.order.as_ref().unwrap(),
+            &after.iter().map(|row| row.id.clone()).collect::<Vec<_>>()
+        );
+        assert!(serde_json::to_vec(&patch).unwrap().len() < crate::MAX_OWNER_PROVIDER_ENTRY_BYTES);
+        let mut actual = before.clone();
+        patch.apply(&mut actual).unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        let mut layer = cockpit_config::config::providers::ProviderEntry::default();
+        patch.apply_to_layer(&before, &mut layer).unwrap();
+        assert_eq!(layer.model_order, patch.order);
+        assert!(layer.models.is_empty() && layer.model_field_patches.is_empty());
+        assert!(serde_json::to_vec(&layer).unwrap().len() < crate::MAX_OWNER_PROVIDER_ENTRY_BYTES);
     }
 
     #[test]

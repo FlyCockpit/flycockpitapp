@@ -1432,43 +1432,205 @@ impl ModelPlacement {
         Ok(())
     }
 
-    /// Minimum serialized placement bytes relative to the surviving rows
-    /// followed by appended new rows. A maximum-weight increasing subsequence
-    /// stays in place: the weight saved by keeping a row includes its ID, its
-    /// desired predecessor, JSON escaping, and the operation's comma. Counting
-    /// moves alone can select an oversized encoding when ID lengths differ.
+    /// Compare insertion forests with schedules that can use temporary
+    /// anchors. Once a row is placed, its order relative to every stationary
+    /// or already placed row is final; not-yet-placed rows can still serve as
+    /// cheap anchors and move away later.
     pub fn between(before: &[String], after: &[String]) -> Vec<Self> {
-        let positions = before
+        if before == after || after.is_empty() {
+            return Vec::new();
+        }
+        let framing = Self::framing_bytes();
+        let indexes = after
             .iter()
             .enumerate()
             .map(|(i, id)| (id, i))
             .collect::<BTreeMap<_, _>>();
-        // Fenwick prefix maxima make the weighted subsequence O(n log n).
-        // All placements use the preceding desired row, so moving the other
-        // rows from left to right gives exactly `after` for any such subsequence.
-        let mut prefixes = vec![(0usize, None); before.len() + 1];
-        let mut previous = vec![None; after.len()];
-        for (i, id) in after.iter().enumerate() {
-            let position = positions[id];
+        let initial = before.iter().map(|id| indexes[id]).collect::<Vec<_>>();
+        let costs = after
+            .iter()
+            .map(|id| serde_json::to_vec(id).expect("string serializes").len())
+            .collect::<Vec<_>>();
+        let row_weighted = Self::row_weighted_pins(&initial, &costs);
+        let anchor_cost = costs.iter().copied().min().unwrap_or(4).min(4);
+        let lower_bound = row_weighted
+            .iter()
+            .map(|index| costs[*index] + framing + 1 + anchor_cost)
+            .sum::<usize>();
+        // Even an arbitrary placement program must move the complement of a
+        // common subsequence and pay these ID/framing bytes. If that alone is
+        // oversized, skip the forest search; the caller can still choose full
+        // order, whose framing is smaller, or reject the exact charged edit.
+        if lower_bound > MAX_AUTHORED_PROVIDER_ENTRY_BYTES {
+            let pinned = row_weighted
+                .iter()
+                .map(|index| after[*index].as_str())
+                .collect();
+            return Self::for_pinned_order(after, &pinned);
+        }
+        let mut best =
+            Self::insertion_forest_between(before, after, &std::collections::BTreeSet::new());
+        let mut best_bytes = serde_json::to_vec(&best)
+            .expect("placements serialize")
+            .len();
+        let pinned = best
+            .iter()
+            .map(|placement| indexes[&placement.id])
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut pin_sets = vec![pinned];
+        if !pin_sets.contains(&row_weighted) {
+            pin_sets.push(row_weighted);
+        }
+        for pinned in pin_sets {
+            let desired = pinned.iter().copied().collect::<Vec<_>>();
+            let mut by_cost = desired.clone();
+            by_cost.sort_by_key(|index| (costs[*index], *index));
+            let schedules = [
+                desired.clone(),
+                desired.into_iter().rev().collect(),
+                by_cost.clone(),
+                by_cost.into_iter().rev().collect(),
+            ];
+            for schedule in schedules {
+                for allow_scaffolds in [false, true] {
+                    let mut pending = std::collections::VecDeque::from(schedule.clone());
+                    let mut current = initial.clone();
+                    let mut fixed = (0..after.len())
+                        .filter(|index| !pinned.contains(index))
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let mut placed = vec![false; after.len()];
+                    let mut program = Vec::with_capacity(pinned.len());
+                    let mut program_bytes = 2usize;
+                    let mut exceeded = false;
+                    while let Some(row) = pending.pop_front() {
+                        let source = current
+                            .iter()
+                            .position(|id| *id == row)
+                            .expect("existing row");
+                        current.remove(source);
+                        let anchor = loop {
+                            let predecessor = fixed.range(..row).next_back();
+                            let successor = fixed.range(row..).next().copied();
+                            let start = predecessor.map_or(0, |id| {
+                                current
+                                    .iter()
+                                    .position(|candidate| candidate == id)
+                                    .expect("fixed predecessor")
+                                    + 1
+                            });
+                            let end = successor.map_or(current.len(), |id| {
+                                current
+                                    .iter()
+                                    .position(|candidate| *candidate == id)
+                                    .expect("fixed successor")
+                            });
+                            let mut anchor = start.checked_sub(1);
+                            let mut anchor_cost = anchor.map_or(4, |index| costs[current[index]]);
+                            for (index, id) in current.iter().enumerate().take(end).skip(start) {
+                                if costs[*id] < anchor_cost {
+                                    anchor = Some(index);
+                                    anchor_cost = costs[*id];
+                                }
+                            }
+                            // A stationary successor can be a cheap temporary
+                            // handle, then move back after this row. Keep each
+                            // ID single-use: an already placed row stays fixed.
+                            if allow_scaffolds
+                                && let Some(successor) = successor
+                                && !placed[successor]
+                                && costs[successor] < anchor_cost
+                            {
+                                fixed.remove(&successor);
+                                pending.push_back(successor);
+                                continue;
+                            }
+                            break anchor;
+                        };
+                        // Charge prefixes before cloning long anchor strings.
+                        // A prefix already as large as the incumbent cannot win.
+                        let operation_bytes = framing
+                            + costs[row]
+                            + anchor.map_or(4, |index| costs[current[index]])
+                            + usize::from(!program.is_empty());
+                        if program_bytes.saturating_add(operation_bytes) >= best_bytes {
+                            exceeded = true;
+                            break;
+                        }
+                        program_bytes += operation_bytes;
+                        program.push(Self {
+                            id: after[row].clone(),
+                            after: anchor.map(|index| after[current[index]].clone()),
+                        });
+                        current.insert(anchor.map_or(0, |index| index + 1), row);
+                        fixed.insert(row);
+                        placed[row] = true;
+                    }
+                    if exceeded {
+                        continue;
+                    }
+                    let bytes = serde_json::to_vec(&program)
+                        .expect("placements serialize")
+                        .len();
+                    if bytes < best_bytes {
+                        best = program;
+                        best_bytes = bytes;
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Choose the cheapest insertion forest while retaining every required
+    /// durable pin. Request encodings need not determine new durable pins.
+    pub fn between_with_pins(
+        before: &[String],
+        after: &[String],
+        required: &std::collections::BTreeSet<&str>,
+    ) -> Vec<Self> {
+        let required = after
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| required.contains(id.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        Self::insertion_forest_between(before, after, &required)
+    }
+
+    fn framing_bytes() -> usize {
+        serde_json::to_vec(&Self {
+            id: String::new(),
+            after: None,
+        })
+        .expect("placement serializes")
+        .len()
+            - 2
+            - 4
+    }
+
+    // Temporary anchors can change which rows are cheapest to move. Keep a
+    // second common subsequence weighted without desired-predecessor costs.
+    fn row_weighted_pins(initial: &[usize], costs: &[usize]) -> std::collections::BTreeSet<usize> {
+        let mut positions = vec![0; initial.len()];
+        for (position, &index) in initial.iter().enumerate() {
+            positions[index] = position;
+        }
+        let anchor_cost = costs.iter().copied().min().unwrap_or(4).min(4);
+        let framing = Self::framing_bytes() + 1;
+        let mut prefixes = vec![(0usize, None); initial.len() + 1];
+        let mut previous = vec![None; initial.len()];
+        for (index, &cost) in costs.iter().enumerate() {
             let mut best = (0, None);
-            let mut slot = position;
+            let mut slot = positions[index];
             while slot > 0 {
                 if prefixes[slot].0 > best.0 {
                     best = prefixes[slot];
                 }
                 slot &= slot - 1;
             }
-            previous[i] = best.1;
-            let placement = Self {
-                id: id.clone(),
-                after: i.checked_sub(1).map(|prior| after[prior].clone()),
-            };
-            let weight = serde_json::to_vec(&placement)
-                .expect("string placement serializes")
-                .len()
-                + 1;
-            let candidate = (best.0 + weight, Some(i));
-            slot = position + 1;
+            previous[index] = best.1;
+            let candidate = (best.0 + cost + framing + anchor_cost, Some(index));
+            slot = positions[index] + 1;
             while slot < prefixes.len() {
                 if candidate.0 > prefixes[slot].0 {
                     prefixes[slot] = candidate;
@@ -1476,29 +1638,197 @@ impl ModelPlacement {
                 slot += slot & slot.wrapping_neg();
             }
         }
-        let mut stable = std::collections::BTreeSet::new();
         let mut best = (0, None);
-        let mut slot = before.len();
+        let mut slot = initial.len();
         while slot > 0 {
             if prefixes[slot].0 > best.0 {
                 best = prefixes[slot];
             }
             slot &= slot - 1;
         }
+        let mut stable = std::collections::BTreeSet::new();
         let mut cursor = best.1;
         while let Some(index) = cursor {
             stable.insert(index);
             cursor = previous[index];
         }
-        after
+        (0..initial.len())
+            .filter(|index| !stable.contains(index))
+            .collect()
+    }
+
+    /// Minimize serialized bytes over insertion forests and stable common
+    /// subsequences. Each movable gap can repeat any preceding anchor in that
+    /// gap; reverse prepends and non-immediate anchors are ordinary candidates.
+    fn insertion_forest_between(
+        before: &[String],
+        after: &[String],
+        required: &std::collections::BTreeSet<usize>,
+    ) -> Vec<Self> {
+        if before == after && required.is_empty() {
+            return Vec::new();
+        }
+        let positions = before
             .iter()
             .enumerate()
-            .filter(|(i, _)| !stable.contains(i))
-            .map(|(i, id)| Self {
-                id: id.clone(),
-                after: i.checked_sub(1).map(|prior| after[prior].clone()),
-            })
-            .collect()
+            .map(|(i, id)| (id, i))
+            .collect::<BTreeMap<_, _>>();
+        let ranks = after.iter().map(|id| positions[id]).collect::<Vec<_>>();
+        let costs = after
+            .iter()
+            .map(|id| serde_json::to_vec(id).expect("string serializes").len())
+            .collect::<Vec<_>>();
+        // A state keeps its last stationary row. Extending its movable gap
+        // charges the moved ID and cheapest preceding anchor, including JSON
+        // escaping and the comma. Stabilizing a row is possible exactly when
+        // its original position follows the previous stationary row.
+        // State zero is the virtual start anchor, serialized as null.
+        let overhead = Self::framing_bytes() + 1;
+        let mut states = vec![(0usize, 0usize, 4usize)];
+        let mut remaining = ranks
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut previous = Vec::with_capacity(after.len());
+        for (index, (&position, &cost)) in ranks.iter().zip(&costs).enumerate() {
+            let mut best = (usize::MAX, 0);
+            for &(state, bytes, _) in &states {
+                if !required.contains(&index)
+                    && (state == 0 || ranks[state - 1] < position)
+                    && bytes < best.0
+                {
+                    best = (bytes, state);
+                }
+            }
+            previous.push(best.1);
+            for (_, bytes, anchor) in &mut states {
+                *bytes += overhead + cost + *anchor;
+                *anchor = (*anchor).min(cost);
+            }
+            if !required.contains(&index) {
+                states.push((index + 1, best.0, cost));
+            }
+            remaining.remove(&position);
+            // States with the same next remaining original position have the
+            // same eligibility for EVERY future stationary row. Within that
+            // class, a cheaper state with a cheaper anchor dominates forever.
+            // This avoids quadratic scans of a long otherwise unchanged prefix
+            // when one cheap row is moved across a large catalog.
+            let bucket = |state: usize| {
+                if state == 0 {
+                    remaining.first().copied()
+                } else {
+                    remaining
+                        .range((
+                            std::ops::Bound::Excluded(ranks[state - 1]),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .copied()
+                }
+                .unwrap_or(usize::MAX)
+            };
+            let mut choices = BTreeMap::<(usize, usize), (usize, usize)>::new();
+            for &(state, bytes, anchor) in &states {
+                let choice = choices
+                    .entry((bucket(state), anchor))
+                    .or_insert((bytes, state));
+                if bytes < choice.0 {
+                    *choice = (bytes, state);
+                }
+            }
+            let mut keep = std::collections::BTreeSet::new();
+            let mut prior_bucket = None;
+            let mut least_bytes = usize::MAX;
+            for ((bucket, _), (bytes, state)) in choices {
+                if prior_bucket != Some(bucket) {
+                    least_bytes = usize::MAX;
+                    prior_bucket = Some(bucket);
+                }
+                if bytes < least_bytes {
+                    keep.insert(state);
+                    least_bytes = bytes;
+                }
+            }
+            states.retain(|(state, _, _)| keep.contains(state));
+        }
+        let mut state = states
+            .iter()
+            .min_by_key(|(_, bytes, _)| *bytes)
+            .expect("start state")
+            .0;
+        let mut stable = std::collections::BTreeSet::new();
+        while state != 0 {
+            stable.insert(after[state - 1].as_str());
+            state = previous[state - 1];
+        }
+        let pinned = after
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !stable.contains(id))
+            .collect();
+        Self::for_pinned_order(after, &pinned)
+    }
+
+    /// Re-encode every specified pin without removing any of them. Each gap
+    /// between unpinned rows forms an ordered insertion tree. A row can use the
+    /// cheapest preceding anchor in that gap, and siblings are inserted in
+    /// reverse order. This includes repeated prepends and non-immediate anchors.
+    /// Work/storage are linear in the order and its serialized ID bytes, aside
+    /// from the pin-set lookups. No recursion grows with a provider catalog.
+    pub fn for_pinned_order(
+        order: &[String],
+        pinned: &std::collections::BTreeSet<&str>,
+    ) -> Vec<Self> {
+        if pinned.is_empty() {
+            return Vec::new();
+        }
+        let costs = order
+            .iter()
+            .map(|id| serde_json::to_vec(id).expect("string serializes").len())
+            .collect::<Vec<_>>();
+        let mut placements = Vec::with_capacity(pinned.len());
+        let mut start = 0;
+        while start < order.len() {
+            if !pinned.contains(order[start].as_str()) {
+                start += 1;
+                continue;
+            }
+            let mut end = start + 1;
+            while end < order.len() && pinned.contains(order[end].as_str()) {
+                end += 1;
+            }
+            // Node zero is the stationary predecessor (or the beginning).
+            let root = start.checked_sub(1);
+            let mut cheapest = 0;
+            let mut cheapest_cost = root.map_or(4, |index| costs[index]);
+            let mut children = vec![Vec::new(); end - start + 1];
+            let mut parents = vec![0; end - start];
+            for (index, &cost) in costs.iter().enumerate().take(end).skip(start) {
+                let node = index - start + 1;
+                parents[node - 1] = cheapest;
+                children[cheapest].push(node);
+                if cost < cheapest_cost {
+                    cheapest = node;
+                    cheapest_cost = cost;
+                }
+            }
+            let mut pending = std::mem::take(&mut children[0]);
+            while let Some(node) = pending.pop() {
+                let parent = parents[node - 1];
+                placements.push(Self {
+                    id: order[start + node - 1].clone(),
+                    after: if parent == 0 {
+                        root.map(|index| order[index].clone())
+                    } else {
+                        Some(order[start + parent - 1].clone())
+                    },
+                });
+                pending.append(&mut children[node]);
+            }
+            start = end;
+        }
+        placements
     }
 }
 

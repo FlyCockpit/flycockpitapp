@@ -22373,8 +22373,10 @@ fn ensure_catalog_entries_editable(
             .map(|v| v.len())
             .unwrap_or(usize::MAX);
         // Existing rows are edited as field deltas and stay in their owning
-        // layers; only provider metadata has to fit one editable entry.
-        metadata_bytes.saturating_add(256) > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
+        // layers. Bound metadata itself here; request admission charges the
+        // actual (metadata, patch), and ConfigDoc validates the final raw owner
+        // entry and document. A fixed patch reserve would reject fitting edits.
+        metadata_bytes > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
     }) {
         return Err(bad_request(
             "protected models or other provider configuration exceed the editable entry limit; no catalog was written",

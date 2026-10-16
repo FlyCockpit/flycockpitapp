@@ -10996,7 +10996,12 @@ fn byte_bounded_reorder_fitting_wrong_underlying_program_rejects_without_writes(
 
 #[test]
 fn reviewer_r9_unrelated_deletion_preserves_fitting_temporary_pin_program() {
-    assert_temporary_pin_transition(TemporaryPinTransition::Delete, 0);
+    assert_temporary_pin_transition(TemporaryPinTransition::Delete, 0, 130);
+}
+
+#[test]
+fn temporary_pin_program_delete_with_512_byte_authored_margin() {
+    assert_temporary_pin_transition(TemporaryPinTransition::Delete, 0, 512);
 }
 
 #[derive(Clone, Copy)]
@@ -11009,25 +11014,29 @@ enum TemporaryPinTransition {
 
 #[test]
 fn temporary_pin_program_add_preserves_prior_intent() {
-    assert_temporary_pin_transition(TemporaryPinTransition::Add, 0);
+    assert_temporary_pin_transition(TemporaryPinTransition::Add, 0, 768);
 }
 
 #[test]
 fn temporary_pin_program_hidden_replacement_preserves_prior_intent() {
-    assert_temporary_pin_transition(TemporaryPinTransition::ReplaceHidden, 0);
+    assert_temporary_pin_transition(TemporaryPinTransition::ReplaceHidden, 0, 768);
 }
 
 #[test]
 fn temporary_pin_program_reorder_preserves_prior_intent() {
-    assert_temporary_pin_transition(TemporaryPinTransition::Reorder, 0);
+    assert_temporary_pin_transition(TemporaryPinTransition::Reorder, 0, 768);
 }
 
 #[test]
 fn temporary_pin_program_add_beyond_eager_inventory_preserves_prior_intent() {
-    assert_temporary_pin_transition(TemporaryPinTransition::Add, 3);
+    assert_temporary_pin_transition(TemporaryPinTransition::Add, 3, 768);
 }
 
-fn assert_temporary_pin_transition(transition: TemporaryPinTransition, prefix_count: usize) {
+fn assert_temporary_pin_transition(
+    transition: TemporaryPinTransition,
+    prefix_count: usize,
+    authored_margin: usize,
+) {
     use cockpit_config::config::providers::ModelPlacement;
     let (_fixture, runtime) = provider_daemon_runtime();
     let _runtime_guard = runtime.enter();
@@ -11094,14 +11103,7 @@ fn assert_temporary_pin_transition(transition: TemporaryPinTransition, prefix_co
             };
         owner_entry.name = Some(String::new());
         let overhead = serde_json::to_vec(&owner_entry).unwrap().len();
-        owner_entry.name = Some("n".repeat(
-            cap - overhead
-                - if matches!(transition, TemporaryPinTransition::Delete) {
-                    512
-                } else {
-                    768
-                },
-        ));
+        owner_entry.name = Some("n".repeat(cap - overhead - authored_margin));
         let mut owner = ProvidersConfig::default();
         owner.providers.insert("p".into(), owner_entry);
         let (tmp, mut dialog) = dialog_with_config(owner);
@@ -11175,6 +11177,22 @@ fn assert_temporary_pin_transition(transition: TemporaryPinTransition, prefix_co
                 .validate_provider_write("p", &feasible)
                 .unwrap();
             assert_eq!(feasible.model_membership.placements, pins);
+            assert_eq!(
+                serde_json::to_vec(&initial).unwrap().len(),
+                cap - authored_margin
+            );
+            if authored_margin == 130 {
+                assert_eq!(serde_json::to_vec(&metadata).unwrap().len(), 261_890);
+                assert_eq!(serde_json::to_vec(&patch).unwrap().len(), 111);
+                assert_eq!(
+                    serde_json::to_vec(&(&metadata, Some(&patch)))
+                        .unwrap()
+                        .len(),
+                    262_004
+                );
+                assert_eq!(serde_json::to_vec(&initial).unwrap().len(), 262_014);
+                assert_eq!(serde_json::to_vec(&feasible).unwrap().len(), 262_018);
+            }
         }
         let sources = [
             global.clone(),
@@ -11268,15 +11286,25 @@ fn assert_temporary_pin_transition(transition: TemporaryPinTransition, prefix_co
 
 #[test]
 fn reviewer_r9_three_short_temporary_handles_select_fitting_program() {
-    assert_three_short_handles(false);
+    assert_three_short_handles(false, 64);
+}
+
+#[test]
+fn temporary_pin_three_short_handles_with_320_byte_request_margin() {
+    assert_three_short_handles(false, 320);
 }
 
 #[test]
 fn temporary_pin_three_short_handles_accepts_alternate_rpc() {
-    assert_three_short_handles(true);
+    assert_three_short_handles(true, 320);
 }
 
-fn assert_three_short_handles(alternate_rpc: bool) {
+#[test]
+fn temporary_pin_three_short_handles_accepts_alternate_rpc_at_64_byte_margin() {
+    assert_three_short_handles(true, 64);
+}
+
+fn assert_three_short_handles(alternate_rpc: bool, request_margin: usize) {
     use cockpit_config::config::providers::ModelPlacement;
     let (_fixture, runtime) = provider_daemon_runtime();
     let _runtime_guard = runtime.enter();
@@ -11334,7 +11362,7 @@ fn assert_three_short_handles(alternate_rpc: bool) {
         let empty_bytes = serde_json::to_vec(&(&owner_entry, Some(&alternate)))
             .unwrap()
             .len();
-        owner_entry.name = Some("n".repeat(cap - empty_bytes - 320));
+        owner_entry.name = Some("n".repeat(cap - empty_bytes - request_margin));
         let global = cockpit_config::config::dirs::global_config_file().unwrap();
         std::fs::create_dir_all(global.parent().unwrap()).unwrap();
         std::fs::write(&global, "{}").unwrap();
@@ -11382,6 +11410,13 @@ fn assert_three_short_handles(alternate_rpc: bool) {
             .validate_provider_write("p", &feasible)
             .unwrap();
         let feasible_bytes = serde_json::to_vec(&feasible).unwrap().len();
+        assert_eq!(alternate_bytes, cap - request_margin);
+        if request_margin == 64 {
+            assert_eq!(serde_json::to_vec(&metadata).unwrap().len(), 261_890);
+            assert_eq!(serde_json::to_vec(&automatic).unwrap().len(), 187);
+            assert_eq!(selected_bytes, 262_080);
+            assert_eq!(feasible_bytes, 261_995);
+        }
         let files = [
             global.clone(),
             global.parent().unwrap().join("providers/p.json"),

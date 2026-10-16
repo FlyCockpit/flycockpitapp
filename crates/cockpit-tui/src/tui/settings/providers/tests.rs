@@ -12096,3 +12096,199 @@ fn assert_clear_exact_request_margin(alternate_rpc: bool, authored_overflow: boo
         }
     });
 }
+
+#[test]
+fn ordinary_failed_fetch_persists_observed_auth_category_without_prose_classification() {
+    use cockpit_config::providers::{ModelFetchFailure, ModelFetchStatusKind};
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        for (status, body, expected) in [
+            (401, "hello", ModelFetchStatusKind::AuthFailed),
+            (403, "hello", ModelFetchStatusKind::AuthFailed),
+            (
+                200,
+                "credentials rejected returned 401 subscription auth",
+                ModelFetchStatusKind::FailedKeptExisting,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 16384];
+                assert!(socket.read(&mut request).unwrap() > 0);
+                write!(socket,"HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            });
+            let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+            let entry = config.providers.get_mut("p").unwrap();
+            entry.url = format!("http://{address}/v1");
+            entry.allow_insecure_http = true;
+            entry.auth = Some(AuthKind::None);
+            entry.mark_model_fetch_failed_kept_existing(
+                "previous attempt rejected credentials",
+                ModelFetchFailure::CredentialsRejected,
+            );
+            let (tmp, mut dialog) = dialog_with_config(config);
+            let root = tmp.path().display().to_string();
+            let client = runtime
+                .block_on(crate::tui::settings::settings_daemon_client(
+                    &crate::tui::settings::test_lifecycle_client(),
+                ))
+                .unwrap();
+            let initial = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            dialog
+                .adopt_refreshed_provider_snapshot(Ok(initial))
+                .unwrap();
+            let entry = dialog.config.providers["p"].clone();
+            dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
+                "p".into(),
+                entry.clone(),
+            ))));
+            let handle = FetchHandle::spawn(
+                crate::tui::settings::test_lifecycle_client(),
+                "p".into(),
+                entry,
+                root,
+            );
+            let completion = runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    loop {
+                        if let Some(completion) = handle.take() {
+                            break completion;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap()
+            });
+            server.join().unwrap();
+            let expected_failure = if status == 200 {
+                ModelFetchFailure::Other
+            } else {
+                ModelFetchFailure::CredentialsRejected
+            };
+            assert!(
+                matches!(&completion.outcome,Ok(FetchOutcome::Failed {failure,..}) if *failure==expected_failure)
+            );
+            dialog
+                .adopt_refreshed_provider_snapshot(completion.snapshot)
+                .unwrap();
+            dialog.apply_fetch_result("p", completion.outcome);
+            dialog.flush_request_daemon_effects_for_test();
+            let saved = load_provider(&tmp.path().join(".cockpit/config.json"), "p");
+            assert_eq!(
+                saved.last_model_fetch.unwrap().status,
+                expected,
+                "observed HTTP {status}, body {body:?}"
+            );
+            assert_eq!(
+                saved
+                    .models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["stale", "current"]
+            );
+        }
+    });
+}
+
+#[test]
+fn ordinary_fetch_all_persists_each_observed_failure_after_final_snapshot() {
+    use cockpit_config::providers::{ModelFetchFailure, ModelFetchStatusKind};
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+        let base = config.providers["p"].clone();
+        config.providers.clear();
+        let mut servers = Vec::new();
+        for (id, status, body) in [
+            ("auth", 401, "hello"),
+            ("parse", 200, "credentials rejected returned 403"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            servers.push(std::thread::spawn(move || {
+                let (mut socket,_)=listener.accept().unwrap();
+                let mut request=[0;16384];assert!(socket.read(&mut request).unwrap()>0);
+                write!(socket,"HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }));
+            let mut entry = base.clone();
+            entry.url = format!("http://{address}/v1");
+            entry.allow_insecure_http = true;
+            entry.auth = Some(AuthKind::None);
+            entry.mark_model_fetch_failed_kept_existing(
+                "previous rejected credentials",
+                ModelFetchFailure::CredentialsRejected,
+            );
+            config.providers.insert(id.into(), entry);
+        }
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        assert!(dialog.config.providers.contains_key("auth"));
+        assert!(dialog.config.providers.contains_key("parse"));
+        let all = FetchAllState::spawn(
+            crate::tui::settings::test_lifecycle_client(),
+            &dialog.config,
+            tmp.path().display().to_string(),
+        );
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(all)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            dialog.tick();
+            dialog.settle_test_effects();
+            let done = matches!(dialog.page.downcast_ref::<ProvidersPage>(),Some(ProvidersPage::FetchAll(state)) if state.in_flight.is_empty()&&state.policy_resolved);
+            if done
+                && !dialog.authority_operation_pending()
+                && !dialog.provider_catalog_reload_required
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed fetch-all did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
+        for (id, expected) in [
+            ("auth", ModelFetchStatusKind::AuthFailed),
+            ("parse", ModelFetchStatusKind::FailedKeptExisting),
+        ] {
+            let saved = load_provider(&tmp.path().join(".cockpit/config.json"), id);
+            assert_eq!(
+                saved.last_model_fetch.unwrap().status,
+                expected,
+                "{id} persisted category after final read-back"
+            );
+            assert_eq!(
+                saved
+                    .models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["stale", "current"]
+            );
+        }
+    });
+}

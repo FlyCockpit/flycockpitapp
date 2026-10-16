@@ -2059,6 +2059,7 @@ fn model_fetch_failure_status_classifies_auth_and_redacts_reason() {
     let mut provider = ProviderEntry::default();
     provider.mark_model_fetch_failed_kept_existing(
             "https://api.example.test/v1/models returned 401 — credentials rejected. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456",
+            ModelFetchFailure::CredentialsRejected,
         );
 
     let status = provider.last_model_fetch.unwrap();
@@ -2069,8 +2070,10 @@ fn model_fetch_failure_status_classifies_auth_and_redacts_reason() {
     assert!(!reason.contains("sk-test-token"));
 
     let mut provider = ProviderEntry::default();
-    provider
-        .mark_model_fetch_failed_kept_existing("https://api.example.test/v1/models returned 503");
+    provider.mark_model_fetch_failed_kept_existing(
+        "https://api.example.test/v1/models returned 503",
+        ModelFetchFailure::Other,
+    );
     assert_eq!(
         provider.last_model_fetch.unwrap().status,
         ModelFetchStatusKind::FailedKeptExisting

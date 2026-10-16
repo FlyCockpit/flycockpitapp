@@ -24849,6 +24849,19 @@ pub(super) async fn provider_models_fetch(
     )
     .map_err(internal)?;
     let credential_table = provider_response_credential_table(&store, &config, &env)?;
+    // Normalize existing catalogs before ordinary preview/merge decisions.
+    // Deep probes must still address the upstream model IDs; that path crosses
+    // the same projection boundary after probing and before its summary/write.
+    if !deep {
+        for id in &provider_ids {
+            let entry = config.providers.get_mut(id).expect("selected provider");
+            entry.models = crate::providers::provider_http::scrub_catalog_models_with_table(
+                std::mem::take(&mut entry.models),
+                &credential_table,
+            )
+            .map_err(internal)?;
+        }
+    }
     crate::providers::provider_http::diagnostic_scope(credential_table, async {
     let selected_policy = on_unlisted
         .or(config.on_unlisted_models_fetch)
@@ -25076,7 +25089,7 @@ pub(super) async fn provider_models_fetch(
                         // failure marker. A later --allow-fallback retry can
                         // safely activate the returned fallback catalog.
                         let mut updated = entry.clone();
-                        updated.mark_model_fetch_failed_kept_existing(reason.clone());
+                        updated.mark_model_fetch_failed_kept_existing(reason.clone(), failure_kind.persisted_failure());
                         config.providers.insert(provider_id.clone(), updated);
                         changed_provider_ids.insert(provider_id.clone());
                     }
@@ -25459,6 +25472,7 @@ async fn daemon_deep_provider_fetch(
     };
     let targets = collect_deepfetch_targets(config, &scope).map_err(internal)?;
     let mut resolved = std::collections::BTreeMap::new();
+    let mut credential_headers = Vec::new();
     let mut failures = std::collections::BTreeMap::new();
     for target in &targets {
         if resolved.contains_key(&target.provider_id) {
@@ -25477,6 +25491,7 @@ async fn daemon_deep_provider_fetch(
         .await;
         match request {
             Ok(request) => {
+                credential_headers.extend(request.headers.iter().cloned());
                 resolved.insert(target.provider_id.clone(), request);
             }
             Err(error) => {
@@ -25508,6 +25523,7 @@ async fn daemon_deep_provider_fetch(
             .await
             {
                 Ok(Some(request)) => {
+                    credential_headers.extend(request.headers.iter().cloned());
                     client.replace_resolved(target.provider_id.clone(), request);
                     probe = probe_target(&mut client, config, target).await;
                 }
@@ -25529,6 +25545,14 @@ async fn daemon_deep_provider_fetch(
                 crate::config::providers::redact_model_fetch_reason(error.to_string()),
             );
         }
+    }
+    for id in provider_ids {
+        let entry = config.providers.get_mut(id).expect("selected provider");
+        entry.models = crate::providers::provider_http::scrub_catalog_models(
+            std::mem::take(&mut entry.models),
+            &credential_headers,
+        )
+        .map_err(internal)?;
     }
     // Persistence happens only after the caller has a bounded complete
     // response; see `provider_models_fetch`.
@@ -25819,17 +25843,24 @@ pub(super) fn scrub_provider_response(
     store: &crate::credentials::CredentialStore,
     env: &std::collections::HashMap<String, String>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    fn scrub_value(value: &mut serde_json::Value, secret_values: &[String], identity: bool) {
+    fn scrub_value(
+        value: &mut serde_json::Value,
+        secret_values: &[String],
+        credential_table: &crate::redact::RedactionTable,
+        identity: bool,
+    ) -> std::result::Result<(), ErrorPayload> {
         match value {
             serde_json::Value::String(text) => {
                 if identity {
-                    // IDs have already crossed the credential-scrubbed catalog
-                    // boundary. Repeat exact credential removal, but never apply
-                    // diagnostic heuristics or truncation to catalog identities.
-                    for secret in secret_values {
-                        if !secret.is_empty() {
-                            *text = text.replace(secret, "[redacted]");
-                        }
+                    // Never rename an identity after catalog decisions. Reject
+                    // before persistence if any producer missed the boundary.
+                    if crate::providers::provider_http::catalog_identity_contains_credentials(
+                        text,
+                        credential_table,
+                    ) {
+                        return Err(bad_request(
+                            "provider response contains an unsafe catalog identity",
+                        ));
                     }
                 } else {
                     *text = redact_provider_response_text_with_values(
@@ -25840,26 +25871,31 @@ pub(super) fn scrub_provider_response(
             }
             serde_json::Value::Array(items) => {
                 for item in items {
-                    scrub_value(item, secret_values, identity);
+                    scrub_value(item, secret_values, credential_table, identity)?;
                 }
             }
             serde_json::Value::Object(fields) => {
                 for (key, value) in fields {
-                    // All three fetched/unlisted/fallback summaries use the
-                    // shared ProviderModelIdSummary.ids wire field.
-                    scrub_value(value, secret_values, key == "ids" || key == "provider_id");
+                    scrub_value(
+                        value,
+                        secret_values,
+                        credential_table,
+                        key == "ids" || key == "provider_id",
+                    )?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
+    let credential_table = provider_response_credential_table(store, config, env)?;
     let mut secret_values = provider_response_secret_values(store, config, env)
         .into_iter()
         .collect::<Vec<_>>();
     secret_values.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     let mut value = serde_json::to_value(response).map_err(internal)?;
-    scrub_value(&mut value, &secret_values, false);
+    scrub_value(&mut value, &secret_values, &credential_table, false)?;
     serde_json::from_value(value).map_err(internal)
 }
 

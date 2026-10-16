@@ -53,6 +53,12 @@ pub enum FetchOutcome {
         reason: String,
     },
     Unsupported,
+    /// The daemon observed a failed fetch. Keep its category beside the
+    /// scrubbed display text through settings/onboarding persistence.
+    Failed {
+        reason: String,
+        failure: cockpit_config::providers::ModelFetchFailure,
+    },
 }
 
 /// Shared cell for an in-flight `/models` fetch. The background task
@@ -142,7 +148,13 @@ impl FetchHandle {
                             ProviderModelFetchOutcome::Unsupported => Ok(FetchOutcome::Unsupported),
                             ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted } => Err(format!(
                                 "model fetch needs a keep/remove decision for {} configured model(s)", unlisted.count)),
-                            ProviderModelFetchOutcome::Error { message } => Err(message),
+                            ProviderModelFetchOutcome::Error { message } => Ok(FetchOutcome::Failed {
+                                reason: message,
+                                failure: match result.verification {
+                                    Some(cockpit_proto::ProviderModelVerification::Unauthorized { status: 401 | 403 }) => cockpit_config::providers::ModelFetchFailure::CredentialsRejected,
+                                    _ => cockpit_config::providers::ModelFetchFailure::Other,
+                                },
+                            }),
                         }
                     });
                     FetchCompletion { outcome, snapshot }

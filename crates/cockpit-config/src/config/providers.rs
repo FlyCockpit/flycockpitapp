@@ -2961,6 +2961,13 @@ pub enum ModelFetchStatusKind {
     AuthFailed,
 }
 
+/// Evidence supplied by the fetch owner, never inferred from diagnostic prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFetchFailure {
+    CredentialsRejected,
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelFetchSource {
@@ -3444,12 +3451,14 @@ impl ProviderEntry {
         });
     }
 
-    pub fn mark_model_fetch_failed_kept_existing(&mut self, reason: impl Into<String>) {
-        let reason = reason.into();
-        let status = if is_model_fetch_auth_failure(&reason) {
-            ModelFetchStatusKind::AuthFailed
-        } else {
-            ModelFetchStatusKind::FailedKeptExisting
+    pub fn mark_model_fetch_failed_kept_existing(
+        &mut self,
+        reason: impl Into<String>,
+        failure: ModelFetchFailure,
+    ) {
+        let status = match failure {
+            ModelFetchFailure::CredentialsRejected => ModelFetchStatusKind::AuthFailed,
+            ModelFetchFailure::Other => ModelFetchStatusKind::FailedKeptExisting,
         };
         self.last_model_fetch = Some(ModelFetchStatus {
             status,
@@ -3458,17 +3467,6 @@ impl ProviderEntry {
             reason: Some(redact_model_fetch_reason(reason)),
         });
     }
-}
-
-fn is_model_fetch_auth_failure(reason: &str) -> bool {
-    let lower = reason.to_ascii_lowercase();
-    lower.contains(" returned 401")
-        || lower.contains(" returned 403")
-        || lower.contains("credentials rejected")
-        || lower.contains("subscription auth")
-        || lower.contains("authorization for provider")
-        || lower.contains("requires an official github token")
-        || lower.contains("missing chatgpt-account-id")
 }
 
 pub fn redact_model_fetch_reason(reason: impl Into<String>) -> String {

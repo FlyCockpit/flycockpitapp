@@ -923,6 +923,18 @@ pub enum ModelFetchFailureKind {
     Parse,
 }
 
+impl ModelFetchFailureKind {
+    pub fn persisted_failure(self) -> crate::config::providers::ModelFetchFailure {
+        use crate::config::providers::ModelFetchFailure;
+        match self {
+            Self::HttpStatus(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
+                ModelFetchFailure::CredentialsRejected
+            }
+            Self::HttpStatus(_) | Self::Network | Self::Parse => ModelFetchFailure::Other,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub(crate) struct ModelFetchError {
@@ -1054,8 +1066,7 @@ async fn fetch_models_at_detailed(
 
     let body = super::provider_http::read_body_limited(resp, "/models").await?;
     let body_nonempty = !body.trim().is_empty();
-    let body = super::provider_http::diagnostic_body(&body, headers);
-    let models = parse_models_body_with_abi(&body, catalog_abi)?;
+    let models = parse_credential_safe_models_body(&body, catalog_abi, headers)?;
     Ok(FetchModelsAtResult {
         outcome: FetchOutcome::Models {
             models,
@@ -1153,8 +1164,7 @@ pub async fn fetch_models_for_provider_with_store(
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
     let mut url = provider.models_url(entry, &request.base_url);
-    let fallback_models =
-        crate::config::providers::coalesce_fetched_models(provider.fallback_models());
+    let fallback_models = provider.fallback_models();
     let fallback_catalog = provider.fallback_catalog();
     let mut outcome = fetch_models_at_detailed(
         &url,
@@ -1197,6 +1207,11 @@ pub async fn fetch_models_for_provider_with_store(
     if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
     }
+    // Validate the offered fallback only after selecting a fallback outcome.
+    // A fallback projection failure must not replace an observed rejection or
+    // prevent a successful live catalog from being used.
+    let safe_fallback_models =
+        || super::provider_http::scrub_catalog_models(fallback_models.clone(), &request.headers);
     match outcome {
         Ok(FetchModelsAtResult {
             outcome: FetchOutcome::Unsupported,
@@ -1208,7 +1223,7 @@ pub async fn fetch_models_for_provider_with_store(
                 "provider /models unavailable; fallback catalog available"
             );
             Ok(FetchOutcome::FallbackAvailable {
-                models: fallback_models,
+                models: safe_fallback_models()?,
                 catalog: fallback_catalog,
                 reason: super::provider_http::diagnostic_body(
                     &format!("{url} returned 404"),
@@ -1229,7 +1244,7 @@ pub async fn fetch_models_for_provider_with_store(
                 "provider /models returned an empty model list; fallback catalog available"
             );
             Ok(FetchOutcome::FallbackAvailable {
-                models: fallback_models,
+                models: safe_fallback_models()?,
                 catalog: fallback_catalog,
                 reason: super::provider_http::diagnostic_body(
                     &format!("{url} returned an empty model list (status {status})"),
@@ -1251,7 +1266,7 @@ pub async fn fetch_models_for_provider_with_store(
                 "provider /models fetch failed; fallback catalog available"
             );
             Ok(FetchOutcome::FallbackAvailable {
-                models: fallback_models,
+                models: safe_fallback_models()?,
                 catalog: fallback_catalog,
                 reason,
                 failure_kind,
@@ -1322,9 +1337,102 @@ impl From<ProviderRequestKind> for ModelCatalogAbi {
     }
 }
 
+/// Protect identities before applying the existing decoded-field diagnostic
+/// scrub. Restore them by row, then run the native typed projection. Scrubbing
+/// a serialized ModelEntry instead would corrupt trusted flags/enum values
+/// when a credential happens to equal a schema word such as `manual`.
+fn parse_credential_safe_models_body(
+    body: &str,
+    catalog_abi: ModelCatalogAbi,
+    headers: &[ResolvedHeader],
+) -> Result<Vec<ModelEntry>> {
+    let original = parse_models_body_with_abi(body, catalog_abi).map_err(|_| {
+        let safe_body = super::provider_http::diagnostic_body(body, headers);
+        let message = parse_models_body_with_abi(&safe_body, catalog_abi)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| {
+                "provider catalog contains invalid credential-bearing metadata".into()
+            });
+        ModelFetchError::parse(message)
+    })?;
+    let original_ids = original
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let projected = super::provider_http::scrub_catalog_models(original, headers)?;
+    if projected.len() != original_ids.len() {
+        return Err(ModelFetchError::parse(
+            "catalog identity projection changed model count".into(),
+        )
+        .into());
+    }
+    let identities = original_ids
+        .into_iter()
+        .zip(projected.into_iter().map(|model| model.id))
+        .collect::<std::collections::HashMap<_, _>>();
+    // The raw parser above has already validated the root/envelope and types.
+    let entries = model_catalog_entries(serde_json::from_str(body)?)?;
+    let safe_body =
+        super::provider_http::diagnostic_body(&serde_json::to_string(&entries)?, headers);
+    let mut safe_entries: Vec<Value> = serde_json::from_str(&safe_body).map_err(|_| {
+        ModelFetchError::parse("provider catalog metadata could not be scrubbed safely".into())
+    })?;
+    if safe_entries.len() != entries.len() {
+        return Err(ModelFetchError::parse(
+            "provider catalog changed length during credential projection".into(),
+        )
+        .into());
+    }
+    for (raw, safe) in entries.iter().zip(&mut safe_entries) {
+        if let Some(id) = catalog_entry_id(raw) {
+            let projected_id = identities
+                .get(id)
+                .context("catalog identity projection is incomplete")?;
+            safe.as_object_mut()
+                .context("catalog row changed type during credential projection")?
+                .insert("id".into(), Value::String(projected_id.clone()));
+        }
+    }
+    // Opaque IDs here were minted above; the raw upstream namespace guard has
+    // already run. This private projection never admits an unvalidated input.
+    parse_models_body_projection(&serde_json::to_string(&safe_entries)?, catalog_abi)
+        .map(crate::config::providers::coalesce_fetched_models)
+        .map_err(|error| ModelFetchError::parse(error.to_string()).into())
+}
+
+fn catalog_entry_id(raw: &Value) -> Option<&str> {
+    let object = raw.as_object()?;
+    object
+        .get("id")
+        .or_else(|| object.get("slug"))
+        .and_then(Value::as_str)
+}
+
+fn model_catalog_entries(parsed: Value) -> Result<Vec<Value>> {
+    match parsed {
+        Value::Array(entries) => Ok(entries),
+        Value::Object(mut object) => match (object.remove("data"), object.remove("models")) {
+            (Some(Value::Array(entries)), _) | (_, Some(Value::Array(entries))) => Ok(entries),
+            _ => Err(anyhow!("models response lacks a `data` or `models` array")),
+        },
+        _ => Err(anyhow!("unexpected models response root")),
+    }
+}
+
 fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Result<Vec<ModelEntry>> {
     parse_models_body_projection(body, catalog_abi)
-        .map(crate::config::providers::coalesce_fetched_models)
+        .and_then(|models| {
+            if models
+                .iter()
+                .any(|model| super::provider_http::is_catalog_identity_token(&model.id))
+            {
+                anyhow::bail!(
+                    "upstream model ID uses the reserved credential-safe identity namespace"
+                );
+            }
+            Ok(crate::config::providers::coalesce_fetched_models(models))
+        })
         .map_err(|error| ModelFetchError::parse(error.to_string()).into())
 }
 
@@ -1334,24 +1442,13 @@ fn parse_models_body_projection(
 ) -> Result<Vec<ModelEntry>> {
     let parsed: Value = serde_json::from_str(body)
         .with_context(|| format!("parsing /models response: {}", response_body_snippet(body)))?;
-    let entries: Vec<Value> = match parsed {
-        Value::Array(xs) => xs,
-        Value::Object(mut m) => match (m.remove("data"), m.remove("models")) {
-            (Some(Value::Array(xs)), _) | (_, Some(Value::Array(xs))) => xs,
-            _ => return Err(anyhow!("models response lacks a `data` or `models` array")),
-        },
-        _ => return Err(anyhow!("unexpected models response root")),
-    };
+    let entries = model_catalog_entries(parsed)?;
 
     entries
         .into_iter()
         .filter_map(|raw| {
             let obj = raw.as_object()?;
-            let id = obj
-                .get("id")
-                .or_else(|| obj.get("slug"))
-                .and_then(Value::as_str)?
-                .to_string();
+            let id = catalog_entry_id(&raw)?.to_string();
 
             let name = obj
                 .get("display_name")
@@ -4453,7 +4550,10 @@ mod tests {
                     .unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("response body exceeded"), "{msg}");
-            entry.mark_model_fetch_failed_kept_existing(msg);
+            entry.mark_model_fetch_failed_kept_existing(
+                msg,
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_eq!(entry.models[0].id, "manual-keep");
             assert_eq!(entry.models.len(), 1);
         }
@@ -4641,7 +4741,10 @@ mod tests {
             let _ = request_handle.await;
             let msg = err.to_string();
             assert!(msg.contains(&format!("returned {status}")), "{msg}");
-            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            entry.mark_model_fetch_failed_kept_existing(
+                msg.clone(),
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_kept(&entry, &msg, true);
         }
 
@@ -4682,7 +4785,10 @@ mod tests {
             );
             let msg = err.to_string();
             assert!(msg.contains("429"), "{msg}");
-            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            entry.mark_model_fetch_failed_kept_existing(
+                msg.clone(),
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_kept(&entry, &msg, false);
         }
 
@@ -4707,7 +4813,10 @@ mod tests {
                     .await
                     .unwrap_err();
             let msg = err.to_string();
-            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            entry.mark_model_fetch_failed_kept_existing(
+                msg.clone(),
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_kept(&entry, &msg, false);
         }
 
@@ -4739,7 +4848,10 @@ mod tests {
                     .await
                     .unwrap_err();
             let msg = err.to_string();
-            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            entry.mark_model_fetch_failed_kept_existing(
+                msg.clone(),
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_kept(&entry, &msg, false);
         }
 
@@ -4767,7 +4879,10 @@ mod tests {
                     .await
                     .unwrap_err();
             let msg = err.to_string();
-            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            entry.mark_model_fetch_failed_kept_existing(
+                msg.clone(),
+                model_fetch_failure_kind(&err).persisted_failure(),
+            );
             assert_kept(&entry, &msg, false);
         }
     }

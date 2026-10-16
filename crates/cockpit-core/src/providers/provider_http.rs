@@ -177,6 +177,97 @@ pub(crate) fn diagnostic_value(
     Ok(())
 }
 
+/// The opaque identity namespace is reserved for the owner projection. Raw
+/// upstream IDs cannot impersonate persisted tokens from an earlier refresh.
+pub(crate) fn is_catalog_identity_token(id: &str) -> bool {
+    id.strip_prefix('~').is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+/// Inspect the same decoded JSON string/key surfaces as diagnostics, without
+/// serializing or canonicalizing an identity that contains no credential.
+pub(crate) fn catalog_identity_contains_credentials(
+    identity: &str,
+    table: &crate::redact::RedactionTable,
+) -> bool {
+    if !matches!(table.scrub_cow(identity), std::borrow::Cow::Borrowed(text) if text == identity) {
+        return true;
+    }
+    fn contains(value: &serde_json::Value, table: &crate::redact::RedactionTable) -> bool {
+        match value {
+            serde_json::Value::String(text) => catalog_identity_contains_credentials(text, table),
+            serde_json::Value::Array(values) => values.iter().any(|value| contains(value, table)),
+            serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+                catalog_identity_contains_credentials(key, table) || contains(value, table)
+            }),
+            _ => false,
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(identity).is_ok_and(|value| contains(&value, table))
+}
+
+/// Catalog identities cross this boundary before merge, counts or summaries.
+/// Replaced IDs receive distinct opaque tokens; ordinary IDs remain byte-exact.
+/// Reserve every input ID so an upstream literal cannot impersonate a token.
+pub(crate) fn scrub_catalog_models(
+    models: Vec<crate::config::providers::ModelEntry>,
+    headers: &[super::models_fetch::ResolvedHeader],
+) -> Result<Vec<crate::config::providers::ModelEntry>> {
+    let table = match DIAGNOSTIC_CREDENTIALS.try_with(Clone::clone) {
+        Ok(table) => with_diagnostic_credentials(table, headers)?,
+        Err(_) => diagnostic_credentials(headers)?,
+    };
+    scrub_catalog_models_with_table(models, &table)
+}
+
+pub(crate) fn scrub_catalog_models_with_table(
+    models: Vec<crate::config::providers::ModelEntry>,
+    table: &crate::redact::RedactionTable,
+) -> Result<Vec<crate::config::providers::ModelEntry>> {
+    use sha2::{Digest, Sha256};
+    const IDENTITY_HASH_DOMAIN: &[u8] = b"provider model identity\0";
+    let mut reserved = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut identities = std::collections::HashMap::<String, String>::new();
+    let mut safe = Vec::with_capacity(models.len());
+    for mut model in models {
+        let id = if let Some(id) = identities.get(&model.id) {
+            id.clone()
+        } else {
+            let id = if !catalog_identity_contains_credentials(&model.id, table) {
+                model.id.clone()
+            } else {
+                // Bounded collision handling includes both upstream-chosen
+                // identities and credentials occurring inside a candidate token.
+                let token = (0_u32..64).find_map(|attempt| {
+                    let mut hash = Sha256::new();
+                    hash.update(IDENTITY_HASH_DOMAIN);
+                    hash.update(model.id.as_bytes());
+                    hash.update(attempt.to_be_bytes());
+                    let candidate = format!("~{}", crate::intel::hex_lower(&hash.finalize()));
+                    (table.scrub(&candidate) == candidate && reserved.insert(candidate.clone()))
+                        .then_some(candidate)
+                });
+                token.context("cannot represent credential-safe unique model identities")?
+            };
+            identities.insert(model.id.clone(), id.clone());
+            id
+        };
+        // Typed owner controls and semantic enum values are not upstream
+        // diagnostic text. Project only the identity; fetch parsing scrubs
+        // untrusted metadata before it becomes these typed values.
+        model.id = id;
+        safe.push(model);
+    }
+    Ok(crate::config::providers::coalesce_fetched_models(safe))
+}
+
 /// Scrub complete decoded fields before callers slice, escape, persist or log
 /// provider diagnostics. The table includes every outbound header literal and
 /// its authorization payload, including dynamically resolved credentials.
@@ -702,5 +793,56 @@ mod credential_floor_tests {
             diagnostic_body("abc reflected", &headers),
             "[provider diagnostic omitted]"
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_identity_tests {
+    use super::*;
+    use crate::config::providers::{CapabilityStatus, ModelEntry, WireApi};
+    use crate::providers::models_fetch::ResolvedHeader;
+
+    #[test]
+    fn identity_projection_does_not_scrub_owner_control_keys() {
+        let model = ModelEntry {
+            id: "owner".into(),
+            manual: true,
+            favorite: true,
+            wire_api: WireApi::Responses,
+            ..Default::default()
+        };
+        let expected = serde_json::to_value(&model).unwrap();
+        let result = scrub_catalog_models(
+            vec![model],
+            &[ResolvedHeader {
+                name: "X-Private".into(),
+                value: "manual".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&result[0]).unwrap(),
+            expected,
+            "a credential equal to manual must not remove the protected flag"
+        );
+    }
+
+    #[test]
+    fn identity_projection_does_not_scrub_native_capability_enum_values() {
+        let mut model = ModelEntry {
+            id: "native".into(),
+            ..Default::default()
+        };
+        model.capabilities.tool_calling = CapabilityStatus::Supported;
+        let expected = serde_json::to_value(&model).unwrap();
+        let result = scrub_catalog_models(
+            vec![model],
+            &[ResolvedHeader {
+                name: "X-Private".into(),
+                value: "supported".into(),
+            }],
+        )
+        .expect("typed capability enum values must not be re-parsed as scrubbed upstream prose");
+        assert_eq!(serde_json::to_value(&result[0]).unwrap(), expected);
     }
 }

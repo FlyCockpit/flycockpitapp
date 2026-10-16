@@ -672,6 +672,7 @@ enum PendingOnboardingValidationCommit {
     FailedKeptExisting {
         provider_id: String,
         reason: String,
+        failure: cockpit_config::providers::ModelFetchFailure,
     },
 }
 
@@ -3960,8 +3961,10 @@ impl SettingsCx {
             PendingOnboardingValidationCommit::Fallback { reason, .. } => {
                 entry.mark_model_fetch_fallback(reason);
             }
-            PendingOnboardingValidationCommit::FailedKeptExisting { reason, .. } => {
-                entry.mark_model_fetch_failed_kept_existing(reason);
+            PendingOnboardingValidationCommit::FailedKeptExisting {
+                reason, failure, ..
+            } => {
+                entry.mark_model_fetch_failed_kept_existing(reason, failure);
             }
         }
         let entry = entry.clone();

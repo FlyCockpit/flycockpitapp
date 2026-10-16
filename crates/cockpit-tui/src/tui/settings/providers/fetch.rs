@@ -68,7 +68,7 @@ pub(in crate::tui::settings) struct FetchedSummary {
 
 enum FetchDegradedStatus {
     Unsupported,
-    Failed(String),
+    Failed(String, cockpit_config::providers::ModelFetchFailure),
 }
 
 pub(in crate::tui::settings) struct FetchOnePromptState {
@@ -237,8 +237,8 @@ impl SettingsDialog {
             };
             match status {
                 FetchDegradedStatus::Unsupported => entry.mark_model_fetch_unsupported(),
-                FetchDegradedStatus::Failed(reason) => {
-                    entry.mark_model_fetch_failed_kept_existing(reason)
+                FetchDegradedStatus::Failed(reason, failure) => {
+                    entry.mark_model_fetch_failed_kept_existing(reason, failure)
                 }
             }
         }
@@ -437,7 +437,7 @@ pub(in crate::tui::settings) fn render_fetch_all_results(
                 ),
                 green,
             ),
-            Err(e) => (
+            Ok(FetchOutcome::Failed { reason: e, .. }) | Err(e) => (
                 "✗",
                 format!(
                     "{} — {}",
@@ -463,7 +463,11 @@ fn fetch_all_summary(s: &FetchAllState) -> String {
         .finished
         .iter()
         .filter(|f| {
-            f.outcome.is_err() || matches!(f.outcome, Ok(FetchOutcome::FallbackAvailable { .. }))
+            f.outcome.is_err()
+                || matches!(
+                    f.outcome,
+                    Ok(FetchOutcome::FallbackAvailable { .. } | FetchOutcome::Failed { .. })
+                )
         })
         .collect();
     let ok = total - failed.len();
@@ -472,7 +476,9 @@ fn fetch_all_summary(s: &FetchAllState) -> String {
     } else {
         let first = &failed[0];
         let reason = match &first.outcome {
-            Err(e) => redact_model_fetch_reason(e.as_str()),
+            Ok(FetchOutcome::Failed { reason: e, .. }) | Err(e) => {
+                redact_model_fetch_reason(e.as_str())
+            }
             Ok(FetchOutcome::FallbackAvailable { reason, .. }) => {
                 redact_model_fetch_reason(reason.as_str())
             }
@@ -526,11 +532,21 @@ fn fetch_all_degraded_statuses(dialog: &SettingsDialog) -> Vec<(String, FetchDeg
             )),
             Ok(FetchOutcome::FallbackAvailable { reason, .. }) => Some((
                 summary.provider_id.clone(),
-                FetchDegradedStatus::Failed(redact_model_fetch_reason(reason.as_str())),
+                FetchDegradedStatus::Failed(
+                    redact_model_fetch_reason(reason.as_str()),
+                    cockpit_config::providers::ModelFetchFailure::Other,
+                ),
             )),
             Err(error) => Some((
                 summary.provider_id.clone(),
-                FetchDegradedStatus::Failed(redact_model_fetch_reason(error.as_str())),
+                FetchDegradedStatus::Failed(
+                    redact_model_fetch_reason(error.as_str()),
+                    cockpit_config::providers::ModelFetchFailure::Other,
+                ),
+            )),
+            Ok(FetchOutcome::Failed { reason, failure }) => Some((
+                summary.provider_id.clone(),
+                FetchDegradedStatus::Failed(redact_model_fetch_reason(reason.as_str()), *failure),
             )),
             Ok(FetchOutcome::Models { .. } | FetchOutcome::FallbackApplied { .. }) => None,
         })

@@ -988,6 +988,7 @@ pub(super) struct AddState {
     fallback_offer: Option<FallbackOffer>,
     fallback_commit_pending: bool,
     pub(super) validation_failure: Option<String>,
+    validation_failure_kind: cockpit_config::providers::ModelFetchFailure,
     pub(super) verify: Option<Box<crate::tui::onboarding::VerifyScreen>>,
 }
 
@@ -1039,6 +1040,7 @@ impl AddState {
             fallback_offer: None,
             fallback_commit_pending: false,
             validation_failure: None,
+            validation_failure_kind: cockpit_config::providers::ModelFetchFailure::Other,
             verify: None,
         };
         state.restore_non_secret_inputs();
@@ -1177,6 +1179,10 @@ impl SettingsDialog {
         provider_id: &str,
         result: Result<FetchOutcome, String>,
     ) {
+        let (result, failure) = match result {
+            Ok(FetchOutcome::Failed { reason, failure }) => (Err(reason), failure),
+            result => (result, cockpit_config::providers::ModelFetchFailure::Other),
+        };
         let unsupported = matches!(&result, Ok(FetchOutcome::Unsupported));
         let referenced_environment = self
             .config
@@ -1392,7 +1398,7 @@ impl SettingsDialog {
                 Err(e) => {
                     let reason = redact_model_fetch_reason(e.as_str());
                     if let Some(entry) = self.config.providers.get_mut(provider_id) {
-                        entry.mark_model_fetch_failed_kept_existing(reason.clone());
+                        entry.mark_model_fetch_failed_kept_existing(reason.clone(), failure);
                     }
                     // A hard offline/validation error is exactly as much
                     // "a completed provider validation attempt" as a
@@ -1415,7 +1421,8 @@ impl SettingsDialog {
                 Ok(
                     FetchOutcome::Models { .. }
                     | FetchOutcome::FallbackAvailable { .. }
-                    | FetchOutcome::FallbackApplied { .. },
+                    | FetchOutcome::FallbackApplied { .. }
+                    | FetchOutcome::Failed { .. },
                 ) => {
                     unreachable!()
                 }
@@ -1438,6 +1445,7 @@ impl SettingsDialog {
                     s.fallback_offer = fallback_offer;
                     if let Some(reason) = validation_failure.as_ref() {
                         s.validation_failure = Some(reason.clone());
+                        s.validation_failure_kind = failure;
                     }
                     if let (Some(reason), Some(screen)) = (validation_failure, s.verify.as_mut()) {
                         screen.apply(crate::tui::onboarding::VerifyOutcome::Failed(reason), None);
@@ -2310,6 +2318,7 @@ impl SettingsCx {
                             super::PendingOnboardingValidationCommit::FailedKeptExisting {
                                 provider_id,
                                 reason,
+                                failure: s.validation_failure_kind,
                             },
                         );
                         self.commit_onboarding_validation_after_catalog_refresh();
@@ -3325,7 +3334,10 @@ impl SettingsCx {
                 }
                 1 => {
                     if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
-                        entry.mark_model_fetch_failed_kept_existing(s.reason.clone());
+                        entry.mark_model_fetch_failed_kept_existing(
+                            s.reason.clone(),
+                            cockpit_config::providers::ModelFetchFailure::Other,
+                        );
                     }
                     return self.commit_provider_mutation(
                         super::ProviderMutationNavigation::Edit {

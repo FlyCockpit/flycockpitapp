@@ -1127,6 +1127,7 @@ pub struct RedactionTable {
     /// replaced with [`COVERAGE_WITHHELD_PLACEHOLDER`]. Used where a
     /// response must still be delivered but no current coverage exists.
     withhold_all: bool,
+    scrub_refusals: Vec<coverage_authority::CoverageTableBinding>,
     /// Test-only fault injection: when set, [`Self::enforced_checked`] returns
     /// an error, so a caller's fail-closed-before-side-effect path (e.g. the
     /// external-harness runner constructing its scrub view before spawning a
@@ -1135,6 +1136,8 @@ pub struct RedactionTable {
     /// shipped build.
     #[cfg(test)]
     fail_enforced_view: bool,
+    #[cfg(test)]
+    fail_composition: bool,
     /// Set only on a table a session's redaction owner PUBLISHED (and on its
     /// enforced view): a weak link back to that owner plus the publication
     /// generation. Every scrub/match entry point resolves it first, so a
@@ -1644,6 +1647,17 @@ impl RedactionTable {
                 .then_with(|| a.value.cmp(&b.value))
         });
         entries.dedup_by(|a, b| a.value == b.value);
+        // A real password can be a word in the configured marker. Never omit
+        // that entry or emit it again as part of the replacement. A three-byte
+        // marker cannot contain any entry (the hard minimum is four bytes).
+        let placeholder = if entries
+            .iter()
+            .any(|entry| placeholder.contains(&entry.value))
+        {
+            "█".to_owned()
+        } else {
+            placeholder
+        };
         // The persisted/base table never carries a `Sealed` replacement: the
         // actionable marker is an ephemeral per-target decision resolved by
         // [`Self::with_sealed_replacements`] at egress time. Freezing it here
@@ -1664,8 +1678,11 @@ impl RedactionTable {
                 coverage_binding: None,
                 source_freshness: None,
                 withhold_all: false,
+                scrub_refusals: Vec::new(),
                 #[cfg(test)]
                 fail_enforced_view: false,
+                #[cfg(test)]
+                fail_composition: false,
                 live: None,
             });
         }
@@ -1712,8 +1729,11 @@ impl RedactionTable {
             coverage_binding: None,
             source_freshness: None,
             withhold_all: false,
+            scrub_refusals: Vec::new(),
             #[cfg(test)]
             fail_enforced_view: false,
+            #[cfg(test)]
+            fail_composition: false,
             live: None,
         })
     }
@@ -1784,7 +1804,22 @@ impl RedactionTable {
     /// lineage and must never be installed or published. Only
     /// [`crate::daemon::EventScrub`] holds one, and it exposes no table.
     pub(crate) fn scrub_only_union(&self, other: &Self) -> Result<Self> {
-        self.merged_entries(other)
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.fail_composition && !other.fail_composition,
+            "injected matcher composition failure"
+        );
+        let mut merged = self.merged_entries(other)?;
+        // A scrub-only composition cannot certify a lineage, but must retain
+        // every operand's refusal. Evaluate binding freshness on every scrub:
+        // a cached derived view can outlive an authority invalidation.
+        merged
+            .scrub_refusals
+            .extend(self.coverage_binding.iter().cloned());
+        merged
+            .scrub_refusals
+            .extend(other.coverage_binding.iter().cloned());
+        Ok(merged)
     }
 
     fn merged_entries(&self, other: &Self) -> Result<Self> {
@@ -1802,6 +1837,11 @@ impl RedactionTable {
             unsupported_files,
             protected,
         )?;
+        merged.withhold_all = self.withhold_all || other.withhold_all;
+        merged.scrub_refusals = self.scrub_refusals.clone();
+        merged
+            .scrub_refusals
+            .extend(other.scrub_refusals.iter().cloned());
         merged.live = self.derived_link().or_else(|| other.derived_link());
         Ok(merged)
     }
@@ -1826,6 +1866,8 @@ impl RedactionTable {
             self.protected.clone(),
         )?;
         table.coverage_binding = self.coverage_binding.clone();
+        table.scrub_refusals = self.scrub_refusals.clone();
+        table.withhold_all = self.withhold_all;
         table.source_freshness = self.source_freshness.clone();
         table.live = self.derived_link();
         Ok(table)
@@ -1849,6 +1891,8 @@ impl RedactionTable {
             self.protected.clone(),
         )?;
         table.coverage_binding = self.coverage_binding.clone();
+        table.scrub_refusals = self.scrub_refusals.clone();
+        table.withhold_all = self.withhold_all;
         table.source_freshness = self.source_freshness.clone();
         table.live = self.derived_link();
         Ok(table)
@@ -1873,6 +1917,8 @@ impl RedactionTable {
             self.protected.clone(),
         )?;
         table.coverage_binding = self.coverage_binding.clone();
+        table.scrub_refusals = self.scrub_refusals.clone();
+        table.withhold_all = self.withhold_all;
         table.source_freshness = self.source_freshness.clone();
         table.live = self.derived_link();
         Ok(table)
@@ -1955,8 +2001,11 @@ impl RedactionTable {
             coverage_binding: self.coverage_binding.clone(),
             source_freshness: self.source_freshness.clone(),
             withhold_all: self.withhold_all,
+            scrub_refusals: self.scrub_refusals.clone(),
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
+            #[cfg(test)]
+            fail_composition: self.fail_composition,
             live: None,
         }
     }
@@ -2032,6 +2081,10 @@ impl RedactionTable {
         cfg: &RedactConfig,
         observed: &[ObservedSecret],
     ) -> Result<Self> {
+        anyhow::ensure!(
+            !observed.iter().any(ObservedSecret::incomplete),
+            "command output withheld: secret observation capacity exceeded"
+        );
         let mut entries: Vec<(String, String, OrdinarySource)> = Vec::new();
         for secret in observed {
             if is_pruned_candidate(&secret.value, cfg.min_secret_length, secret.length_exempt) {
@@ -2384,8 +2437,11 @@ impl RedactionTable {
             coverage_binding: self.coverage_binding.clone(),
             source_freshness: self.source_freshness.clone(),
             withhold_all: self.withhold_all,
+            scrub_refusals: self.scrub_refusals.clone(),
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
+            #[cfg(test)]
+            fail_composition: self.fail_composition,
             // The enforced view of a published table follows the same owner
             // (a derived table's resolution cache is per view: the enforced
             // resolution differs from the opt-out one).
@@ -2439,18 +2495,22 @@ impl RedactionTable {
         }
         // The derived table's own entries plus the owner's newest. The merge
         // is unlinked, so resolution never recurses.
-        match newest.scrub_only_union(self) {
-            Ok(merged) => {
+        let mut local = self.clone();
+        local.coverage_binding = None;
+        local.scrub_refusals.clear();
+        local.live = None;
+        match newest.scrub_only_union(&local) {
+            Ok(mut merged) => {
+                merged.live = None;
                 let merged = std::sync::Arc::new(merged);
                 *cache = Some((newest_generation, merged.clone()));
                 Some(merged)
             }
             Err(error) => {
-                // Building the merged matcher failed: prefer the owner's
-                // newest table (the session registrations) over the stale
-                // derived snapshot.
+                // Neither operand alone covers the combined credentials.
+                // Refuse release until a complete view can be composed.
                 tracing::warn!(error = %error, "resolving a derived redaction view failed");
-                Some(newest)
+                Some(std::sync::Arc::new(Self::withholding_all()))
             }
         }
     }
@@ -2484,13 +2544,14 @@ impl RedactionTable {
         if let Some(binding) = &self.coverage_binding {
             binding.validate()?;
         }
+        for binding in &self.scrub_refusals {
+            binding.validate()?;
+        }
         Ok(())
     }
 
     fn coverage_binding_stale(&self) -> bool {
-        self.coverage_binding
-            .as_ref()
-            .is_some_and(|binding| binding.validate().is_err())
+        self.ensure_binding_current().is_err()
     }
 
     /// [`Self::enforced`] wrapped in a `Result`.
@@ -2782,8 +2843,11 @@ impl RedactionTable {
             coverage_binding: None,
             source_freshness: None,
             withhold_all: false,
+            scrub_refusals: Vec::new(),
             #[cfg(test)]
             fail_enforced_view: false,
+            #[cfg(test)]
+            fail_composition: false,
             live: None,
         }
     }
@@ -3818,3 +3882,164 @@ pub(crate) mod coverage_route_behavior;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod security_review_r4_coverage {
+    use super::*;
+    use coverage_authority::{
+        CoverageBinding, CoverageBuild, CoverageScope, RedactionCoverageAuthority,
+        RedactionCoverageKey,
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn r4_derived_view_retains_stale_coverage_refusal() {
+        let binding = || CoverageBinding::from_daemon_bytes([55u8; 16]);
+        let key = RedactionCoverageKey::session(
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+        );
+        let boundary = coverage_bindings::OwnedSourceRevisions {
+            environment: binding(),
+            credential_vault: binding(),
+            policy: binding(),
+            sealed: binding(),
+            override_revision: binding(),
+            machine_sources: binding(),
+        };
+        let authority = RedactionCoverageAuthority::default();
+        let initial = authority
+            .acquire(key, CoverageScope::SessionStart, move || {
+                Ok(CoverageBuild::from_complete_table(
+                    RedactionTable::empty(),
+                    boundary,
+                ))
+            })
+            .await
+            .unwrap()
+            .install_table()
+            .unwrap();
+        let owner = crate::engine::redaction_owner::SessionRedactionOwner::new(
+            Arc::new(std::sync::RwLock::new(Arc::new(initial))),
+            uuid::Uuid::new_v4(),
+        );
+        let snapshot = owner.current();
+        let derived = snapshot
+            .with_forced_literal("providerCredentialR4".into(), "$secret:provider-r4".into())
+            .unwrap();
+        {
+            let guard = owner.lock().await;
+            guard.publish_persisted(
+                guard.link(
+                    guard
+                        .current()
+                        .with_forced_literal("registeredR4".into(), "$leak:contained".into())
+                        .unwrap(),
+                ),
+            );
+        }
+        authority.invalidate();
+        let unknown = "NewUncaptured515Secret78529";
+        assert!(
+            owner.current().ensure_binding_current().is_err(),
+            "precondition: current table is stale"
+        );
+        assert!(
+            !owner.current().scrub(unknown).contains(unknown),
+            "control: current bound table withholds unknown text"
+        );
+        let outbound = crate::engine::model::OutboundGuard::new(Arc::new(derived));
+        let rendered = outbound.scrub(unknown);
+        assert!(
+            !rendered.contains(unknown),
+            "live derived resolution dropped stale coverage binding"
+        );
+        {
+            let guard = owner.lock().await;
+            guard.publish_persisted(guard.link(RedactionTable::empty()));
+        }
+        assert_eq!(
+            outbound.scrub(unknown),
+            unknown,
+            "a current owner must clear a predecessor generation's refusal"
+        );
+        assert!(
+            !outbound
+                .scrub("providerCredentialR4")
+                .contains("providerCredentialR4"),
+            "refresh must retain local provider credentials"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_review_r4 {
+    use super::*;
+    use crate::engine::redaction_owner::SessionRedactionOwner;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn r4_live_and_derived_views_keep_withholding() {
+        let shared = Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
+        let owner = SessionRedactionOwner::new(shared, uuid::Uuid::new_v4());
+        let old = owner.current();
+        let derived = old
+            .with_forced_literal("LocalSentinel515".into(), "$leak:contained".into())
+            .unwrap();
+        {
+            let guard = owner.lock().await;
+            let next = guard.link(RedactionTable::withholding_all());
+            guard.publish_persisted(next);
+        }
+        assert_eq!(
+            old.scrub("SensitiveNovelText515"),
+            COVERAGE_WITHHELD_PLACEHOLDER,
+            "stale owner-published view must resolve to live withhold-all"
+        );
+        assert_eq!(
+            derived.scrub("SensitiveNovelText515"),
+            COVERAGE_WITHHELD_PLACEHOLDER,
+            "derived view must not discard live withhold-all"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_r4_composition_failure {
+    use super::*;
+    #[tokio::test]
+    async fn r4_live_composition_error_withholds_local_and_unknown_values() {
+        let owner = crate::engine::redaction_owner::SessionRedactionOwner::new(
+            std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+                RedactionTable::empty(),
+            ))),
+            uuid::Uuid::new_v4(),
+        );
+        let derived = owner
+            .current()
+            .with_forced_literal("NovelLocalCredential515".into(), "$secret:provider".into())
+            .unwrap();
+        {
+            let guard = owner.lock().await;
+            let mut next = RedactionTable::empty();
+            next.fail_composition = true;
+            guard.publish_persisted(guard.link(next));
+        }
+        let outbound = crate::engine::model::OutboundGuard::new(std::sync::Arc::new(derived));
+        assert_eq!(
+            outbound.scrub("NovelLocalCredential515"),
+            COVERAGE_WITHHELD_PLACEHOLDER
+        );
+        assert_eq!(
+            outbound.scrub("other uncaptured content"),
+            COVERAGE_WITHHELD_PLACEHOLDER
+        );
+    }
+}

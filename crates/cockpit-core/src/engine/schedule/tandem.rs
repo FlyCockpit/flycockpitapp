@@ -98,12 +98,20 @@ impl TandemSet {
         &mut self,
         providers: &crate::config::providers::ProvidersConfig,
         table: &Arc<crate::redact::RedactionTable>,
-    ) {
-        for target in &mut self.targets {
-            let mut model = (*target.handle).clone();
-            model.set_redact_table_for_config(providers, table.clone());
-            target.handle = Arc::new(model);
+    ) -> anyhow::Result<()> {
+        let refreshed = self
+            .targets
+            .iter()
+            .map(|target| {
+                let mut model = (*target.handle).clone();
+                model.set_redact_table_for_config(providers, table.clone())?;
+                Ok(Arc::new(model))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for (target, handle) in self.targets.iter_mut().zip(refreshed) {
+            target.handle = handle;
         }
+        Ok(())
     }
 
     /// `true` when at least one tandem model is selected — i.e. the feature is

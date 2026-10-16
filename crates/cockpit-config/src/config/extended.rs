@@ -1597,7 +1597,7 @@ fn resolve_redact_list_unions_from_docs(
 fn redact_list_strings(redact: &Map<String, Value>, key: &str) -> Vec<String> {
     redact
         .get(key)
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .and_then(|value| crate::config::value_free::from_value(value.clone()).ok())
         .unwrap_or_default()
 }
 
@@ -1696,7 +1696,7 @@ fn layer_path_base(config_path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
 fn redact_list_paths(redact: &Map<String, Value>, key: &str) -> Vec<PathBuf> {
     redact
         .get(key)
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .and_then(|value| crate::config::value_free::from_value(value.clone()).ok())
         .unwrap_or_default()
 }
 
@@ -2223,7 +2223,8 @@ fn parse_installation_update_channel_value(
     match raw {
         Value::String(label) => crate::config::update_channel::UpdateChannel::from_label(label)
             .map_err(|error| anyhow::anyhow!("{error}")),
-        _ => serde_json::from_value(raw.clone()).context("invalid update channel value"),
+        _ => crate::config::value_free::from_value(raw.clone())
+            .context("invalid update channel value"),
     }
 }
 
@@ -2235,7 +2236,7 @@ pub fn load_installation_daemon_boot() -> Result<DaemonBootConfig> {
     let doc = ExtendedConfigDoc::load(&path)?;
     let boot = match doc.raw_field("daemon") {
         Some(raw) => {
-            serde_json::from_value::<DaemonConfig>(raw.clone())
+            crate::config::value_free::from_value::<DaemonConfig>(raw.clone())
                 .context("invalid installation daemon configuration")?
                 .boot
         }
@@ -2255,7 +2256,7 @@ pub fn load_installation_handover_timers() -> Result<HandoverTimersConfig> {
     let doc = ExtendedConfigDoc::load(&path)?;
     Ok(match doc.raw_field("daemon") {
         Some(raw) => {
-            serde_json::from_value::<DaemonConfig>(raw.clone())
+            crate::config::value_free::from_value::<DaemonConfig>(raw.clone())
                 .context("invalid installation daemon configuration")?
                 .handover
         }
@@ -2627,7 +2628,7 @@ fn validate_policy_section(
         field.insert(key.clone(), entry.clone());
         let mut probe = Map::new();
         probe.insert(section.key().to_string(), Value::Object(field));
-        if serde_json::from_value::<ExtendedConfig>(Value::Object(probe)).is_err() {
+        if crate::config::value_free::from_value::<ExtendedConfig>(Value::Object(probe)).is_err() {
             return Err(problem(Some(key), InstallationPolicyProblem::WrongType));
         }
     }
@@ -2801,7 +2802,7 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
             .context("serializing retained workspace provider configuration")?;
         deep_merge_value(&mut merged_providers, &workspace_provider_value);
     }
-    let providers = serde_json::from_value(merged_providers)
+    let providers = crate::config::value_free::from_value(merged_providers)
         .context("projecting retained workspace provider configuration")?;
 
     let mut docs: Vec<_> = captured
@@ -2819,7 +2820,8 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
     let mut validation = Ok(());
     for doc in &docs {
         if let Some(value) = doc.raw_field("response_metrics_tokenizer")
-            && let Err(source) = serde_json::from_value::<TiktokenEncoding>(value.clone())
+            && let Err(source) =
+                crate::config::value_free::from_value::<TiktokenEncoding>(value.clone())
             && validation.is_ok()
         {
             validation = Err(InvalidResponseMetricsTokenizer {
@@ -2897,7 +2899,8 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
     let mut validation = Ok(());
     for doc in &docs {
         if let Some(value) = doc.raw_field("response_metrics_tokenizer")
-            && let Err(source) = serde_json::from_value::<TiktokenEncoding>(value.clone())
+            && let Err(source) =
+                crate::config::value_free::from_value::<TiktokenEncoding>(value.clone())
             && validation.is_ok()
         {
             validation = Err(InvalidResponseMetricsTokenizer {
@@ -3015,7 +3018,7 @@ fn append_unresolved_tail(
 #[derive(Debug)]
 pub struct InvalidResponseMetricsTokenizer {
     path: PathBuf,
-    source: serde_json::Error,
+    source: anyhow::Error,
 }
 
 impl InvalidResponseMetricsTokenizer {
@@ -3106,7 +3109,7 @@ pub fn resolve_computer_use_policy_from_paths(paths: &[PathBuf]) -> Option<Compu
                 let Some(value) = doc.raw_field("computer_use") else {
                     continue;
                 };
-                match serde_json::from_value::<ComputerUseMode>(value.clone()) {
+                match crate::config::value_free::from_value::<ComputerUseMode>(value.clone()) {
                     Ok(tier) => tiers.push(tier),
                     Err(error) => {
                         tracing::warn!(
@@ -3129,7 +3132,7 @@ pub fn resolve_computer_use_policy_from_paths(paths: &[PathBuf]) -> Option<Compu
 fn resolve_computer_use_policy_from_docs(docs: &[ExtendedConfigDoc]) -> Option<ComputerUseMode> {
     ComputerUseMode::most_restrictive(docs.iter().filter_map(|doc| {
         let value = doc.raw_field("computer_use")?;
-        match serde_json::from_value::<ComputerUseMode>(value.clone()) {
+        match crate::config::value_free::from_value::<ComputerUseMode>(value.clone()) {
             Ok(tier) => Some(tier),
             Err(error) => {
                 tracing::warn!(
@@ -3205,7 +3208,7 @@ fn fold_enablement_value(acc: Option<bool>, next: Option<bool>) -> Option<bool> 
 /// with a field-only warning.
 fn guidance_proposal_field_from_doc(doc: &ExtendedConfigDoc) -> Option<bool> {
     let value = doc.raw_field("allow_computer_guidance_proposals")?;
-    match serde_json::from_value::<Option<bool>>(value.clone()) {
+    match crate::config::value_free::from_value::<Option<bool>>(value.clone()) {
         Ok(parsed) => parsed,
         Err(error) => {
             tracing::warn!(
@@ -3408,10 +3411,14 @@ fn parse_config_root_object(bytes: &[u8]) -> Result<Value> {
     if text.trim().is_empty() {
         return Ok(Value::Object(Map::new()));
     }
-    let value: Value = serde_json::from_str(text).context("config.json is not valid JSON")?;
+    let value: Value =
+        crate::config::value_free::from_str(text).context("config.json is not valid JSON")?;
     match value {
         Value::Object(_) => Ok(value),
-        other => anyhow::bail!("expected config.json root to be an object, found {other:?}"),
+        other => anyhow::bail!(
+            "expected config.json root to be an object, found {}",
+            crate::config::value_free::json_kind(&other)
+        ),
     }
 }
 
@@ -3687,7 +3694,7 @@ impl ExtendedConfigDoc {
         let raw: Value = if raw_str.trim().is_empty() {
             Value::Object(Map::new())
         } else {
-            serde_json::from_str(&raw_str)
+            crate::config::value_free::from_str(&raw_str)
                 .with_context(|| format!("parsing config.json at {}", path.display()))?
         };
         let mut raw = match raw {
@@ -3782,7 +3789,9 @@ impl ExtendedConfigDoc {
         let Some(raw_obj) = self.raw.as_object() else {
             return (cfg, warnings);
         };
-        match serde_json::from_value::<ExtendedConfig>(Value::Object(raw_obj.clone())) {
+        match crate::config::value_free::from_value::<ExtendedConfig>(Value::Object(
+            raw_obj.clone(),
+        )) {
             Ok(parsed) => cfg = parsed,
             Err(_) => cfg = self.recover_typed_config(raw_obj, &mut warnings),
         }
@@ -3834,14 +3843,16 @@ impl ExtendedConfigDoc {
         for (key, value) in raw {
             let mut probe = Map::new();
             probe.insert(key.clone(), value.clone());
-            match serde_json::from_value::<ExtendedConfig>(Value::Object(probe)) {
+            match crate::config::value_free::from_value::<ExtendedConfig>(Value::Object(probe)) {
                 Ok(_) => {
                     accepted.insert(key.clone(), value.clone());
                 }
                 Err(error) => self.warn_skipped_config_key(key, &error, warnings),
             }
         }
-        match serde_json::from_value::<ExtendedConfig>(Value::Object(accepted.clone())) {
+        match crate::config::value_free::from_value::<ExtendedConfig>(Value::Object(
+            accepted.clone(),
+        )) {
             Ok(parsed) => parsed,
             Err(_) => {
                 let mut accumulated: Map<String, Value> = Map::new();
@@ -3849,7 +3860,9 @@ impl ExtendedConfigDoc {
                 for (key, value) in &accepted {
                     let mut probe = accumulated.clone();
                     probe.insert(key.clone(), value.clone());
-                    match serde_json::from_value::<ExtendedConfig>(Value::Object(probe.clone())) {
+                    match crate::config::value_free::from_value::<ExtendedConfig>(Value::Object(
+                        probe.clone(),
+                    )) {
                         Ok(parsed) => {
                             accumulated = probe;
                             recovered = parsed;
@@ -3870,7 +3883,7 @@ impl ExtendedConfigDoc {
     fn warn_skipped_config_key(
         &self,
         key: &str,
-        error: &serde_json::Error,
+        error: &anyhow::Error,
         warnings: &mut Vec<String>,
     ) {
         match key {
@@ -3937,9 +3950,9 @@ impl ExtendedConfigDoc {
         // a layered config value (its only authority is the ledger), so there
         // is nothing to sanitize or fail closed on at this boundary.
         if let Some(value) = obj.get("image_generation")
-            && serde_json::from_value::<crate::config::image_generation::ImageGenerationConfig>(
-                value.clone(),
-            )
+            && crate::config::value_free::from_value::<
+                crate::config::image_generation::ImageGenerationConfig,
+            >(value.clone())
             .is_err()
         {
             // A present-but-invalid registry (missing endpoint for an enabled
@@ -3959,7 +3972,9 @@ impl ExtendedConfigDoc {
             obj.insert("image_generation".into(), serde_json::json!({}));
         }
         if let Some(value) = obj.get("knowledgeBases") {
-            match serde_json::from_value::<Vec<KnowledgeBaseRegistryEntry>>(value.clone()) {
+            match crate::config::value_free::from_value::<Vec<KnowledgeBaseRegistryEntry>>(
+                value.clone(),
+            ) {
                 Ok(entries) if validate_knowledge_base_local_policy(&entries).is_ok() => {}
                 Ok(_) | Err(_) => {
                     tracing::warn!("ignored invalid `knowledgeBases` policy");
@@ -3992,7 +4007,9 @@ impl ExtendedConfigDoc {
             };
             let mut probe = Map::new();
             probe.insert(key.clone(), value);
-            if let Err(error) = serde_json::from_value::<ExtendedConfig>(Value::Object(probe)) {
+            if let Err(error) =
+                crate::config::value_free::from_value::<ExtendedConfig>(Value::Object(probe))
+            {
                 tracing::warn!(
                     path = %self.path.display(),
                     key = %key,
@@ -4136,9 +4153,9 @@ impl ExtendedConfigDoc {
         // gain an `image_generation` they didn't have.
         if obj.contains_key("image_generation") {
             let reloaded_invalid = obj.get("image_generation").is_some_and(|value| {
-                serde_json::from_value::<crate::config::image_generation::ImageGenerationConfig>(
-                    value.clone(),
-                )
+                crate::config::value_free::from_value::<
+                    crate::config::image_generation::ImageGenerationConfig,
+                >(value.clone())
                 .is_err()
             });
             if caller_changed_image_generation || reloaded_invalid {
@@ -4215,3 +4232,19 @@ fn apply_object_delta(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod security_review_r4 {
+    use super::*;
+    #[test]
+    fn r4_malformed_extended_root_error_is_value_free() {
+        let secret = "NovelRootEnv515Secret78529";
+        let bytes = serde_json::to_vec(&serde_json::json!([{"hooks":{"SessionStart":[{"command":["echo"],"env":{"TOKEN":secret}}]}}])).unwrap();
+        let error = parse_config_root_object(&bytes).unwrap_err();
+        let rendered = format!("{error:#} / {error:?}");
+        assert!(
+            !rendered.contains(secret),
+            "malformed raw document disclosed the env value through Debug: {rendered}"
+        );
+    }
+}

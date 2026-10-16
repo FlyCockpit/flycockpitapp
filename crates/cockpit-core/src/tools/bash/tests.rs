@@ -4474,6 +4474,22 @@ async fn codex_r2_bounded_capture_preserves_yaml_context() {
         output.push_str(&format!("  {secret}\n"));
     }
     std::fs::write(tmp.path().join("ordinary.yaml"), output).unwrap();
+    let overflow = BashTool::new()
+        .call(serde_json::json!({"command":command}), &ctx)
+        .await;
+    let error = overflow
+        .err()
+        .expect("over-cap YAML custody must withhold the command");
+    assert!(format!("{error:#}").contains("withheld"));
+    // A bounded semantic scalar still registers when its key line is omitted
+    // from a large capture; a later keyless echo survives in the retained tail
+    // only if intake registration is broken.
+    let control = format!(
+        "{}password: |\n  {secret}\nnext: fine\n{}{secret}\n",
+        "ordinary benign line\n".repeat(7000),
+        "ordinary benign line\n".repeat(20000)
+    );
+    std::fs::write(tmp.path().join("ordinary.yaml"), control).unwrap();
     let result = BashTool::new()
         .call(serde_json::json!({"command":command}), &ctx)
         .await
@@ -4497,4 +4513,39 @@ fn codex_r2_quoted_env_assignment_log_identity_is_value_free() {
         !identity.contains(secret),
         "quoted environment assignment credential becomes logged program: {identity}"
     );
+}
+
+#[tokio::test]
+async fn r4_over_budget_actual_bash_withholds_cross_stream_echo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let secret = "NovelOverBudget515Echo78529";
+    let command = "cat overflow.txt; cat echo.txt 1>&2";
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let live = install_live_redaction_hub(&mut ctx);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+    let mut input = (0..12000)
+        .map(|i| format!("PASSWORD=NovelObservation515Secret{i:08}\n"))
+        .collect::<String>();
+    input.push_str(&format!("PASSWORD={secret}\n"));
+    std::fs::write(tmp.path().join("overflow.txt"), input).unwrap();
+    std::fs::write(tmp.path().join("echo.txt"), secret).unwrap();
+    let result = BashTool::new()
+        .call(serde_json::json!({"command": command}), &ctx)
+        .await;
+    match result {
+        Err(error) => assert!(format!("{error:#}").contains("withheld")),
+        Ok(output) => {
+            assert!(
+                output.content.contains("withheld"),
+                "overflow must explicitly withhold output"
+            );
+            assert!(
+                !output.content.contains(secret),
+                "overflow released a dropped observation's echo"
+            );
+        }
+    }
+    // Refusal must not install a partial table as successfully registered.
+    assert!(live.read().unwrap().scrub(secret).contains(secret));
 }

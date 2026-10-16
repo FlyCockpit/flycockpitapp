@@ -265,7 +265,7 @@ fn load_cached(
     store
         .reread_owned(provider_id)?
         .and_then(|record| record.get("auth_command").cloned())
-        .map(serde_json::from_value::<CachedCommandCredential>)
+        .map(crate::config::value_free::from_value::<CachedCommandCredential>)
         .transpose()
         .context("cached auth-command credential is malformed")
         .map(|cached| {
@@ -590,6 +590,35 @@ mod tests {
         assert!(
             !diagnostic.contains(secret),
             "auth command header parse leaks through unwrapped serde cause: {diagnostic}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_review_r4 {
+    use super::*;
+    #[test]
+    fn r4_cached_auth_header_error_is_value_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::open(tmp.path().join("credentials.json")).unwrap();
+        let secret = "NovelCachedHeader515Secret78529";
+        store
+            .save_record_merged(
+                "r4provider",
+                serde_json::json!({"auth_command": {
+                    "configuration_identity":"anything", "refresh_generation":1,
+                    "credential":{"token":"fake-token", "headers":secret}
+                }}),
+            )
+            .unwrap();
+        let error = match load_cached(&store, "r4provider", "anything") {
+            Err(error) => error,
+            Ok(_) => panic!("malformed cached header must fail"),
+        };
+        let rendered = format!("{error:#} / {error:?}");
+        assert!(
+            !rendered.contains(secret),
+            "cached-header parser retained credential-bearing serde cause: {rendered}"
         );
     }
 }

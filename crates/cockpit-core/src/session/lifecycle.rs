@@ -1469,6 +1469,7 @@ impl Session {
             tool_surface_override_json: Mutex::new(row.tool_surface_override_json),
             goal_settings_override_json: Mutex::new(row.goal_settings_override_json),
             redaction_table_json: Mutex::new(redaction_table_json),
+            pending_redaction_commits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             secret_path_matcher: std::sync::OnceLock::new(),
             model_system_prompt_snapshot,
             knowledge_base_prompt_snapshot,
@@ -1621,7 +1622,7 @@ impl Session {
     /// Persist the accumulated egress redaction table with the session so raw
     /// history remains covered after resume even if env/dotenv sources change.
     ///
-    /// The in-memory cache advertised by [`Self::persisted_redaction_table`] is
+    /// The in-memory committed-table mirror is
     /// updated only after the vault write commits. A failed persist leaves both
     /// the durable vault and every cache advertised as persisted at the last
     /// committed table (persist-before-swap).
@@ -1641,63 +1642,71 @@ impl Session {
         Ok(())
     }
 
-    /// Advertise `json` as committed after a transaction wrote it to the
-    /// vault item of `written_for`. When the live identity moved to a
-    /// compaction successor while the transaction ran, the committed table is
-    /// re-persisted onto the successor too (the retarget copied the cache as
-    /// it was BEFORE this commit), so the successor never resumes without a
-    /// registration that committed during the retarget.
-    ///
-    /// The transaction already committed, so a failed re-persist is logged,
-    /// not returned: failing the caller would make it roll its live table
-    /// back BELOW the durable one. The next table commit re-persists the full
-    /// table to the successor.
-    pub(crate) fn commit_redaction_cache(&self, written_for: Uuid, json: String) {
+    /// Reserve a journal commit under the same lock as identity transitions.
+    /// The permit travels inside the DB result, so dropping the caller cannot
+    /// release it before the writer has committed or rolled back.
+    pub(super) fn begin_redaction_commit(&self) -> (Uuid, PendingRedactionCommit) {
+        let _cache = self
+            .redaction_table_json
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.pending_redaction_commits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (
+            self.live_id(),
+            PendingRedactionCommit(self.pending_redaction_commits.clone()),
+        )
+    }
+
+    pub(crate) fn commit_redaction_cache(&self, written_for: Uuid, json: String) -> Result<()> {
         let mut cache = self
             .redaction_table_json
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let live = self.live_id();
-        if live != written_for
-            && let Err(error) =
-                persist_redaction_table_to_vault(&self.secret_vault, live, json.as_bytes())
-        {
-            tracing::warn!(
-                error = %error,
-                "re-persisting a committed redaction table onto the compaction successor failed"
-            );
-        }
+        anyhow::ensure!(
+            self.live_id() == written_for,
+            "redaction custody identity changed during commit"
+        );
         *cache = Some(json);
+        Ok(())
     }
 
-    /// Copy the last committed redaction table onto `successor` under the
-    /// cache lock (called by [`Self::adopt_compaction_successor`] while it
-    /// swaps the live identity).
+    /// The vault is authoritative after a cancelled journal await. Both
+    /// operands are read under the identity-transition lock, after every
+    /// queued commit's permit has been released. A failed transfer leaves
+    /// the predecessor identity and cache untouched.
     pub(super) fn retarget_redaction_custody(
         &self,
-        cache: &Option<String>,
+        predecessor: Uuid,
         successor: Uuid,
-    ) -> Result<()> {
-        match cache {
-            Some(json) => {
-                persist_redaction_table_to_vault(&self.secret_vault, successor, json.as_bytes())
-            }
-            None => Ok(()),
-        }
+    ) -> Result<String> {
+        let load = |id| -> Result<crate::redact::RedactionTable> {
+            let json = require_redaction_table_json_from_vault(
+                &self.secret_vault,
+                id,
+                "retargeting redaction custody",
+            )?;
+            crate::redact::RedactionTable::from_persisted_json(&json)
+        };
+        let merged = load(predecessor)?.union(&load(successor)?)?;
+        let json = merged.to_persisted_json()?;
+        persist_redaction_table_to_vault(&self.secret_vault, successor, json.as_bytes())?;
+        Ok(json)
     }
 
-    /// Load the last committed redaction table. The in-memory cache is a
-    /// committed-table mirror, never a speculative write.
+    /// Load the last committed redaction table from its authoritative vault.
+    /// The in-memory mirror can lag behind a cancelled journal reply.
     ///
     /// `Ok(None)` is only for a not-yet-durable deferred session that has never
     /// written a vault item. A persisted session with a missing item is lost
     /// custody, never an empty table.
     pub fn persisted_redaction_table(&self) -> Result<Option<crate::redact::RedactionTable>> {
-        if let Some(json) = self.redaction_table_json.lock().unwrap().clone() {
-            return crate::redact::RedactionTable::from_persisted_json(&json)
-                .map(Some)
-                .context("loading persisted session redaction table");
-        }
+        // A cancelled journal reply can leave the cache behind a committed
+        // vault write. Never use that cache as an overwrite/adoption base.
+        let _cache = self
+            .redaction_table_json
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !self.is_persisted() {
             return match load_redaction_table_from_vault(&self.secret_vault, self.live_id())? {
                 Some(json) => crate::redact::RedactionTable::from_persisted_json(&json)
@@ -1716,7 +1725,7 @@ impl Session {
             .context("loading vault session redaction table")
     }
 
-    /// Drop the in-memory redaction cache so the next load hits the vault.
+    /// Drop the in-memory mirror to exercise recovery without cached state.
     /// Used to inject vault-read failures on security-relevant paths.
     #[cfg(test)]
     pub(crate) fn clear_cached_redaction_table_for_test(&self) {
@@ -2334,5 +2343,13 @@ mod vault_unification_tests {
             "failure must come from the vault write, before insert_session_row_conn: {err:#}"
         );
         assert!(db.list_sessions(true, 10).await.unwrap().is_empty());
+    }
+}
+
+/// Kept in the transaction's reply until durable completion.
+pub(super) struct PendingRedactionCommit(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for PendingRedactionCommit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }

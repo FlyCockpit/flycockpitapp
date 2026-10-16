@@ -222,7 +222,7 @@ pub fn retained_provider_model_source_from_workspace_layer_snapshots(
         else {
             continue;
         };
-        let provider: Value = serde_json::from_slice(provider_bytes)
+        let provider: Value = crate::config::value_free::from_slice(provider_bytes)
             .with_context(|| format!("parsing retained provider `{provider_id}`"))?;
         let provider = provider
             .as_object()
@@ -408,7 +408,8 @@ impl RetainedProviderModelFavoriteTarget {
         let raw: Value = if bytes.iter().all(u8::is_ascii_whitespace) {
             Value::Object(Map::new())
         } else {
-            serde_json::from_slice(&bytes).context("parsing captured provider config")?
+            crate::config::value_free::from_slice(&bytes)
+                .context("parsing captured provider config")?
         };
         let provider = raw
             .as_object()
@@ -462,7 +463,7 @@ impl RetainedProviderModelFavoriteTarget {
         let mut raw: Value = if bytes.iter().all(u8::is_ascii_whitespace) {
             Value::Object(Map::new())
         } else {
-            serde_json::from_slice(&bytes)
+            crate::config::value_free::from_slice(&bytes)
                 .context("parsing captured provider config")
                 .map_err(RetainedProviderModelFavoriteWriteError::Rejected)?
         };
@@ -550,7 +551,8 @@ fn authored_model_value(provider: &Map<String, Value>, model_id: &str) -> Result
         model = Some(serde_json::json!({"id":model_id}));
     }
     if let Some(raw) = provider.get("model_field_patches") {
-        let patches: Vec<ModelEntryFieldPatch> = serde_json::from_value(raw.clone())?;
+        let patches: Vec<ModelEntryFieldPatch> =
+            crate::config::value_free::from_value(raw.clone())?;
         let mut matching = patches.iter().filter(|patch| patch.id == model_id);
         if let Some(patch) = matching.next() {
             anyhow::ensure!(
@@ -571,7 +573,8 @@ fn update_existing_model_field_patch(
     let Some(raw) = provider.get("model_field_patches") else {
         return Ok(false);
     };
-    let mut patches: Vec<ModelEntryFieldPatch> = serde_json::from_value(raw.clone())?;
+    let mut patches: Vec<ModelEntryFieldPatch> =
+        crate::config::value_free::from_value(raw.clone())?;
     let Some(patch) = patches.iter_mut().find(|patch| patch.id == update.id) else {
         return Ok(false);
     };
@@ -775,7 +778,8 @@ impl ConfigDoc {
         let mut raw: Value = if text.trim().is_empty() {
             Value::Object(Map::new())
         } else {
-            serde_json::from_str(text).context("workspace config.json is not valid JSON")?
+            crate::config::value_free::from_str(text)
+                .context("workspace config.json is not valid JSON")?
         };
         let Some(root) = raw.as_object_mut() else {
             anyhow::bail!("workspace config.json root must be an object");
@@ -784,7 +788,7 @@ impl ConfigDoc {
         let mut warnings = Vec::new();
         for (id, bytes) in &snapshot.provider_files {
             validate_provider_id_for_filename(id)?;
-            let value: Value = serde_json::from_slice(bytes)
+            let value: Value = crate::config::value_free::from_slice(bytes)
                 .with_context(|| format!("parsing workspace provider `{id}`"))?;
             let Some(mut provider) = value.as_object().cloned() else {
                 anyhow::bail!("workspace provider `{id}` must be a JSON object");
@@ -1113,13 +1117,16 @@ impl ConfigDoc {
         let raw: Value = if raw_str.trim().is_empty() {
             Value::Object(Map::new())
         } else {
-            serde_json::from_str(&raw_str)
+            crate::config::value_free::from_str(&raw_str)
                 .with_context(|| format!("parsing config.json at {}", path.display()))?
         };
         let raw = match raw {
             Value::Object(_) => raw,
             other => {
-                anyhow::bail!("expected config.json root to be an object, found {other:?}")
+                anyhow::bail!(
+                    "expected config.json root to be an object, found {}",
+                    crate::config::value_free::json_kind(&other)
+                )
             }
         };
         let mut providers = ProvidersConfig::default();
@@ -1421,14 +1428,15 @@ impl ConfigDoc {
         let value: Value = if raw.trim().is_empty() {
             Value::Object(Map::new())
         } else {
-            serde_json::from_str(&raw)
+            crate::config::value_free::from_str(&raw)
                 .with_context(|| format!("parsing provider config at {}", path.display()))?
         };
         match value {
             Value::Object(map) => Ok(map),
             other => anyhow::bail!(
-                "expected provider config root to be an object at {}, found {other:?}",
-                path.display()
+                "expected provider config root to be an object at {}, found {}",
+                path.display(),
+                crate::config::value_free::json_kind(&other)
             ),
         }
     }
@@ -2057,14 +2065,15 @@ pub fn load_provider_raw_file(path: &Path) -> Result<Map<String, Value>> {
     let value: Value = if raw.trim().is_empty() {
         Value::Object(Map::new())
     } else {
-        serde_json::from_str(&raw)
+        crate::config::value_free::from_str(&raw)
             .with_context(|| format!("parsing provider config at {}", path.display()))?
     };
     match value {
         Value::Object(map) => Ok(map),
         other => anyhow::bail!(
-            "expected provider config root to be an object at {}, found {other:?}",
-            path.display()
+            "expected provider config root to be an object at {}, found {}",
+            path.display(),
+            crate::config::value_free::json_kind(&other)
         ),
     }
 }
@@ -2694,6 +2703,28 @@ mod codex_r2_doc_probe {
         assert!(
             !format!("{doc:?}").contains(secret),
             "raw config document Debug leaks header value"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_review_r4 {
+    use super::*;
+    #[test]
+    fn r4_malformed_config_root_error_is_value_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        let secret = "NovelRootHeader515Secret78529";
+        std::fs::write(
+            &path,
+            serde_json::json!([{"headers":[{"name":"Authorization","value":secret}]}]).to_string(),
+        )
+        .unwrap();
+        let error = ConfigDoc::load(&path).unwrap_err();
+        let rendered = format!("{error:#} / {error:?}");
+        assert!(
+            !rendered.contains(secret),
+            "malformed raw document disclosed the header through Debug: {rendered}"
         );
     }
 }

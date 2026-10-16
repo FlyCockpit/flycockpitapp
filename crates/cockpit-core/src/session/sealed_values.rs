@@ -260,13 +260,14 @@ impl Session {
         let write_json = unioned.to_persisted_json()?;
         let cache_json = write_json.clone();
         let vault = self.secret_vault.clone();
-        let session_id = self.live_id();
+        let (session_id, pending_commit) = self.begin_redaction_commit();
         let item_id = crate::secure_key::session_sealed_item_id(&session_id.to_string(), name, 1);
         let literal = value.to_owned();
         let reason = description.to_owned();
         let acquisition_id = acquisition_id.to_owned();
         let source_tool_call_id = source_tool_call_id.to_owned();
-        self.db
+        let pending_commit = self
+            .db
             .transaction(move |conn| {
                 let exists: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM sessions WHERE session_id = ?1",
@@ -315,12 +316,13 @@ impl Session {
                     row.active_version == 1,
                     "agent-acquired create did not publish version one"
                 );
-                Ok(())
+                Ok(pending_commit)
             })
             .await?;
         // Persist-before-swap: advertise the union as persisted only after the
         // vault write commits, matching [`Session::persist_redaction_table`].
-        self.commit_redaction_cache(session_id, cache_json);
+        self.commit_redaction_cache(session_id, cache_json)?;
+        drop(pending_commit);
         Ok(())
     }
 
@@ -523,10 +525,10 @@ impl Session {
         use crate::redact::protected_redaction_history::append_and_attach_conn;
 
         let json = table.to_persisted_json()?;
-        let session_id = self.live_id();
+        let (session_id, pending_commit) = self.begin_redaction_commit();
         let write_json = json.clone();
         let vault = self.secret_vault.clone();
-        let metadata = self
+        let (metadata, pending_commit) = self
             .db
             .transaction(move |conn| {
                 let exists: i64 = conn.query_row(
@@ -579,13 +581,14 @@ impl Session {
                     }
                     None => None,
                 };
-                Ok(metadata)
+                Ok((metadata, pending_commit))
             })
             .await?;
         // Persist-before-swap: advertise the union as persisted only after the
         // transaction commits, so a rollback never leaves a cache ahead of the
         // durable table.
-        self.commit_redaction_cache(session_id, json);
+        self.commit_redaction_cache(session_id, json)?;
+        drop(pending_commit);
         if let Some((authority, key, _policy_digest)) = self.redaction_coverage() {
             authority.invalidate_key(&key);
         }

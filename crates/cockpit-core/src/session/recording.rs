@@ -3232,7 +3232,9 @@ mod trusted_journaling_tests {
         let window1 = session.id;
         let window2 = db.create_compaction_successor(window1).await.unwrap();
         let window2_short = window2.short_id.clone();
-        session.adopt_compaction_successor(window2.session_id, window2_short.clone());
+        session
+            .adopt_compaction_successor(window2.session_id, window2_short.clone())
+            .unwrap();
         let window3 = db
             .create_compaction_successor(window2.session_id)
             .await

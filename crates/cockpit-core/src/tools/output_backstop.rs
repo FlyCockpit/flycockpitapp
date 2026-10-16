@@ -208,7 +208,7 @@ impl NovelScrubIntake {
         let scrubbed = if truncated {
             self.stream.push_truncated_line(&text)
         } else {
-            self.stream.push_line(&text)
+            self.stream.push_line_with_ending(&text, newline)
         };
         if let Some(scrubbed) = scrubbed {
             if scrubbed == text {
@@ -594,11 +594,10 @@ mod tests {
         assert!(!live.read().unwrap().scrub(&encoded).contains(&encoded));
     }
 
-    /// Secrets r2 C6: a password that equals its user name or a well-known
-    /// default is replaced, but only the user:password pair is installed —
-    /// the stated policy exception, so `postgres` is not rewritten everywhere.
+    /// URL passwords register even when they equal the user name or a
+    /// published default. Later plain echoes and the pair both remain covered.
     #[tokio::test]
-    async fn well_known_url_passwords_register_only_the_pair() {
+    async fn well_known_url_passwords_register_actual_password_and_pair() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = test_session(&db, &tmp);
@@ -612,13 +611,19 @@ mod tests {
         )
         .await
         .unwrap();
-        // r3: replaced in this output (the username equals the password, so
-        // the whole userinfo is withheld), registered only as the pair.
-        assert!(out.starts_with("DATABASE_URL=postgres://"), "{out}");
+        // Equality with the username withholds both positions, and the
+        // actual password remains covered outside the URL too.
+        assert!(
+            out.starts_with(&format!(
+                "DATABASE_URL={}://",
+                RedactionTable::empty().placeholder()
+            )),
+            "{out}"
+        );
         assert!(!out.contains("postgres@localhost"), "{out}");
         assert!(!out.contains("://postgres:"), "{out}");
         let live = live.read().unwrap().clone();
-        assert!(live.scrub("image postgres:16").contains("postgres:16"));
+        assert!(!live.scrub("image postgres:16").contains("postgres:16"));
         assert!(
             !live
                 .scrub("postgres:postgres")
@@ -742,8 +747,8 @@ mod tests {
     }
 
     /// Secrets r2: source-code type annotations under secret-shaped keys are
-    /// not secrets — they stay visible and are never registered, so reading a
-    /// Rust/TypeScript file through the shell is not rewritten afterwards.
+    /// redacted in place without registration, so later Rust/TypeScript file
+    /// reads are not rewritten by session-wide type-name patterns.
     #[tokio::test]
     async fn code_type_annotations_under_secret_keys_are_redacted_not_registered() {
         let tmp = tempfile::TempDir::new().unwrap();

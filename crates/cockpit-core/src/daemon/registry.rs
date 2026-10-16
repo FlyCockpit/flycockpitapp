@@ -7244,7 +7244,9 @@ mod tests {
         assert_eq!(reg.activation_leases(spawn_id), Some(1));
         assert!(claim.handle().same_worker_as(&handle));
 
-        session.adopt_compaction_successor(successor_id, successor_short);
+        session
+            .adopt_compaction_successor(successor_id, successor_short)
+            .unwrap();
         assert_eq!(session.live_id(), successor_id);
         assert_eq!(handle.session_id(), successor_id);
         assert!(

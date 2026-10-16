@@ -66,6 +66,11 @@ pub struct BackgroundHandle {
 #[derive(Default)]
 pub(crate) struct BackgroundCustody {
     pending: Mutex<crate::redact::ObservedSet>,
+    registration: tokio::sync::Mutex<()>,
+    /// Unfinished semantic values cannot yet yield complete observations.
+    /// Their custody also survives runner cancellation, which leaves the tail
+    /// withheld rather than declaring a dropped parser settled.
+    open_constructs: std::sync::atomic::AtomicUsize,
     failed: std::sync::atomic::AtomicBool,
     /// When the last registration ran: arriving observations register at
     /// once unless one ran within [`REGISTRATION_BATCH_INTERVAL`], so a burst
@@ -115,6 +120,8 @@ impl BackgroundCustody {
     /// Register `found` plus anything still pending. On failure everything
     /// stays pending and the latch is set; on success it is cleared.
     async fn register(&self, found: Vec<crate::redact::ObservedSecret>) {
+        self.defer(found);
+        let _registration = self.registration.lock().await;
         let sink = self
             .sink
             .lock()
@@ -124,12 +131,11 @@ impl BackgroundCustody {
             return;
         };
         let all = {
-            let mut pending = self
+            let pending = self
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.extend(found);
-            pending.take()
+            pending.snapshot()
         };
         if all.is_empty() {
             return;
@@ -143,14 +149,15 @@ impl BackgroundCustody {
             .register_observed_output_secrets(&sink.session, &sink.cfg, &all)
             .await
         {
-            Ok(_) => self
-                .failed
-                .store(false, std::sync::atomic::Ordering::SeqCst),
-            Err(_) => {
+            Ok(_) => {
                 self.pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .extend(all);
+                    .acknowledge(&all);
+                self.failed
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            Err(_) => {
                 self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -172,18 +179,30 @@ impl BackgroundCustody {
         let current = sink.interrupts.current_live_redaction()?;
         match redact.scrub_only_union(&current) {
             Ok(merged) => Some(merged),
-            // Fail closed: the owner's table carries every registration.
-            Err(_) => Some((*current).clone()),
+            // Neither operand alone covers the combined credentials.
+            Err(_) => Some(RedactionTable::withholding_all()),
         }
     }
 
     /// `true` when every observation is registered (registering pending
     /// ones first, and retrying failed ones).
     async fn settled(&self) -> bool {
+        if self
+            .open_constructs
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+        {
+            return false;
+        }
         if self.failed.load(std::sync::atomic::Ordering::SeqCst) || self.has_pending() {
             self.register(Vec::new()).await;
         }
         !self.failed.load(std::sync::atomic::Ordering::SeqCst)
+            && !self.has_pending()
+            && self
+                .open_constructs
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
     }
 }
 
@@ -811,14 +830,27 @@ async fn ingest_background_line(
     stream: &mut crate::redact::NovelScrubStream,
     line: &str,
     truncated: bool,
+    terminated: bool,
     custody: &BackgroundCustody,
 ) -> Option<String> {
+    let was_open = stream.has_unfinished_value();
     let scrubbed = if truncated {
         stream.push_truncated_line(line)
     } else {
-        stream.push_line(line)
+        stream.push_line_with_ending(line, terminated)
     };
     custody.defer(stream.take_found());
+    if stream.has_unfinished_value() != was_open {
+        if was_open {
+            custody
+                .open_constructs
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            custody
+                .open_constructs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     custody.register_if_due().await;
     scrubbed
 }
@@ -903,6 +935,7 @@ struct CappedLineReader<R> {
     discarding: bool,
     /// The line most recently returned was cut at the cap.
     last_truncated: bool,
+    last_terminated: bool,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> CappedLineReader<R> {
@@ -913,6 +946,7 @@ impl<R: tokio::io::AsyncRead + Unpin> CappedLineReader<R> {
             cap: cap.max(1),
             discarding: false,
             last_truncated: false,
+            last_terminated: false,
         }
     }
 
@@ -924,6 +958,7 @@ impl<R: tokio::io::AsyncRead + Unpin> CappedLineReader<R> {
 
     async fn next_line(&mut self) -> std::io::Result<Option<String>> {
         self.last_truncated = false;
+        self.last_terminated = false;
         loop {
             let chunk = self.reader.fill_buf().await?;
             if chunk.is_empty() {
@@ -954,6 +989,7 @@ impl<R: tokio::io::AsyncRead + Unpin> CappedLineReader<R> {
                     // only then is a trailing `\r` a genuine CRLF terminator.
                     let complete = take == nl;
                     self.last_truncated = !complete;
+                    self.last_terminated = complete;
                     self.pending.extend_from_slice(&chunk[..take]);
                     // Consume through the newline, dropping any bytes in
                     // `chunk[take..nl]` that overflowed the cap.
@@ -1149,6 +1185,7 @@ async fn run_background(
                                 &mut out_scrub,
                                 &l,
                                 out_lines.last_was_truncated(),
+                                out_lines.last_terminated,
                                 &custody,
                             )
                             .await
@@ -1173,6 +1210,7 @@ async fn run_background(
                                 &mut err_scrub,
                                 &l,
                                 err_lines.last_was_truncated(),
+                                err_lines.last_terminated,
                                 &custody,
                             )
                             .await
@@ -1197,9 +1235,15 @@ async fn run_background(
     }
 
     for stream in [&mut out_scrub, &mut err_scrub] {
+        let was_open = stream.has_unfinished_value();
         stream.finish();
-        let found = stream.take_found();
-        custody.register(found).await;
+        custody.defer(stream.take_found());
+        if was_open {
+            custody
+                .open_constructs
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        custody.register(Vec::new()).await;
     }
 
     let status = child.wait().await;
@@ -1473,6 +1517,20 @@ mod tests {
         event_tx: mpsc::Sender<ScheduleEvent>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                cwd.clone(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.persist_redaction_table(&redact).unwrap();
+        let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(redact.clone())),
+            session.clone(),
+        ));
         spawn(BackgroundSpawn {
             job_id: "job-1".to_string(),
             label: label.to_string(),
@@ -1491,7 +1549,11 @@ mod tests {
             turn_tx,
             event_tx,
             cancel,
-            observed_sink: None,
+            observed_sink: Some(ObservedOutputSink {
+                interrupts,
+                session,
+                cfg: Default::default(),
+            }),
         })
     }
 
@@ -2467,6 +2529,244 @@ mod codex_r2_background_failure_probe {
         assert!(
             !model_bound.contains(secret),
             "completion withheld but tail leaks unregistered stderr echo: {model_bound}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_review_r4 {
+    use super::*;
+    #[tokio::test]
+    async fn r4_tail_waits_for_inflight_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let table = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&table).unwrap();
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(table.clone())),
+            session.clone(),
+        ));
+        let custody = Arc::new(BackgroundCustody {
+            sink: Mutex::new(Some(ObservedOutputSink {
+                interrupts: hub.clone(),
+                session: session.clone(),
+                cfg: Default::default(),
+            })),
+            ..Default::default()
+        });
+        let secret = "NovelInflight515Secret78529";
+        let found = table
+            .scrub_novel_command_output_secrets_with_mode(
+                &format!("DB_SECRET={secret}"),
+                crate::redact::NovelScrubMode::KeyedNarrow,
+            )
+            .found;
+        custody.defer(found);
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push(format!("earlier stderr echo {secret}"));
+        let handle = BackgroundHandle {
+            label: "r4-inflight".into(),
+            ring: Arc::new(Mutex::new(ring)),
+            attached_knowledge_read: false,
+            utility_guard_probe: Arc::new(|| {
+                crate::knowledge::KbUtilityGuard::new(
+                    &Default::default(),
+                    Default::default(),
+                    Arc::new(RedactionTable::empty()),
+                    std::path::Path::new("."),
+                )
+            }),
+            kill_tx: tokio::sync::watch::channel(false).0,
+            pgid: Arc::new(Mutex::new(None)),
+            custody: custody.clone(),
+        };
+        let guard = hub.redaction_owner().unwrap().lock().await;
+        let mut registration = Box::pin(custody.register(Vec::new()));
+        assert!(
+            futures::poll!(registration.as_mut()).is_pending(),
+            "registration must be waiting for the actual owner lock"
+        );
+        let tail = tokio::time::timeout(Duration::from_millis(100), handle.tail(100, &table)).await;
+        let model_bound = match tail {
+            Ok(tail) => Some(
+                crate::tools::output_backstop::scrub_command_output(
+                    &hub,
+                    &session,
+                    &table,
+                    &Default::default(),
+                    &tail,
+                )
+                .await
+                .unwrap(),
+            ),
+            Err(_) => None,
+        };
+        drop(guard);
+        registration.await;
+        let protected_tail = handle.tail(100, &table).await;
+        assert!(
+            !protected_tail.contains(secret),
+            "control: committed registration must hide echo"
+        );
+        if let Some(model_bound) = model_bound {
+            assert!(
+                !model_bound.contains(secret),
+                "tail returned unregistered echo while custody commit was in flight: {model_bound}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_r4_cancellation {
+    use super::*;
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        Arc<crate::engine::interrupt::InterruptHub>,
+        Arc<BackgroundCustody>,
+        BackgroundHandle,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let table = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&table).unwrap();
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(table)),
+            session.clone(),
+        ));
+        let custody = Arc::new(BackgroundCustody {
+            sink: Mutex::new(Some(ObservedOutputSink {
+                interrupts: hub.clone(),
+                session,
+                cfg: Default::default(),
+            })),
+            ..Default::default()
+        });
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push("earlier stderr echo NovelInflight515Secret78529".to_string());
+        let handle = BackgroundHandle {
+            label: "r4-cancel".into(),
+            ring: Arc::new(Mutex::new(ring)),
+            attached_knowledge_read: false,
+            utility_guard_probe: Arc::new(|| {
+                crate::knowledge::KbUtilityGuard::new(
+                    &Default::default(),
+                    Default::default(),
+                    Arc::new(RedactionTable::empty()),
+                    std::path::Path::new("."),
+                )
+            }),
+            kill_tx: tokio::sync::watch::channel(false).0,
+            pgid: Arc::new(Mutex::new(None)),
+            custody: custody.clone(),
+        };
+        (tmp, hub, custody, handle)
+    }
+
+    #[tokio::test]
+    async fn r4_tail_waits_for_semantic_value_closure() {
+        let (_tmp, _hub, custody, handle) = fixture().await;
+        let secret = "ab cd";
+        handle
+            .ring
+            .lock()
+            .unwrap()
+            .push(format!("earlier echo {secret}"));
+        let mut stream = crate::redact::NovelScrubStream::new(
+            "[redacted]",
+            crate::redact::NovelScrubMode::KeyedNarrow,
+        );
+        for line in ["password: >-", "  ab", "  cd"] {
+            ingest_background_line(&mut stream, line, false, true, &custody)
+                .await
+                .expect("scalar line is represented");
+        }
+        let tail = handle.tail(100, &RedactionTable::empty()).await;
+        assert!(tail.contains("withheld"));
+        assert!(!tail.contains(secret));
+        ingest_background_line(&mut stream, "done", false, true, &custody)
+            .await
+            .expect("dedented line is preserved");
+        let tail = handle.tail(100, &RedactionTable::empty()).await;
+        assert!(!tail.contains(secret));
+        assert!(
+            !tail.contains("withheld"),
+            "semantic closure must release ordinary protected output"
+        );
+    }
+
+    #[tokio::test]
+    async fn r4_cancelled_background_registration_keeps_custody() {
+        let (_tmp, hub, custody, handle) = fixture().await;
+        let table = RedactionTable::empty();
+        custody.defer(
+            table
+                .scrub_novel_command_output_secrets_with_mode(
+                    "PASSWORD=NovelInflight515Secret78529",
+                    crate::redact::NovelScrubMode::KeyedNarrow,
+                )
+                .found,
+        );
+        let lock = hub.redaction_owner().unwrap().lock().await;
+        let mut registration = Box::pin(custody.register(Vec::new()));
+        assert!(futures::poll!(registration.as_mut()).is_pending());
+        drop(registration);
+        assert!(
+            custody.has_pending(),
+            "cancellation dropped in-flight observations"
+        );
+        drop(lock);
+        let tail = handle.tail(100, &table).await;
+        assert!(!tail.contains("NovelInflight515Secret78529"));
+        assert!(
+            !tail.contains("withheld"),
+            "successful retry must release ordinary output"
+        );
+        assert!(!custody.has_pending());
+    }
+
+    #[tokio::test]
+    async fn r4_background_observation_overflow_withholds_echo() {
+        let (_tmp, _hub, custody, handle) = fixture().await;
+        let mut stream = crate::redact::NovelScrubStream::new(
+            "[redacted]",
+            crate::redact::NovelScrubMode::KeyedNarrow,
+        );
+        for i in 0..12000 {
+            stream.push_line(&format!("PASSWORD=NovelObservation515Secret{i:08}"));
+            custody.defer(stream.take_found());
+        }
+        custody.defer(
+            RedactionTable::empty()
+                .scrub_novel_command_output_secrets_with_mode(
+                    "PASSWORD=NovelInflight515Secret78529",
+                    crate::redact::NovelScrubMode::KeyedNarrow,
+                )
+                .found,
+        );
+        let tail = handle.tail(100, &RedactionTable::empty()).await;
+        assert!(tail.contains("withheld"));
+        assert!(!tail.contains("NovelInflight515Secret78529"));
+        assert!(
+            custody.has_pending(),
+            "overflow must remain a refusal after retry"
         );
     }
 }

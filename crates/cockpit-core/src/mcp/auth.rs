@@ -641,7 +641,7 @@ async fn exchange_code(
         return Err(oauth_token_endpoint_error("exchange", status));
     }
     let response_body = zeroize::Zeroizing::new(resp.bytes().await?.to_vec());
-    let parsed: TokenResp = serde_json::from_slice(&response_body)?;
+    let parsed: TokenResp = crate::config::value_free::from_slice(&response_body)?;
     Ok(into_stored(parsed))
 }
 
@@ -668,7 +668,7 @@ async fn refresh_token(oauth: &OauthAuth, refresh: &str) -> Result<StoredTokens>
         return Err(oauth_token_endpoint_error("refresh", status));
     }
     let response_body = zeroize::Zeroizing::new(resp.bytes().await?.to_vec());
-    let parsed: TokenResp = serde_json::from_slice(&response_body)?;
+    let parsed: TokenResp = crate::config::value_free::from_slice(&response_body)?;
     let mut tokens = into_stored(parsed);
     // Some servers omit the refresh token on refresh — keep the old one.
     if tokens.refresh_token.is_none() {
@@ -1075,5 +1075,39 @@ mod value_free_error_tests {
             assert!(!error.contains(&secret), "{error}");
         }
         assert!(!format!("{resolved:?}").contains(&secret));
+    }
+}
+
+#[cfg(test)]
+mod security_r4_diagnostics {
+    use super::*;
+    #[tokio::test]
+    async fn r4_malformed_mcp_token_response_is_value_free() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for body in [
+                r#"{"access_token":"NovelMcp515Secret78529","expires_in":"NovelMcp515Secret78529"}"#,
+                r#"{"access_token":"valid-token","expires_in":3600}"#,
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                stream.read(&mut request).await.unwrap();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let oauth = OauthAuth {
+            token_url: Some(format!("http://{address}/token")),
+            ..Default::default()
+        };
+        let error = refresh_token(&oauth, "fake-refresh")
+            .await
+            .err()
+            .expect("malformed response must fail");
+        assert!(!format!("{error:#} / {error:?}").contains("NovelMcp515Secret78529"));
+        let valid = refresh_token(&oauth, "fake-refresh").await.unwrap();
+        assert_eq!(valid.access_token, "valid-token");
+        server.await.unwrap();
     }
 }

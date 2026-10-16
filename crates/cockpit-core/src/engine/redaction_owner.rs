@@ -243,20 +243,20 @@ pub(crate) fn adopt_live_redaction_for_round(
     providers: &crate::config::providers::ProvidersConfig,
     redact: &mut Arc<RedactionTable>,
     agent: &mut Arc<crate::engine::agent::Agent>,
-) -> bool {
+) -> anyhow::Result<bool> {
     let Some(current) = interrupts.current_live_redaction() else {
-        return false;
+        return Ok(false);
     };
     if Arc::ptr_eq(&current, redact) {
-        return false;
+        return Ok(false);
     }
     let mut refreshed = (**agent).clone();
     let mut model = (*refreshed.model).clone();
-    model.set_redact_table_for_config(providers, current.clone());
+    model.set_redact_table_for_config(providers, current.clone())?;
     refreshed.model = Arc::new(model);
     *agent = Arc::new(refreshed);
     *redact = current;
-    true
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -312,7 +312,9 @@ mod codex_r2_successor_probe {
         .await
         .unwrap();
         assert!(!current_redaction(&table).scrub(secret).contains(secret));
-        session.adopt_compaction_successor(row.session_id, row.short_id);
+        session
+            .adopt_compaction_successor(row.session_id, row.short_id)
+            .unwrap();
         let json = crate::session::lifecycle::require_redaction_table_json_from_vault(
             session.secret_vault(),
             successor,
@@ -433,5 +435,195 @@ mod live_link_tests {
             !derived.scrub(local).contains(local),
             "derived resolution dropped the table's own literal"
         );
+    }
+}
+
+#[cfg(test)]
+mod security_review_r4 {
+    use super::*;
+    async fn successor(session: &Session, db: &crate::db::Db) -> (Uuid, String) {
+        let predecessor = session.live_id();
+        let successor = Uuid::new_v4();
+        session.begin_compaction_successor(successor).unwrap();
+        let vault = session.secret_vault().clone();
+        let row = db
+            .transaction(move |conn| {
+                crate::session::lifecycle::copy_vault_session_secrets_on_conn(
+                    conn,
+                    &vault,
+                    predecessor,
+                    successor,
+                )?;
+                crate::db::Db::create_compaction_successor_conn(
+                    conn,
+                    predecessor,
+                    successor,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            })
+            .await
+            .unwrap();
+        (row.session_id, row.short_id)
+    }
+    fn actual_table(session: &Session, id: Uuid) -> RedactionTable {
+        let json = crate::session::lifecycle::require_redaction_table_json_from_vault(
+            session.secret_vault(),
+            id,
+            "r4 direct vault check",
+        )
+        .unwrap();
+        RedactionTable::from_persisted_json(&json).unwrap()
+    }
+    #[tokio::test]
+    async fn r4_inflight_journal_fences_compaction_adoption_after_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("r4-inflight.db")).unwrap();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let initial = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&initial).unwrap();
+        let hub = crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(initial)),
+            session.clone(),
+        );
+        let (id, short) = successor(&session, &db).await;
+        let secret = "NovelInflightJournal515Secret78529";
+        let stall = db.stall_writer_for_test().unwrap();
+        let identity = crate::sealed::identity::SealedRedactionIdentity {
+            scope: crate::sealed::identity::SealedScopeKind::Session,
+            record_id: None,
+            name: crate::sealed::identity::SealedName::canonical("r4inflight").unwrap(),
+            version: 0,
+        };
+        let mut operation =
+            Box::pin(hub.seal_redaction_with_identity(&session, secret.to_owned(), identity));
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        let error = session
+            .adopt_compaction_successor(id, short.clone())
+            .unwrap_err();
+        assert!(error.to_string().contains("custody is committing"));
+        drop(operation);
+        let error = session
+            .adopt_compaction_successor(id, short.clone())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("custody is committing"),
+            "cancellation released the durable commit fence too early"
+        );
+        drop(stall);
+        db.write(|_| Ok(())).await.unwrap();
+        session.adopt_compaction_successor(id, short).unwrap();
+        assert_eq!(session.live_id(), id);
+        assert!(!actual_table(&session, id).scrub(secret).contains(secret));
+    }
+
+    #[tokio::test]
+    async fn r4_cancelled_commit_survives_compaction_adoption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("r4-cancel.db")).unwrap();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let initial = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&initial).unwrap();
+        let hub = crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(initial)),
+            session.clone(),
+        );
+        let secret = "NovelCancelledCustody51578529";
+        let stall = db.stall_writer_for_test().unwrap();
+        let identity = crate::sealed::identity::SealedRedactionIdentity {
+            scope: crate::sealed::identity::SealedScopeKind::Session,
+            record_id: None,
+            name: crate::sealed::identity::SealedName::canonical("r4cancel").unwrap(),
+            version: 0,
+        };
+        let mut operation =
+            Box::pin(hub.seal_redaction_with_identity(&session, secret.to_owned(), identity));
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        drop(operation);
+        drop(stall);
+        db.write(|_| Ok(())).await.unwrap();
+        assert!(
+            !actual_table(&session, session.live_id())
+                .scrub(secret)
+                .contains(secret),
+            "precondition: cancelled transaction committed"
+        );
+        assert!(
+            !hub.current_live_redaction()
+                .unwrap()
+                .scrub(secret)
+                .contains(secret),
+            "precondition: live publication kept literal"
+        );
+        let (id, short) = successor(&session, &db).await;
+        assert!(
+            !actual_table(&session, id).scrub(secret).contains(secret),
+            "precondition: copy includes committed literal"
+        );
+        session.adopt_compaction_successor(id, short).unwrap();
+        assert!(
+            !actual_table(&session, id).scrub(secret).contains(secret),
+            "stale cache overwrote committed successor custody after cancellation"
+        );
+    }
+    #[tokio::test]
+    async fn r4_retarget_failure_cannot_adopt_unprotected_successor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let initial = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&initial).unwrap();
+        let hub = crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(initial.clone())),
+            session.clone(),
+        );
+        let (id, short) = successor(&session, &db).await;
+        let secret = "NovelRetarget515Secret78529";
+        crate::tools::output_backstop::scrub_command_output(
+            &hub,
+            &session,
+            &initial,
+            &Default::default(),
+            &format!("DB_SECRET={secret}"),
+        )
+        .await
+        .unwrap();
+        crate::session::lifecycle::fail_next_redaction_vault_write_for_test();
+        let adoption = session.adopt_compaction_successor(id, short.clone());
+        assert!(adoption.is_err(), "failed transfer must refuse adoption");
+        assert!(
+            !crate::session::lifecycle::redaction_vault_write_failure_armed_for_test(),
+            "precondition: retarget persist failed"
+        );
+        assert!(
+            session.live_id() != id || !actual_table(&session, id).scrub(secret).contains(secret),
+            "failed retarget silently adopted successor without a successful I2 registration"
+        );
+        session.adopt_compaction_successor(id, short).unwrap();
+        assert_eq!(session.live_id(), id);
+        assert!(!actual_table(&session, id).scrub(secret).contains(secret));
     }
 }

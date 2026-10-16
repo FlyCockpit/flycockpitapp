@@ -657,7 +657,7 @@ async fn run_iteration(
             &ctx.config.providers(),
             &mut round_redact,
             &mut round_agent,
-        ) {
+        )? {
             turn_agent = (*round_agent).clone();
             turn_agent.bind_retry_budget(&run_budget);
         }

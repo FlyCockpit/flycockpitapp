@@ -405,7 +405,7 @@ async fn run_swarm_loop(
             &pinned.providers(),
             &mut round_redact,
             &mut agent,
-        );
+        )?;
         // Round reservation before dispatch: same gate as the interactive
         // driver (`admit_provider_round`) and the schedule/noninteractive loops.
         if let Err(exhaustion) = ctx.budget.charge_round() {
@@ -2014,6 +2014,7 @@ mod tests {
                 mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
             };
             let ctx = ScheduleContext {
+                interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
                 dream_read_scope: session.dream_read_scope(),
                 session,
                 locks: Arc::new(crate::locks::LockManager::in_memory(

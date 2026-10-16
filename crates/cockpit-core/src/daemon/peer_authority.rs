@@ -330,10 +330,18 @@ type MintBoundary = Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>;
 /// Why a credential was withdrawn, kept until its connection ends so a
 /// connection that learns of the loss late (a queued frame, a dropped notice)
 /// reports the real cause.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct RevocationRecord {
     token: String,
     reason: PeerCredentialRevocation,
+}
+
+impl std::fmt::Debug for RevocationRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevocationRecord")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A record removed from the registry for a reason its connection must hear.
@@ -1932,5 +1940,21 @@ mod tests {
         let launcher = current_process_peer_identity();
         registry.record_launch_provenance("not-hex".to_string(), Some(launcher));
         assert!(!registry.verify_launch_provenance(Some("not-hex"), launcher));
+    }
+}
+
+#[cfg(test)]
+mod security_r4_debug {
+    use super::*;
+    #[test]
+    fn r4_revocation_record_debug_is_value_free() {
+        let record = RevocationRecord {
+            token: "NovelRevocation515Secret78529".into(),
+            reason: PeerCredentialRevocation::Lapsed,
+        };
+        for rendered in [format!("{record:?}"), format!("{record:#?}")] {
+            assert!(!rendered.contains("NovelRevocation515Secret78529"));
+            assert!(rendered.contains("Lapsed"));
+        }
     }
 }

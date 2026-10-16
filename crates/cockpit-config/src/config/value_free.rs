@@ -40,8 +40,7 @@ pub fn value_free_message(message: &str) -> String {
 }
 
 /// serde data-error kinds whose message structure is known: `<kind>: <the
-/// offending input>, expected <shape>`. Only the kind and the expected shape
-/// are kept.
+/// offending input>, expected <shape>`. Only the static kind is kept.
 const SERDE_DATA_ERROR_KINDS: &[&str] = &[
     "invalid type",
     "invalid value",
@@ -53,8 +52,8 @@ const SERDE_DATA_ERROR_KINDS: &[&str] = &[
 ];
 
 /// A value-free `anyhow` error for a JSON (de)serialization failure, built
-/// from typed facts only — category, the data-error kind and expected
-/// shape when serde reports one, and the line/column — never from the
+/// from typed facts only — category, the static data-error kind and the
+/// line/column — never from the
 /// input-bearing message text. A custom deserializer message (which may
 /// format the input) is reduced to its category.
 pub fn json_error(error: &serde_json::Error) -> anyhow::Error {
@@ -78,10 +77,6 @@ pub fn json_error(error: &serde_json::Error) -> anyhow::Error {
         {
             out.push_str(": ");
             out.push_str(kind);
-            if let Some((_, expected)) = message.rsplit_once(", expected ") {
-                out.push_str(", expected ");
-                out.push_str(&value_free_message(expected));
-            }
         }
     }
     if error.line() > 0 {
@@ -145,6 +140,18 @@ pub fn redacted_url(url: &str) -> String {
         });
     }
     out
+}
+
+/// JSON root shape without formatting any input value.
+pub fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 #[cfg(test)]

@@ -505,7 +505,7 @@ fn load_cached_record(
     store
         .get_owned(record_id)?
         .and_then(|record| record.get("oauth").cloned())
-        .map(serde_json::from_value::<StoredCredential>)
+        .map(crate::config::value_free::from_value::<StoredCredential>)
         .transpose()
         .with_context(|| format!("stored OAuth credential `{record_id}` is malformed"))
         .map(|cached| cached.filter(|cached| cached.configuration_identity == identity))
@@ -1238,5 +1238,42 @@ mod tests {
         let reloaded = store.reopen().unwrap();
         assert_eq!(reloaded.api_key("firecrawl").as_deref(), Some("web-key"));
         assert!(reloaded.get(&credential_record_id("firecrawl")).is_some());
+    }
+}
+
+#[cfg(test)]
+mod security_r4_cached_oauth {
+    use super::*;
+    #[test]
+    fn r4_cached_oauth_error_is_value_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::open(tmp.path().join("credentials.json")).unwrap();
+        store
+            .save_record_merged(
+                "r4-cache",
+                serde_json::json!({"oauth": {
+                    "configuration_identity":"r4", "refresh_generation":1,
+                    "token":"NovelCachedOauth515Secret78529", "expires_at":null,
+                }}),
+            )
+            .unwrap();
+        let error = load_cached_record(&store, "r4-cache", "r4")
+            .err()
+            .expect("wrong token shape must fail");
+        assert!(!format!("{error:#} / {error:?}").contains("NovelCachedOauth515Secret78529"));
+        store
+            .save_record_merged(
+                "r4-cache",
+                serde_json::json!({"oauth": {
+                    "configuration_identity":"r4", "refresh_generation":1,
+                    "token":{"access_token":"valid-token"}, "expires_at":null,
+                }}),
+            )
+            .unwrap();
+        assert!(
+            load_cached_record(&store, "r4-cache", "r4")
+                .unwrap()
+                .is_some()
+        );
     }
 }

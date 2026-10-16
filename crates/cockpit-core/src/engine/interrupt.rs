@@ -3551,7 +3551,9 @@ mod tests {
         let spawn_id = session.id;
         let successor = db.create_compaction_successor(spawn_id).await.unwrap();
         let successor_short = successor.short_id.clone();
-        session.adopt_compaction_successor(successor.session_id, successor_short);
+        session
+            .adopt_compaction_successor(successor.session_id, successor_short)
+            .unwrap();
         let live_id = session.live_id();
         assert_ne!(live_id, spawn_id);
 

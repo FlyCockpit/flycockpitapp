@@ -2219,8 +2219,16 @@ impl Driver {
             self.trace_compaction_apply("timeline_recorded");
         }
 
-        self.session
-            .adopt_compaction_successor(successor_row.session_id, successor_short_id.clone());
+        if let Err(error) = self
+            .session
+            .adopt_compaction_successor(successor_row.session_id, successor_short_id.clone())
+        {
+            self.session
+                .abort_compaction_successor(successor_row.session_id);
+            return Err(PreparedCompactionApplyError::SeedSuccessor(format!(
+                "transferring compaction redaction custody: {error:#}"
+            )));
+        }
 
         let seed_record = crate::session::SessionCompactionRecord {
             predecessor_session_id: predecessor_id,

@@ -142,8 +142,8 @@ pub async fn request_device_authorization(oauth: &OauthAuth) -> Result<DeviceAut
         );
     }
     let body = zeroize::Zeroizing::new(resp.text().await.unwrap_or_default());
-    let mut parsed: DeviceCodeResponse =
-        serde_json::from_str(&body).context("parsing MCP device-authorization response")?;
+    let mut parsed: DeviceCodeResponse = crate::config::value_free::from_str(&body)
+        .context("parsing MCP device-authorization response")?;
     validate_user_code(&parsed.user_code)?;
     let verification_uri = parsed
         .verification_uri
@@ -212,8 +212,8 @@ pub async fn poll_device_token(oauth: &OauthAuth, device_code: &str) -> Result<D
                 self.refresh_token.zeroize();
             }
         }
-        let mut parsed: TokenResp =
-            serde_json::from_str(&body).context("parsing MCP device token response")?;
+        let mut parsed: TokenResp = crate::config::value_free::from_str(&body)
+            .context("parsing MCP device token response")?;
         let expires_at = parsed
             .expires_in
             .map(|secs| chrono::Utc::now().timestamp() + secs)
@@ -364,5 +364,51 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod security_r4_diagnostics {
+    use super::*;
+    #[tokio::test]
+    async fn r4_malformed_mcp_device_responses_are_value_free() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for body in [
+                r#"{"device_code":"fake-device","user_code":"FAKE-CODE","interval":"NovelDevice515Secret78529"}"#,
+                r#"{"access_token":"fake-token","expires_in":"NovelDevice515Secret78529"}"#,
+                r#"{"device_code":"fake-device","user_code":"FAKE-CODE","verification_uri":"https://example.test/device"}"#,
+                r#"{"access_token":"valid-token","expires_in":3600}"#,
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                stream.read(&mut request).await.unwrap();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let oauth = OauthAuth {
+            token_url: Some(format!("http://{address}/token")),
+            device_authorization_endpoint: Some(format!("http://{address}/device")),
+            ..Default::default()
+        };
+        let error = request_device_authorization(&oauth)
+            .await
+            .err()
+            .expect("malformed device response must fail");
+        assert!(!format!("{error:#} / {error:?}").contains("NovelDevice515Secret78529"));
+        let error = poll_device_token(&oauth, "fake-device")
+            .await
+            .err()
+            .expect("malformed token response must fail");
+        assert!(!format!("{error:#} / {error:?}").contains("NovelDevice515Secret78529"));
+        let valid = request_device_authorization(&oauth).await.unwrap();
+        assert_eq!(valid.user_code, "FAKE-CODE");
+        assert!(matches!(
+            poll_device_token(&oauth, "fake-device").await.unwrap(),
+            DevicePollOutcome::Success(_)
+        ));
+        server.await.unwrap();
     }
 }

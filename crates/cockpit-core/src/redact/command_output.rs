@@ -124,9 +124,9 @@
 //! indented continuation is treated as a value rather than as fresh text;
 //! multi-line constructs retain at most `MAX_RETAINED_CONSTRUCT_BYTES` and
 //! the pending-registration set at most `MAX_PENDING_FOUND_BYTES` (beyond
-//! either, the construct is still REDACTED in output; only a bounded prefix
-//! is registered; a joined multi-line value above
-//! `MAX_JOINED_REGISTRATION_BYTES` registers per line only); type /
+//! either, custody is marked incomplete and every command consumer withholds
+//! output; a joined multi-line value above `MAX_JOINED_REGISTRATION_BYTES`
+//! also refuses release); type /
 //! reference recursion is capped
 //! (`MAX_TYPE_DEPTH`, `MAX_REFERENCE_DEPTH`). Scanning runs on the raw pipe
 //! bytes BEFORE head/tail truncation, so a truncated capture never loses
@@ -137,8 +137,9 @@
 //! OR-ed); the redaction placeholder itself (or any value containing it) is
 //! never registered. A heuristic exemption that exists only to avoid false
 //! positives never leaves a value visible: short counts under ordinary keys
-//! (`max_tokens: 4096`) and unquoted code-type expressions (`token: String`)
-//! are REDACTED in that output but not registered globally.
+//! (`max_tokens: 4096`) and type annotations inside a source declaration
+//! are REDACTED in that output but not registered session-wide. Type-like
+//! data passwords and URL defaults have no vocabulary exemption.
 //!
 //! Outside the contract (stated plainly): keyless opaque tokens in narrow
 //! mode (git SHAs, UUIDs and digests are work product; the Full `!` mode
@@ -147,8 +148,7 @@
 //! before printing; values below the hard `MIN_REDACTION_ENTRY_LENGTH`
 //! floor; never-scrub literals (`true`, `null`, …); pure interpolation
 //! references (`${API_KEY}`, `${{ secrets.X }}`), which name a source rather
-//! than carry a value; and the remainder of a construct beyond the state
-//! caps (redacted, but only its bounded prefix is registered).
+//! than carry a value. Exceeding state caps fails closed for the command.
 //!
 //! Every pass is linear in its line length: quote positions, `>` positions,
 //! and close-tag starts are collected in one scan and looked up by binary
@@ -239,6 +239,8 @@ pub(crate) struct ObservedSecret {
     pub(crate) encoded_variants: bool,
     /// Register lower / upper / capitalized spellings.
     pub(crate) case_variants: bool,
+    /// Typed, sticky loss of custody; never a literal or matcher entry.
+    incomplete: bool,
 }
 
 impl std::fmt::Debug for ObservedSecret {
@@ -255,18 +257,24 @@ impl std::fmt::Debug for ObservedSecret {
 /// A bounded, deduplicated accumulation of observations (one command's
 /// intake, a background job's pending registrations). A value observed
 /// again merges to the STRONGEST policy (R11); the total retained value
-/// bytes are capped at [`MAX_PENDING_FOUND_BYTES`] — beyond it new values are
-/// dropped (their output was already replaced). Linear in what it is fed.
+/// allocation charge is capped at [`MAX_PENDING_FOUND_BYTES`]. Overflow is
+/// sticky incomplete custody and refuses every output consumer. Linear in
+/// what it is fed.
 #[derive(Default)]
 pub(crate) struct ObservedSet {
     items: Vec<ObservedSecret>,
     index: HashMap<String, usize>,
     bytes: usize,
+    incomplete: bool,
 }
 
 impl ObservedSet {
     pub(crate) fn extend(&mut self, found: impl IntoIterator<Item = ObservedSecret>) {
         for secret in found {
+            if secret.incomplete() {
+                self.incomplete = true;
+                continue;
+            }
             if let Some(&at) = self.index.get(&secret.value) {
                 let existing = &mut self.items[at];
                 existing.length_exempt |= secret.length_exempt;
@@ -274,27 +282,78 @@ impl ObservedSet {
                 existing.case_variants |= secret.case_variants;
                 continue;
             }
-            if self.bytes.saturating_add(secret.value.len()) > MAX_PENDING_FOUND_BYTES {
+            // Charge both retained value copies and descriptor/index overhead.
+            let charge = secret
+                .value
+                .len()
+                .saturating_mul(2)
+                .saturating_add(2 * std::mem::size_of::<ObservedSecret>() + 64);
+            if self.bytes.saturating_add(charge) > MAX_PENDING_FOUND_BYTES {
+                self.incomplete = true;
                 continue;
             }
-            self.bytes += secret.value.len();
+            self.bytes += charge;
             self.index.insert(secret.value.clone(), self.items.len());
             self.items.push(secret);
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.items.is_empty() && !self.incomplete
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<ObservedSecret> {
+        let mut items = self.items.clone();
+        if self.incomplete {
+            items.push(ObservedSecret::incomplete_custody());
+        }
+        items
+    }
+
+    /// Only acknowledge identical policy, preserving arrivals/stronger
+    /// duplicate observations while a registration was awaiting the owner.
+    pub(crate) fn acknowledge(&mut self, committed: &[ObservedSecret]) {
+        let committed: HashMap<_, _> = committed.iter().map(|s| (s.value.as_str(), s)).collect();
+        let remaining = self
+            .items
+            .drain(..)
+            .filter(|s| {
+                committed
+                    .get(s.value.as_str())
+                    .is_none_or(|old| **old != *s)
+            })
+            .collect::<Vec<_>>();
+        self.index.clear();
+        self.bytes = 0;
+        self.extend(remaining);
     }
 
     pub(crate) fn take(&mut self) -> Vec<ObservedSecret> {
         self.index.clear();
         self.bytes = 0;
-        std::mem::take(&mut self.items)
+        let mut items = std::mem::take(&mut self.items);
+        if self.incomplete {
+            items.push(ObservedSecret::incomplete_custody());
+        }
+        items
     }
 }
 
 impl ObservedSecret {
+    pub(crate) fn incomplete(&self) -> bool {
+        self.incomplete
+    }
+
+    fn incomplete_custody() -> Self {
+        Self {
+            value: String::new(),
+            length_exempt: false,
+            encoded_variants: false,
+            case_variants: false,
+            incomplete: true,
+        }
+    }
+
     /// A value under a secret-shaped key. The key is the secrecy evidence, so
     /// the value is registered down to the hard [`MIN_REDACTION_ENTRY_LENGTH`]
     /// floor regardless of `min_secret_length`. The backstop registers what it
@@ -302,10 +361,11 @@ impl ObservedSecret {
     fn keyed(key: &str, value: &str) -> Self {
         let credential = credential_shaped_key(key);
         Self {
-            value: strip_matching_quotes(value).to_string(),
+            value: value.to_string(),
             length_exempt: true,
             encoded_variants: true,
             case_variants: credential,
+            incomplete: false,
         }
     }
 
@@ -315,6 +375,7 @@ impl ObservedSecret {
             length_exempt: true,
             encoded_variants: true,
             case_variants: false,
+            incomplete: false,
         }
     }
 
@@ -324,6 +385,7 @@ impl ObservedSecret {
             length_exempt,
             encoded_variants: false,
             case_variants: false,
+            incomplete: false,
         }
     }
 }
@@ -405,15 +467,6 @@ fn observe_keyed(found: &mut Vec<ObservedSecret>, key: &str, raw: &str, quote: O
         // A short all-digit value under a count-like key (`max_tokens: 4096`)
         // is replaced in this output but not registered session-wide, for the
         // same false-positive reason as code types below.
-        return;
-    }
-    if quote.is_none() && is_code_type_expression(bare) {
-        // An UNQUOTED source-code type annotation (`password: String,`) is
-        // replaced in this output but never registered session-wide: the
-        // false-positive cost of installing `String` as a secret is the only
-        // reason for the distinction, so the value is still withheld here.
-        // A quoted data string (`{"password":"String"}`) is a value and is
-        // registered like any other.
         return;
     }
     found.push(ObservedSecret::keyed(key, bare));
@@ -504,6 +557,133 @@ fn reference_default_literals(value: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The supported declaration grammar is deliberately narrow: an ASCII type
+/// name, optional balanced generic parameters, and an opening body. Unknown
+/// source forms keep ordinary keyed registration instead of guessing a type.
+fn source_declaration_header(code: &str) -> bool {
+    let Some((header, body)) = code.split_once('{') else {
+        return false;
+    };
+    let body = body.trim().trim_end_matches('}').trim();
+    if !body.is_empty() && source_field_type(body).is_none() {
+        return false;
+    }
+    let header = header.trim();
+    let Some(rest) = [
+        "struct ",
+        "pub struct ",
+        "pub(crate) struct ",
+        "pub(super) struct ",
+        "interface ",
+        "export interface ",
+        "class ",
+        "export class ",
+    ]
+    .iter()
+    .find_map(|prefix| header.strip_prefix(*prefix)) else {
+        return false;
+    };
+    let name_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    if !source_identifier(name) {
+        return false;
+    }
+    let parameters = rest[name_end..].trim();
+    if parameters.is_empty() {
+        return true;
+    }
+    if !parameters.starts_with('<') || !parameters.ends_with('>') {
+        return false;
+    }
+    let mut depth = 0usize;
+    for c in parameters.chars() {
+        match c {
+            '<' => {
+                depth += 1;
+                if depth > 16 {
+                    return false;
+                }
+            }
+            '>' => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            c if c.is_ascii_alphanumeric()
+                || c.is_ascii_whitespace()
+                || matches!(c, '_' | ',' | ':' | '\'' | '&') => {}
+            _ => return false,
+        }
+    }
+    depth == 0
+}
+
+fn source_identifier(value: &str) -> bool {
+    value.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn source_code_line(content: &str) -> &str {
+    content.split_once("//").map_or(content, |(code, _)| code)
+}
+
+/// Only an exact `field: Type` annotation can consume a type observation.
+/// Assignments, quoted data and text merely following a source-looking prefix
+/// remain credentials. Braces in a line comment never extend declaration scope.
+fn source_type_annotation(code: &str, value: &str) -> bool {
+    // The data parsers can include a field terminator or trailing line comment
+    // in their observation. Compare the same code span that validated the
+    // declaration, while independently retaining every comment credential.
+    let observed = source_code_line(value)
+        .trim()
+        .trim_end_matches([',', ';'])
+        .trim_end();
+    source_field_type(code).is_some_and(|ty| ty == observed && is_code_type_expression(ty))
+}
+
+fn source_field_type(code: &str) -> Option<&str> {
+    let field = code.rsplit_once('{').map_or(code, |(_, body)| body).trim();
+    let field = ["pub ", "pub(crate) ", "pub(super) "]
+        .iter()
+        .find_map(|prefix| field.strip_prefix(*prefix))
+        .unwrap_or(field);
+    let (name, ty) = field.split_once(':')?;
+    if !source_identifier(name.trim().trim_end_matches('?')) {
+        return None;
+    }
+    let ty = ty
+        .trim_end_matches(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | ';' | '}'))
+        .trim_start();
+    let mut depth = 0usize;
+    let mut previous = None;
+    for c in ty.chars() {
+        match c {
+            '<' => {
+                depth += 1;
+                if depth > 16 {
+                    return None;
+                }
+            }
+            '>' => {
+                depth = depth.checked_sub(1)?;
+            }
+            ',' if depth == 0 => return None,
+            '\'' if !matches!(previous, Some('&' | '<' | ',')) => return None,
+            c if c.is_ascii_alphanumeric()
+                || c.is_ascii_whitespace()
+                || matches!(c, '_' | ',' | ':' | '\'' | '&' | '[' | ']') => {}
+            _ => return None,
+        }
+        if !c.is_ascii_whitespace() {
+            previous = Some(c);
+        }
+    }
+    (!ty.is_empty() && depth == 0).then_some(ty)
 }
 
 /// `true` when a keyed value is a source-code TYPE annotation, not a value:
@@ -730,7 +910,10 @@ impl RedactionTable {
                 Some(content) => (content, "\n"),
                 None => (line, ""),
             };
-            lines.push((stream.push_line(content), newline));
+            lines.push((
+                stream.push_line_with_ending(content, !newline.is_empty()),
+                newline,
+            ));
         }
         stream.finish();
         // A bounded capture (head + tail around an omission) or a tail slice
@@ -749,10 +932,11 @@ impl RedactionTable {
                 out.push_str(newline);
             }
         }
-        NovelScrubOutput {
-            text: out,
-            found: stream.take_found(),
+        let found = stream.take_found();
+        if found.iter().any(ObservedSecret::incomplete) {
+            out = super::COVERAGE_WITHHELD_PLACEHOLDER.to_string();
         }
+        NovelScrubOutput { text: out, found }
     }
 }
 
@@ -763,7 +947,7 @@ struct OpenQuote {
     quote: char,
     key: String,
     parts: Vec<String>,
-    /// Bytes retained in `parts` (capped by [`MAX_RETAINED_CONSTRUCT_BYTES`]).
+    /// Allocation charge for `parts`, including descriptors and separators.
     retained: usize,
 }
 
@@ -774,6 +958,9 @@ struct OpenBlock {
     key_indent: usize,
     /// `|` (literal: lines joined by newlines) or `>` (folded: by spaces).
     style: char,
+    chomp: char,
+    terminated: bool,
+    body_indent: Option<usize>,
     lines: Vec<String>,
     retained: usize,
 }
@@ -794,7 +981,7 @@ struct OpenXml {
     retained: usize,
 }
 
-/// Hard cap on the raw bytes any one open multi-line construct (PEM block,
+/// Hard cap on retained allocation for any one open multi-line construct (PEM block,
 /// multiline quoted value, block scalar, XML element) retains for
 /// registration. Past it the construct's remaining lines are still dropped
 /// from the output (withheld) but no longer retained, so endless adversarial
@@ -806,11 +993,9 @@ pub(crate) const MAX_RETAINED_CONSTRUCT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_FOUND_BYTES: usize = 1024 * 1024;
 
 /// Upper bound on a JOINED multi-line value registered as one literal (a PEM
-/// block, a block scalar, a multi-line quoted or XML value). A credential
-/// spanning several lines is far smaller; above this the joined spelling is
-/// not registered (each line still is) — registering a quarter-megabyte
-/// literal, with its encoded variants, would cost every later scrub and the
-/// persisted table without protecting anything a per-line entry does not.
+/// block, a block scalar, a multi-line quoted or XML value). Exceeding it marks
+/// custody incomplete and withholds consumers: per-line entries cannot cover
+/// the assembled scalar or its encodings.
 const MAX_JOINED_REGISTRATION_BYTES: usize = 16 * 1024;
 
 /// Single-character stand-in for the configured placeholder while a line is
@@ -843,6 +1028,9 @@ pub(crate) struct NovelScrubStream {
     uncertain: Option<UncertainContext>,
     found: Vec<ObservedSecret>,
     found_bytes: usize,
+    incomplete: bool,
+    source_declaration_depth: usize,
+    line_terminated: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -867,7 +1055,19 @@ impl NovelScrubStream {
             uncertain: None,
             found: Vec::new(),
             found_bytes: 0,
+            incomplete: false,
+            source_declaration_depth: 0,
+            line_terminated: true,
         }
+    }
+
+    pub(crate) fn has_unfinished_value(&self) -> bool {
+        self.in_private_key_block
+            || self.open_quote.is_some()
+            || self.open_xml.is_some()
+            || self.block_scalar.is_some()
+            || self.pending_key.is_some()
+            || self.uncertain.is_some()
     }
 
     fn mode_scrubs_orphan_pem(&self) -> bool {
@@ -878,6 +1078,15 @@ impl NovelScrubStream {
     /// or `None` when the line is dropped entirely (it lies inside a
     /// collapsed PEM block, a multiline secret value or a secret XML element).
     pub(crate) fn push_line(&mut self, content: &str) -> Option<String> {
+        self.push_line_with_ending(content, true)
+    }
+
+    pub(crate) fn push_line_with_ending(
+        &mut self,
+        content: &str,
+        terminated: bool,
+    ) -> Option<String> {
+        self.line_terminated = terminated;
         let masked = if self.placeholder.is_empty() {
             content.to_string()
         } else {
@@ -886,6 +1095,10 @@ impl NovelScrubStream {
         let before = self.found.len();
         let out = self.push_masked(&masked);
         self.account_found(before);
+        self.incomplete |= self
+            .open_quote
+            .as_ref()
+            .is_some_and(|v| v.retained > MAX_RETAINED_CONSTRUCT_BYTES);
         out.map(|line| line.replace(PLACEHOLDER_SENTINEL, &self.placeholder))
     }
 
@@ -905,12 +1118,19 @@ impl NovelScrubStream {
 
     fn account_found(&mut self, before: usize) {
         // Bounded and linear in what this line added: keep the new
-        // observations while they fit under the cap, drop the rest (the
-        // output for every dropped observation was already replaced).
+        // observations while they fit under the cap, and latch incomplete
+        // custody for every consumer if any observation cannot be retained.
         let mut keep = before;
         for index in before..self.found.len() {
-            let len = self.found[index].value.len();
+            if self.found[index].incomplete() {
+                self.incomplete = true;
+            }
+            let len = self.found[index]
+                .value
+                .len()
+                .saturating_add(2 * std::mem::size_of::<ObservedSecret>());
             if self.found_bytes.saturating_add(len) > MAX_PENDING_FOUND_BYTES {
+                self.incomplete = true;
                 break;
             }
             self.found_bytes += len;
@@ -925,10 +1145,11 @@ impl NovelScrubStream {
             // The whole block collapsed to one placeholder at its BEGIN
             // fence; keep dropping lines (the END fence included) until the
             // block closes. Retention is capped; dropping is not.
-            if self.private_key_retained < MAX_RETAINED_CONSTRUCT_BYTES {
-                self.private_key_retained += content.len();
-                self.private_key_lines.push(content.to_string());
-            }
+            self.incomplete |= !retain_part(
+                &mut self.private_key_lines,
+                &mut self.private_key_retained,
+                content,
+            );
             if is_private_key_fence(content, "-----END") {
                 self.in_private_key_block = false;
                 self.private_key_retained = 0;
@@ -941,14 +1162,15 @@ impl NovelScrubStream {
             // text up to its closing quote; the rest of the line is ordinary.
             match closing_quote(content, open.quote) {
                 Some(close) => {
-                    retain_part(&mut open.parts, &mut open.retained, &content[..close]);
+                    self.incomplete |=
+                        !retain_part(&mut open.parts, &mut open.retained, &content[..close]);
                     let open = self.open_quote.take().expect("open quote");
                     observe_multiline_value(&mut self.found, &open);
                     let rest = &content[close..];
                     return Some(self.scrub_ordinary(rest));
                 }
                 None => {
-                    retain_part(&mut open.parts, &mut open.retained, content);
+                    self.incomplete |= !retain_part(&mut open.parts, &mut open.retained, content);
                     return None;
                 }
             }
@@ -957,14 +1179,15 @@ impl NovelScrubStream {
             let close_tag = format!("</{}>", open.tag);
             match content.find(&close_tag) {
                 Some(close) => {
-                    retain_part(&mut open.parts, &mut open.retained, &content[..close]);
+                    self.incomplete |=
+                        !retain_part(&mut open.parts, &mut open.retained, &content[..close]);
                     let open = self.open_xml.take().expect("open xml");
                     observe_joined_value(&mut self.found, &open.tag, &open.parts, "\n");
                     let rest = &content[close..];
                     return Some(self.scrub_ordinary(rest));
                 }
                 None => {
-                    retain_part(&mut open.parts, &mut open.retained, content);
+                    self.incomplete |= !retain_part(&mut open.parts, &mut open.retained, content);
                     return None;
                 }
             }
@@ -972,8 +1195,12 @@ impl NovelScrubStream {
         if is_private_key_fence(content, "-----BEGIN") {
             self.in_private_key_block = true;
             self.uncertain = None;
-            self.private_key_retained = content.len();
-            self.private_key_lines.push(content.to_string());
+            self.private_key_retained = 0;
+            self.incomplete |= !retain_part(
+                &mut self.private_key_lines,
+                &mut self.private_key_retained,
+                content,
+            );
             return Some(placeholder.to_string());
         }
         if let Some(UncertainContext::AfterCutLine { indent: cut_indent }) = self.uncertain {
@@ -1004,21 +1231,32 @@ impl NovelScrubStream {
         }
         if let Some(block) = self.block_scalar.as_mut() {
             let indent = content.len() - content.trim_start().len();
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                // Blank lines do not close a YAML block scalar.
-                return Some(content.to_string());
-            }
-            if indent > block.key_indent {
-                if trimmed != placeholder && !keyed_novel_value_is_visible(trimmed) {
-                    retain_part(&mut block.lines, &mut block.retained, trimmed);
-                    let key = block.key.clone();
-                    self.found.push(ObservedSecret::keyed(&key, trimmed));
-                    return Some(format!("{}{placeholder}", &content[..indent]));
+            if content.trim().is_empty() || indent > block.key_indent {
+                let part = if content.trim().is_empty() {
+                    ""
+                } else {
+                    let base = *block.body_indent.get_or_insert(indent);
+                    if indent < base {
+                        self.incomplete = true;
+                    }
+                    &content[base.min(indent)..]
+                };
+                block.terminated = self.line_terminated;
+                self.incomplete |= !retain_part(&mut block.lines, &mut block.retained, part);
+                // The floor belongs to the assembled semantic scalar. No
+                // fragment can be released before that decision is possible.
+                if !keyed_novel_value_is_visible(part) {
+                    self.found.push(ObservedSecret::keyed(&block.key, part));
                 }
-                return Some(content.to_string());
+                if self.mode == NovelScrubMode::Full
+                    && NEVER_SCRUB_LITERALS
+                        .iter()
+                        .any(|literal| part.eq_ignore_ascii_case(literal))
+                {
+                    return Some(content.to_string());
+                }
+                return Some(format!("{}{placeholder}", &content[..indent]));
             }
-            // Dedent closes the block; this line is normal output.
             let block = self.block_scalar.take().expect("open block");
             observe_block_scalar(&mut self.found, &block);
         }
@@ -1043,7 +1281,9 @@ impl NovelScrubStream {
         let indent = content.len() - content.trim_start().len();
         let body = content.trim_end();
         let rest = &body[indent..];
-        if rest.starts_with(['{', '[', '-', '|', '>', '}', ']', '<'])
+        if rest.starts_with(['{', '[', '|', '>', '}', ']', '<'])
+            || rest == "-"
+            || rest.starts_with("- ")
             || looks_like_mapping_key(rest)
         {
             return None;
@@ -1080,6 +1320,20 @@ impl NovelScrubStream {
     /// opens for the following lines.
     fn scrub_ordinary(&mut self, content: &str) -> String {
         let placeholder = PLACEHOLDER_SENTINEL;
+        let code = source_code_line(content);
+        if code.trim_start().starts_with('}') {
+            self.source_declaration_depth = 0;
+        }
+        let declaration = source_declaration_header(code);
+        if self.source_declaration_depth > 0
+            && !code.trim().is_empty()
+            && !declaration
+            && source_field_type(code).is_none()
+        {
+            self.source_declaration_depth = 0;
+        }
+        let source_context = self.source_declaration_depth > 0 || declaration;
+        let before = self.found.len();
         let intro = secret_shaped_block_scalar_intro(content);
         let pending_key = dangling_secret_key(content);
         let xml_open = secret_xml_open_without_close(content);
@@ -1090,12 +1344,44 @@ impl NovelScrubStream {
             &mut self.found,
             &mut self.open_quote,
         );
+        if source_context {
+            let mut comment_found = Vec::new();
+            if let Some((_, comment)) = content.split_once("//") {
+                drop(scrub_line(
+                    comment,
+                    placeholder,
+                    self.mode,
+                    &mut comment_found,
+                    &mut None,
+                ));
+            }
+            let comment_values = comment_found
+                .into_iter()
+                .map(|secret| secret.value)
+                .collect::<std::collections::HashSet<_>>();
+            self.found[before..].iter_mut().for_each(|secret| {
+                if source_type_annotation(code, &secret.value)
+                    && !comment_values.contains(&secret.value)
+                {
+                    secret.value.clear();
+                }
+            });
+            let opens = code.bytes().filter(|&b| b == b'{').count();
+            let closes = code.bytes().filter(|&b| b == b'}').count();
+            self.source_declaration_depth = self
+                .source_declaration_depth
+                .saturating_add(opens)
+                .saturating_sub(closes);
+        }
         if self.open_quote.is_none() {
-            if let Some((indent, key, style)) = intro {
+            if let Some((indent, key, style, chomp, body_indent)) = intro {
                 self.block_scalar = Some(OpenBlock {
                     key,
                     key_indent: indent,
                     style,
+                    chomp,
+                    terminated: false,
+                    body_indent,
                     lines: Vec::new(),
                     retained: 0,
                 });
@@ -1107,9 +1393,7 @@ impl NovelScrubStream {
                 let value_part = content[open_end..].to_string();
                 let mut parts = Vec::new();
                 let mut retained = 0;
-                if !value_part.trim().is_empty() {
-                    retain_part(&mut parts, &mut retained, value_part.trim());
-                }
+                self.incomplete |= !retain_part(&mut parts, &mut retained, &value_part);
                 self.open_xml = Some(OpenXml {
                     tag,
                     parts,
@@ -1149,20 +1433,20 @@ impl NovelScrubStream {
     /// Everything replaced so far, one descriptor per value. Duplicate
     /// observations of a value MERGE their policies (strongest wins: length
     /// exemption, encoded and case variants), so a weak first sighting can
-    /// never discard a stronger later one. The scanner's own placeholder, any
-    /// fragment of it and any value carrying the parse-time placeholder
-    /// sentinel are never observations.
+    /// never discard a stronger later one. Generated placeholder sentinel
+    /// spans are never observations. Real marker-word
+    /// credentials remain ordinary values.
     pub(crate) fn take_found(&mut self) -> Vec<ObservedSecret> {
-        let placeholder = self.placeholder.clone();
         let found = std::mem::take(&mut self.found);
         self.found_bytes = 0;
         let mut merged: Vec<ObservedSecret> = Vec::with_capacity(found.len());
         let mut index: HashMap<String, usize> = HashMap::new();
         for secret in found {
-            if secret.value.is_empty()
-                || secret.value.contains(PLACEHOLDER_SENTINEL)
-                || placeholder.contains(secret.value.as_str())
-            {
+            if secret.incomplete() {
+                self.incomplete = true;
+                continue;
+            }
+            if secret.value.is_empty() || secret.value.contains(PLACEHOLDER_SENTINEL) {
                 continue;
             }
             match index.get(&secret.value) {
@@ -1178,17 +1462,28 @@ impl NovelScrubStream {
                 }
             }
         }
+        if self.incomplete {
+            merged.push(ObservedSecret::incomplete_custody());
+        }
         merged
     }
 }
 
 /// Append `part` to a construct's retained parts while it stays under the
 /// [`MAX_RETAINED_CONSTRUCT_BYTES`] cap.
-fn retain_part(parts: &mut Vec<String>, retained: &mut usize, part: &str) {
-    if *retained < MAX_RETAINED_CONSTRUCT_BYTES {
-        *retained += part.len();
-        parts.push(part.to_string());
+fn retain_part(parts: &mut Vec<String>, retained: &mut usize, part: &str) -> bool {
+    // Vec may double capacity on append; charge that descriptor capacity,
+    // the owned string and the separator even for empty lines.
+    let charge = part
+        .len()
+        .saturating_add(1 + 2 * std::mem::size_of::<String>());
+    if retained.saturating_add(charge) > MAX_RETAINED_CONSTRUCT_BYTES {
+        *retained = MAX_RETAINED_CONSTRUCT_BYTES + 1;
+        return false;
     }
+    *retained += charge;
+    parts.push(part.to_string());
+    true
 }
 
 /// `true` when a line starts a nested mapping entry (`name:` / `name: v` /
@@ -1218,21 +1513,56 @@ fn is_pem_body_line(trimmed: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
 }
 
-/// Register a closed YAML block scalar: each body line (keyed policy, so
-/// encoded variants are registered) plus the scalar's SEMANTIC value —
-/// literal style joins lines with newlines, folded style with spaces.
+/// Register a closed YAML block scalar's semantic value with keyed policy,
+/// including encoded variants. Folding, indentation and chomping are parsed
+/// before applying the registration floor.
 fn observe_block_scalar(found: &mut Vec<ObservedSecret>, block: &OpenBlock) {
-    if block.lines.len() > 1 {
-        let separator = if block.style == '>' { " " } else { "\n" };
-        let joined = block.lines.join(separator);
-        if joined.len() <= MAX_JOINED_REGISTRATION_BYTES {
-            found.push(ObservedSecret::keyed(&block.key, &joined));
+    if block.retained > MAX_RETAINED_CONSTRUCT_BYTES {
+        found.push(ObservedSecret::incomplete_custody());
+        return;
+    }
+    // Parse one bounded scalar with the existing YAML parser. The explicit
+    // two-space indentation preserves more-indented content, blank-line
+    // folding and chomping, without exposing mappings, aliases or tags to
+    // this parse. No raw document or parser error leaves the boundary.
+    let mut scalar = format!(
+        "{}2{}\n",
+        block.style,
+        if block.chomp == ' ' {
+            ""
+        } else if block.chomp == '-' {
+            "-"
+        } else {
+            "+"
         }
+    );
+    for (index, line) in block.lines.iter().enumerate() {
+        scalar.push_str("  ");
+        scalar.push_str(line);
+        if index + 1 < block.lines.len() || block.terminated {
+            scalar.push('\n');
+        }
+    }
+    match serde_yaml::from_str::<String>(&scalar) {
+        Ok(value) if value.len() > MAX_JOINED_REGISTRATION_BYTES => {
+            found.push(ObservedSecret::incomplete_custody())
+        }
+        Ok(value) if !keyed_novel_value_is_visible(&value) => {
+            found.push(ObservedSecret::keyed(&block.key, &value))
+        }
+        Ok(_) => {}
+        Err(_) => found.push(ObservedSecret::incomplete_custody()),
     }
 }
 
 /// Register a value assembled from several lines (multi-line XML element).
 fn observe_joined_value(found: &mut Vec<ObservedSecret>, key: &str, parts: &[String], sep: &str) {
+    let raw = parts.join(sep);
+    if raw.len() <= MAX_JOINED_REGISTRATION_BYTES {
+        observe_xml_value(found, key, &raw);
+    } else {
+        found.push(ObservedSecret::incomplete_custody());
+    }
     let trimmed: Vec<&str> = parts
         .iter()
         .map(|part| part.trim())
@@ -1242,17 +1572,65 @@ fn observe_joined_value(found: &mut Vec<ObservedSecret>, key: &str, parts: &[Str
         return;
     }
     let joined = trimmed.join(sep);
+    if joined.len() > MAX_JOINED_REGISTRATION_BYTES {
+        found.push(ObservedSecret::incomplete_custody());
+    }
     if joined.len() <= MAX_JOINED_REGISTRATION_BYTES
         && !joined.contains('<')
         && !keyed_novel_value_is_visible(&joined)
     {
-        found.push(ObservedSecret::keyed(key, &joined));
+        observe_xml_value(found, key, &joined);
     }
     for part in &trimmed {
         // Nested markup is withheld with the element but never registered.
         if !part.contains('<') && !keyed_novel_value_is_visible(part) {
-            found.push(ObservedSecret::keyed(key, part));
+            observe_xml_value(found, key, part);
         }
+    }
+}
+
+fn observe_xml_value(found: &mut Vec<ObservedSecret>, key: &str, raw: &str) {
+    // Nested markup/DTD requires more than this scalar grammar: refuse instead
+    // of registering markup as though it were the credential's character data.
+    if raw.contains('<') {
+        found.push(ObservedSecret::incomplete_custody());
+        return;
+    }
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let mut decoded = String::with_capacity(raw.len());
+    let mut rest = normalized.as_str();
+    while let Some(at) = rest.find('&') {
+        decoded.push_str(&rest[..at]);
+        let Some(end) = rest[at..].find(';') else {
+            found.push(ObservedSecret::incomplete_custody());
+            return;
+        };
+        let entity = &rest[at + 1..at + end];
+        let scalar = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix("#x")
+                .and_then(|s| u32::from_str_radix(s, 16).ok())
+                .or_else(|| entity.strip_prefix('#').and_then(|s| s.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        let Some(scalar) = scalar else {
+            found.push(ObservedSecret::incomplete_custody());
+            return;
+        };
+        decoded.push(scalar);
+        rest = &rest[at + end + 1..];
+    }
+    decoded.push_str(rest);
+    if !keyed_novel_value_is_visible(raw) {
+        found.push(ObservedSecret::keyed(key, raw));
+    }
+    if decoded != raw && !keyed_novel_value_is_visible(&decoded) {
+        found.push(ObservedSecret::keyed(key, &decoded));
     }
 }
 
@@ -1363,7 +1741,10 @@ fn closing_quote(content: &str, quote: char) -> Option<usize> {
 /// distinctive line.
 fn observe_multiline_value(found: &mut Vec<ObservedSecret>, open: &OpenQuote) {
     let joined = open.parts.join("\n");
-    if joined.len() <= MAX_JOINED_REGISTRATION_BYTES {
+    if joined.len() > MAX_JOINED_REGISTRATION_BYTES || open.retained > MAX_RETAINED_CONSTRUCT_BYTES
+    {
+        found.push(ObservedSecret::incomplete_custody());
+    } else {
         let raw = format!("{q}{joined}{q}", q = open.quote);
         observe_keyed(found, &open.key, &raw, Some(open.quote));
     }
@@ -1432,6 +1813,8 @@ fn observe_private_key_block(lines: &mut Vec<String>, found: &mut Vec<ObservedSe
     let joined = lines.join("\n");
     if joined.len() <= MAX_JOINED_REGISTRATION_BYTES {
         found.push(ObservedSecret::literal(joined, true));
+    } else {
+        found.push(ObservedSecret::incomplete_custody());
     }
     for line in lines.iter() {
         let trimmed = line.trim();
@@ -1469,10 +1852,9 @@ fn scrub_line(
 
 /// Scrub the password of every `scheme://user:PASS@host` URL on the line
 /// (the `DATABASE_URL` / `REDIS_URL` shape, whose key is not secret-shaped).
-/// The user name and host survive. The registered value is the whole
-/// `user:PASS` userinfo rather than the bare password, so a common password
-/// word (`postgres:postgres@`) is not installed as a session-wide pattern on
-/// its own while echoes of the same credential pair are still caught.
+/// The user name and host survive this pass. Register both the credential
+/// pair and its raw/decoded password so later unkeyed echoes are protected,
+/// including common password words.
 fn scrub_url_userinfo_passwords(
     content: &str,
     placeholder: &str,
@@ -1554,31 +1936,15 @@ fn observe_url_password(
     password: &str,
     userinfo: &str,
 ) {
-    // Published defaults (`postgres:postgres@`, `root:root@`): the password is
-    // still replaced in this output, but registering the bare word would
-    // rewrite every later mention of `postgres` or `root`, so only the
-    // `user:password` pair is registered (the R5/R6 policy: redact here,
-    // never leave visible, register only what cannot be ordinary text).
-    // Equality with the username is NOT an exemption: a novel value used as
-    // both is a novel secret.
-    const WELL_KNOWN_DEFAULTS: &[&str] = &[
-        "password", "postgres", "root", "admin", "guest", "changeme", "example", "test", "user",
-        "pass", "mysql", "redis", "secret", "default",
-    ];
     found.push(ObservedSecret::literal(userinfo.to_string(), true));
     let decoded = percent_decode(password).unwrap_or_else(|| password.to_string());
-    if WELL_KNOWN_DEFAULTS
-        .iter()
-        .any(|default| decoded.eq_ignore_ascii_case(default))
-    {
-        return;
-    }
     for value in [password.to_string(), decoded] {
         found.push(ObservedSecret {
             value,
             length_exempt: true,
             encoded_variants: true,
             case_variants: false,
+            incomplete: false,
         });
     }
 }
@@ -1668,7 +2034,7 @@ fn scrub_secret_shaped_xml(
                 let close_end = close_start + tag.len() + 3;
                 let value = &line[value_start..close_start];
                 if value != placeholder && !keyed_value_is_visible(mode, tag, value) {
-                    observe_keyed(found, tag, value, None);
+                    observe_xml_value(found, tag, value);
                     out.push_str(&line[copied..value_start]);
                     out.push_str(placeholder);
                     // Only the inner text is secret: the close tag is
@@ -2228,7 +2594,9 @@ fn scrub_secret_shaped_colon_pairs(
 /// (`- key: |`) is skipped first, so a list-item block classifies exactly
 /// like a line-anchored one (the returned floor indentation stays the key
 /// line's own indent, which list-item value lines exceed).
-fn secret_shaped_block_scalar_intro(content: &str) -> Option<(usize, String, char)> {
+fn secret_shaped_block_scalar_intro(
+    content: &str,
+) -> Option<(usize, String, char, char, Option<usize>)> {
     let indent = content.len() - content.trim_start().len();
     let mut trimmed = content.trim_start();
     if let Some(rest) = trimmed.strip_prefix('-') {
@@ -2246,7 +2614,19 @@ fn secret_shaped_block_scalar_intro(content: &str) -> Option<(usize, String, cha
     let indicator = trimmed[colon + 1..].trim();
     is_block_scalar_indicator(indicator).then(|| {
         let style = if indicator.starts_with('>') { '>' } else { '|' };
-        (indent, key.to_string(), style)
+        let indicators = indicator.split_whitespace().next().unwrap_or("");
+        let chomp = if indicators.contains('-') {
+            '-'
+        } else if indicators.contains('+') {
+            '+'
+        } else {
+            ' '
+        };
+        let body_indent = indicators
+            .chars()
+            .find_map(|c| c.to_digit(10))
+            .map(|n| indent + n as usize);
+        (indent, key.to_string(), style, chomp, body_indent)
     })
 }
 
@@ -2493,19 +2873,25 @@ fn scrub_prefixed_token_run<'a>(
     let mut search = 0;
     while let Some(rel) = content[search..].find(prefix) {
         let start = search + rel;
+        let at_boundary = start == 0
+            || content[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|prev| !is_credential_word_char(prev));
+        if !at_boundary {
+            search = start + prefix.len();
+            continue;
+        }
         let mut end = start;
         for (idx, ch) in content[start..].char_indices() {
+            #[cfg(test)]
+            PREFIX_SCANNED_CHARS.with(|count| count.set(count.get() + 1));
             if is_credential_word_char(ch) {
                 end = start + idx + ch.len_utf8();
             } else {
                 break;
             }
         }
-        let at_boundary = start == 0
-            || content[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|prev| !is_credential_word_char(prev));
         if at_boundary && end - start >= min_total {
             found.push(ObservedSecret::known_format(&content[start..end]));
             out.push_str(&content[copied..start]);
@@ -2580,7 +2966,8 @@ fn scrub_jwt_tokens<'a>(
     let mut run_start: Option<usize> = None;
     let mut handle_run =
         |start: usize, end: usize, out: &mut Option<String>, copied: &mut usize| {
-            let run = &content[start..end];
+            let run = content[start..end].trim_end_matches('.');
+            let end = start + run.len();
             if is_jwt_candidate(run) {
                 found.push(ObservedSecret::known_format(run));
                 let buffer = out.get_or_insert_with(|| String::with_capacity(content.len()));
@@ -4213,8 +4600,19 @@ mod contract_tests {
         stream.finish();
         found.extend(stream.take_found());
         let found = found.take();
+        let refused = RedactionTable::empty().observed_output_addition(&Default::default(), &found);
+        assert!(
+            refused.is_err(),
+            "an over-cap construct must refuse incomplete registration"
+        );
+        let control = format!(
+            "password: |\n{}  {SECRET}\n",
+            "  ordinary scalar filler\n".repeat(300)
+        );
+        let bounded = RedactionTable::empty()
+            .scrub_novel_command_output_secrets_with_mode(&control, NovelScrubMode::KeyedNarrow);
         let addition = RedactionTable::empty()
-            .observed_output_addition(&crate::config::extended::RedactConfig::default(), &found)
+            .observed_output_addition(&Default::default(), &bounded.found)
             .unwrap();
         let elapsed = started.elapsed();
         eprintln!(
@@ -4243,7 +4641,7 @@ mod contract_tests {
     #[test]
     fn heuristic_exemptions_redact_without_registering() {
         let table = RedactionTable::empty();
-        for input in ["max_tokens: 4096", "password: String,"] {
+        for input in ["max_tokens: 4096", "struct Creds {\npassword: String,\n}"] {
             let result = table
                 .scrub_novel_command_output_secrets_with_mode(input, NovelScrubMode::KeyedNarrow);
             assert!(
@@ -4252,6 +4650,443 @@ mod contract_tests {
                 result.text
             );
             assert!(result.found.is_empty(), "{input}: {:?}", result.found);
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_review_r4 {
+    use super::*;
+    fn addition(input: &str) -> (String, RedactionTable) {
+        let table = RedactionTable::empty();
+        let out =
+            table.scrub_novel_command_output_secrets_with_mode(input, NovelScrubMode::KeyedNarrow);
+        let added = table
+            .observed_output_addition(
+                &crate::config::extended::RedactConfig::default(),
+                &out.found,
+            )
+            .unwrap();
+        (out.text, added)
+    }
+    #[test]
+    fn r4_default_url_password_is_registered() {
+        let (text, added) = addition("postgres://u:test@host/db");
+        assert!(!text.contains(":test@"), "initial URL must be hidden");
+        assert!(
+            !added.scrub("test").contains("test"),
+            "actual four-byte URL password was not registered"
+        );
+    }
+    #[test]
+    fn r4_unquoted_yaml_password_is_registered() {
+        let (text, added) = addition("password: SecretString");
+        assert!(
+            !text.contains("SecretString"),
+            "initial scalar must be hidden"
+        );
+        assert!(
+            !added.scrub("SecretString").contains("SecretString"),
+            "valid unquoted YAML password was treated as source code"
+        );
+    }
+    #[test]
+    fn r4_yaml_block_short_parts_form_a_secret() {
+        let (text, added) = addition("password: >-\n  ab\n  cd\n");
+        assert!(
+            !text.contains("\n  ab\n"),
+            "a full semantic scalar above the four-byte floor leaked through per-line pruning"
+        );
+        assert!(
+            !added.scrub("ab cd").contains("ab cd"),
+            "folded value was not registered"
+        );
+    }
+    #[test]
+    fn r4_yaml_folded_value_keeps_chomping_newline_for_encoded_echo() {
+        use base64::Engine as _;
+        let (_, added) = addition("password: >\n  NovelFolded515\n  Secret78529\n");
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("NovelFolded515 Secret78529\n");
+        assert!(
+            !added.scrub(&encoded).contains(&encoded),
+            "YAML clip-mode terminal newline was omitted from the registered semantic value"
+        );
+    }
+    #[test]
+    fn r4_jwt_followed_by_sentence_period_is_scrubbed() {
+        let jwt = "eyAiYWxnIjogIkhTMjU2IiwgInR5cCI6ICJKV1QiIH0.eyJzdWIiOiJjb250cmFjdCJ9.c2lnbmF0dXJlLWNvbnRyYWN0LTUxNQ";
+        let (control, _) = addition(jwt);
+        assert!(
+            !control.contains(jwt),
+            "control: JWT without punctuation must be recognized"
+        );
+        let (text, added) = addition(&format!("Received {jwt}."));
+        assert!(
+            !text.contains(jwt),
+            "ordinary sentence punctuation defeated the JWT detector"
+        );
+        assert!(
+            !added.scrub(jwt).contains(jwt),
+            "punctuated JWT was not registered"
+        );
+    }
+    #[test]
+    fn r4_yaml_next_line_negative_leading_password_is_scrubbed() {
+        let secret = "-NovelPassword51578529";
+        let (text, added) = addition(&format!("password:\n  {secret}\n"));
+        assert!(
+            !text.contains(secret),
+            "valid plain YAML scalar beginning with '-' was discarded as structure"
+        );
+        assert!(!added.scrub(secret).contains(secret));
+    }
+    #[test]
+    fn r4_xml_entity_semantic_value_is_registered() {
+        let secret = "Novel&Xml515Secret78529";
+        let (text, added) = addition("<password>Novel&amp;Xml515Secret78529</password>");
+        assert!(
+            !text.contains("Novel&amp;Xml515Secret78529"),
+            "initial XML value must be hidden"
+        );
+        assert!(
+            !added.scrub(secret).contains(secret),
+            "XML entity decoding was missing from registration"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_review_r4_bounds {
+    use super::*;
+    #[test]
+    fn r4_blank_pem_lines_have_a_memory_bound() {
+        let mut stream = NovelScrubStream::new("[redacted]", NovelScrubMode::KeyedNarrow);
+        stream.push_line("-----BEGIN PRIVATE KEY-----");
+        for _ in 0..100_000 {
+            stream.push_line("");
+        }
+        let retained = stream.private_key_lines.capacity() * std::mem::size_of::<String>()
+            + stream
+                .private_key_lines
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>();
+        eprintln!(
+            "PEM state for blank lines: count={}, value_bytes={}, allocation_bytes={retained}",
+            stream.private_key_lines.len(),
+            stream.private_key_retained
+        );
+        assert!(
+            retained <= MAX_RETAINED_CONSTRUCT_BYTES * 2,
+            "zero-length parts bypassed the retained-byte budget"
+        );
+    }
+    #[test]
+    fn r4_blank_multiline_quote_lines_have_a_memory_bound() {
+        let mut stream = NovelScrubStream::new("[redacted]", NovelScrubMode::KeyedNarrow);
+        stream.push_line("TOKEN=\"Novel515");
+        for _ in 0..100_000 {
+            stream.push_line("");
+        }
+        let open = stream.open_quote.as_ref().expect("open quote");
+        let retained = open.parts.capacity() * std::mem::size_of::<String>()
+            + open.parts.iter().map(String::capacity).sum::<usize>();
+        assert!(
+            retained <= MAX_RETAINED_CONSTRUCT_BYTES * 2,
+            "zero-length quote parts bypassed the retained-byte budget: {} parts, {retained} allocation bytes",
+            open.parts.len()
+        );
+    }
+    #[test]
+    fn r4_prefix_barrage_work_measurement() {
+        for repetitions in [3000, 6000] {
+            let input = format!("x{}", "sk-".repeat(repetitions));
+            let started = std::time::Instant::now();
+            let result = RedactionTable::empty()
+                .scrub_novel_command_output_secrets_with_mode(&input, NovelScrubMode::KeyedNarrow);
+            eprintln!(
+                "prefix barrage: {} bytes, {:?}",
+                input.len(),
+                started.elapsed()
+            );
+            assert_eq!(
+                result.text, input,
+                "all candidate starts are inside an ordinary word"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_review_r4_placeholder {
+    use super::*;
+    #[test]
+    fn r4_real_password_equal_to_marker_word_is_registered() {
+        let table = RedactionTable::empty();
+        let secret = "COCKPIT";
+        let out = table.scrub_novel_command_output_secrets_with_mode(
+            "PASSWORD=COCKPIT",
+            NovelScrubMode::KeyedNarrow,
+        );
+        assert!(
+            out.text.contains(table.placeholder()),
+            "initial credential must be hidden"
+        );
+        let addition = table
+            .observed_output_addition(&Default::default(), &out.found)
+            .unwrap();
+        assert!(
+            !addition.scrub(secret).contains(secret),
+            "actual credential was discarded because it is a substring of the default marker"
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! { static PREFIX_SCANNED_CHARS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+mod security_r4_inverse {
+    use super::*;
+
+    #[test]
+    fn r4_prefix_suffix_work_is_linear() {
+        for repetitions in [1000, 2000] {
+            let input = format!("x{}", "sk-".repeat(repetitions));
+            PREFIX_SCANNED_CHARS.with(|c| c.set(0));
+            let out = RedactionTable::empty()
+                .scrub_novel_command_output_secrets_with_mode(&input, NovelScrubMode::KeyedNarrow);
+            assert_eq!(out.text, input);
+            let work = PREFIX_SCANNED_CHARS.with(|c| c.get());
+            assert!(
+                work <= input.len(),
+                "non-boundary candidates traversed {work} suffix characters for {} input bytes",
+                input.len()
+            );
+        }
+        let token = "sk-NovelPrefix515Secret78529";
+        let out = RedactionTable::empty()
+            .scrub_novel_command_output_secrets_with_mode(token, NovelScrubMode::KeyedNarrow);
+        assert!(!out.text.contains(token));
+        assert!(out.found.iter().any(|s| s.value == token));
+    }
+
+    #[test]
+    fn r4_observation_overflow_is_sticky_and_refuses_registration() {
+        let table = RedactionTable::empty();
+        let mut set = ObservedSet::default();
+        for i in 0..12000 {
+            set.extend([ObservedSecret::keyed(
+                "PASSWORD",
+                &format!("NovelObservation515Secret{i:08}"),
+            )]);
+        }
+        let lost = "NovelOverBudget515Echo78529";
+        set.extend([ObservedSecret::keyed("PASSWORD", lost)]);
+        let batch = set.take();
+        assert!(batch.iter().any(ObservedSecret::incomplete));
+        assert!(
+            table
+                .observed_output_addition(&Default::default(), &batch)
+                .is_err()
+        );
+        assert!(!set.is_empty(), "draining must not forgive lost custody");
+        assert!(set.take().iter().any(ObservedSecret::incomplete));
+        let direct = table.scrub_novel_command_output_secrets_with_mode(
+            &(0..12000)
+                .map(|i| format!("PASSWORD=NovelObservation515Secret{i:08}\n"))
+                .collect::<String>(),
+            NovelScrubMode::KeyedNarrow,
+        );
+        assert!(direct.found.iter().any(ObservedSecret::incomplete));
+        assert!(!direct.text.contains("PASSWORD="));
+    }
+
+    #[test]
+    fn r4_scalar_semantics_and_floor_controls() {
+        use base64::Engine as _;
+        for (input, value) in [
+            ("password: |-\n  ab\n  cd\n", "ab\ncd"),
+            ("password: >-\n  ab\n  cd\n", "ab cd"),
+            ("password: >-\n  abcd\n\n  efgh\n", "abcd\nefgh"),
+            ("password: >\n  ab\n  cd", "ab cd"),
+            ("password: |+\n  abcd\n\n", "abcd\n\n"),
+            ("password: |2-\n  abcd\n    efgh\n", "abcd\n  efgh"),
+            (
+                "<password>abcd&#x26;efgh&#38;ijkl</password>",
+                "abcd&efgh&ijkl",
+            ),
+            (
+                "<password>\n  abcd&amp;efgh\n</password>",
+                "\n  abcd&efgh\n",
+            ),
+            ("password: SecretString", "SecretString"),
+            ("PASSWORD=COCKPIT", "COCKPIT"),
+        ] {
+            let out = RedactionTable::empty()
+                .scrub_novel_command_output_secrets_with_mode(input, NovelScrubMode::KeyedNarrow);
+            let added = RedactionTable::empty()
+                .observed_output_addition(&Default::default(), &out.found)
+                .unwrap();
+            assert!(
+                !added.scrub(value).contains(value),
+                "semantic scalar not registered: {input}"
+            );
+            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+            assert!(
+                !added.scrub(&encoded).contains(&encoded),
+                "semantic encoding not registered: {input}"
+            );
+        }
+        let short = RedactionTable::empty().scrub_novel_command_output_secrets_with_mode(
+            "PASSWORD=abc",
+            NovelScrubMode::KeyedNarrow,
+        );
+        assert_eq!(short.text, "PASSWORD=abc");
+        assert!(short.found.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod security_r4_marker_collision {
+    use super::*;
+    #[test]
+    fn r4_registered_marker_word_uses_a_value_free_stable_replacement() {
+        let base = RedactionTable::empty();
+        for value in ["COCKPIT", "REDACTED", "WORKAROUND"] {
+            let out = base.scrub_novel_command_output_secrets_with_mode(
+                &format!("PASSWORD={value}"),
+                NovelScrubMode::KeyedNarrow,
+            );
+            let addition = base
+                .observed_output_addition(&Default::default(), &out.found)
+                .unwrap();
+            let rendered = addition.scrub(value);
+            assert!(!rendered.contains(value));
+            assert_eq!(
+                addition.scrub(&rendered),
+                rendered,
+                "replacement must remain stable"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_r4_semantic_quoting {
+    use super::*;
+    #[test]
+    fn r4_semantic_xml_and_block_quotes_are_credential_bytes() {
+        use base64::Engine as _;
+        for (input, value) in [
+            ("<password>&quot;Novel515&quot;</password>", "\"Novel515\""),
+            (
+                "<password>Novel515\r\nSecret78529</password>",
+                "Novel515\nSecret78529",
+            ),
+            ("password: |-\n  \"Novel515\"\n", "\"Novel515\""),
+        ] {
+            let base = RedactionTable::empty();
+            let out = base
+                .scrub_novel_command_output_secrets_with_mode(input, NovelScrubMode::KeyedNarrow);
+            let addition = base
+                .observed_output_addition(&Default::default(), &out.found)
+                .unwrap();
+            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+            assert!(
+                !addition.scrub(&encoded).contains(&encoded),
+                "semantic scalar bytes not registered: {input}"
+            );
+        }
+        let out = RedactionTable::empty().scrub_novel_command_output_secrets_with_mode(
+            "<password><![CDATA[Novel515Secret]]></password>",
+            NovelScrubMode::KeyedNarrow,
+        );
+        assert!(out.found.iter().any(ObservedSecret::incomplete));
+        assert!(!out.text.contains("Novel515Secret"));
+    }
+}
+
+#[cfg(test)]
+mod security_r4_full_semantic_floor {
+    use super::*;
+    #[test]
+    fn r4_full_and_narrow_modes_apply_the_assembled_scalar_floor() {
+        let table = RedactionTable::empty();
+        for mode in [NovelScrubMode::Full, NovelScrubMode::KeyedNarrow] {
+            let out = table
+                .scrub_novel_command_output_secrets_with_mode("password: >-\n  ab\n  cd\n", mode);
+            assert!(!out.text.contains("\n  ab\n"));
+            assert!(!out.text.contains("\n  cd\n"));
+            let addition = table
+                .observed_output_addition(&Default::default(), &out.found)
+                .unwrap();
+            assert!(!addition.scrub("ab cd").contains("ab cd"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_r4_source_annotation_bound {
+    use super::*;
+    #[test]
+    fn r4_mixed_source_output_cannot_exempt_data_passwords() {
+        let table = RedactionTable::empty();
+        for input in [
+            "pub struct PASSWORD=SecretString {\n}\n",
+            "pub struct Creds {\nPASSWORD=SecretString\n}\n",
+            "pub struct Creds { // {\n password: String,\n}\nPASSWORD=SecretString\n",
+        ] {
+            let out = table
+                .scrub_novel_command_output_secrets_with_mode(input, NovelScrubMode::KeyedNarrow);
+            assert!(!out.text.contains("SecretString"));
+            let addition = table
+                .observed_output_addition(&Default::default(), &out.found)
+                .unwrap();
+            assert!(
+                !addition.scrub("SecretString").contains("SecretString"),
+                "source-looking text exempted actual assignment data: {input}"
+            );
+            assert_eq!(
+                addition.scrub("String"),
+                "String",
+                "the genuine annotation remains a type"
+            );
+        }
+    }
+    #[test]
+    fn r4_valid_generic_declarations_preserve_type_annotation_controls() {
+        let input = "pub(crate) struct Creds<T> {\n password: String, // {\n api_key: Option<SecretString>,\n marker: std::marker::PhantomData<T>,\n}\ninterface X { token: string; }\n";
+        let out = RedactionTable::empty()
+            .scrub_novel_command_output_secrets_with_mode(input, NovelScrubMode::KeyedNarrow);
+        assert!(
+            out.found.is_empty(),
+            "validated type annotations must not create credential observations: {:?}",
+            out.found
+        );
+        assert!(!out.text.contains("password: String"));
+    }
+}
+
+#[cfg(test)]
+mod security_r4_comment_data {
+    use super::*;
+    #[test]
+    fn r4_comment_credentials_cannot_be_consumed_as_type_annotations() {
+        for value in ["String", r#"\u0053tring"#] {
+            let input =
+                format!("pub struct Creds {{\n password: String, // PASSWORD=\"{value}\"\n}}\n");
+            let table = RedactionTable::empty();
+            let out = table
+                .scrub_novel_command_output_secrets_with_mode(&input, NovelScrubMode::KeyedNarrow);
+            let addition = table
+                .observed_output_addition(&Default::default(), &out.found)
+                .unwrap();
+            assert!(
+                !addition.scrub("String").contains("String"),
+                "a real comment credential was mistaken for an annotation"
+            );
         }
     }
 }

@@ -3022,7 +3022,9 @@ impl Driver {
         // The root model was built on the caller's (unlinked) table: rebuild
         // every model view on the owner-published one, so every send resolves
         // through the owner's newest table.
-        driver.set_redaction_table(linked_redact);
+        driver
+            .set_redaction_table(linked_redact)
+            .expect("initial model redaction must bind to its session owner");
         driver
     }
 
@@ -3087,12 +3089,12 @@ impl Driver {
                 Ok::<_, anyhow::Error>(Arc::new(refreshed))
             })
             .transpose()?;
+        self.tandem_set.refresh_redaction(providers, &table)?;
         for (frame, agent) in self.stack.iter_mut().zip(agents) {
             frame.agent = agent;
         }
         self.model_override = model_override;
         self.redact = table.clone();
-        self.tandem_set.refresh_redaction(providers, &table);
         self.schedule.set_redaction_table(table);
         Ok(())
     }

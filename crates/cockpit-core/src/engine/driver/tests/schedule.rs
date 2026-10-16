@@ -1037,7 +1037,9 @@ fn background_output_secret_is_scrubbed_and_registered_for_later_turns() {
 fn background_tail_never_returns_novel_pem_body_lines() {
     crate::test_env::run_async_with_large_stack(|| async {
         let (mut driver, _tmp) = test_driver_without_network(8);
-        driver.set_redaction_table(Arc::new(crate::redact::RedactionTable::empty()));
+        driver
+            .set_redaction_table(Arc::new(crate::redact::RedactionTable::empty()))
+            .unwrap();
         driver.session.set_sandbox_enabled(false);
         let live: crate::daemon::SharedRedactionTable =
             Arc::new(std::sync::RwLock::new(driver.redact.clone()));

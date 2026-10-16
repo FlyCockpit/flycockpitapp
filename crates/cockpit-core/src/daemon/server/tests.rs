@@ -6,6 +6,9 @@ mod code_root_receipt_tests;
 #[path = "provider_onboarding_settlement_tests.rs"]
 mod provider_onboarding_settlement_tests;
 
+#[path = "provider_catalog_verification_tests.rs"]
+mod provider_catalog_verification_tests;
+
 #[path = "tool_recovery_tests.rs"]
 pub(crate) mod tool_recovery_tests;
 
@@ -32797,17 +32800,21 @@ fn message_attachment_exactly_once_local_v2_replay_preserves_durable_reference()
 fn provider_verification_errors_are_categorized_and_bounded_for_daemon_clients() {
     use crate::daemon::proto::ProviderModelVerification;
 
+    use crate::providers::models_fetch::{ModelFetchError, ModelFetchFailureKind};
     let cases = [
         (
             "provider returned HTTP 401 Unauthorized",
+            ModelFetchFailureKind::HttpStatus(reqwest::StatusCode::UNAUTHORIZED),
             ProviderModelVerification::Unauthorized { status: 401 },
         ),
         (
             "provider returned HTTP 404 Not Found",
+            ModelFetchFailureKind::HttpStatus(reqwest::StatusCode::NOT_FOUND),
             ProviderModelVerification::NotFound,
         ),
         (
             "provider returned HTTP 429: rate limited",
+            ModelFetchFailureKind::HttpStatus(reqwest::StatusCode::TOO_MANY_REQUESTS),
             ProviderModelVerification::HttpStatus {
                 status: 429,
                 snippet: "provider returned HTTP 429: rate limited".into(),
@@ -32815,6 +32822,7 @@ fn provider_verification_errors_are_categorized_and_bounded_for_daemon_clients()
         ),
         (
             "provider returned HTTP 500: model endpoint not found in registry",
+            ModelFetchFailureKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
             ProviderModelVerification::HttpStatus {
                 status: 500,
                 snippet: "provider returned HTTP 500: model endpoint not found in registry".into(),
@@ -32822,33 +32830,51 @@ fn provider_verification_errors_are_categorized_and_bounded_for_daemon_clients()
         ),
         (
             "request error: DNS connect failed",
+            ModelFetchFailureKind::Network,
             ProviderModelVerification::Network {
                 message: "request error: DNS connect failed".into(),
             },
         ),
         (
             "could not parse JSON model list",
+            ModelFetchFailureKind::Parse,
             ProviderModelVerification::Parse {
                 message: "could not parse JSON model list".into(),
             },
         ),
     ];
-    for (message, expected) in cases {
+    for (message, kind, expected) in cases {
         assert_eq!(
-            super::dispatch::categorize_provider_model_fetch_error(&anyhow::anyhow!(message)),
+            super::dispatch::categorize_provider_model_fetch_error(&anyhow::Error::new(
+                ModelFetchError {
+                    kind,
+                    message: message.into()
+                }
+            )),
             expected,
             "classification must preserve the daemon's stable failure class"
         );
     }
-
     let long = format!("HTTP 500 {}", "response-fragment ".repeat(30));
-    let ProviderModelVerification::HttpStatus { snippet, .. } =
-        super::dispatch::categorize_provider_model_fetch_error(&anyhow::anyhow!(long))
+    let ProviderModelVerification::HttpStatus { status, snippet } =
+        super::dispatch::categorize_provider_model_fetch_error(&anyhow::Error::new(
+            ModelFetchError::http(reqwest::StatusCode::INTERNAL_SERVER_ERROR, long),
+        ))
     else {
         panic!("500 response must remain an HTTP-status failure");
     };
+    assert_eq!(status, 500);
     assert_eq!(snippet.chars().count(), 200);
     assert!(snippet.ends_with('…'));
+    for message in ["HTTP 401 Unauthorized", "not found", "DNS connect failed"] {
+        assert!(
+            matches!(
+                super::dispatch::categorize_provider_model_fetch_error(&anyhow::anyhow!(message)),
+                ProviderModelVerification::Parse { .. }
+            ),
+            "diagnostic prose cannot manufacture a transport observation"
+        );
+    }
 }
 
 #[test]
@@ -32865,9 +32891,10 @@ fn provider_verification_typed_causes_use_only_the_scrubbed_diagnostic() {
             message: "safe connection context".into()
         },
     );
-    let rejected = anyhow::Error::new(AuthCheckError::CredentialsRejected(
-        "private-credential-diagnostic".into(),
-    ))
+    let rejected = anyhow::Error::new(AuthCheckError::CredentialsRejected {
+        status: reqwest::StatusCode::FORBIDDEN,
+        message: "private-credential-diagnostic".into(),
+    })
     .context("provider returned HTTP 403: scrubbed");
     assert_eq!(
         super::dispatch::categorize_provider_model_fetch_error(&rejected),

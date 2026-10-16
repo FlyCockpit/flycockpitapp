@@ -2435,3 +2435,44 @@ fn xai_rule_follows_template_identity_not_catalog_metadata() {
             .is_none()
     );
 }
+
+#[test]
+fn fetched_model_identity_coalescing_preserves_first_row_and_distinct_ids() {
+    let fetched = vec![
+        ModelEntry {
+            id: "same".into(),
+            name: Some("first".into()),
+            ..Default::default()
+        },
+        ModelEntry {
+            id: "same".into(),
+            name: Some("second".into()),
+            ..Default::default()
+        },
+        ModelEntry {
+            id: "Same".into(),
+            ..Default::default()
+        },
+        ModelEntry {
+            id: "模型".into(),
+            ..Default::default()
+        },
+    ];
+    for policy in [
+        ModelMergePolicy::KeepUnlisted,
+        ModelMergePolicy::RemoveUnlisted,
+    ] {
+        let existing = vec![ModelEntry {
+            id: "same".into(),
+            favorite: true,
+            ..Default::default()
+        }];
+        let models = merge_fetched_models_with_policy(None, &existing, fetched.clone(), policy);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["same", "Same", "模型"]
+        );
+        assert_eq!(models[0].name.as_deref(), Some("first"));
+        assert!(models[0].favorite);
+    }
+}

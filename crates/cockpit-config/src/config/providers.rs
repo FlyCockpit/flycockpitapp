@@ -3105,6 +3105,15 @@ pub enum ModelMergePolicy {
     RemoveUnlisted,
 }
 
+/// Normalize a fetched catalog after credential scrubbing. The first row for
+/// each exact model ID wins; distinct IDs retain their upstream order.
+/// Use this before counting, previewing or persisting a fetched inventory.
+pub fn coalesce_fetched_models(mut models: Vec<ModelEntry>) -> Vec<ModelEntry> {
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|model| seen.insert(model.id.clone()));
+    models
+}
+
 /// Merge a freshly-fetched `/models` list into an existing model list,
 /// preserving manually-added entries.
 ///
@@ -3140,7 +3149,7 @@ pub fn merge_fetched_models_with_policy(
     policy: ModelMergePolicy,
 ) -> Vec<ModelEntry> {
     let mut merged = Vec::new();
-    for mut m in fetched {
+    for mut m in coalesce_fetched_models(fetched) {
         if let Some(prev) = existing.iter().find(|e| e.id == m.id) {
             preserve_model_overrides(prev, &mut m);
         } else {

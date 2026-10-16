@@ -11,8 +11,10 @@
 //! The body parser is tolerant: it accepts the canonical
 //! `{"data": [...]}` envelope, Codex's `{"models": [...]}` envelope, and the
 //! bare-array shape some compat gateways emit. Entries missing an `id` are
-//! dropped rather than erroring (matches mixer-rs's behavior; see
-//! `mixer-rs/src/providers/common/models_list.rs`).
+//! dropped rather than erroring; duplicate IDs keep their first projected row.
+//! Normalization follows credential scrubbing and precedes every catalog consumer.
+//! Missing-ID handling matches mixer-rs's behavior; see
+//! `mixer-rs/src/providers/common/models_list.rs`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -913,6 +915,57 @@ pub(crate) fn resolve_codex_model_list_request(
     })
 }
 
+/// Transport observations and catalog failures, independent of diagnostic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelFetchFailureKind {
+    HttpStatus(StatusCode),
+    Network,
+    Parse,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct ModelFetchError {
+    pub kind: ModelFetchFailureKind,
+    pub message: String,
+}
+
+impl ModelFetchError {
+    pub fn http(status: StatusCode, message: String) -> Self {
+        Self {
+            kind: ModelFetchFailureKind::HttpStatus(status),
+            message,
+        }
+    }
+
+    fn parse(message: String) -> Self {
+        Self {
+            kind: ModelFetchFailureKind::Parse,
+            message,
+        }
+    }
+}
+
+pub(crate) fn model_fetch_failure_kind(error: &anyhow::Error) -> ModelFetchFailureKind {
+    if let Some(failure) = error.downcast_ref::<ModelFetchError>() {
+        return failure.kind;
+    }
+    if let Some(transport) = error.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = transport.status() {
+            return ModelFetchFailureKind::HttpStatus(status);
+        }
+        if transport.is_connect()
+            || transport.is_timeout()
+            || transport.is_request()
+            || transport.is_body()
+        {
+            return ModelFetchFailureKind::Network;
+        }
+    }
+    // Local request/catalog validation has no observed HTTP failure status.
+    ModelFetchFailureKind::Parse
+}
+
 /// Outcome of [`fetch_models`].
 #[derive(Debug)]
 pub enum FetchOutcome {
@@ -927,6 +980,7 @@ pub enum FetchOutcome {
         models: Vec<ModelEntry>,
         catalog: ProviderModelCatalog,
         reason: String,
+        failure_kind: ModelFetchFailureKind,
     },
     /// The provider doesn't expose `/models` (404).
     Unsupported,
@@ -982,14 +1036,20 @@ async fn fetch_models_at_detailed(
         });
     }
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        anyhow::bail!(
+        return Err(ModelFetchError::http(status, format!(
             "{url} returned {status} — credentials rejected. Verify the API key, OAuth login, and headers."
-        );
+        )).into());
     }
     if !status.is_success() {
-        let body = super::provider_http::read_body_limited(resp, "/models").await?;
+        let body = super::provider_http::read_body_limited(resp, "/models")
+            .await
+            .map_err(|error| ModelFetchError::http(status, error.to_string()))?;
         let body = super::provider_http::diagnostic_body(&body, headers);
-        anyhow::bail!("{url} returned {status}: {}", response_body_snippet(&body));
+        return Err(ModelFetchError::http(
+            status,
+            format!("{url} returned {status}: {}", response_body_snippet(&body)),
+        )
+        .into());
     }
 
     let body = super::provider_http::read_body_limited(resp, "/models").await?;
@@ -1082,7 +1142,7 @@ pub async fn fetch_models_for_provider_with_store(
     env_lookup: impl Fn(&str) -> Option<String> + Sync,
 ) -> Result<FetchOutcome> {
     let auth_store = store.clone();
-    let request = resolve_model_list_request_async_with_store(
+    let mut request = resolve_model_list_request_async_with_store(
         provider_id,
         entry,
         resolved,
@@ -1093,7 +1153,8 @@ pub async fn fetch_models_for_provider_with_store(
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
     let mut url = provider.models_url(entry, &request.base_url);
-    let fallback_models = provider.fallback_models();
+    let fallback_models =
+        crate::config::providers::coalesce_fetched_models(provider.fallback_models());
     let fallback_catalog = provider.fallback_catalog();
     let mut outcome = fetch_models_at_detailed(
         &url,
@@ -1131,6 +1192,7 @@ pub async fn fetch_models_for_provider_with_store(
         .await
         .and_then(|result| validate_anthropic_fetch_result(provider_id, entry, result));
         url = refreshed_url;
+        request = refreshed;
     }
     if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
@@ -1148,7 +1210,11 @@ pub async fn fetch_models_for_provider_with_store(
             Ok(FetchOutcome::FallbackAvailable {
                 models: fallback_models,
                 catalog: fallback_catalog,
-                reason: format!("{url} returned 404"),
+                reason: super::provider_http::diagnostic_body(
+                    &format!("{url} returned 404"),
+                    &request.headers,
+                ),
+                failure_kind: ModelFetchFailureKind::HttpStatus(StatusCode::NOT_FOUND),
             })
         }
         Ok(FetchModelsAtResult {
@@ -1165,12 +1231,18 @@ pub async fn fetch_models_for_provider_with_store(
             Ok(FetchOutcome::FallbackAvailable {
                 models: fallback_models,
                 catalog: fallback_catalog,
-                reason: format!("{url} returned an empty model list (status {status})"),
+                reason: super::provider_http::diagnostic_body(
+                    &format!("{url} returned an empty model list (status {status})"),
+                    &request.headers,
+                ),
+                failure_kind: ModelFetchFailureKind::Parse,
             })
         }
         Err(error) => {
-            let reason = error.to_string();
-            if reason.contains("returned 401") || reason.contains("returned 403") {
+            let failure_kind = model_fetch_failure_kind(&error);
+            let reason =
+                super::provider_http::diagnostic_body(&error.to_string(), &request.headers);
+            if auth_rejection_error(&error) {
                 return Err(error);
             }
             tracing::warn!(
@@ -1182,6 +1254,7 @@ pub async fn fetch_models_for_provider_with_store(
                 models: fallback_models,
                 catalog: fallback_catalog,
                 reason,
+                failure_kind,
             })
         }
         Ok(result) => Ok(result.outcome),
@@ -1189,8 +1262,10 @@ pub async fn fetch_models_for_provider_with_store(
 }
 
 fn auth_rejection_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("returned 401") || message.contains("returned 403")
+    matches!(
+        model_fetch_failure_kind(error),
+        ModelFetchFailureKind::HttpStatus(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+    )
 }
 
 fn validate_anthropic_fetch_result(
@@ -1212,10 +1287,11 @@ fn validate_anthropic_fetch_result(
             if let Err(error) =
                 validate_anthropic_model_configuration(&candidate_provider, &fetched.id)
             {
-                anyhow::bail!(
+                return Err(ModelFetchError::parse(format!(
                     "rejecting invalid Anthropic catalog entry `{}`: {error:#}",
                     fetched.id
-                );
+                ))
+                .into());
             }
         }
     }
@@ -1247,6 +1323,15 @@ impl From<ProviderRequestKind> for ModelCatalogAbi {
 }
 
 fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Result<Vec<ModelEntry>> {
+    parse_models_body_projection(body, catalog_abi)
+        .map(crate::config::providers::coalesce_fetched_models)
+        .map_err(|error| ModelFetchError::parse(error.to_string()).into())
+}
+
+fn parse_models_body_projection(
+    body: &str,
+    catalog_abi: ModelCatalogAbi,
+) -> Result<Vec<ModelEntry>> {
     let parsed: Value = serde_json::from_str(body)
         .with_context(|| format!("parsing /models response: {}", response_body_snippet(body)))?;
     let entries: Vec<Value> = match parsed {
@@ -3718,6 +3803,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_timeout_fallback_retains_network_kind_and_scrubs_reason() {
+        let env = crate::test_env::lock_async().await;
+        let tmp = tempfile::tempdir().unwrap();
+        install_codex_tokens(&env, &tmp);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            loop {
+                sockets.push(listener.accept().await.unwrap().0);
+            }
+        });
+        let base_url = format!("http://{address}/codex-access-1");
+        let entry = codex_entry(base_url.clone());
+        let resolved = ResolvedRequest {
+            base_url,
+            headers: Vec::new(),
+            is_codex_credential: false,
+        };
+        let outcome = fetch_models_for_provider_with_store(
+            "codex-oauth",
+            &entry,
+            &resolved,
+            Duration::from_millis(20),
+            Some(crate::credentials::CredentialStore::open_default().unwrap()),
+            |_| None,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let FetchOutcome::FallbackAvailable {
+            failure_kind,
+            reason,
+            models,
+            ..
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(failure_kind, ModelFetchFailureKind::Network);
+        assert_eq!(models.len(), 3);
+        assert!(!reason.contains("codex-access-1"));
+    }
+
+    #[tokio::test]
     async fn codex_empty_success_responses_offer_fallback_catalog() {
         let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
@@ -3774,7 +3905,9 @@ mod tests {
                     models,
                     catalog,
                     reason,
+                    failure_kind,
                 } => {
+                    assert_eq!(failure_kind, ModelFetchFailureKind::Parse);
                     assert_eq!(catalog, ProviderModelCatalog::CodexFallback);
                     assert_eq!(models.len(), 3);
                     assert!(reason.contains("empty model list"));

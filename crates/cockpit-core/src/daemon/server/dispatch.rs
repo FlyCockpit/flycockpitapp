@@ -24928,10 +24928,12 @@ pub(super) async fn provider_models_fetch(
                         models,
                         catalog,
                         reason,
+                        failure_kind,
                     } => crate::providers::models_fetch::FetchOutcome::FallbackAvailable {
                         models,
                         catalog,
                         reason,
+                        failure_kind,
                     },
                     crate::providers::auth_check::AuthCheckSuccess::Checked => {
                         crate::providers::models_fetch::FetchOutcome::Unsupported
@@ -24971,9 +24973,10 @@ pub(super) async fn provider_models_fetch(
                 .await
                 .and_then(|outcome| match outcome {
                     crate::providers::models_fetch::FetchOutcome::Unsupported => Err(
-                        anyhow::anyhow!(
-                            "provider models endpoint returned 404; no authenticated response was received"
-                        ),
+                        crate::providers::models_fetch::ModelFetchError::http(
+                            reqwest::StatusCode::NOT_FOUND,
+                            "provider models endpoint returned 404; no authenticated response was received".into()
+                        ).into(),
                     ),
                     outcome => Ok(outcome),
                 })
@@ -25042,11 +25045,10 @@ pub(super) async fn provider_models_fetch(
                     models,
                     catalog,
                     reason,
+                    failure_kind,
                 }) => {
                     let reason = redact_provider_response_text(&reason, &store, &config, &env);
-                    verification = Some(categorize_provider_model_fetch_error(&anyhow::anyhow!(
-                        reason.clone()
-                    )));
+                    verification = Some(provider_model_verification(failure_kind, &reason));
                     if allow_fallback {
                         let mut updated = entry.clone();
                         let merge_policy = match selected_policy {
@@ -25393,92 +25395,34 @@ pub(super) fn categorize_provider_model_fetch_error(
     error: &anyhow::Error,
 ) -> crate::daemon::proto::ProviderModelVerification {
     let message = crate::config::providers::redact_model_fetch_reason(error.to_string());
-    let lower = message.to_ascii_lowercase();
-    if let Some(auth_error) = error.downcast_ref::<crate::providers::auth_check::AuthCheckError>() {
-        match auth_error {
-            crate::providers::auth_check::AuthCheckError::CredentialsRejected(_) => {
-                let status = provider_http_status(&lower).unwrap_or(401);
-                return crate::daemon::proto::ProviderModelVerification::Unauthorized { status };
-            }
-            crate::providers::auth_check::AuthCheckError::Network(_) => {
-                return crate::daemon::proto::ProviderModelVerification::Network {
-                    message: bounded_provider_model_error(&message),
-                };
-            }
-            crate::providers::auth_check::AuthCheckError::Other(_) => {}
-        }
-    }
-    // Transport context (e.g. GET <url>) must not hide reqwest's typed
-    // connection/timeout failure behind the generic HTTP fallback.
-    if let Some(transport) = error.downcast_ref::<reqwest::Error>()
-        && (transport.is_connect() || transport.is_timeout() || transport.is_request())
-    {
-        return crate::daemon::proto::ProviderModelVerification::Network {
-            message: bounded_provider_model_error(&message),
-        };
-    }
-    let status = provider_http_status(&lower);
-    if let Some(401) = status {
-        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 401 };
-    }
-    if let Some(403) = status {
-        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 403 };
-    }
-    if status == Some(404) {
-        return crate::daemon::proto::ProviderModelVerification::NotFound;
-    }
-    if let Some(status) = status.filter(|value| *value >= 400) {
-        return crate::daemon::proto::ProviderModelVerification::HttpStatus {
-            status,
-            snippet: bounded_provider_model_error(&message),
-        };
-    }
-    let message = bounded_provider_model_error(&message);
-    if lower.contains("unauthorized") {
-        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 401 };
-    }
-    if lower.contains("forbidden") || lower.contains("credentials rejected") {
-        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 403 };
-    }
-    if lower.contains("not found") {
-        return crate::daemon::proto::ProviderModelVerification::NotFound;
-    }
-    if lower.contains("json")
-        || lower.contains("model array")
-        || lower.contains("model list")
-        || lower.contains("parse")
-    {
-        return crate::daemon::proto::ProviderModelVerification::Parse { message };
-    }
-    if lower.contains("dns")
-        || lower.contains("tls")
-        || lower.contains("connect")
-        || lower.contains("timeout")
-        || lower.contains("sending request")
-        || lower.contains("request error")
-    {
-        return crate::daemon::proto::ProviderModelVerification::Network { message };
-    }
-    crate::daemon::proto::ProviderModelVerification::HttpStatus {
-        status: status.unwrap_or(500),
-        snippet: message,
-    }
+    let kind = error
+        .downcast_ref::<crate::providers::auth_check::AuthCheckError>()
+        .map(|error| error.failure_kind())
+        .unwrap_or_else(|| crate::providers::models_fetch::model_fetch_failure_kind(error));
+    provider_model_verification(kind, &message)
 }
 
-fn provider_http_status(message: &str) -> Option<u16> {
-    ["returned http ", "returned ", "rejected (", "http "]
-        .into_iter()
-        .find_map(|marker| {
-            let tail = message.split_once(marker)?.1;
-            let digits = tail
-                .trim_start_matches(|character: char| !character.is_ascii_digit())
-                .chars()
-                .take_while(|character| character.is_ascii_digit())
-                .collect::<String>();
-            (digits.len() == 3)
-                .then(|| digits.parse::<u16>().ok())
-                .flatten()
-        })
+fn provider_model_verification(
+    kind: crate::providers::models_fetch::ModelFetchFailureKind,
+    message: &str,
+) -> crate::daemon::proto::ProviderModelVerification {
+    use crate::daemon::proto::ProviderModelVerification;
+    use crate::providers::models_fetch::ModelFetchFailureKind;
+    let message = bounded_provider_model_error(message);
+    match kind {
+        ModelFetchFailureKind::HttpStatus(status) => match status.as_u16() {
+            401 | 403 => ProviderModelVerification::Unauthorized {
+                status: status.as_u16(),
+            },
+            404 => ProviderModelVerification::NotFound,
+            status => ProviderModelVerification::HttpStatus {
+                status,
+                snippet: message,
+            },
+        },
+        ModelFetchFailureKind::Network => ProviderModelVerification::Network { message },
+        ModelFetchFailureKind::Parse => ProviderModelVerification::Parse { message },
+    }
 }
 
 fn bounded_provider_model_error(message: &str) -> String {
@@ -25875,31 +25819,47 @@ pub(super) fn scrub_provider_response(
     store: &crate::credentials::CredentialStore,
     env: &std::collections::HashMap<String, String>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    fn scrub_value(value: &mut serde_json::Value, secret_values: &[String]) {
+    fn scrub_value(value: &mut serde_json::Value, secret_values: &[String], identity: bool) {
         match value {
             serde_json::Value::String(text) => {
-                *text =
-                    redact_provider_response_text_with_values(text, secret_values.iter().cloned());
+                if identity {
+                    // IDs have already crossed the credential-scrubbed catalog
+                    // boundary. Repeat exact credential removal, but never apply
+                    // diagnostic heuristics or truncation to catalog identities.
+                    for secret in secret_values {
+                        if !secret.is_empty() {
+                            *text = text.replace(secret, "[redacted]");
+                        }
+                    }
+                } else {
+                    *text = redact_provider_response_text_with_values(
+                        text,
+                        secret_values.iter().cloned(),
+                    );
+                }
             }
             serde_json::Value::Array(items) => {
                 for item in items {
-                    scrub_value(item, secret_values);
+                    scrub_value(item, secret_values, identity);
                 }
             }
             serde_json::Value::Object(fields) => {
-                for value in fields.values_mut() {
-                    scrub_value(value, secret_values);
+                for (key, value) in fields {
+                    // All three fetched/unlisted/fallback summaries use the
+                    // shared ProviderModelIdSummary.ids wire field.
+                    scrub_value(value, secret_values, key == "ids" || key == "provider_id");
                 }
             }
             _ => {}
         }
     }
 
-    let secret_values = provider_response_secret_values(store, config, env)
+    let mut secret_values = provider_response_secret_values(store, config, env)
         .into_iter()
         .collect::<Vec<_>>();
+    secret_values.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     let mut value = serde_json::to_value(response).map_err(internal)?;
-    scrub_value(&mut value, &secret_values);
+    scrub_value(&mut value, &secret_values, false);
     serde_json::from_value(value).map_err(internal)
 }
 

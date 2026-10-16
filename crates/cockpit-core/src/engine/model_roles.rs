@@ -817,7 +817,11 @@ fn build_redacted_policy_model(
 /// authored `models` list of an unprepared slot).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FiniteSlotRoute {
-    pub provider: String,
+    /// Presentation identity used only for parent selector matching.
+    pub provider_id: String,
+    /// Installed catalog/credential identity used for all policy lookups.
+    /// Unprepared routes use their provider id here as well.
+    pub provider_profile_handle: String,
     pub model: String,
     pub is_default: bool,
 }
@@ -852,11 +856,11 @@ pub(crate) fn select_finite_slot_route(
             let (provider, model) = split_selector(selector).ok_or_else(not_allowed)?;
             let route = routes
                 .iter()
-                .find(|route| route.provider == provider && route.model == model)
+                .find(|route| route.provider_id == provider && route.model == model)
                 .ok_or_else(not_allowed)?;
             providers
                 .check_route_capability_requirements(
-                    &route.provider,
+                    &route.provider_profile_handle,
                     &route.model,
                     required_capabilities,
                     *min_context_tokens,
@@ -884,13 +888,13 @@ pub(crate) fn select_finite_slot_route(
                 .iter()
                 .filter(|route| {
                     providers.route_permits_category(
-                        &route.provider,
+                        &route.provider_profile_handle,
                         &route.model,
                         category,
                         Some(agent_name),
                     ) && providers
                         .check_route_capability_requirements(
-                            &route.provider,
+                            &route.provider_profile_handle,
                             &route.model,
                             required_capabilities,
                             *min_context_tokens,
@@ -899,17 +903,17 @@ pub(crate) fn select_finite_slot_route(
                 })
                 .collect();
             let quality = |route: &FiniteSlotRoute| {
-                providers.resolve_quality_rank(&route.provider, &route.model)
+                providers.resolve_quality_rank(&route.provider_profile_handle, &route.model)
             };
             let cost = |route: &FiniteSlotRoute| {
-                providers.resolve_cost_rank(&route.provider, &route.model)
+                providers.resolve_cost_rank(&route.provider_profile_handle, &route.model)
             };
             // Like category discovery: a route that explicitly lists the
             // category outranks one that is merely unrestricted.
             let explicit = |route: &FiniteSlotRoute| {
                 providers
                     .providers
-                    .get(&route.provider)
+                    .get(&route.provider_profile_handle)
                     .and_then(|entry| entry.models.iter().find(|m| m.id == route.model))
                     .is_some_and(|model| {
                         model.availability.categories.iter().any(|c| c == category)

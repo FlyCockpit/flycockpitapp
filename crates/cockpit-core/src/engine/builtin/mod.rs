@@ -3682,7 +3682,8 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
         let candidates: Vec<_> = routes
             .iter()
             .map(|route| crate::engine::model_roles::FiniteSlotRoute {
-                provider: route.provider_id.clone(),
+                provider_id: route.provider_id.clone(),
+                provider_profile_handle: route.provider_profile_handle.clone(),
                 model: route.model_id.clone(),
                 is_default: route.is_default,
             })
@@ -3697,12 +3698,16 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
         .map_err(anyhow::Error::msg)?;
         let route = routes
             .iter()
-            .find(|route| route.provider_id == chosen.provider && route.model_id == chosen.model)
+            .find(|route| {
+                route.provider_id == chosen.provider_id
+                    && route.provider_profile_handle == chosen.provider_profile_handle
+                    && route.model_id == chosen.model
+            })
             .context("selected prepared vNext route vanished")?;
         return model_from_prepared_route(route, args).with_context(|| {
             format!(
                 "loading prepared vNext child route `{}:{}`",
-                chosen.provider, chosen.model
+                chosen.provider_id, chosen.model
             )
         });
     }
@@ -3834,7 +3839,8 @@ fn resolve_unprepared_vnext_delegation_selector(
         .models
         .iter()
         .map(|allowed| crate::engine::model_roles::FiniteSlotRoute {
-            provider: allowed.provider_id.clone(),
+            provider_id: allowed.provider_id.clone(),
+            provider_profile_handle: allowed.provider_id.clone(),
             model: allowed.model_id.clone(),
             is_default: default.is_some_and(|default| {
                 default.provider_id == allowed.provider_id && default.model_id == allowed.model_id
@@ -3852,9 +3858,12 @@ fn resolve_unprepared_vnext_delegation_selector(
     model_from_unprepared_slot_ids(
         def,
         args,
-        &chosen.provider,
+        &chosen.provider_profile_handle,
         &chosen.model,
-        &format!("parent-named route `{}:{}`", chosen.provider, chosen.model),
+        &format!(
+            "parent-named route `{}:{}`",
+            chosen.provider_id, chosen.model
+        ),
     )
 }
 
@@ -8502,6 +8511,74 @@ pub(crate) mod tests {
         assert!(!names.contains(&"spawn"), "{names:?}");
     }
 
+    /// Stored delegation tools do not authorize calls hidden for this turn.
+    #[tokio::test]
+    async fn hidden_delegation_tools_cannot_reenter_structural_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args_with_provider_can_delegate(tmp.path(), Some(false));
+        let mut agent = build(&args);
+        // Build stores task; add spawn to exercise both delegation surfaces.
+        agent.tools = agent
+            .tools
+            .with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(0, 1)));
+        assert!(!agent.model.can_delegate());
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let active =
+            crate::engine::agent::turn_toolbox(&agent, &session, tmp.path(), &args.config).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        for (name, arguments) in [
+            (
+                "task",
+                serde_json::json!({"intent":"delegate", "payload":{"agent":"explore", "prompt":"inspect"}}),
+            ),
+            (
+                "spawn",
+                serde_json::json!({"prompt":"inspect", "write_scope":"slice"}),
+            ),
+        ] {
+            assert!(agent.tools.get(name).is_some(), "stored {name} grant");
+            assert!(active.get(name).is_none(), "effective {name} removal");
+            let call = crate::engine::message::tool_call_with_identity(
+                format!("hidden-{name}"),
+                None,
+                None,
+                rig::message::ToolFunction {
+                    name: name.into(),
+                    arguments,
+                },
+                None,
+                None,
+            );
+            let flow = crate::engine::agent::phase_10_dispatch_one_call(
+                &agent,
+                &active,
+                &session,
+                &args.config,
+                &tx,
+                &call,
+                name,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(flow, std::ops::ControlFlow::Continue(())),
+                "hidden {name} must reach ordinary unknown-tool refusal: {flow:?}"
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "hidden calls must emit no structural events"
+        );
+    }
+
     #[tokio::test]
     async fn can_delegate_unset_keeps_delegation_tools() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8950,6 +9027,242 @@ pub(crate) mod tests {
             crate::daemon::session_worker::SessionConfigSnapshot::new(0, providers, extended),
         );
         args
+    }
+
+    /// Install a finite child whose portable names differ from its local profile.
+    fn prepared_finite_slot_args(cwd: &Path) -> (crate::agents::AgentDef, SpawnArgs) {
+        use std::collections::BTreeMap;
+        let mut def = vnext_def_with_primary_models(vec![
+            slot_model("portable-provider", "slot-default", true),
+            slot_model("portable-provider", "slot-big", false),
+        ]);
+        def.vnext
+            .as_mut()
+            .unwrap()
+            .model_slots
+            .get_mut("primary")
+            .unwrap()
+            .min_context_tokens = 8_000;
+        let mut args = finite_slot_args_with_catalog(cwd);
+        let parent = crate::agents::embedded_default("Build").unwrap();
+        args.parent_vnext_grant = Some(
+            parent
+                .resolve_vnext_grant(&crate::agents::VnextHostPolicy::for_session_config(
+                    &args.config.extended(),
+                ))
+                .unwrap(),
+        );
+        let child_id = uuid::Uuid::new_v4();
+        args.vnext_local_installation_resolver =
+            crate::agents::LocalInstallationResolver::from_bound_definitions(BTreeMap::from([
+                (child_id, def.clone()),
+                (uuid::Uuid::new_v4(), parent),
+            ]))
+            .unwrap()
+            .with_primary_slot_routes(BTreeMap::from([(
+                child_id,
+                [("slot-default", true), ("slot-big", false)]
+                    .into_iter()
+                    .map(
+                        |(model, is_default)| crate::agents::PreparedPrimarySlotRoute {
+                            provider_profile_handle: "lmstudio".into(),
+                            provider_id: "portable-provider".into(),
+                            model_id: model.into(),
+                            is_default,
+                            hard_capability_verified: true,
+                        },
+                    )
+                    .collect(),
+            )]))
+            .unwrap();
+        (def, args)
+    }
+
+    fn replace_slot_catalog(
+        args: &mut SpawnArgs,
+        providers: crate::config::providers::ProvidersConfig,
+    ) {
+        args.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                providers,
+                args.config.extended(),
+            ),
+        );
+    }
+
+    #[test]
+    fn prepared_finite_slot_uses_profile_context_and_presentation_selectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (def, mut args) = prepared_finite_slot_args(tmp.path());
+        let default = resolve_agent_model(&def, &args).unwrap();
+        assert_eq!(default.provider_id(), "lmstudio");
+        assert_eq!(default.model_id_ref(), "slot-default");
+        for selector in ["portable-provider/slot-big", "portable-provider:slot-big"] {
+            args.delegation_model =
+                Some(crate::engine::model_roles::DelegationModelSelector::Exact {
+                    selector: selector.into(),
+                    required_capabilities: Vec::new(),
+                    min_context_tokens: Some(1_000_000),
+                });
+            let selected = resolve_agent_model(&def, &args)
+                .expect("selector checks the installed profile window");
+            assert_eq!(selected.provider_id(), "lmstudio");
+            assert_eq!(selected.model_id_ref(), "slot-big");
+        }
+        let mut providers = args.config.providers();
+        // A presentation catalog must not rescue missing metadata on the profile.
+        let presentation = providers.providers["lmstudio"].clone();
+        providers.providers.get_mut("lmstudio").unwrap().models[1].context_length = None;
+        providers
+            .providers
+            .insert("portable-provider".into(), presentation);
+        replace_slot_catalog(&mut args, providers);
+        let error = resolve_agent_model(&def, &args)
+            .err()
+            .expect("selector must refuse this route");
+        assert!(
+            format!("{error:#}").contains("not in the child slot allowed route set"),
+            "{error:#}"
+        );
+        // The unrelated valid default survives compatibility filtering.
+        args.delegation_model = None;
+        assert_eq!(
+            resolve_agent_model(&def, &args).unwrap().model_id_ref(),
+            "slot-default"
+        );
+    }
+
+    #[test]
+    fn prepared_finite_slot_rejects_conflicting_presentation_requirements() {
+        use crate::config::providers::ModelOptimization;
+        use crate::config::providers::{CapabilityStatus, RequiredModelCapability};
+        use crate::engine::model_roles::DelegationModelSelector;
+        let tmp = tempfile::tempdir().unwrap();
+        let (def, mut args) = prepared_finite_slot_args(tmp.path());
+        let mut providers = args.config.providers();
+        let mut presentation = providers.providers["lmstudio"].clone();
+        presentation.models[1].capabilities.tool_calling = CapabilityStatus::Supported;
+        let actual = providers.providers.get_mut("lmstudio").unwrap();
+        actual.models[1].context_length = Some(8_000);
+        actual.models[1].capabilities.tool_calling = CapabilityStatus::Unsupported;
+        providers
+            .providers
+            .insert("portable-provider".into(), presentation);
+        replace_slot_catalog(&mut args, providers);
+        assert_eq!(
+            resolve_agent_model(&def, &args).unwrap().provider_id(),
+            "lmstudio"
+        );
+        for (requires, min_context) in [
+            (Vec::new(), Some(1_000_000)),
+            (vec![RequiredModelCapability::ToolCalling], None),
+        ] {
+            args.delegation_model = Some(DelegationModelSelector::Exact {
+                selector: "portable-provider/slot-big".into(),
+                required_capabilities: requires.clone(),
+                min_context_tokens: min_context,
+            });
+            let error = resolve_agent_model(&def, &args)
+                .err()
+                .expect("selector must refuse this route");
+            assert!(
+                format!("{error:#}").contains("does not meet the selector's requirements"),
+                "{error:#}"
+            );
+            args.delegation_model = Some(DelegationModelSelector::Category {
+                category: Some("review".into()),
+                optimize: ModelOptimization::Balanced,
+                required_capabilities: requires,
+                min_context_tokens: min_context,
+            });
+            let error = resolve_agent_model(&def, &args)
+                .err()
+                .expect("selector must refuse this route");
+            assert!(
+                format!("{error:#}")
+                    .contains("no route in the child slot admits category `review`"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_finite_slot_categories_and_ranks_use_profile_metadata() {
+        use crate::config::providers::ModelOptimization;
+        let tmp = tempfile::tempdir().unwrap();
+        let (def, mut args) = prepared_finite_slot_args(tmp.path());
+        // Each independent scenario disagrees with the presentation catalog.
+        for scenario in [
+            "provider-availability",
+            "model-availability",
+            "explicit-category",
+            "quality",
+            "cost",
+        ] {
+            let mut providers = finite_slot_args_with_catalog(tmp.path()).config.providers();
+            let actual = providers.providers.get_mut("lmstudio").unwrap();
+            for model in &mut actual.models {
+                model.availability.categories.clear();
+            }
+            let mut presentation = actual.clone();
+            match scenario {
+                "provider-availability" => {
+                    presentation.availability.categories = vec!["other".into()]
+                }
+                "model-availability" => {
+                    actual.models[0].availability.categories = vec!["other".into()];
+                    presentation.models[1].availability.categories = vec!["other".into()];
+                }
+                "explicit-category" => {
+                    actual.models[1].availability.categories = vec!["review".into()];
+                    presentation.models[0].availability.categories = vec!["review".into()];
+                }
+                "quality" => {
+                    actual.models[1].quality_rank = Some(10);
+                    presentation.models[0].quality_rank = Some(10);
+                }
+                "cost" => {
+                    actual.models[1].cost_rank = Some(-10);
+                    presentation.models[0].cost_rank = Some(-10);
+                }
+                _ => unreachable!(),
+            }
+            providers
+                .providers
+                .insert("portable-provider".into(), presentation.clone());
+            replace_slot_catalog(&mut args, providers);
+            args.delegation_model = Some(
+                crate::engine::model_roles::DelegationModelSelector::Category {
+                    category: Some("review".into()),
+                    optimize: if scenario == "cost" {
+                        ModelOptimization::Cost
+                    } else {
+                        ModelOptimization::Quality
+                    },
+                    required_capabilities: Vec::new(),
+                    min_context_tokens: None,
+                },
+            );
+            let selected = resolve_agent_model(&def, &args)
+                .unwrap_or_else(|error| panic!("{scenario}: {error:#}"));
+            assert_eq!(selected.provider_id(), "lmstudio", "{scenario}");
+            assert_eq!(
+                selected.model_id_ref(),
+                if scenario == "provider-availability" {
+                    "slot-default"
+                } else {
+                    "slot-big"
+                },
+                "{scenario}"
+            );
+            assert_eq!(
+                serde_json::to_value(&args.config.providers().providers["portable-provider"])
+                    .unwrap(),
+                serde_json::to_value(&presentation).unwrap(),
+                "selection must not alias or overwrite the presentation catalog"
+            );
+        }
     }
 
     /// #549 C5: in a finite (authored) child slot, an exact selector's

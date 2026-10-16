@@ -24,6 +24,13 @@ async fn dispatch_task_args(
 ) -> crate::engine::agent::TurnOutcome {
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
     let tc = task_tool_call_with_args("task-unknown-agent", "fn-task-unknown-agent", args);
+    let active_tools = crate::engine::agent::turn_toolbox(
+        &driver.stack[0].agent,
+        &driver.session,
+        &driver.cwd,
+        &driver.config,
+    )
+    .await;
     let outcome = crate::config::trust::scope_workspace_trust_policy(
         crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::resolve_trust_root(&driver.cwd).unwrap(),
@@ -31,6 +38,7 @@ async fn dispatch_task_args(
         },
         crate::engine::agent::phase_10_dispatch_one_call(
             &driver.stack[0].agent,
+            &active_tools,
             &driver.session,
             &driver.config,
             &tx,

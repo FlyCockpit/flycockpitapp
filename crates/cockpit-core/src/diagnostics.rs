@@ -1340,6 +1340,10 @@ async fn provider_network_lines(
                 ),
                 true,
             ),
+            Err(error @ crate::providers::auth_check::AuthCheckError::UnsafeModelIdentity) => (
+                format!("{id}: check failed ({error}) — run: cockpit provider add {template_id}"),
+                true,
+            ),
             Err(crate::providers::auth_check::AuthCheckError::Other(error))
             | Err(crate::providers::auth_check::AuthCheckError::Parse(error))
             | Err(crate::providers::auth_check::AuthCheckError::HttpStatus { message: error, .. }) => (

@@ -20,8 +20,80 @@ pub(super) struct ProviderSnapshot {
 }
 
 pub struct FetchCompletion {
-    pub outcome: Result<FetchOutcome, String>,
+    pub observation: FetchObservation,
     pub(super) snapshot: Result<ProviderSnapshot, String>,
+}
+
+/// The fetch observation survives independently of read-back authority. In
+/// particular, never turn a real rejection into a snapshot/transport error.
+/// Successful catalogs are materialized only from an adopted complete snapshot,
+/// not from a possibly truncated wire summary or a pre-fetch model bag.
+pub struct FetchObservation {
+    pub(super) provider_id: String,
+    response: Result<cockpit_proto::ProviderModelFetchResult, String>,
+    allow_fallback: bool,
+}
+
+impl FetchObservation {
+    pub(super) fn into_outcome(
+        self,
+        config: &cockpit_config::providers::ProvidersConfig,
+    ) -> Result<FetchOutcome, String> {
+        let result = self.response?;
+        let persisted = || {
+            config
+                .providers
+                .get(&self.provider_id)
+                .map(|entry| entry.models.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "provider `{}` disappeared after the model fetch",
+                        self.provider_id
+                    )
+                })
+        };
+        match result.outcome {
+            ProviderModelFetchOutcome::Models {
+                models,
+                catalog,
+                kept,
+            } => Ok(FetchOutcome::Models {
+                models: persisted()?,
+                catalog,
+                trim_note: cockpit_proto::catalog_trim_note(models.count, kept),
+            }),
+            ProviderModelFetchOutcome::FallbackAvailable {
+                catalog, reason, ..
+            } if self.allow_fallback => Ok(FetchOutcome::FallbackApplied {
+                models: persisted()?,
+                catalog,
+                reason,
+            }),
+            ProviderModelFetchOutcome::FallbackAvailable {
+                models,
+                catalog,
+                reason,
+            } => Ok(FetchOutcome::FallbackAvailable {
+                fallback_count: models.count,
+                catalog,
+                reason,
+            }),
+            ProviderModelFetchOutcome::Unsupported => Ok(FetchOutcome::Unsupported),
+            ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted } => Err(format!(
+                "model fetch needs a keep/remove decision for {} configured model(s)",
+                unlisted.count
+            )),
+            ProviderModelFetchOutcome::Error { message } => Ok(FetchOutcome::Failed {
+                reason: message,
+                failure: match result.verification {
+                    Some(cockpit_proto::ProviderModelVerification::Unauthorized {
+                        status: 401 | 403,
+                    }) => cockpit_config::providers::ModelFetchFailure::CredentialsRejected,
+                    _ => cockpit_config::providers::ModelFetchFailure::Other,
+                },
+            }),
+        }
+    }
 }
 
 /// Settings-side result of one daemon catalog refresh.
@@ -109,7 +181,11 @@ impl FetchHandle {
         tokio::spawn(async move {
             let completion = match crate::tui::settings::settings_daemon_client(&lifecycle).await {
                 Err(error) => FetchCompletion {
-                    outcome: Err(error.to_string()),
+                    observation: FetchObservation {
+                        provider_id: pid.clone(),
+                        response: Err(error.to_string()),
+                        allow_fallback,
+                    },
                     snapshot: Err(error.to_string()),
                 },
                 Ok(client) => {
@@ -128,36 +204,27 @@ impl FetchHandle {
                     // A lost reply can follow a commit. Always read back, even
                     // when the very first request returned a transport error.
                     let snapshot = provider_snapshot(&client, &project_root).await;
-                    let outcome = response.and_then(|response| {
+                    let response = response.and_then(|response| {
                         let Response::ProviderModelsFetched { mut results, .. } = response else {
-                            return Err("daemon returned unexpected provider model fetch response".into());
+                            return Err(
+                                "daemon returned unexpected provider model fetch response".into()
+                            );
                         };
-                        let result = results.pop().ok_or_else(|| "daemon returned no provider model fetch result".to_string())?;
-                        let persisted = || snapshot.as_ref().map_err(Clone::clone)?
-                            .config.providers.get(&pid).map(|view| view.entry.models.clone())
-                            .ok_or_else(|| format!("provider `{pid}` disappeared after the model fetch"));
-                        match result.outcome {
-                            ProviderModelFetchOutcome::Models { models, catalog, kept } => Ok(FetchOutcome::Models {
-                                models: persisted()?, catalog,
-                                trim_note: cockpit_proto::catalog_trim_note(models.count, kept),
-                            }),
-                            ProviderModelFetchOutcome::FallbackAvailable { models: _, catalog, reason } if allow_fallback =>
-                                Ok(FetchOutcome::FallbackApplied { models: persisted()?, catalog, reason }),
-                            ProviderModelFetchOutcome::FallbackAvailable { models, catalog, reason } =>
-                                Ok(FetchOutcome::FallbackAvailable { fallback_count: models.count, catalog, reason }),
-                            ProviderModelFetchOutcome::Unsupported => Ok(FetchOutcome::Unsupported),
-                            ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted } => Err(format!(
-                                "model fetch needs a keep/remove decision for {} configured model(s)", unlisted.count)),
-                            ProviderModelFetchOutcome::Error { message } => Ok(FetchOutcome::Failed {
-                                reason: message,
-                                failure: match result.verification {
-                                    Some(cockpit_proto::ProviderModelVerification::Unauthorized { status: 401 | 403 }) => cockpit_config::providers::ModelFetchFailure::CredentialsRejected,
-                                    _ => cockpit_config::providers::ModelFetchFailure::Other,
-                                },
-                            }),
+                        if results.len() != 1 || results[0].provider_id != pid {
+                            return Err(
+                                "daemon returned mismatched provider model fetch results".into()
+                            );
                         }
+                        Ok(results.remove(0))
                     });
-                    FetchCompletion { outcome, snapshot }
+                    FetchCompletion {
+                        observation: FetchObservation {
+                            provider_id: pid,
+                            response,
+                            allow_fallback,
+                        },
+                        snapshot,
+                    }
                 }
             };
             if let Ok(mut s) = state_w.lock() {

@@ -40,6 +40,30 @@ async fn fetch(
     results.remove(0)
 }
 
+async fn reject_fetch(
+    ctx: &DaemonContext,
+    workspace: &Path,
+    id: &str,
+    policy: Option<OnUnlistedModelsFetch>,
+    consent: bool,
+    env: HashMap<String, String>,
+) -> ErrorPayload {
+    let error = provider_models_fetch(
+        ctx,
+        &workspace.to_string_lossy(),
+        Some(id),
+        None,
+        false,
+        policy,
+        consent,
+        env,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    error
+}
+
 fn read_entry(path: &Path, id: &str) -> ProviderEntry {
     ConfigDoc::providers_from_paths(&[path.to_path_buf()])
         .providers
@@ -137,7 +161,7 @@ async fn fetched_catalog_duplicates_are_coalesced_before_preview_summary_and_sav
 }
 
 #[tokio::test]
-async fn fetched_catalog_scrub_collisions_are_unique_without_dropping_distinct_ids() {
+async fn unsafe_catalog_collisions_reject_without_dropping_or_readdressing_models() {
     let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
     let path = cockpit_config::config::dirs::global_config_file().unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -160,7 +184,8 @@ async fn fetched_catalog_scrub_collisions_are_unique_without_dropping_distinct_i
             ..Default::default()
         },
     );
-    let result = fetch(
+    let before = std::fs::read(global_provider_path("local")).unwrap();
+    let result = reject_fetch(
         &ctx,
         &workspace,
         "local",
@@ -171,27 +196,12 @@ async fn fetched_catalog_scrub_collisions_are_unique_without_dropping_distinct_i
     .await;
     let encoded = serde_json::to_string(&result).unwrap();
     assert!(!encoded.contains(SECRET));
-    let ProviderModelFetchOutcome::Models { models, .. } = result.outcome else {
-        panic!("{result:?}");
-    };
-    assert_eq!(models.count, 2);
-    assert_eq!(models.ids.len(), 2);
-    assert_eq!(models.ids[1], "distinct");
-    assert_ne!(models.ids[0], models.ids[1]);
-    let saved = read_entry(&path, "local");
     assert_eq!(
-        saved
-            .models
-            .iter()
-            .map(|m| m.id.clone())
-            .collect::<Vec<_>>(),
-        models.ids
+        std::fs::read(global_provider_path("local")).unwrap(),
+        before,
+        "unsafe operational IDs must reject the entire write, including policy/status"
     );
-    assert!(
-        !std::fs::read_to_string(global_provider_path("local"))
-            .unwrap()
-            .contains(SECRET)
-    );
+    assert!(read_entry(&path, "local").models.is_empty());
     server.await.unwrap();
 }
 
@@ -472,6 +482,9 @@ async fn distinct_catalog_ids_survive_the_final_response_scrubber_unchanged() {
         format!("{prefix}first"),
         format!("{prefix}second"),
         "~ordinary".into(),
+        format!("~{}", "a".repeat(64)),
+        cockpit_config::config::extended::RedactConfig::default().placeholder,
+        "[redacted]".into(),
         format!("~{}", "G".repeat(64)),
         r#"{"payload":" {\"n\": 1} "}"#.into(),
         r#"{"payload":"{\"n\":1}"}"#.into(),
@@ -503,7 +516,7 @@ async fn distinct_catalog_ids_survive_the_final_response_scrubber_unchanged() {
         let ProviderModelFetchOutcome::Models { models, .. } = result.outcome else {
             panic!("{result:?}");
         };
-        assert_eq!(models.count, 8);
+        assert_eq!(models.count as usize, ids.len());
         assert_eq!(
             models.ids, ids,
             "final diagnostics must not collapse or truncate distinct catalog IDs"
@@ -521,7 +534,7 @@ async fn distinct_catalog_ids_survive_the_final_response_scrubber_unchanged() {
 }
 
 #[tokio::test]
-async fn final_catalog_identity_projection_preserves_secret_and_marker_distinctions() {
+async fn unsafe_catalog_secret_marker_and_nested_ids_reject_before_write() {
     let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
     let path = cockpit_config::config::dirs::global_config_file().unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -578,7 +591,8 @@ async fn final_catalog_identity_projection_preserves_secret_and_marker_distincti
                     ..Default::default()
                 },
             );
-            let result = fetch(
+            let before = std::fs::read(global_provider_path("local")).unwrap();
+            let result = reject_fetch(
                 &ctx,
                 &workspace,
                 "local",
@@ -595,77 +609,24 @@ async fn final_catalog_identity_projection_preserves_secret_and_marker_distincti
             for secret in [ONE, TWO, THREE] {
                 assert!(!encoded.contains(secret), "credential in published result");
             }
-            let ProviderModelFetchOutcome::Models { models, kept, .. } = result.outcome else {
-                panic!("{result:?}");
-            };
             assert_eq!(
-                models.count, 7,
-                "distinct secret/marker IDs must survive projection"
+                std::fs::read(global_provider_path("local")).unwrap(),
+                before
             );
-            assert_eq!(kept, 7);
-            assert_eq!(
-                models.ids.iter().collect::<HashSet<_>>().len(),
-                7,
-                "final published IDs must be unique"
-            );
-            assert_eq!(models.ids[3], projected_marker);
-            assert_eq!(models.ids[4], "ordinary-distinct");
-            assert_ne!(
-                models.ids[5], nested,
-                "nested JSON Unicode escapes must not carry a credential"
-            );
-            assert_ne!(models.ids[6], spaced_nested);
-            assert!(!models.ids.iter().any(|id| id.contains(&encoded_secret)));
-            let saved = read_entry(&path, "local");
-            assert_eq!(
-                saved
-                    .models
-                    .iter()
-                    .map(|model| model.id.clone())
-                    .collect::<Vec<_>>(),
-                models.ids,
-                "published identities must equal independently loaded persisted identities"
-            );
-            assert_eq!(
-                saved
-                    .models
-                    .iter()
-                    .map(|model| model.name.as_deref().unwrap())
-                    .collect::<Vec<_>>(),
-                [
-                    "first",
-                    "other secret",
-                    "marker",
-                    "literal",
-                    "ordinary",
-                    "nested",
-                    "spaced nested"
-                ]
-            );
-            let saved_text = std::fs::read_to_string(global_provider_path("local")).unwrap();
-            for secret in [ONE, TWO, THREE] {
-                assert!(
-                    !saved_text.contains(secret),
-                    "credential in persisted catalog"
-                );
-            }
+            assert!(read_entry(&path, "local").models.is_empty());
             server.await.unwrap();
         }
     }
 }
 
 #[tokio::test]
-async fn final_unlisted_preview_identity_projection_is_unique_and_matches_later_write() {
+async fn unsafe_existing_catalog_rejects_preview_and_later_write_with_exact_preimage() {
     let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
     let path = cockpit_config::config::dirs::global_config_file().unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let marker = cockpit_config::config::extended::RedactConfig::default().placeholder;
     let projected_marker = marker.replace("COCKPIT", "[redacted]");
-    let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![
-        (200, r#"{"data":[{"id":"live"}]}"#.into(), true),
-        (200, r#"{"data":[{"id":"live"}]}"#.into(), true),
-    ])
-    .await;
+    let url = "http://127.0.0.1:1/v1".to_string();
     seed(
         &path,
         "local",
@@ -694,59 +655,24 @@ async fn final_unlisted_preview_identity_projection_is_unique_and_matches_later_
     );
     let before = std::fs::read(global_provider_path("local")).unwrap();
     let env = HashMap::from([("R16_MARKER".into(), "COCKPIT".into())]);
-    let preview = fetch(
-        &ctx,
-        &workspace,
-        "local",
-        Some(OnUnlistedModelsFetch::Ask),
-        false,
-        env.clone(),
-    )
-    .await;
-    assert!(!serde_json::to_string(&preview).unwrap().contains("COCKPIT"));
-    let ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted } = preview.outcome else {
-        panic!("{preview:?}");
-    };
-    assert_eq!(unlisted.count, 2);
-    assert_eq!(
-        unlisted.ids.iter().collect::<HashSet<_>>().len(),
-        2,
-        "preview IDs must remain distinct after final scrubbing"
-    );
-    assert_eq!(unlisted.ids[1], projected_marker);
-    assert_eq!(
-        std::fs::read(global_provider_path("local")).unwrap(),
-        before,
-        "Ask must not write projected identities"
-    );
-    assert_eq!(read_entry(&path, "local").models.len(), 2);
-    let result = fetch(
-        &ctx,
-        &workspace,
-        "local",
-        Some(OnUnlistedModelsFetch::Keep),
-        false,
-        env,
-    )
-    .await;
-    assert!(matches!(
-        result.outcome,
-        ProviderModelFetchOutcome::Models { .. }
-    ));
-    let saved = read_entry(&path, "local");
-    assert_eq!(
-        saved
-            .models
-            .iter()
-            .skip(1)
-            .map(|model| model.id.clone())
-            .collect::<Vec<_>>(),
-        unlisted.ids,
-        "preview must use the same safe identities as the later merge/write"
-    );
-    assert_eq!(saved.models[1].name.as_deref(), Some("first"));
-    assert_eq!(saved.models[2].name.as_deref(), Some("second"));
-    server.await.unwrap();
+    for policy in [
+        OnUnlistedModelsFetch::Ask,
+        OnUnlistedModelsFetch::Keep,
+        OnUnlistedModelsFetch::Remove,
+    ] {
+        let error = reject_fetch(&ctx, &workspace, "local", Some(policy), false, env.clone()).await;
+        assert!(!serde_json::to_string(&error).unwrap().contains("COCKPIT"));
+        assert_eq!(
+            std::fs::read(global_provider_path("local")).unwrap(),
+            before,
+            "an unsafe preview must never create an unusable later persisted address"
+        );
+        let saved = read_entry(&path, "local");
+        assert_eq!(saved.models.len(), 2);
+        assert_eq!(saved.models[0].name.as_deref(), Some("first"));
+        assert_eq!(saved.models[1].id, projected_marker);
+        assert_eq!(saved.models[1].name.as_deref(), Some("second"));
+    }
 }
 
 #[tokio::test]
@@ -815,7 +741,7 @@ async fn persisted_fallback_failure_category_ignores_credential_rejection_prose(
 }
 
 #[tokio::test]
-async fn fallback_catalog_id_projection_is_unique_private_and_persisted_exactly() {
+async fn unsafe_fallback_operational_ids_reject_with_and_without_consent() {
     let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
     let path = cockpit_config::config::dirs::global_config_file().unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -843,9 +769,9 @@ async fn fallback_catalog_id_projection_is_unique_private_and_persisted_exactly(
             ..Default::default()
         },
     );
-    let mut offered = None;
+    let before = std::fs::read(global_provider_path("codex-oauth")).unwrap();
     for consent in [false, true] {
-        let result = fetch(
+        let error = reject_fetch(
             &ctx,
             &workspace,
             "codex-oauth",
@@ -854,48 +780,20 @@ async fn fallback_catalog_id_projection_is_unique_private_and_persisted_exactly(
             HashMap::new(),
         )
         .await;
-        assert!(!serde_json::to_string(&result).unwrap().contains("gpt-"));
-        let ProviderModelFetchOutcome::FallbackAvailable { models, .. } = result.outcome else {
-            panic!("{result:?}");
-        };
-        assert_eq!(models.count, 3);
-        assert_eq!(models.ids.iter().collect::<HashSet<_>>().len(), 3);
-        let saved = read_entry(&path, "codex-oauth");
-        if consent {
-            assert_eq!(
-                saved
-                    .models
-                    .iter()
-                    .map(|model| model.id.clone())
-                    .collect::<Vec<_>>(),
-                models.ids
-            );
-            assert_eq!(Some(models.ids), offered);
-        } else {
-            assert_eq!(saved.models[0].id, "existing");
-            offered = Some(models.ids);
-        }
+        assert!(!serde_json::to_string(&error).unwrap().contains("gpt-"));
+        assert_eq!(
+            std::fs::read(global_provider_path("codex-oauth")).unwrap(),
+            before
+        );
+        assert_eq!(read_entry(&path, "codex-oauth").models[0].id, "existing");
     }
     server.await.unwrap();
 }
 
 #[tokio::test]
-async fn upstream_catalog_cannot_impersonate_an_opaque_identity() {
-    use crate::providers::models_fetch::ResolvedHeader;
+async fn unsafe_upstream_catalog_cannot_publish_an_opaque_replacement() {
     const SECRET: &str = "synthetic-r16-token-collision-0042";
-    let headers = [ResolvedHeader {
-        name: "X-Private".into(),
-        value: SECRET.into(),
-    }];
-    let initial = crate::providers::provider_http::scrub_catalog_models(
-        vec![ModelEntry {
-            id: SECRET.into(),
-            ..Default::default()
-        }],
-        &headers,
-    )
-    .unwrap();
-    let literal = initial[0].id.clone();
+    let literal = format!("~{}", "a".repeat(64));
     let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
     let path = cockpit_config::config::dirs::global_config_file().unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -917,7 +815,7 @@ async fn upstream_catalog_cannot_impersonate_an_opaque_identity() {
         },
     );
     let before = std::fs::read(global_provider_path("local")).unwrap();
-    let result = fetch(
+    let result = reject_fetch(
         &ctx,
         &workspace,
         "local",
@@ -927,14 +825,6 @@ async fn upstream_catalog_cannot_impersonate_an_opaque_identity() {
     )
     .await;
     assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
-    assert!(matches!(
-        result.verification,
-        Some(ProviderModelVerification::Parse { .. })
-    ));
-    assert!(matches!(
-        result.outcome,
-        ProviderModelFetchOutcome::Error { .. }
-    ));
     assert_eq!(
         std::fs::read(global_provider_path("local")).unwrap(),
         before,
@@ -998,7 +888,7 @@ fn final_response_identity_barrier_rejects_unsafe_ids_without_renaming() {
 }
 
 #[tokio::test]
-async fn deep_summary_identity_projection_is_unique_and_keeps_no_target_fetch_read_only() {
+async fn unsafe_deep_catalog_rejects_without_targets_and_without_writing() {
     let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
     let path = cockpit_config::config::dirs::global_config_file().unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1029,7 +919,7 @@ async fn deep_summary_identity_projection_is_unique_and_keeps_no_target_fetch_re
         },
     );
     let before = std::fs::read(global_provider_path("local")).unwrap();
-    let response = provider_models_fetch(
+    let error = provider_models_fetch(
         &ctx,
         &workspace.to_string_lossy(),
         Some("local"),
@@ -1040,22 +930,9 @@ async fn deep_summary_identity_projection_is_unique_and_keeps_no_target_fetch_re
         HashMap::from([("R16_DEEP".into(), "COCKPIT".into())]),
     )
     .await
-    .unwrap();
-    assert!(
-        !serde_json::to_string(&response)
-            .unwrap()
-            .contains("COCKPIT")
-    );
-    let Response::ProviderModelsFetched { mut results, .. } = response else {
-        panic!("{response:?}");
-    };
-    let ProviderModelFetchOutcome::Models { models, kept, .. } = results.remove(0).outcome else {
-        panic!("wrong deep summary");
-    };
-    assert_eq!(models.count, 2);
-    assert_eq!(kept, 2);
-    assert_eq!(models.ids.iter().collect::<HashSet<_>>().len(), 2);
-    assert_eq!(models.ids[1], other);
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(!serde_json::to_string(&error).unwrap().contains("COCKPIT"));
     assert_eq!(
         std::fs::read(global_provider_path("local")).unwrap(),
         before
@@ -1165,16 +1042,8 @@ async fn unusable_fallback_projection_cannot_replace_live_success_or_observed_au
         id: "gpt-5.5".into(),
         ..Default::default()
     }];
-    let mut literals = vec!["gpt-".to_string()];
-    // Obtain each next candidate through the production allocator, then make
-    // it unsafe. This proves the irrelevant fallback really cannot project.
-    for _ in 0..64 {
-        let table =
-            crate::redact::RedactionTable::for_provider_credentials(literals.clone()).unwrap();
-        let candidate = scrub_catalog_models_with_table(fallback.clone(), &table).unwrap();
-        literals.push(candidate[0].id.clone());
-    }
-    let blocked = crate::redact::RedactionTable::for_provider_credentials(literals).unwrap();
+    let blocked =
+        crate::redact::RedactionTable::for_provider_credentials(vec!["gpt-".to_string()]).unwrap();
     assert!(scrub_catalog_models_with_table(fallback, &blocked).is_err());
     for status in [401, 403, 200] {
         let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
@@ -1243,4 +1112,288 @@ async fn unusable_fallback_projection_cannot_replace_live_success_or_observed_au
         }
         server.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn r17_unsafe_operational_ids_reject_every_decoded_form_before_any_write() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    const SECRET: &str = "gpt-";
+    let escaped = SECRET
+        .chars()
+        .map(|ch| format!("\\u{:04x}", ch as u32))
+        .collect::<String>();
+    let nested = format!("{{\"{escaped}\":\"value\"}}");
+    let nested_string = serde_json::to_string(&nested).unwrap();
+    for id in ["gpt-first".to_string(), nested, nested_string] {
+        for envelope in ["data", "models", "array"] {
+            let rows = serde_json::json!([{"id":id,"name":"first"},{"id":id,"name":"duplicate"},{"id":"[redacted]"},{"id":"other"}]);
+            let body = match envelope {
+                "data" => serde_json::json!({"data":rows}),
+                "models" => serde_json::json!({"models":rows}),
+                _ => rows,
+            }
+            .to_string();
+            let (url, server) =
+                crate::providers::provider_http::serve_test_bodies(vec![(200, body, true)]).await;
+            seed(
+                &path,
+                "local",
+                ProviderEntry {
+                    url,
+                    allow_insecure_http: true,
+                    auth: Some(AuthKind::None),
+                    headers: vec![HeaderSpec {
+                        name: "X-Private".into(),
+                        value: "$R17_KEY".into(),
+                    }],
+                    models: vec![ModelEntry {
+                        id: "existing".into(),
+                        manual: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let before = std::fs::read(global_provider_path("local")).unwrap();
+            let config_before = std::fs::read(&path).unwrap();
+            let error = reject_fetch(
+                &ctx,
+                &workspace,
+                "local",
+                Some(OnUnlistedModelsFetch::Remove),
+                true,
+                HashMap::from([("R17_KEY".into(), SECRET.into())]),
+            )
+            .await;
+            assert!(error.message.contains("unsafe operational model ID"));
+            assert!(!serde_json::to_string(&error).unwrap().contains(SECRET));
+            assert_eq!(
+                std::fs::read(global_provider_path("local")).unwrap(),
+                before
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                config_before,
+                "policy is also a write"
+            );
+            let saved = read_entry(&path, "local");
+            assert_eq!(saved.models.len(), 1);
+            assert_eq!(saved.models[0].id, "existing");
+            assert!(saved.models[0].manual);
+            assert!(saved.last_model_fetch.is_none());
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn r17_ordinary_fetch_save_and_each_deep_reentry_send_original_model_addresses() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let ids = vec![
+        "gpt-first".to_string(),
+        "gpt-second-模型\u{200d}\u{202e}".to_string(),
+    ];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let expected = ids.clone();
+    let server = tokio::spawn(async move {
+        let mut addressed = Vec::new();
+        for index in 0..4 {
+            let (mut socket, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("every remaining/re-entered target must actually be probed")
+                    .unwrap();
+            let mut request = Vec::new();
+            let (header_end, content_length) = loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 16384);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while request.len() < header_end + content_length {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 16384);
+            }
+            let (status, body) = if index == 0 {
+                assert!(request.starts_with(b"GET /v1/models "));
+                (200, serde_json::json!({"data":[{"id":expected[0],"name":"first"},{"id":expected[0],"name":"duplicate"},{"id":expected[1]}]}).to_string())
+            } else {
+                assert!(request.starts_with(b"POST /v1/chat/completions "));
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..header_end + content_length])
+                        .unwrap();
+                addressed.push(body["model"].as_str().unwrap().to_string());
+                (400, "maximum context length is 128000 tokens".into())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+        addressed
+    });
+    seed(
+        &path,
+        "local",
+        ProviderEntry {
+            url: format!("http://{address}/v1"),
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            wire_api: crate::config::providers::WireApi::Completions,
+            headers: vec![HeaderSpec {
+                name: "X-Private".into(),
+                value: "$R17_KEY".into(),
+            }],
+            ..Default::default()
+        },
+    );
+    let env = HashMap::from([("R17_KEY".into(), "ordinary-private-value".into())]);
+    let result = fetch(&ctx, &workspace, "local", None, false, env.clone()).await;
+    let ProviderModelFetchOutcome::Models { models, kept, .. } = result.outcome else {
+        panic!("{result:?}")
+    };
+    assert_eq!(models.ids, ids);
+    assert_eq!(models.count, 2);
+    assert_eq!(kept, 2);
+    assert_eq!(
+        read_entry(&path, "local").models[0].name.as_deref(),
+        Some("first")
+    );
+    // These are the targets captured before the first per-model operation,
+    // just as the running settings deep-fetch flow captures them.
+    let mut config = ProvidersConfig::default();
+    config
+        .providers
+        .insert("local".into(), read_entry(&path, "local"));
+    let targets = crate::providers::deepfetch::collect_deepfetch_targets(
+        &config,
+        &crate::providers::deepfetch::DeepfetchScope {
+            provider: Some("local".into()),
+            model: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(targets.len(), 2);
+    for target in targets.iter().chain(std::iter::once(&targets[1])) {
+        let response = provider_models_fetch(
+            &ctx,
+            &workspace.to_string_lossy(),
+            Some("local"),
+            Some(&target.model_id),
+            true,
+            None,
+            false,
+            env.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("ordinary-private-value")
+        );
+        let saved = read_entry(&path, "local");
+        assert_eq!(
+            saved
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(
+            saved
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+    assert_eq!(
+        server.await.unwrap(),
+        [ids[0].clone(), ids[1].clone(), ids[1].clone()]
+    );
+    let saved = read_entry(&path, "local");
+    assert!(
+        saved
+            .models
+            .iter()
+            .all(|model| model.capabilities.context_tokens == Some(128000))
+    );
+}
+
+#[tokio::test]
+async fn r17_unsafe_final_provider_identity_rejects_ordinary_write_with_exact_preimage() {
+    let (_env, _tmp, ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    let path = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    const ID: &str = "synthetic-r17-provider-identity";
+    let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+        200,
+        r#"{"data":[{"id":"live"}]}"#.into(),
+        true,
+    )])
+    .await;
+    seed(
+        &path,
+        ID,
+        ProviderEntry {
+            url,
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            headers: vec![HeaderSpec {
+                name: "X-Private".into(),
+                value: "$R17_KEY".into(),
+            }],
+            models: vec![ModelEntry {
+                id: "existing".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let before = std::fs::read(global_provider_path(ID)).unwrap();
+    let config_before = std::fs::read(&path).unwrap();
+    let error = reject_fetch(
+        &ctx,
+        &workspace,
+        ID,
+        Some(OnUnlistedModelsFetch::Keep),
+        false,
+        HashMap::from([("R17_KEY".into(), ID.into())]),
+    )
+    .await;
+    assert!(!serde_json::to_string(&error).unwrap().contains(ID));
+    assert_eq!(std::fs::read(global_provider_path(ID)).unwrap(), before);
+    assert_eq!(std::fs::read(&path).unwrap(), config_before);
+    let saved = read_entry(&path, ID);
+    assert_eq!(saved.models.len(), 1);
+    assert_eq!(saved.models[0].id, "existing");
+    assert!(saved.last_model_fetch.is_none());
+    server.await.unwrap();
 }

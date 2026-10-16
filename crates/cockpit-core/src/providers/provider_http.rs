@@ -177,17 +177,6 @@ pub(crate) fn diagnostic_value(
     Ok(())
 }
 
-/// The opaque identity namespace is reserved for the owner projection. Raw
-/// upstream IDs cannot impersonate persisted tokens from an earlier refresh.
-pub(crate) fn is_catalog_identity_token(id: &str) -> bool {
-    id.strip_prefix('~').is_some_and(|digest| {
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
-}
-
 /// Inspect the same decoded JSON string/key surfaces as diagnostics, without
 /// serializing or canonicalizing an identity that contains no credential.
 pub(crate) fn catalog_identity_contains_credentials(
@@ -210,9 +199,10 @@ pub(crate) fn catalog_identity_contains_credentials(
     serde_json::from_str::<serde_json::Value>(identity).is_ok_and(|value| contains(&value, table))
 }
 
-/// Catalog identities cross this boundary before merge, counts or summaries.
-/// Replaced IDs receive distinct opaque tokens; ordinary IDs remain byte-exact.
-/// Reserve every input ID so an upstream literal cannot impersonate a token.
+/// Operational IDs are provider addresses, not display text. Reject a catalog
+/// whose IDs cannot be published safely; never replace an address with a hash
+/// or a diagnostic marker. This runs before merge/count/preview/write, including
+/// existing catalogs and fallback catalogs. Safe IDs remain byte-exact.
 pub(crate) fn scrub_catalog_models(
     models: Vec<crate::config::providers::ModelEntry>,
     headers: &[super::models_fetch::ResolvedHeader],
@@ -228,44 +218,14 @@ pub(crate) fn scrub_catalog_models_with_table(
     models: Vec<crate::config::providers::ModelEntry>,
     table: &crate::redact::RedactionTable,
 ) -> Result<Vec<crate::config::providers::ModelEntry>> {
-    use sha2::{Digest, Sha256};
-    const IDENTITY_HASH_DOMAIN: &[u8] = b"provider model identity\0";
-    let mut reserved = models
+    if models
         .iter()
-        .map(|model| model.id.clone())
-        .collect::<std::collections::HashSet<_>>();
-    let mut identities = std::collections::HashMap::<String, String>::new();
-    let mut safe = Vec::with_capacity(models.len());
-    for mut model in models {
-        let id = if let Some(id) = identities.get(&model.id) {
-            id.clone()
-        } else {
-            let id = if !catalog_identity_contains_credentials(&model.id, table) {
-                model.id.clone()
-            } else {
-                // Bounded collision handling includes both upstream-chosen
-                // identities and credentials occurring inside a candidate token.
-                let token = (0_u32..64).find_map(|attempt| {
-                    let mut hash = Sha256::new();
-                    hash.update(IDENTITY_HASH_DOMAIN);
-                    hash.update(model.id.as_bytes());
-                    hash.update(attempt.to_be_bytes());
-                    let candidate = format!("~{}", crate::intel::hex_lower(&hash.finalize()));
-                    (table.scrub(&candidate) == candidate && reserved.insert(candidate.clone()))
-                        .then_some(candidate)
-                });
-                token.context("cannot represent credential-safe unique model identities")?
-            };
-            identities.insert(model.id.clone(), id.clone());
-            id
-        };
-        // Typed owner controls and semantic enum values are not upstream
-        // diagnostic text. Project only the identity; fetch parsing scrubs
-        // untrusted metadata before it becomes these typed values.
-        model.id = id;
-        safe.push(model);
+        .any(|model| catalog_identity_contains_credentials(&model.id, table))
+    {
+        return Err(super::auth_check::AuthCheckError::UnsafeModelIdentity.into());
     }
-    Ok(crate::config::providers::coalesce_fetched_models(safe))
+    // Typed owner controls and capability enum values are not diagnostic text.
+    Ok(crate::config::providers::coalesce_fetched_models(models))
 }
 
 /// Scrub complete decoded fields before callers slice, escape, persist or log

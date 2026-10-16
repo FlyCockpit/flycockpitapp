@@ -5032,11 +5032,11 @@ impl SettingsCx {
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
 
-        // Progress view while fetches are in flight, plus the running
-        // per-provider results so the user sees outcomes land one by one.
+        // Count observations as they arrive; finalized per-provider results
+        // wait for the authoritative snapshot.
         if s.is_fetching() {
-            let done = s.finished.len();
-            let total = done + s.in_flight.len();
+            let done = s.finished.len() + s.observations.len();
+            let total = s.providers.len();
             lines.push(Line::from(Span::styled(
                 format!("Refetching provider /models catalogs… ({done}/{total})"),
                 Style::default().add_modifier(Modifier::BOLD),

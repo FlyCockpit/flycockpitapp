@@ -1553,6 +1553,8 @@ fn prompt_fixture(kind: PromptFixture) -> (tempfile::TempDir, SettingsDialog) {
     let entry = dialog.config.providers["p"].clone();
     dialog.page = super::super::providers_page(match kind {
         PromptFixture::FetchAll => ProvidersPage::FetchAll(FetchAllState {
+            observations: Vec::new(),
+            final_snapshot_pending: false,
             providers: vec!["p".into()],
             in_flight: Vec::new(),
             finished: Vec::new(),
@@ -5240,6 +5242,8 @@ fn fetch_all_prompt_remove_drops_only_non_manual_unlisted_models() {
         ..Default::default()
     });
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        observations: Vec::new(),
+        final_snapshot_pending: false,
         providers: vec!["p".to_string()],
         in_flight: Vec::new(),
         finished: vec![FetchedSummary {
@@ -5291,6 +5295,8 @@ fn fetch_all_stored_remove_applies_without_prompt() {
     let (_tmp, mut dialog) =
         dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Remove)));
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        observations: Vec::new(),
+        final_snapshot_pending: false,
         providers: vec!["p".to_string()],
         in_flight: Vec::new(),
         finished: vec![FetchedSummary {
@@ -5314,6 +5320,7 @@ fn fetch_all_stored_remove_applies_without_prompt() {
     })));
 
     dialog.drain_fetch_all();
+    dialog.settle_test_effects();
 
     let state = match dialog.test_page() {
         TestPageRef::Providers(ProvidersPage::FetchAll(s)) => s,
@@ -5333,6 +5340,8 @@ fn fetch_all_stored_keep_applies_without_prompt() {
     let (_tmp, mut dialog) =
         dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        observations: Vec::new(),
+        final_snapshot_pending: false,
         providers: vec!["p".to_string()],
         in_flight: Vec::new(),
         finished: vec![FetchedSummary {
@@ -5356,6 +5365,7 @@ fn fetch_all_stored_keep_applies_without_prompt() {
     })));
 
     dialog.drain_fetch_all();
+    dialog.settle_test_effects();
 
     let ids: Vec<&str> = dialog.config.providers["p"]
         .models
@@ -5441,6 +5451,8 @@ fn fetch_one_prompt_save_failure_surfaces() {
 fn fetch_all_save_failure_surfaces() {
     let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
+        observations: Vec::new(),
+        final_snapshot_pending: false,
         providers: vec!["p".to_string()],
         in_flight: Vec::new(),
         finished: vec![FetchedSummary {
@@ -8250,7 +8262,8 @@ fn refresh_adopts_authority_then_saves_without_reconstructing_trimmed_models() {
                 .config_generation
                 > before
         );
-        dialog.apply_fetch_result("p", completion.outcome);
+        let outcome = completion.observation.into_outcome(&dialog.original_config);
+        dialog.apply_fetch_result("p", outcome);
         dialog.settle_test_effects();
         let Some(ProvidersPage::Edit(editor)) = dialog.page.downcast_mut::<ProvidersPage>() else {
             panic!("editor");
@@ -12172,13 +12185,14 @@ fn ordinary_failed_fetch_persists_observed_auth_category_without_prose_classific
             } else {
                 ModelFetchFailure::CredentialsRejected
             };
-            assert!(
-                matches!(&completion.outcome,Ok(FetchOutcome::Failed {failure,..}) if *failure==expected_failure)
-            );
             dialog
                 .adopt_refreshed_provider_snapshot(completion.snapshot)
                 .unwrap();
-            dialog.apply_fetch_result("p", completion.outcome);
+            let outcome = completion.observation.into_outcome(&dialog.original_config);
+            assert!(
+                matches!(&outcome, Ok(FetchOutcome::Failed {failure,..}) if *failure == expected_failure)
+            );
+            dialog.apply_fetch_result("p", outcome);
             dialog.flush_request_daemon_effects_for_test();
             let saved = load_provider(&tmp.path().join(".cockpit/config.json"), "p");
             assert_eq!(
@@ -12291,4 +12305,253 @@ fn ordinary_fetch_all_persists_each_observed_failure_after_final_snapshot() {
             );
         }
     });
+}
+
+/// Real HTTP observations and a real daemon snapshot failure: malformed MCP
+/// input prevents edit authority from being constructed without preventing the
+/// provider fetch itself. Recover the file only after both read-back attempts
+/// fail, then use the ordinary Enter reload/save path and independent disk read.
+fn r17_readback_recovery_preserves_fetch_observations(fetch_all: bool) {
+    use cockpit_config::providers::{ModelFetchFailure, ModelFetchStatusKind};
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cases = [
+            ("auth401", 401, "hello", ModelFetchStatusKind::AuthFailed),
+            ("auth403", 403, "hello", ModelFetchStatusKind::AuthFailed),
+            (
+                "parse",
+                200,
+                "credentials rejected returned 401 subscription auth",
+                ModelFetchStatusKind::FailedKeptExisting,
+            ),
+            (
+                "other",
+                418,
+                "credentials rejected returned 403",
+                ModelFetchStatusKind::FailedKeptExisting,
+            ),
+        ];
+        // Fetch-all owns several observations at once; single-provider owns
+        // exactly one and exercises the same matrix in separate ordinary flows.
+        let batches = if fetch_all {
+            vec![cases.to_vec()]
+        } else {
+            cases.into_iter().map(|case| vec![case]).collect()
+        };
+        for batch in batches {
+            let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+            let base = config.providers.remove("p").unwrap();
+            let mut servers = Vec::new();
+            for (id, status, body, _) in &batch {
+                let (status, body) = (*status, *body);
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                servers.push(std::thread::spawn(move || {
+                    listener.set_nonblocking(true).unwrap();
+                    let deadline = std::time::Instant::now()+std::time::Duration::from_secs(10);
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket,_))=>break socket,
+                            Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{
+                                assert!(std::time::Instant::now()<deadline,"fetch never reached real HTTP");
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            },
+                            Err(error)=>panic!("accept: {error}"),
+                        }
+                    };
+                    socket.set_nonblocking(false).unwrap();
+                    socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                    let mut request = [0;16384];
+                    assert!(socket.read(&mut request).unwrap()>0);
+                    write!(socket,"HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+                }));
+                let mut entry = base.clone();
+                entry.url = format!("http://{address}/v1");
+                entry.allow_insecure_http = true;
+                entry.auth = Some(AuthKind::None);
+                // Prior auth status must not contaminate a later non-auth
+                // observation even when authority has to be recovered.
+                entry.mark_model_fetch_failed_kept_existing(
+                    "previous rejection",
+                    ModelFetchFailure::CredentialsRejected,
+                );
+                config.providers.insert((*id).into(), entry);
+            }
+            let (tmp, mut dialog) = dialog_with_config(config);
+            let root = tmp.path().display().to_string();
+            let client = runtime
+                .block_on(crate::tui::settings::settings_daemon_client(
+                    &crate::tui::settings::test_lifecycle_client(),
+                ))
+                .unwrap();
+            let initial = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            dialog
+                .adopt_refreshed_provider_snapshot(Ok(initial))
+                .unwrap();
+            let before = ConfigDoc::load(&tmp.path().join(".cockpit/config.json"))
+                .unwrap()
+                .providers();
+            let mcp_path = tmp.path().join(".cockpit/mcp.json");
+            std::fs::write(&mcp_path, "[").unwrap();
+            let handles = if fetch_all {
+                let all = FetchAllState::spawn(
+                    crate::tui::settings::test_lifecycle_client(),
+                    &dialog.config,
+                    root,
+                );
+                let handles = all.in_flight.clone();
+                dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(all)));
+                handles
+            } else {
+                let id = batch[0].0;
+                let entry = dialog.config.providers[id].clone();
+                let handle = FetchHandle::spawn(
+                    crate::tui::settings::test_lifecycle_client(),
+                    id.into(),
+                    entry.clone(),
+                    root,
+                );
+                let mut editor = EditState::new(id.into(), entry);
+                editor.fetch = Some(handle.clone());
+                dialog.set_test_page(Page::Providers(ProvidersPage::Edit(editor)));
+                vec![handle]
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let done = handles.iter().all(|handle| {
+                    matches!(
+                        &*handle.state.lock().unwrap(),
+                        super::super::auth::FetchState::Done(_)
+                    )
+                });
+                if done {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "HTTP/read-back did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            for handle in &handles {
+                let guard = handle.state.lock().unwrap();
+                let super::super::auth::FetchState::Done(completion) = &*guard else {
+                    panic!("not done")
+                };
+                assert!(
+                    completion.snapshot.is_err(),
+                    "fixture must fail the actual per-handle snapshot"
+                );
+            }
+            for server in servers {
+                server.join().unwrap();
+            }
+            dialog.tick();
+            assert!(dialog.provider_edit_authority.is_none());
+            assert!(dialog.provider_catalog_reload_required);
+            assert!(
+                dialog.save_config().is_err(),
+                "observation is not edit authority"
+            );
+            if fetch_all {
+                let Some(ProvidersPage::FetchAll(state)) =
+                    dialog.page.downcast_ref::<ProvidersPage>()
+                else {
+                    panic!("fetch-all")
+                };
+                assert_eq!(state.observations.len(), batch.len());
+                assert!(
+                    state.is_fetching(),
+                    "recovery cannot show a completed fetch"
+                );
+                assert!(!state.policy_resolved);
+            } else {
+                assert!(
+                    dialog.pending_fetch_observation.is_some(),
+                    "single fetch observation must survive consumption"
+                );
+            }
+            // The final snapshot also fails once. Neither completion may
+            // discard or persist the pending observations while authority is absent.
+            dialog.flush_request_daemon_effects_for_test();
+            assert!(dialog.provider_catalog_reload_required);
+            assert!(dialog.provider_edit_authority.is_none());
+            assert_eq!(
+                serde_json::to_value(
+                    ConfigDoc::load(&tmp.path().join(".cockpit/config.json"))
+                        .unwrap()
+                        .providers()
+                )
+                .unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            std::fs::write(&mcp_path, "{}").unwrap();
+            assert!(!dialog.handle_key(press(KeyCode::Enter)));
+            dialog.settle_test_effects();
+            dialog.tick();
+            dialog.settle_test_effects();
+            assert!(dialog.provider_edit_authority.is_some());
+            assert!(!dialog.provider_catalog_reload_required);
+            assert!(dialog.pending_fetch_observation.is_none());
+            for (id, status, _, expected) in &batch {
+                let saved = load_provider(&tmp.path().join(".cockpit/config.json"), id);
+                let marker = saved.last_model_fetch.as_ref().unwrap();
+                assert_eq!(
+                    marker.status, *expected,
+                    "{id}: observed HTTP {status} must survive failed read-back"
+                );
+                assert_ne!(marker.reason.as_deref(), Some("previous rejection"));
+                assert!(
+                    !marker
+                        .reason
+                        .as_deref()
+                        .unwrap()
+                        .contains("reading the refreshed catalog failed")
+                );
+                assert_eq!(
+                    saved
+                        .models
+                        .iter()
+                        .map(|model| model.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["stale", "current"]
+                );
+            }
+            let saved_once = batch
+                .iter()
+                .map(|(id, _, _, _)| {
+                    let path = cockpit_config::providers::provider_file_path_for_config(
+                        &tmp.path().join(".cockpit/config.json"),
+                        id,
+                    )
+                    .unwrap();
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect::<Vec<_>>();
+            dialog.tick();
+            dialog.settle_test_effects();
+            for (path, bytes) in saved_once {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    bytes,
+                    "a consumed observation must not save twice"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn r17_fetch_all_recovers_typed_observations_after_failed_readbacks() {
+    r17_readback_recovery_preserves_fetch_observations(true);
+}
+
+#[test]
+fn r17_single_fetch_recovers_typed_observations_after_failed_readbacks() {
+    r17_readback_recovery_preserves_fetch_observations(false);
 }

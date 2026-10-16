@@ -4,6 +4,8 @@ pub(in crate::tui::settings) struct FetchAllState {
     pub(in crate::tui::settings) providers: Vec<String>,
     pub(in crate::tui::settings) in_flight: Vec<FetchHandle>,
     pub(in crate::tui::settings) finished: Vec<FetchedSummary>,
+    pub(in crate::tui::settings) observations: Vec<super::super::auth::FetchObservation>,
+    pub(in crate::tui::settings) final_snapshot_pending: bool,
     pub(in crate::tui::settings) pre_fetch_models:
         std::collections::BTreeMap<String, Vec<ModelEntry>>,
     pub(in crate::tui::settings) policy_resolved: bool,
@@ -47,6 +49,8 @@ impl FetchAllState {
             providers: ids,
             in_flight,
             finished,
+            observations: Vec::new(),
+            final_snapshot_pending: false,
             pre_fetch_models,
             policy_resolved: false,
             cursor: 0,
@@ -55,9 +59,9 @@ impl FetchAllState {
         }
     }
 
-    /// True while at least one per-provider fetch is still running.
+    /// Remain busy until observations have an authoritative final snapshot.
     pub(in crate::tui::settings) fn is_fetching(&self) -> bool {
-        !self.in_flight.is_empty()
+        !self.in_flight.is_empty() || (self.final_snapshot_pending && !self.policy_resolved)
     }
 }
 
@@ -95,58 +99,58 @@ pub(in crate::tui::settings) struct FetchFallbackPromptState {
 
 impl SettingsDialog {
     /// Poll the in-flight handles of an active all-providers refetch.
-    /// Each finished handle is removed from `in_flight` and recorded in
-    /// `finished`; model config is not mutated until the unlisted-model
-    /// policy is resolved. When `in_flight` empties, the aggregated
-    /// unlisted-models set is built so [`Self::render_fetch_all`] can show
-    /// the Keep/Remove prompt when needed.
-    /// A per-provider failure is just an `Err` summary — it never aborts
-    /// the others.
+    /// Retain each raw observation separately from snapshot authority. Once
+    /// every handle settles, acquire one final complete snapshot, then build
+    /// summaries and apply status/policy. Failed final reads keep observations
+    /// pending behind the ordinary Enter-to-reload editing gate.
     pub(in crate::tui::settings) fn drain_fetch_all(&mut self) {
         let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
             return;
         };
-        if s.in_flight.is_empty() {
-            if !s.finished.is_empty() && !s.policy_resolved {
-                self.finish_fetch_all_if_ready();
-            }
-            return;
-        }
-
         let mut completed = Vec::new();
         s.in_flight.retain(|handle| match handle.take() {
             Some(completion) => {
-                completed.push((handle.provider_id.clone(), completion));
+                completed.push(completion);
                 false
             }
             None => true,
         });
-        let mut newly_done = Vec::new();
-        for (provider_id, completion) in completed {
-            let outcome = match self.adopt_refreshed_provider_snapshot(completion.snapshot) {
-                Ok(()) => completion.outcome,
-                Err(error) => Err(error),
-            };
-            newly_done.push(FetchedSummary {
-                provider_id,
-                outcome,
-            });
+        for completion in completed {
+            // A failed snapshot disables edits but cannot replace the observed
+            // fetch result. Retain every result until the final read succeeds.
+            let _ = self.adopt_refreshed_provider_snapshot(completion.snapshot);
+            if let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() {
+                s.observations.push(completion.observation);
+            }
         }
-        if newly_done.is_empty() {
+        let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
+            return;
+        };
+        if !s.in_flight.is_empty() || s.policy_resolved {
             return;
         }
-
-        let all_done = {
-            let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
-                return;
-            };
-            s.finished.extend(newly_done);
-            s.in_flight.is_empty()
-        };
-
-        if all_done {
-            self.finish_fetch_all_if_ready();
+        if !s.final_snapshot_pending {
+            s.final_snapshot_pending = true;
+            // Always read after all handles settle; no per-handle snapshot is
+            // authoritative for the complete batch. Failed final reads retain
+            // the observations and the normal Enter-to-reload gate retries.
+            self.queue_provider_catalog(None);
         }
+        // The transport may settle the read inline. In both synchronous and
+        // asynchronous delivery, authority (not queueing) controls reduction.
+        if self.provider_catalog_reload_required || self.provider_edit_authority.is_none() {
+            return;
+        }
+        let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() else {
+            return;
+        };
+        for observation in std::mem::take(&mut s.observations) {
+            s.finished.push(FetchedSummary {
+                provider_id: observation.provider_id.clone(),
+                outcome: observation.into_outcome(&self.cx.original_config),
+            });
+        }
+        self.finish_fetch_all_if_ready();
     }
 
     fn finish_fetch_all_if_ready(&mut self) {
@@ -177,11 +181,12 @@ impl SettingsDialog {
             self.apply_fetch_all_policy(merges, policy);
         }
         self.apply_fetch_all_degraded_statuses(degraded);
-        // Read once after *all* requests have settled. Per-handle snapshots
-        // may have raced a later provider commit or a failed read-back.
-        // Status saves wait for this final authority, too.
-        self.pending_fetch_all_save = true;
-        self.queue_provider_catalog(None);
+        // This reducer runs only after the final authoritative snapshot.
+        if let Err(error) = self.save_config() {
+            self.extended_warnings = vec![format!(
+                "could not save refreshed provider statuses: {error}"
+            )];
+        }
         if let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() {
             s.unlisted = if auto_policy.is_some() {
                 Vec::new()

@@ -1257,7 +1257,12 @@ pub async fn fetch_models_for_provider_with_store(
             let failure_kind = model_fetch_failure_kind(&error);
             let reason =
                 super::provider_http::diagnostic_body(&error.to_string(), &request.headers);
-            if auth_rejection_error(&error) {
+            if auth_rejection_error(&error)
+                || matches!(
+                    error.downcast_ref::<super::auth_check::AuthCheckError>(),
+                    Some(super::auth_check::AuthCheckError::UnsafeModelIdentity)
+                )
+            {
                 return Err(error);
             }
             tracing::warn!(
@@ -1394,8 +1399,8 @@ fn parse_credential_safe_models_body(
                 .insert("id".into(), Value::String(projected_id.clone()));
         }
     }
-    // Opaque IDs here were minted above; the raw upstream namespace guard has
-    // already run. This private projection never admits an unvalidated input.
+    // Each restored ID was validated above and remains the raw upstream
+    // address. Metadata scrubbing must never change its operational identity.
     parse_models_body_projection(&serde_json::to_string(&safe_entries)?, catalog_abi)
         .map(crate::config::providers::coalesce_fetched_models)
         .map_err(|error| ModelFetchError::parse(error.to_string()).into())
@@ -1422,17 +1427,7 @@ fn model_catalog_entries(parsed: Value) -> Result<Vec<Value>> {
 
 fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Result<Vec<ModelEntry>> {
     parse_models_body_projection(body, catalog_abi)
-        .and_then(|models| {
-            if models
-                .iter()
-                .any(|model| super::provider_http::is_catalog_identity_token(&model.id))
-            {
-                anyhow::bail!(
-                    "upstream model ID uses the reserved credential-safe identity namespace"
-                );
-            }
-            Ok(crate::config::providers::coalesce_fetched_models(models))
-        })
+        .map(crate::config::providers::coalesce_fetched_models)
         .map_err(|error| ModelFetchError::parse(error.to_string()).into())
 }
 

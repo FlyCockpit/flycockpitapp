@@ -2813,6 +2813,9 @@ pub struct SettingsDialog {
     /// exact boxed page object, including cursor and scroll state.
     stack: Vec<PageBox>,
     cx: SettingsCx,
+    /// One single-provider fetch can await authority recovery. The observation
+    /// outlives its consumed handle and is applied exactly once after adoption.
+    pending_fetch_observation: Option<auth::FetchObservation>,
 }
 
 fn setup_wizard_dialog(
@@ -3251,7 +3254,6 @@ pub struct SettingsCx {
     provider_edit_authority: Option<ProviderEditAuthority>,
     provider_catalog_reload_required: bool,
     provider_catalog_rebase_from: Option<ProvidersConfig>,
-    pending_fetch_all_save: bool,
     latest_provider_snapshot_session_id: Option<String>,
     /// Cached secret-free cockpit-only settings projection. Read by the UI and
     /// Tools pages; mutations are committed only by the daemon.
@@ -4620,14 +4622,6 @@ impl SettingsCx {
                             })
                         {
                             self.commit_onboarding_validation_after_catalog_refresh();
-                        }
-                        if self.pending_fetch_all_save {
-                            self.pending_fetch_all_save = false;
-                            if let Err(error) = self.save_config() {
-                                self.extended_warnings = vec![format!(
-                                    "could not save refreshed provider statuses: {error}"
-                                )];
-                            }
                         }
                         if let Some(navigation) = navigation {
                             self.completed_provider_navigation =
@@ -7311,6 +7305,18 @@ impl SettingsDialog {
         }
     }
 
+    fn resume_provider_fetch(&mut self) {
+        if self.provider_catalog_reload_required || self.provider_edit_authority.is_none() {
+            return;
+        }
+        if let Some(observation) = self.pending_fetch_observation.take() {
+            self.sync_refreshed_provider_editor();
+            let provider_id = observation.provider_id.clone();
+            let outcome = observation.into_outcome(&self.original_config);
+            self.apply_fetch_result(&provider_id, outcome);
+        }
+    }
+
     fn authority_operation_pending(&self) -> bool {
         self.cx.authority_operation_pending()
             || self
@@ -7550,6 +7556,8 @@ impl SettingsDialog {
                         .filter(|warning| warning.as_str() != "loading daemon-owned settings…")
                         .cloned();
                 }
+                self.resume_provider_fetch();
+                self.drain_fetch_all();
                 self.apply_completed_provider_navigation();
                 if let Some(prompt) = self.cx.pending_shadow_prompt.take()
                     && let Some(page) = self.page.downcast_mut::<CategoryPage>()
@@ -8107,6 +8115,7 @@ impl SettingsDialog {
         Self {
             page: root_page(0),
             stack: Vec::new(),
+            pending_fetch_observation: None,
             cx: SettingsCx {
                 lifecycle: cockpit_client::LifecycleClient::disconnected(),
                 dialog_id: uuid::Uuid::new_v4(),
@@ -8142,7 +8151,6 @@ impl SettingsDialog {
                 provider_edit_authority: None,
                 provider_catalog_reload_required: false,
                 provider_catalog_rebase_from: None,
-                pending_fetch_all_save: false,
                 latest_provider_snapshot_session_id: None,
                 extended,
                 extended_base,
@@ -8315,16 +8323,16 @@ impl SettingsDialog {
         if let Some(handle) = pending
             && let Some(result) = handle.take()
         {
-            if self
+            let adopted = self
                 .adopt_refreshed_provider_snapshot(result.snapshot)
-                .is_ok()
-            {
-                self.sync_refreshed_provider_editor();
-                self.apply_fetch_result(&handle.provider_id, result.outcome);
-            } else {
-                self.clear_fetch_handle(&handle.provider_id);
+                .is_ok();
+            self.pending_fetch_observation = Some(result.observation);
+            self.clear_fetch_handle(&handle.provider_id);
+            if !adopted {
+                self.queue_provider_catalog(None);
             }
         }
+        self.resume_provider_fetch();
 
         self.drain_fetch_all();
         self.drain_deep_fetch();

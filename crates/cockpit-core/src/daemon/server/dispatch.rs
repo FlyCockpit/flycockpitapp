@@ -24849,18 +24849,16 @@ pub(super) async fn provider_models_fetch(
     )
     .map_err(internal)?;
     let credential_table = provider_response_credential_table(&store, &config, &env)?;
-    // Normalize existing catalogs before ordinary preview/merge decisions.
-    // Deep probes must still address the upstream model IDs; that path crosses
-    // the same projection boundary after probing and before its summary/write.
-    if !deep {
-        for id in &provider_ids {
-            let entry = config.providers.get_mut(id).expect("selected provider");
-            entry.models = crate::providers::provider_http::scrub_catalog_models_with_table(
-                std::mem::take(&mut entry.models),
-                &credential_table,
-            )
-            .map_err(internal)?;
-        }
+    // Validate existing operational addresses before preview/merge or deep
+    // probes. Rejection preserves the exact persisted preimage; identities are
+    // never rewritten, so subsequent targets and inference use upstream IDs.
+    for id in &provider_ids {
+        let entry = config.providers.get_mut(id).expect("selected provider");
+        entry.models = crate::providers::provider_http::scrub_catalog_models_with_table(
+            std::mem::take(&mut entry.models),
+            &credential_table,
+        )
+        .map_err(|error| bad_request(error.to_string()))?;
     }
     crate::providers::provider_http::diagnostic_scope(credential_table, async {
     let selected_policy = on_unlisted
@@ -25117,6 +25115,14 @@ pub(super) async fn provider_models_fetch(
                     crate::daemon::proto::ProviderModelFetchOutcome::Unsupported
                 }
                 Err(error) => {
+                    if matches!(error.downcast_ref::<crate::providers::auth_check::AuthCheckError>(),
+                        Some(crate::providers::auth_check::AuthCheckError::UnsafeModelIdentity))
+                    {
+                        // Unsafe operational addresses are an admission failure,
+                        // including through the auth-check/fallback wrappers.
+                        // Reject before even persisting a requested policy.
+                        return Err(bad_request(error.to_string()));
+                    }
                     let message =
                         redact_provider_response_text(&error.to_string(), &store, &config, &env);
                     // Keep the error's typed cause for classification, while

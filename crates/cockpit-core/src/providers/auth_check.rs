@@ -27,6 +27,8 @@ pub enum AuthCheckSuccess {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthCheckError {
+    #[error("provider catalog contains an unsafe operational model ID; no catalog was written")]
+    UnsafeModelIdentity,
     #[error("{message}")]
     CredentialsRejected { status: StatusCode, message: String },
     #[error("{message}")]
@@ -46,7 +48,9 @@ impl AuthCheckError {
                 ModelFetchFailureKind::HttpStatus(*status)
             }
             Self::Network(_) => ModelFetchFailureKind::Network,
-            Self::Parse(_) | Self::Other(_) => ModelFetchFailureKind::Parse,
+            Self::Parse(_) | Self::Other(_) | Self::UnsafeModelIdentity => {
+                ModelFetchFailureKind::Parse
+            }
         }
     }
 }
@@ -366,6 +370,12 @@ async fn post_chat_completion_probe(
 }
 
 fn classify_error(error: anyhow::Error) -> AuthCheckError {
+    if matches!(
+        error.downcast_ref::<AuthCheckError>(),
+        Some(AuthCheckError::UnsafeModelIdentity)
+    ) {
+        return AuthCheckError::UnsafeModelIdentity;
+    }
     let message = error.to_string();
     match models_fetch::model_fetch_failure_kind(&error) {
         ModelFetchFailureKind::HttpStatus(status)

@@ -92,7 +92,7 @@ pub struct ProviderModelPatch {
     pub updates: Vec<cockpit_config::config::providers::ModelEntryFieldPatch>,
     pub deletes: Vec<String>,
     /// Present only when the owner changes membership/order. Unchanged catalogs
-    /// do not pay to resend their complete id sequence on a favorite/header edit.
+    /// and clears do not pay to resend an implied id sequence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Vec<String>>,
     /// Sparse alternative to full order for large composed catalogs.
@@ -166,7 +166,9 @@ impl ProviderModelPatch {
             Vec::new()
         };
         let mut patch = Self {
-            order: clear.then(Vec::new),
+            // Clear already supplies complete empty membership. Sending an
+            // empty order as well can strand an otherwise fitting request.
+            order: None,
             moves,
             clear,
             base_digest: Self::digest(before)?,
@@ -198,7 +200,6 @@ impl ProviderModelPatch {
         metadata.models.clear();
         if serde_json::to_vec(&(&metadata, Some(&patch)))?.len()
             <= crate::MAX_OWNER_PROVIDER_ENTRY_BYTES
-            || patch.clear
         {
             return Ok(patch);
         }
@@ -290,7 +291,11 @@ impl ProviderModelPatch {
             layer.model_field_patches.clear();
             layer.models_replace = true;
         }
-        if self.order.is_some()
+        // Clear carries complete membership authority even without a wire
+        // order. Erase old placements/tombstones and replace any prior order,
+        // exactly as for an explicit empty order; none may resurrect rows.
+        if self.clear
+            || self.order.is_some()
             || (layer.model_order.is_some()
                 && (!self.deletes.is_empty() || !self.upserts.is_empty() || !self.moves.is_empty()))
         {
@@ -1023,6 +1028,51 @@ mod model_patch_tests {
             serde_json::to_value(&before).unwrap()
         );
     }
+    #[test]
+    fn model_patch_clear_without_wire_order_replaces_all_prior_membership_authority() {
+        use cockpit_config::config::providers::{ModelPlacement, ProviderEntry};
+        let before = vec![ModelEntry {
+            id: "owned".into(),
+            favorite: true,
+            ..Default::default()
+        }];
+        let patch = ProviderModelPatch::between(&before, &[]).unwrap();
+        assert!(patch.clear);
+        assert!(patch.order.is_none());
+        assert_eq!(serde_json::to_vec(&patch).unwrap().len(), 121);
+        for prior_order in [None, Some(vec!["owned".into()])] {
+            let mut layer = ProviderEntry {
+                models: before.clone(),
+                model_order: prior_order,
+                ..Default::default()
+            };
+            layer.model_field_patches.push(
+                cockpit_config::config::providers::ModelEntryFieldPatch::replacement(&before[0])
+                    .unwrap(),
+            );
+            layer.model_membership.deletes = vec!["hidden".into()];
+            layer.model_membership.placements = vec![ModelPlacement {
+                id: "owned".into(),
+                after: None,
+            }];
+            patch.apply_to_layer(&before, &mut layer).unwrap();
+            assert!(layer.models.is_empty());
+            assert!(layer.model_field_patches.is_empty());
+            assert!(layer.models_replace);
+            assert_eq!(layer.model_order, Some(Vec::new()));
+            assert!(layer.model_membership.deletes.is_empty());
+            assert!(layer.model_membership.placements.is_empty());
+        }
+        let mut stale = Vec::new();
+        assert!(
+            patch
+                .apply(&mut stale)
+                .unwrap_err()
+                .contains("inventory changed")
+        );
+        assert!(stale.is_empty());
+    }
+
     #[test]
     fn model_patch_sparse_membership_permutations_and_repeated_edits_preserve_all_rows() {
         use cockpit_config::config::{

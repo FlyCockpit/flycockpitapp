@@ -11563,6 +11563,13 @@ fn assert_membership_capacity_transition(edit: MembershipCapacityEdit) {
         ConfigDoc::load(&global).unwrap().write(&source).unwrap();
         let mut owner = entry(Vec::new());
         owner.model_membership.deletes = hidden.clone();
+        if matches!(edit, MembershipCapacityEdit::Clear) {
+            owner.model_membership.placements =
+                vec![cockpit_config::config::providers::ModelPlacement {
+                    id: "a".into(),
+                    after: None,
+                }];
+        }
         owner.name = Some(String::new());
         let overhead = serde_json::to_vec(&owner).unwrap().len();
         owner.name = Some("n".repeat(cap - overhead - 1));
@@ -11662,6 +11669,7 @@ fn assert_membership_capacity_transition(edit: MembershipCapacityEdit) {
             durable.model_membership.deletes.is_empty(),
             "complete order carries the exclusion authority"
         );
+        assert!(durable.model_membership.placements.is_empty());
         assert_eq!(
             durable.models_replace,
             matches!(edit, MembershipCapacityEdit::Clear)
@@ -11810,5 +11818,277 @@ fn assert_minimal_clear_capacity(replacement: bool) {
             refreshed.config.providers["p"].entry.models.is_empty(),
             "empty membership remains authoritative after lower refresh"
         );
+    });
+}
+
+#[test]
+fn clear_exact_request_margin_through_ordinary_settings() {
+    assert_clear_exact_request_margin(false, false);
+}
+
+#[test]
+fn clear_exact_request_margin_through_independent_clear_only_rpc() {
+    assert_clear_exact_request_margin(true, false);
+}
+
+#[test]
+fn clear_exact_request_margin_rejects_oversized_owner_through_settings() {
+    assert_clear_exact_request_margin(false, true);
+}
+
+#[test]
+fn clear_exact_request_margin_rejects_oversized_owner_through_rpc() {
+    assert_clear_exact_request_margin(true, true);
+}
+
+fn assert_clear_exact_request_margin(alternate_rpc: bool, authored_overflow: bool) {
+    use sha2::{Digest, Sha256};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let cap = cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES;
+        // The six-row C3 source/owner premise, with exactly 120 more ASCII
+        // name bytes than its 261890-byte metadata and a requested empty image.
+        let ids = [
+            "a".into(),
+            "B".repeat(900),
+            "c".into(),
+            "D".repeat(900),
+            "e".into(),
+            "F".repeat(900),
+        ];
+        let rows = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut row = model(id, false);
+                row.name = Some(format!("reviewer-image-{i}"));
+                row.favorite = i % 2 == 0;
+                row
+            })
+            .collect::<Vec<_>>();
+        let entry = |models| ProviderEntry {
+            url: "https://example.com/v1".into(),
+            auth: Some(AuthKind::None),
+            models,
+            ..Default::default()
+        };
+        let mut owner_entry = entry(Vec::new());
+        owner_entry.name = Some(String::new());
+        let overhead = serde_json::to_vec(&owner_entry).unwrap().len();
+        owner_entry.name = Some("n".repeat(261_890 - overhead + 120));
+        assert_eq!(serde_json::to_vec(&owner_entry).unwrap().len(), 262_010);
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut source = ProvidersConfig::default();
+        source.providers.insert("p".into(), entry(rows.clone()));
+        ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+        let mut owner = ProvidersConfig::default();
+        owner.providers.insert("p".into(), owner_entry.clone());
+        let (tmp, mut dialog) = dialog_with_config(owner);
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert_eq!(raw, serde_json::to_value(&owner_entry).unwrap());
+        if authored_overflow {
+            // Start with a legal raw owner, but leave only 16 bytes for clear.
+            // Even the smallest durable directive (17) must fail closed.
+            raw["retained_capacity"] = json!("");
+            let overhead = serde_json::to_vec(&raw).unwrap().len();
+            raw["retained_capacity"] = json!("x".repeat(cap - overhead - 16));
+            assert_eq!(serde_json::to_vec(&raw).unwrap().len(), cap - 16);
+            std::fs::write(&provider_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        }
+        let doc = ConfigDoc::load(&config_path).unwrap();
+        let mut replacement = owner_entry.clone();
+        replacement.models_replace = true;
+        let mut ordered = owner_entry.clone();
+        ordered.model_order = Some(Vec::new());
+        assert_eq!(serde_json::to_vec(&replacement).unwrap().len(), 262_032);
+        assert_eq!(serde_json::to_vec(&ordered).unwrap().len(), 262_027);
+        for candidate in [&replacement, &ordered] {
+            let result = doc.validate_provider_write("p", candidate);
+            if authored_overflow {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .is::<cockpit_config::config::providers::ProviderWriteValidationError>()
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+        replacement.model_order = Some(Vec::new());
+        assert_eq!(serde_json::to_vec(&replacement).unwrap().len(), 262_049);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&rows).unwrap()
+        );
+        let mut metadata = current.config.providers["p"].entry.clone();
+        metadata.models.clear();
+        assert_eq!(
+            serde_json::to_value(&metadata).unwrap(),
+            serde_json::to_value(&owner_entry).unwrap()
+        );
+        assert_eq!(serde_json::to_vec(&metadata).unwrap().len(), 262_010);
+        // Independent construction: neither shared patch builder chooses the
+        // control request's clear/order fields or computes its base digest.
+        let clear_only = cockpit_proto::ProviderModelPatch {
+            base_digest: Sha256::digest(serde_json::to_vec(&rows).unwrap())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            upserts: Vec::new(),
+            updates: Vec::new(),
+            deletes: Vec::new(),
+            order: None,
+            moves: Vec::new(),
+            clear: true,
+        };
+        let mut redundant = clear_only.clone();
+        redundant.order = Some(Vec::new());
+        assert_eq!(serde_json::to_vec(&clear_only).unwrap().len(), 121);
+        assert_eq!(serde_json::to_vec(&redundant).unwrap().len(), 132);
+        assert_eq!(
+            serde_json::to_vec(&(&metadata, Some(&clear_only)))
+                .unwrap()
+                .len(),
+            262_134
+        );
+        assert_eq!(
+            serde_json::to_vec(&(&metadata, Some(&redundant)))
+                .unwrap()
+                .len(),
+            cap + 1
+        );
+        let sources = [
+            global.clone(),
+            global.parent().unwrap().join("providers/p.json"),
+            config_path.clone(),
+        ];
+        let source_bytes = sources
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let owner_bytes = std::fs::read(&provider_path).unwrap();
+        let revision = current.authority.base_revision.clone();
+        let generation = current.authority.config_generation;
+        let authority = current.authority.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models.clear();
+        let result = if alternate_rpc {
+            let mutation = cockpit_proto::ProviderMutationBatch {
+                upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                    provider_id: "p".into(),
+                    entry: metadata,
+                    header_secrets: Vec::new(),
+                    model_patch: Some(clear_only),
+                }],
+                deletes: Vec::new(),
+                metadata: None,
+            };
+            let intent = mutation.sanitized_intent_hash().unwrap();
+            runtime
+                .block_on(
+                    client.request(cockpit_proto::Request::ApplyProviderMutation {
+                        snapshot_session_id: authority.snapshot_session_id,
+                        layer_id: authority.layer_id,
+                        expected_revision: authority.base_revision,
+                        client_operation_id: uuid::Uuid::new_v4().to_string(),
+                        mutation_intent_hash: intent,
+                        mutation,
+                    }),
+                )
+                .unwrap()
+                .map(|_| ())
+                .map_err(|error| {
+                    assert_eq!(error.code, cockpit_proto::ErrorCode::BadRequest);
+                    error.message
+                })
+        } else {
+            dialog.save_config()
+        };
+        dialog.settle_test_effects();
+        if authored_overflow {
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("authored provider entry exceeds")
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "ordinary clear strands a fitting empty encoding: {result:?}"
+            );
+        }
+        let observed = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            sources
+                .iter()
+                .zip(&source_bytes)
+                .all(|(path, bytes)| std::fs::read(path).unwrap() == *bytes)
+        );
+        if authored_overflow {
+            assert_eq!(std::fs::read(&provider_path).unwrap(), owner_bytes);
+            assert_eq!(observed.authority.base_revision, revision);
+            assert_eq!(observed.authority.config_generation, generation);
+            assert_eq!(
+                serde_json::to_value(&observed.config.providers["p"].entry.models).unwrap(),
+                serde_json::to_value(&rows).unwrap()
+            );
+        } else {
+            assert_ne!(observed.authority.base_revision, revision);
+            assert!(observed.authority.config_generation > generation);
+            let mut expected = owner_entry.clone();
+            expected.models_replace = true;
+            assert_eq!(
+                serde_json::to_value(&observed.config.providers["p"].entry).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            expected.model_order = Some(Vec::new());
+            let authored =
+                ConfigDoc::load(&config_path).unwrap().providers().providers["p"].clone();
+            assert_eq!(
+                serde_json::to_value(&authored).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            let durable: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+            assert_eq!(durable, serde_json::to_value(&expected).unwrap());
+            assert_eq!(serde_json::to_vec(&durable).unwrap().len(), 262_049);
+            let durable_bytes = std::fs::read(&provider_path).unwrap();
+            // Reload after a real lower-layer addition; exclusion is durable.
+            source
+                .providers
+                .get_mut("p")
+                .unwrap()
+                .models
+                .push(model("new-inherited", false));
+            ConfigDoc::load(&global).unwrap().write(&source).unwrap();
+            let refreshed = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            expected.model_order = None;
+            assert_eq!(
+                serde_json::to_value(&refreshed.config.providers["p"].entry).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(std::fs::read(&provider_path).unwrap(), durable_bytes);
+        }
     });
 }

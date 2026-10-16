@@ -625,7 +625,9 @@ pub fn parse_report_leak_args(args: &Value) -> Result<ReportLeakRequest> {
     let source = LeakSource::parse(source_str)
         .map_err(|e| anyhow::anyhow!("`report_leak` source is invalid: {e}"))?;
 
-    let category = if let Some(cat) = object.get("category") {
+    // Strict function-calling wires make every optional field nullable, so
+    // an explicit `null` means "omitted" and takes the default.
+    let category = if let Some(cat) = object.get("category").filter(|cat| !cat.is_null()) {
         let cat_str = cat
             .as_str()
             .context("`report_leak` `category` must be a string")?;

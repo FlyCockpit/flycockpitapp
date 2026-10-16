@@ -23,6 +23,10 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
 /// depth in its description so the model can self-limit (GOALS §24).
 pub struct SpawnTool {
     description: String,
+    /// Whether the optional child `model` selector is advertised. The host
+    /// refuses a model-authored selector while `agent_chooses_subagent_model`
+    /// is off, so the field is withheld then (#549).
+    model_selection: bool,
 }
 
 impl SpawnTool {
@@ -37,7 +41,37 @@ impl SpawnTool {
         let description = format!(
             "Fan out to a parallel `bee` worker (depth {depth} of ceiling {ceiling}; {remaining} recursion left); give each child a dedicated `write_scope` — a strict workspace-relative directory subtree of your own write authority."
         );
-        Self { description }
+        Self {
+            description,
+            model_selection: true,
+        }
+    }
+
+    fn full_parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Self-contained brief for the child: goal, scope of this slice, what to save and return"
+                },
+                "write_scope": {
+                    "type": "string",
+                    "description": "Required strict workspace-relative directory subtree of your own write authority, transferred to the child for the whole run; reads stay workspace-wide"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional child model selector (`provider/model` or `provider:model`). Capability/cost only: data custody is host policy, so a capture-capable child cannot be requested here and delegated routing always applies the redacted untrusted filter"
+                }
+            },
+            "required": ["prompt", "write_scope"]
+        })
+    }
+
+    /// Withhold the `model` selector the host would refuse.
+    pub fn without_model_selection(mut self) -> Self {
+        self.model_selection = false;
+        self
     }
 }
 
@@ -68,24 +102,13 @@ impl Tool for SpawnTool {
     }
 
     fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "Self-contained brief for the child: goal, scope of this slice, what to save and return"
-                },
-                "write_scope": {
-                    "type": "string",
-                    "description": "Required strict workspace-relative directory subtree of your own write authority, transferred to the child for the whole run; reads stay workspace-wide"
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Optional child model selector (`provider/model` or `provider:model`). Capability/cost only: data custody is host policy, so a capture-capable child cannot be requested here and delegated routing always applies the redacted untrusted filter"
-                }
-            },
-            "required": ["prompt", "write_scope"]
-        })
+        let mut schema = self.full_parameters();
+        if !self.model_selection
+            && let Some(properties) = schema["properties"].as_object_mut()
+        {
+            properties.remove("model");
+        }
+        schema
     }
 
     async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {

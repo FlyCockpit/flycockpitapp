@@ -168,7 +168,13 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
                     "agent": "builder",
                     "prompt": "durable interactive handoff",
                     "mode": "subagent_interactive",
-                    "seed_reads": &seed_reads,
+                    "seed_reads": seed_reads
+                        .iter()
+                        .map(|seed| serde_json::json!({
+                            "tool": seed.tool,
+                            "args": crate::engine::seed_reads::args_to_wire(&seed.args),
+                        }))
+                        .collect::<Vec<_>>(),
                     "seed_reads_receipt": &receipt,
                 },
             }),
@@ -655,6 +661,20 @@ fn test_driver_with_url_vnext(
     test_driver_with_url_and_grant(max_schedules, provider_url, true)
 }
 
+/// The structural tools a delegating root holds: `task`, `schedule`, `spawn`.
+pub(super) fn structural_fixture_toolbox() -> crate::engine::tool::ToolBox {
+    crate::engine::tool::ToolBox::new()
+        .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
+            "builder",
+            "explore",
+            "history",
+            "deepthink",
+            "scout",
+        ])))
+        .with(Arc::new(crate::tools::schedule::ScheduleTool))
+        .with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(0, 1)))
+}
+
 fn test_driver_with_url_vnext_in(
     max_schedules: usize,
     provider_url: String,
@@ -797,7 +817,11 @@ fn test_driver_with_url_and_grant_in(
         name: "Build".into(),
         system: String::new(),
         role_prompt: String::new(),
-        tools: crate::engine::tool::ToolBox::new(),
+        // The host intercepts structural tools only for an agent that holds
+        // them (#549 C4), so the fixture root holds the structural surface
+        // these driver tests exercise, exactly as a factory-built root holds
+        // the tools its grant reaches.
+        tools: structural_fixture_toolbox(),
         model,
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: true,

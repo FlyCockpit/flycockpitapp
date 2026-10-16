@@ -1353,34 +1353,72 @@ impl ProvidersConfig {
                 });
             }
         }
-        let caps = self.resolve_effective_model_capabilities(
+        self.check_route_capability_requirements(
             provider,
             &model.id,
-            self.resolution_generation,
-        );
-        for capability in &criteria.required_capabilities {
+            &criteria.required_capabilities,
+            criteria.min_context_tokens,
+        )
+    }
+
+    /// The capability and minimum-context half of candidate admission, for
+    /// callers that already hold an authorized route (a vNext child slot's
+    /// allowed list) and must still honor a caller's selector requirements.
+    pub fn check_route_capability_requirements(
+        &self,
+        provider: &str,
+        model: &str,
+        required_capabilities: &[RequiredModelCapability],
+        min_context_tokens: Option<u32>,
+    ) -> Result<(), ModelPolicyError> {
+        let caps =
+            self.resolve_effective_model_capabilities(provider, model, self.resolution_generation);
+        for capability in required_capabilities {
             let outcome = required_model_capability_outcome(&caps, *capability);
             if let Some(err) = ModelPolicyError::from_required_capability(
                 provider,
-                model.id.clone(),
+                model.to_string(),
                 *capability,
                 outcome,
             ) {
                 return Err(err);
             }
         }
-        if let Some(min) = criteria.min_context_tokens {
+        if let Some(min) = min_context_tokens {
             let actual = caps.context_tokens;
             if actual.is_none_or(|actual| actual < min) {
                 return Err(ModelPolicyError::ContextTooSmall {
                     provider: provider.to_string(),
-                    model: model.id.clone(),
+                    model: model.to_string(),
                     min,
                     actual,
                 });
             }
         }
         Ok(())
+    }
+
+    /// Whether one route's provider and model availability admit `category`
+    /// for `agent`, exactly as category discovery decides it.
+    pub fn route_permits_category(
+        &self,
+        provider: &str,
+        model: &str,
+        category: &str,
+        agent: Option<&str>,
+    ) -> bool {
+        let Some(entry) = self.providers.get(provider) else {
+            return false;
+        };
+        let Some(model_entry) = entry.models.iter().find(|m| m.id == model) else {
+            return false;
+        };
+        entry
+            .availability
+            .permits(Some(category), Some(category), agent)
+            && model_entry
+                .availability
+                .permits(Some(category), Some(category), agent)
     }
 
     #[allow(dead_code)]

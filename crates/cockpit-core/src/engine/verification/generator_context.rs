@@ -9,6 +9,7 @@ use crate::engine::agent::Agent;
 use crate::engine::message::{Message, ToolCall, ToolDefinition};
 use crate::engine::model::ModelParams;
 use crate::engine::tool::{Tool, ToolEffect};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -96,6 +97,7 @@ impl EffectiveGeneratorContext {
         author_slot: &str,
         author: &Agent,
         author_history: &[Message],
+        candidate_schema: &Value,
     ) -> Self {
         let max_turns = spec
             .max_turns
@@ -144,7 +146,7 @@ impl EffectiveGeneratorContext {
         } else {
             (Vec::new(), BTreeMap::new())
         };
-        tools.push(candidate_tool_definition());
+        tools.push(candidate_tool_definition(candidate_schema));
         Self {
             slot: spec.slot.clone(),
             recipe,
@@ -208,20 +210,59 @@ pub(in crate::engine::verification) fn is_private_investigation_tool(tool: &dyn 
         && !name.contains("generation")
 }
 
-pub(in crate::engine::verification) fn candidate_tool_definition() -> ToolDefinition {
+pub(in crate::engine::verification) const CANDIDATE_TOOL_NAME: &str = "verification_candidate";
+
+/// The candidate tool's `args` carry the revised arguments for the tool under
+/// verification, so they are typed with that tool's own schema. An untyped
+/// object would be closed to `{}` by strict function-calling wires (they
+/// cannot decode open objects), making every revision empty there.
+pub(in crate::engine::verification) fn candidate_tool_definition(
+    candidate_schema: &Value,
+) -> ToolDefinition {
+    let args = if candidate_schema.is_object() {
+        serde_json::json!({ "anyOf": [candidate_schema, { "type": "null" }] })
+    } else {
+        serde_json::json!({ "type": ["object", "null"] })
+    };
     ToolDefinition {
-        name: "verification_candidate".to_string(),
+        name: CANDIDATE_TOOL_NAME.to_string(),
         description: "Return one verification candidate for the proposed write or edit."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "kind": { "type": "string", "enum": ["revision", "approve_original", "flag"] },
-                "args": { "type": ["object", "null"] },
+                "args": args,
                 "critique": { "type": "string" }
             },
             "required": ["kind", "args", "critique"],
             "additionalProperties": false
         }),
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    /// #549: the candidate's `args` must survive a strict wire. An untyped
+    /// object is closed to `{}` there, so revisions could carry nothing.
+    #[test]
+    fn candidate_args_carry_the_verified_tool_schema_on_strict_wires() {
+        let write = crate::tools::write::WriteTool;
+        let schema = crate::engine::tool::Tool::parameters(&write);
+        let candidate = candidate_tool_definition(&schema);
+        let violations = crate::engine::model::wire_schema::tests::wire_subset_violations(
+            std::slice::from_ref(&candidate),
+        );
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+        let strict = crate::engine::model::wire_schema::for_responses(&candidate.parameters);
+        let args = &strict["properties"]["args"]["anyOf"][0];
+        for field in ["path", "content"] {
+            assert!(
+                args["properties"].get(field).is_some(),
+                "strict candidate args lost `{field}`: {args}"
+            );
+        }
     }
 }

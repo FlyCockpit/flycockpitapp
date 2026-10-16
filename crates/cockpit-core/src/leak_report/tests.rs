@@ -1147,3 +1147,17 @@ async fn leak_report_no_second_cipher_or_unkeyed_oracle() {
         "Debug must render a redacted secret"
     );
 }
+
+/// Strict function-calling wires (OpenAI Responses) make the optional
+/// `category` nullable, so a model that fills every field sends
+/// `"category": null`. That is "omitted", not a malformed category (#549).
+#[test]
+fn parse_report_leak_treats_null_category_as_omitted() {
+    let args = serde_json::json!({
+        "secret": "abcd",
+        "source": "model_output",
+        "category": null
+    });
+    let req = parse_report_leak_args(&args).expect("null category means the default");
+    assert_eq!(req.category, LeakCategory::Secret);
+}

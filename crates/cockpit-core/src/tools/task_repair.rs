@@ -410,6 +410,9 @@ fn parse_legacy_shape(
     ))
 }
 
+/// Task fields whose value is host-authored data copied verbatim, never pruned.
+const VERBATIM_TASK_FIELDS: &[&str] = &["seed_reads"];
+
 fn prune_empty_defaults(value: &Value) -> (Option<Value>, bool) {
     match value {
         Value::Null => (None, true),
@@ -436,6 +439,18 @@ fn prune_empty_defaults(value: &Value) -> (Option<Value>, bool) {
             let mut changed = false;
             let mut out = Map::new();
             for (key, item) in object {
+                // Host-authored, receipt-bound payloads are data, not routing
+                // defaults: an empty string argument or an empty `args` list
+                // is part of the exact call the receipt binds (#549 C2). Only
+                // an absent-equivalent null is dropped.
+                if VERBATIM_TASK_FIELDS.contains(&key.as_str()) {
+                    if item.is_null() {
+                        changed = true;
+                    } else {
+                        out.insert(key.clone(), item.clone());
+                    }
+                    continue;
+                }
                 let (pruned, item_changed) = prune_empty_defaults(item);
                 changed |= item_changed;
                 if let Some(pruned) = pruned {

@@ -16,6 +16,8 @@ use crate::engine::message::{AssistantContent, Message, collect_tool_calls, tool
 pub const ALLOWED_SEED_READ_TOOLS: &[&str] = &["read", "grep", "code", "graph", "search"];
 pub const MAX_SEED_READ_CALLS: usize = 32;
 pub const MAX_SEED_READ_ARGUMENT_BYTES: usize = 64 * 1024;
+/// Most named arguments one seed call may carry.
+pub const MAX_SEED_READ_ARGS: usize = 12;
 const COMPLETION_NOTICE: &str = "The host executed the explore-selected read-only seed calls above. Use their fresh results and continue with the delegated implementation brief without rediscovering them.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,6 +47,10 @@ impl SeedReadSelection {
 }
 
 impl SeedRead {
+    /// Enforce the seed contract on every path a seed enters by: Monty
+    /// selection, the `task` wire, and recovered synthetic calls. The `task`
+    /// schema advertises the same bounds, but strict wires cannot carry all of
+    /// them, so this is the authority.
     pub fn validate(self) -> Result<Self, String> {
         if !ALLOWED_SEED_READ_TOOLS.contains(&self.tool.as_str()) {
             return Err(format!(
@@ -53,16 +59,81 @@ impl SeedRead {
                 ALLOWED_SEED_READ_TOOLS.join(", ")
             ));
         }
-        if !self.args.is_object() {
+        let Some(args) = self.args.as_object() else {
             return Err(format!(
                 "seed_reads tool `{}` requires `args` to be an object",
                 self.tool
             ));
+        };
+        if args.len() > MAX_SEED_READ_ARGS {
+            return Err(format!(
+                "seed_reads tool `{}` accepts at most {MAX_SEED_READ_ARGS} arguments",
+                self.tool
+            ));
+        }
+        for (name, value) in args {
+            if name.is_empty() {
+                return Err(format!(
+                    "seed_reads tool `{}` has an argument with an empty name",
+                    self.tool
+                ));
+            }
+            if !(value.is_string() || value.is_i64() || value.is_u64() || value.is_boolean()) {
+                return Err(format!(
+                    "seed_reads tool `{}` argument `{name}` must be a string, integer, or boolean",
+                    self.tool
+                ));
+            }
         }
         Ok(self)
     }
 }
 
+/// Render seed arguments in the `task` wire form: `[{name, value}, ...]`.
+/// Strict function-calling wires cannot express an open-keyed object, so the
+/// host prints and parses seed arguments as entries.
+pub fn args_to_wire(args: &Value) -> Value {
+    match args {
+        Value::Object(args) => Value::Array(
+            args.iter()
+                .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Parse `task` wire seed arguments back into the object the read tool takes.
+fn args_from_wire(tool: &str, entries: &Value) -> Result<Value, String> {
+    let entries = entries.as_array().ok_or_else(|| {
+        format!(
+            "seed_reads tool `{tool}` requires `args` to be an array of {{name, value}} entries"
+        )
+    })?;
+    let mut args = serde_json::Map::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry
+            .as_object()
+            .filter(|entry| entry.len() == 2)
+            .ok_or_else(|| {
+                format!("seed_reads tool `{tool}` args entries must be exactly {{name, value}}")
+            })?;
+        let (Some(Value::String(name)), Some(value)) = (entry.get("name"), entry.get("value"))
+        else {
+            return Err(format!(
+                "seed_reads tool `{tool}` args entries need a string `name` and a `value`"
+            ));
+        };
+        if args.insert(name.clone(), value.clone()).is_some() {
+            return Err(format!(
+                "seed_reads tool `{tool}` repeats argument `{name}`"
+            ));
+        }
+    }
+    Ok(Value::Object(args))
+}
+
+/// Parse seeds selected through the Monty host API, whose `args` are objects.
 pub fn parse_seed_reads(value: Option<&Value>) -> Result<Vec<SeedRead>, String> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -70,6 +141,41 @@ pub fn parse_seed_reads(value: Option<&Value>) -> Result<Vec<SeedRead>, String> 
     let calls = value
         .as_array()
         .ok_or_else(|| "seed_reads must be an array".to_string())?;
+    parse_seed_read_calls(calls)
+}
+
+/// Parse seeds copied into a `task` payload, whose `args` use the entry wire
+/// form rendered by [`append_to_report`].
+pub fn parse_task_seed_reads(value: Option<&Value>) -> Result<Vec<SeedRead>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let calls = value
+        .as_array()
+        .ok_or_else(|| "seed_reads must be an array".to_string())?;
+    if calls.len() > MAX_SEED_READ_CALLS {
+        return Err(format!(
+            "seed_reads accepts at most {MAX_SEED_READ_CALLS} calls"
+        ));
+    }
+    let calls = calls
+        .iter()
+        .map(|call| {
+            let mut call = call.clone();
+            if let Some(object) = call.as_object_mut()
+                && let Some(entries) = object.get("args")
+            {
+                let tool = object.get("tool").and_then(Value::as_str).unwrap_or("?");
+                let args = args_from_wire(tool, entries)?;
+                object.insert("args".to_string(), args);
+            }
+            Ok(call)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    parse_seed_read_calls(&calls)
+}
+
+fn parse_seed_read_calls(calls: &[Value]) -> Result<Vec<SeedRead>, String> {
     if calls.len() > MAX_SEED_READ_CALLS {
         return Err(format!(
             "seed_reads accepts at most {MAX_SEED_READ_CALLS} calls"
@@ -293,8 +399,13 @@ fn seed_reads_fork_retry_instruction() -> &'static str {
 }
 
 pub fn append_to_report(mut report: String, selection: &SeedReadSelection) -> String {
+    let calls = selection
+        .calls
+        .iter()
+        .map(|call| serde_json::json!({ "tool": call.tool, "args": args_to_wire(&call.args) }))
+        .collect::<Vec<_>>();
     let payload = serde_json::json!({
-        "seed_reads": selection.calls,
+        "seed_reads": calls,
         "seed_reads_receipt": selection.receipt,
     });
     report.push_str("\n\n## Seed reads\n");
@@ -563,6 +674,124 @@ mod tests {
             .unwrap();
             assert_eq!(calls[0].tool, *tool);
         }
+    }
+
+    /// Issue #549: the explore report renders seed args in the `task` wire
+    /// entry form, and the `task` parser folds them back into the exact
+    /// receipt-bound seeds.
+    #[test]
+    fn task_wire_round_trips_rendered_seed_reads() {
+        let selection = SeedReadSelection {
+            calls: vec![
+                SeedRead {
+                    tool: "grep".to_string(),
+                    args: serde_json::json!({"pattern": "needle", "path": "src", "case_insensitive": true}),
+                },
+                SeedRead {
+                    tool: "read".to_string(),
+                    args: serde_json::json!({"path": "src/lib.rs", "offset": 10}),
+                },
+            ],
+            receipt: Some("receipt".to_string()),
+        };
+        let report = append_to_report("report".to_string(), &selection);
+        let rendered: Value =
+            serde_json::from_str(report.rsplit("## Seed reads\n").next().unwrap().trim()).unwrap();
+        assert_eq!(
+            rendered["seed_reads"][1]["args"],
+            serde_json::json!([
+                {"name": "offset", "value": 10},
+                {"name": "path", "value": "src/lib.rs"}
+            ])
+        );
+        assert_eq!(
+            parse_task_seed_reads(Some(&rendered["seed_reads"])).unwrap(),
+            selection.calls
+        );
+    }
+
+    /// #549 C2: the production path, not just the decoder. The explore
+    /// report is copied into a `task` call, and `parse_task_args` runs its
+    /// default-pruning repair before the seed decoder. Receipt-bound data —
+    /// whitespace-only string values and an empty argument list — must
+    /// survive that unchanged.
+    #[test]
+    fn task_repair_preserves_receipt_bound_seed_data() {
+        let selection = SeedReadSelection {
+            calls: vec![
+                SeedRead {
+                    tool: "search".to_string(),
+                    args: serde_json::json!({"pattern": "  "}),
+                },
+                SeedRead {
+                    tool: "code".to_string(),
+                    args: serde_json::json!({}),
+                },
+                SeedRead {
+                    tool: "read".to_string(),
+                    args: serde_json::json!({"path": "src/lib.rs", "offset": 0}),
+                },
+            ],
+            receipt: Some("receipt".to_string()),
+        };
+        let report = append_to_report("report".to_string(), &selection);
+        let rendered: Value =
+            serde_json::from_str(report.rsplit("## Seed reads\n").next().unwrap().trim()).unwrap();
+        let task_args = serde_json::json!({
+            "intent": "delegate",
+            "payload": {
+                "agent": "builder",
+                "prompt": "implement it",
+                "seed_reads": rendered["seed_reads"],
+                "seed_reads_receipt": rendered["seed_reads_receipt"],
+            }
+        });
+        let parsed =
+            crate::tools::task_repair::parse_task_args(&task_args, &Default::default()).unwrap();
+        let crate::tools::task_repair::ParsedTaskArgs::Delegate { args, .. } = parsed else {
+            panic!("expected a delegate");
+        };
+        assert_eq!(
+            parse_task_seed_reads(args.get("seed_reads")).unwrap(),
+            selection.calls
+        );
+        assert_eq!(args["seed_reads_receipt"], "receipt");
+    }
+
+    /// The task schema once enforced non-empty argument names with
+    /// `propertyNames` and a 12-argument cap with `maxProperties`; strict wires
+    /// reject both keywords, so the parser is the authority for them.
+    #[test]
+    fn task_wire_enforces_the_seed_argument_contract() {
+        let parse = |args: Value| {
+            parse_task_seed_reads(Some(&serde_json::json!([{"tool": "read", "args": args}])))
+                .unwrap_err()
+        };
+        let error = parse(serde_json::json!([{"name": "", "value": "x"}]));
+        assert!(error.contains("empty name"), "{error}");
+        let error = parse(serde_json::json!([
+            {"name": "path", "value": "a"},
+            {"name": "path", "value": "b"}
+        ]));
+        assert!(error.contains("repeats argument `path`"), "{error}");
+        let error = parse(serde_json::json!({"path": "src/lib.rs"}));
+        assert!(error.contains("array of {name, value} entries"), "{error}");
+        let error = parse(serde_json::json!([{"name": "path"}]));
+        assert!(error.contains("exactly {name, value}"), "{error}");
+        let too_many = (0..=MAX_SEED_READ_ARGS)
+            .map(|index| serde_json::json!({"name": format!("a{index}"), "value": index}))
+            .collect::<Vec<_>>();
+        let error = parse(Value::Array(too_many));
+        assert!(error.contains("at most 12 arguments"), "{error}");
+        let error = parse(serde_json::json!([{"name": "paths", "value": ["a"]}]));
+        assert!(error.contains("string, integer, or boolean"), "{error}");
+
+        // Monty selection is held to the same contract before a receipt exists.
+        let error = parse_seed_reads(Some(&serde_json::json!([
+            {"tool": "read", "args": {"": "src/lib.rs"}}
+        ])))
+        .unwrap_err();
+        assert!(error.contains("empty name"), "{error}");
     }
 
     #[test]

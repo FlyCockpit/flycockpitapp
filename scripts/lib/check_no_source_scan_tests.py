@@ -109,7 +109,7 @@ ALLOWLIST: tuple[tuple[str, int], ...] = (
     ("crates/cockpit-tui/src/tui/settings/pointer_acceptance_tests.rs", 2),
     ("crates/cockpit-tui/src/tui/settings/providers/tests.rs", 2),
     ("crates/cockpit-tui/src/tui/settings/tests.rs", 29),
-    ("crates/cockpit-tui/tests/composer_registry_boundary.rs", 8),
+    ("crates/cockpit-tui/tests/composer_registry_boundary.rs", 5),
 )
 
 MOD_DECL = re.compile(

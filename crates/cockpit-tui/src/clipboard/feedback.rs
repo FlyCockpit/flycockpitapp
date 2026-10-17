@@ -64,47 +64,22 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_without_downgrade() {
-        let outcome = classify(&result(Confidence::Confirmed, None));
-        assert!(outcome.is_confirmed());
-        assert!(!outcome.downgraded);
-    }
-
-    #[test]
-    fn confirmed_with_rich_to_plain_downgrade() {
-        let outcome = classify(&result(Confidence::Confirmed, Some(Downgrade::RichToPlain)));
-        assert!(outcome.is_confirmed());
-        assert!(outcome.downgraded);
-    }
-
-    #[test]
-    fn unverified_without_downgrade() {
-        let outcome = classify(&result(Confidence::Unverified, None));
-        assert!(outcome.is_unverified());
-        assert!(!outcome.downgraded);
-    }
-
-    #[test]
-    fn unverified_with_rich_to_plain_downgrade() {
-        let outcome = classify(&result(
+    fn classify_confidence_downgrade_matrix() {
+        for confidence in [
+            Confidence::Confirmed,
             Confidence::Unverified,
-            Some(Downgrade::RichToPlain),
-        ));
-        assert!(outcome.is_unverified());
-        assert!(outcome.downgraded);
-    }
-
-    #[test]
-    fn failed_without_downgrade() {
-        let outcome = classify(&result(Confidence::Failed, None));
-        assert!(outcome.is_failed());
-        assert!(!outcome.downgraded);
-    }
-
-    #[test]
-    fn failed_after_a_downgrade_whose_plain_chain_also_failed() {
-        let outcome = classify(&result(Confidence::Failed, Some(Downgrade::RichToPlain)));
-        assert!(outcome.is_failed());
-        assert!(outcome.downgraded);
+            Confidence::Failed,
+        ] {
+            for (downgrade, downgraded) in [(None, false), (Some(Downgrade::RichToPlain), true)] {
+                let outcome = classify(&result(confidence, downgrade));
+                assert_eq!(outcome.is_confirmed(), confidence == Confidence::Confirmed);
+                assert_eq!(
+                    outcome.is_unverified(),
+                    confidence == Confidence::Unverified
+                );
+                assert_eq!(outcome.is_failed(), confidence == Confidence::Failed);
+                assert_eq!(outcome.downgraded, downgraded);
+            }
+        }
     }
 }

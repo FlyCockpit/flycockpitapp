@@ -918,13 +918,3 @@ fn ratchet_detectors_reject_adversarial_aliases_and_extra_authorities() {
     "#;
     assert!(has_mutable_escape_trait(as_mut));
 }
-
-#[test]
-fn standalone_editors_replace_plain_composer_values() {
-    let btw = include_str!("../src/tui/app/btw_pane.rs");
-    let notes = include_str!("../src/tui/notes_pane.rs");
-    let vim = include_str!("../src/tui/vim_editor.rs");
-    assert!(btw.contains("self.composer = Composer::new(self.composer.vim_enabled())"));
-    assert!(notes.contains("self.editor = Composer::with_text(content, self.vim_enabled)"));
-    assert!(vim.contains("Composer::with_text(text, vim_enabled)"));
-}

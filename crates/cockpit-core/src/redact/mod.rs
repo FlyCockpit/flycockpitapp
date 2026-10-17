@@ -1104,6 +1104,9 @@ pub struct RedactionTable {
     /// purpose so leaks into provider logs are easy to grep for. Sealed
     /// entries render [`sealed_untrusted_inference_marker`] instead.
     placeholder: String,
+    /// Cached at construction; live rendering uses a value-free fallback when
+    /// a credential occurs inside the configured archive/display marker.
+    placeholder_conflicts: bool,
     /// `true` when the user disabled redaction at config level. The
     /// scrub call still returns the input unchanged; we keep the flag
     /// so `cockpit debug redact` can say so.
@@ -1683,17 +1686,9 @@ impl RedactionTable {
                 .then_with(|| a.value.cmp(&b.value))
         });
         entries.dedup_by(|a, b| a.value == b.value);
-        // A real password can be a word in the configured marker. Never omit
-        // that entry or emit it again as part of the replacement. A three-byte
-        // marker cannot contain any entry (the hard minimum is four bytes).
-        let placeholder = if entries
+        let placeholder_conflicts = entries
             .iter()
-            .any(|entry| placeholder.contains(&entry.value))
-        {
-            "█".to_owned()
-        } else {
-            placeholder
-        };
+            .any(|entry| placeholder.contains(&entry.value));
         // The persisted/base table never carries a `Sealed` replacement: the
         // actionable marker is an ephemeral per-target decision resolved by
         // [`Self::with_sealed_replacements`] at egress time. Freezing it here
@@ -1707,6 +1702,7 @@ impl RedactionTable {
                 overlap_matcher: None,
                 entries,
                 placeholder,
+                placeholder_conflicts,
                 disabled,
                 unsupported_files,
                 protected,
@@ -1758,6 +1754,7 @@ impl RedactionTable {
             overlap_matcher: Some(overlap_matcher),
             entries,
             placeholder,
+            placeholder_conflicts,
             disabled,
             unsupported_files,
             protected,
@@ -2030,6 +2027,7 @@ impl RedactionTable {
             overlap_matcher: self.overlap_matcher.clone(),
             entries,
             placeholder: self.placeholder.clone(),
+            placeholder_conflicts: self.placeholder_conflicts,
             disabled: self.disabled,
             unsupported_files: self.unsupported_files.clone(),
             protected: self.protected.clone(),
@@ -2268,6 +2266,31 @@ impl RedactionTable {
         if let Some(view) = self.live_view() {
             return view.scrub_cow(body);
         }
+        // A real password can be a word in the configured marker. Keep that
+        // entry, but never emit it as part of a live replacement. The three-
+        // byte fallback cannot contain an entry (the hard minimum is four).
+        let placeholder = if self.placeholder_conflicts {
+            "█"
+        } else {
+            &self.placeholder
+        };
+        self.scrub_cow_with_placeholder(body, placeholder)
+    }
+
+    /// Archive-only rendering preserves the configured marker. Export owns a
+    /// single scrub pass over each member, so marker text is presentation, even
+    /// when a registered literal is a substring of it. Live/model egress uses
+    /// `scrub` and its collision-free replacement instead. Both paths retain
+    /// every entry and enforce the same coverage/refusal checks.
+    pub(crate) fn scrub_for_archive(&self, body: &str) -> String {
+        if let Some(view) = self.live_view() {
+            return view.scrub_for_archive(body);
+        }
+        self.scrub_cow_with_placeholder(body, &self.placeholder)
+            .into_owned()
+    }
+
+    fn scrub_cow_with_placeholder<'a>(&self, body: &'a str, placeholder: &str) -> Cow<'a, str> {
         if self.withhold_all {
             if body.is_empty() {
                 return Cow::Borrowed(body);
@@ -2280,7 +2303,7 @@ impl RedactionTable {
             }
             // A stale generation-bound table must not silently substitute the
             // whole payload; callers holding an admission lease must refuse.
-            return Cow::Owned(self.placeholder.clone());
+            return Cow::Owned(placeholder.to_owned());
         }
         // The config-level opt-out (`redact.enabled = false`) suppresses
         // substitution even though the entries are present. Only routes
@@ -2364,11 +2387,11 @@ impl RedactionTable {
             // borrows the placeholder with no per-range allocation.
             let replacement: Cow<str> = if single_entry {
                 match &self.entries[first_idx].replacement {
-                    Replacement::Generic => Cow::Borrowed(self.placeholder.as_str()),
-                    other => Cow::Owned(other.render(&self.placeholder)),
+                    Replacement::Generic => Cow::Borrowed(placeholder),
+                    other => Cow::Owned(other.render(placeholder)),
                 }
             } else {
-                Cow::Borrowed(self.placeholder.as_str())
+                Cow::Borrowed(placeholder)
             };
             out.push_str(&replacement);
             last_end = end;
@@ -2466,6 +2489,7 @@ impl RedactionTable {
             overlap_matcher: self.overlap_matcher.clone(),
             entries: self.entries.clone(),
             placeholder: self.placeholder.clone(),
+            placeholder_conflicts: self.placeholder_conflicts,
             disabled: false,
             unsupported_files: self.unsupported_files.clone(),
             protected: self.protected.clone(),
@@ -2883,6 +2907,7 @@ impl RedactionTable {
             overlap_matcher: None,
             entries: Vec::new(),
             placeholder: RedactConfig::default().placeholder,
+            placeholder_conflicts: false,
             disabled: false,
             unsupported_files: Vec::new(),
             protected: ProtectedPaths::default(),
@@ -3715,6 +3740,7 @@ mod scrub_inventory_tests {
     fn source_has_scrub_entrypoint(source: &str) -> bool {
         [
             ".scrub(",
+            ".scrub_for_archive(",
             "scrub_many(",
             "scrub_cow(",
             "scrub_json_strings(",
@@ -4297,5 +4323,44 @@ mod security_r5_refusal_inverse {
             !derived.scrub(ordinary).contains(ordinary),
             "owner advance dropped independent union coverage"
         );
+    }
+}
+
+#[cfg(test)]
+mod security_lane_r7_markers {
+    use super::*;
+
+    #[test]
+    fn r7_archive_marker_and_live_collision_safety_survive_union_and_persistence() {
+        let secret = "REDACTED BY COCKPIT";
+        let normal = "Normal515R7SecretLiteral";
+        let placeholder = RedactConfig::default().placeholder;
+        let table = RedactionTable::empty()
+            .with_forced_literal(secret.into(), "$test:r7".into())
+            .unwrap()
+            .with_forced_literal(normal.into(), "$test:r7".into())
+            .unwrap();
+        let restored =
+            RedactionTable::from_persisted_json(&table.to_persisted_json().unwrap()).unwrap();
+        let union = RedactionTable::empty().union(&restored).unwrap().enforced();
+        for table in [&table, &restored, &union] {
+            assert_eq!(table.placeholder(), placeholder);
+            let body = format!("ALPHA {normal} OMEGA {secret} END");
+            let live = table.scrub(&body);
+            assert!(!live.contains(secret));
+            assert!(!live.contains(normal));
+            assert_eq!(table.scrub(&live), live, "live replacement must be stable");
+            assert_eq!(
+                table.scrub_for_archive(&body),
+                format!("ALPHA {placeholder} OMEGA {placeholder} END"),
+                "archive must replace both original occurrences exactly once"
+            );
+        }
+        let withholding = RedactionTable::withholding_all();
+        assert_eq!(
+            withholding.scrub_for_archive(secret),
+            COVERAGE_WITHHELD_PLACEHOLDER
+        );
+        assert_eq!(withholding.scrub_for_archive(""), "");
     }
 }

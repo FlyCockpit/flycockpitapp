@@ -1336,7 +1336,8 @@ impl Session {
     ///
     /// Redaction custody moves with the identity: under the redaction cache
     /// lock (which every committed table write holds or re-checks), the last
-    /// committed table is re-persisted onto the successor's vault item, so a
+    /// committed table is merged into the successor's vault item (or seeds
+    /// it for an independently constructed test fixture), so a
     /// registration committed between the predecessor→successor custody copy
     /// and this adoption is never missing from the resumed successor.
     // Test fixtures may construct a successor independently. Production must

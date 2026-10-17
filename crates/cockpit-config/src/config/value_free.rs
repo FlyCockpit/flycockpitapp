@@ -5,9 +5,34 @@
 //! integer `1234``. In a credential-bearing document (MCP servers, providers,
 //! credential files, hooks) that input is routinely the credential itself. A
 //! malformed secret field does not license echoing its bytes into an error
-//! chain, a warning or a UI. These helpers keep the error's structure (its
-//! category, its expectation, line/column, custom messages) and replace every
-//! quoted fragment with `…`.
+//! chain, a warning or a UI. JSON helpers retain only typed category, static
+//! error kind and line/column, without chaining the input-bearing serde error.
+//! The separate message helper replaces quoted fragments in static diagnostics.
+
+/// Typed JSON diagnostic containing only static classifications and position.
+/// The original serde error is deliberately neither retained nor chained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JsonError {
+    category: &'static str,
+    kind: Option<&'static str>,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl std::fmt::Display for JsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.category)?;
+        if let Some(kind) = self.kind {
+            write!(f, ": {kind}")?;
+        }
+        if self.line > 0 {
+            write!(f, " at line {} column {}", self.line, self.column)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for JsonError {}
 
 /// `message` with the contents of every `"…"` and `` `…` `` span replaced.
 /// Inside a span a backslash escapes the next character, so an escaped
@@ -64,29 +89,25 @@ pub fn json_error(error: &serde_json::Error) -> anyhow::Error {
         Category::Data => "invalid data",
         Category::Eof => "unexpected end of input",
     };
-    let mut out = category.to_string();
-    if matches!(error.classify(), Category::Data) {
+    let kind = if matches!(error.classify(), Category::Data) {
         let message = error.to_string();
         let message = match message.rfind(" at line ") {
             Some(at) => &message[..at],
             None => message.as_str(),
         };
-        if let Some(kind) = SERDE_DATA_ERROR_KINDS
+        SERDE_DATA_ERROR_KINDS
             .iter()
             .find(|kind| message.starts_with(**kind))
-        {
-            out.push_str(": ");
-            out.push_str(kind);
-        }
-    }
-    if error.line() > 0 {
-        out.push_str(&format!(
-            " at line {} column {}",
-            error.line(),
-            error.column()
-        ));
-    }
-    anyhow::anyhow!(out)
+            .copied()
+    } else {
+        None
+    };
+    anyhow::Error::new(JsonError {
+        category,
+        kind,
+        line: error.line(),
+        column: error.column(),
+    })
 }
 
 /// `serde_json::from_str` whose error is [`json_error`].
@@ -192,5 +213,35 @@ mod tests {
         );
         assert_eq!(url, "https://mcp.example.test:8443/v1/sse?…");
         assert_eq!(redacted_url("/relative/path?token=t"), "/relative/path?…");
+    }
+}
+
+#[cfg(test)]
+mod typed_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn r7_json_errors_retain_typed_position_without_input_or_source() {
+        for input in [
+            "{\n  \"API_KEY\": \"Secret515R7Unfinished",
+            "{\n  \"API_KEY\": 9876543210987}",
+        ] {
+            let original =
+                serde_json::from_str::<std::collections::BTreeMap<String, String>>(input)
+                    .unwrap_err();
+            let error = from_str::<std::collections::BTreeMap<String, String>>(input)
+                .unwrap_err()
+                .context("loading credential document");
+            let diagnostic = error.downcast_ref::<JsonError>().unwrap();
+            assert_eq!(diagnostic.line, original.line());
+            assert_eq!(diagnostic.column, original.column());
+            assert!(diagnostic.line > 0);
+            assert!(std::error::Error::source(diagnostic).is_none());
+            assert_eq!(error.chain().count(), 2);
+            for rendered in [format!("{error:#}"), format!("{error:#?}")] {
+                assert!(!rendered.contains("Secret515R7Unfinished"));
+                assert!(!rendered.contains("9876543210987"));
+            }
+        }
     }
 }

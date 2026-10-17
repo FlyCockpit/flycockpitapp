@@ -2328,6 +2328,12 @@ impl InstallationPolicyUnavailable {
             if cause.downcast_ref::<ConfigLayerVanished>().is_some() {
                 return Self::Vanished;
             }
+            if let Some(json) = cause.downcast_ref::<crate::config::value_free::JsonError>() {
+                return Self::MalformedJson {
+                    line: json.line,
+                    column: json.column,
+                };
+            }
             if let Some(json) = cause.downcast_ref::<serde_json::Error>() {
                 return Self::MalformedJson {
                     line: json.line(),

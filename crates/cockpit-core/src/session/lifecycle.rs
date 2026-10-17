@@ -1766,7 +1766,17 @@ impl Session {
             )?;
             crate::redact::RedactionTable::from_persisted_json(&json)
         };
-        let merged = load(predecessor)?.union(&load(successor)?)?;
+        // Test-support callers can create the successor row independently of
+        // custody. Seed that fixture from the required predecessor; an existing
+        // successor table must still be parsed and merged, never overwritten.
+        // Production publishes the row and its custody in one transaction.
+        let predecessor = load(predecessor)?;
+        let merged = match load_redaction_table_from_vault(&self.secret_vault, successor)? {
+            Some(json) => {
+                predecessor.union(&crate::redact::RedactionTable::from_persisted_json(&json)?)?
+            }
+            None => predecessor,
+        };
         let json = merged.to_persisted_json()?;
         persist_redaction_table_to_vault(&self.secret_vault, successor, json.as_bytes())?;
         Ok(json)
@@ -2496,6 +2506,142 @@ mod independent_security_review_r5_publication {
                 .unwrap()
                 .scrub(secret)
                 .contains(secret)
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_lane_r7_adoption {
+    use super::*;
+    use crate::redact::RedactionTable;
+
+    fn session(db: &crate::db::Db, root: &Path) -> Session {
+        Session::create_for_test(
+            db.clone(),
+            root.to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn r7_fixture_adoption_seeds_missing_successor_only_after_custody_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let parent = session(&db, tmp.path());
+        let predecessor = parent.live_id();
+        let short = parent.short_id();
+        let secret = "AdoptionParent515R7Secret";
+        parent
+            .persist_redaction_table(
+                &RedactionTable::empty()
+                    .with_forced_literal(secret.into(), "$test:r7".into())
+                    .unwrap(),
+            )
+            .unwrap();
+        let successor = db.create_compaction_successor(predecessor).await.unwrap();
+        assert!(
+            load_redaction_table_from_vault(parent.secret_vault(), successor.session_id)
+                .unwrap()
+                .is_none()
+        );
+        fail_next_redaction_vault_write_for_test();
+        let error = parent
+            .adopt_compaction_successor(successor.session_id, successor.short_id.clone())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected redaction vault write failure"));
+        assert!(!redaction_vault_write_failure_armed_for_test());
+        assert_eq!(parent.live_id(), predecessor);
+        assert_eq!(parent.short_id(), short);
+        assert!(
+            load_redaction_table_from_vault(parent.secret_vault(), successor.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        parent
+            .adopt_compaction_successor(successor.session_id, successor.short_id)
+            .unwrap();
+        assert_eq!(parent.live_id(), successor.session_id);
+        let table = parent.persisted_redaction_table().unwrap().unwrap();
+        assert!(!table.scrub(secret).contains(secret));
+    }
+
+    #[tokio::test]
+    async fn r7_fixture_adoption_retains_both_existing_tables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let parent = session(&db, tmp.path());
+        let successor = session(&db, tmp.path());
+        let secrets = ["ParentCustody515R7Secret", "SuccessorCustody515R7Secret"];
+        for (owner, secret) in [(&parent, secrets[0]), (&successor, secrets[1])] {
+            owner
+                .persist_redaction_table(
+                    &RedactionTable::empty()
+                        .with_forced_literal(secret.into(), "$test:r7".into())
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        parent
+            .adopt_compaction_successor(successor.live_id(), successor.short_id())
+            .unwrap();
+        for secret in secrets {
+            assert!(
+                !parent
+                    .persisted_redaction_table()
+                    .unwrap()
+                    .unwrap()
+                    .scrub(secret)
+                    .contains(secret),
+                "adoption discarded committed custody"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn r7_fixture_adoption_refuses_missing_predecessor_and_corrupt_successor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let parent = session(&db, tmp.path());
+        let predecessor = parent.live_id();
+        let short = parent.short_id();
+        let successor = db.create_compaction_successor(predecessor).await.unwrap();
+        parent
+            .secret_vault()
+            .delete_item(
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &crate::secure_key::redaction_table_item_id(&predecessor.to_string()),
+            )
+            .unwrap();
+        let error = parent
+            .adopt_compaction_successor(successor.session_id, successor.short_id.clone())
+            .unwrap_err();
+        assert!(error.to_string().contains("redaction table unavailable"));
+        assert_eq!(parent.live_id(), predecessor);
+        assert_eq!(parent.short_id(), short);
+        assert!(
+            load_redaction_table_from_vault(parent.secret_vault(), successor.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        parent
+            .persist_redaction_table(&RedactionTable::empty())
+            .unwrap();
+        persist_redaction_table_to_vault(parent.secret_vault(), successor.session_id, b"{")
+            .unwrap();
+        let error = parent
+            .adopt_compaction_successor(successor.session_id, successor.short_id)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("deserializing redaction table"));
+        assert_eq!(parent.live_id(), predecessor);
+        assert_eq!(parent.short_id(), short);
+        assert_eq!(
+            load_redaction_table_from_vault(parent.secret_vault(), successor.session_id).unwrap(),
+            Some("{".into()),
+            "corrupt custody must not be silently replaced"
         );
     }
 }

@@ -2215,9 +2215,11 @@ pub fn terminate_group_kill_wait_status(
                 }
             },
             Err(error) => {
-                let _ = child.start_kill();
+                // Retain the unreaped leader pin so the caller can retry group
+                // containment. Killing/polling only the leader here can reap
+                // it and permanently strand live descendants without a pin.
                 return GroupKillWaitOutcome::Unproven {
-                    leader_status: child.try_wait().ok().flatten(),
+                    leader_status: None,
                     failure: GroupContainmentFailure::GroupSignal(error),
                 };
             }
@@ -3170,6 +3172,48 @@ mod tests {
 
         let cleanup = terminate_group_kill_wait_status(&mut child, Duration::from_secs(2));
         assert!(matches!(cleanup, GroupKillWaitOutcome::Quiesced(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r7_failed_group_signal_retains_pin_and_descendants_for_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ready = tmp.path().join("ready");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM; sleep 30 & touch '{}'; wait",
+                ready.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        wait_for_file(&ready);
+        let pid = i32::try_from(child.id().unwrap()).unwrap();
+        let (_, start) = capture_leader_pin(pid).unwrap();
+        inject_next_group_signal_errno(libc::EPERM);
+        let outcome = terminate_group_kill_wait_status(&mut child, Duration::ZERO);
+        assert!(matches!(
+            outcome,
+            GroupKillWaitOutcome::Unproven {
+                leader_status: None,
+                failure: GroupContainmentFailure::GroupSignal(ref error),
+            } if error.raw_os_error() == Some(libc::EPERM)
+        ));
+        assert!(
+            leader_pin_holds(pid, start),
+            "failed signal lost the retry pin"
+        );
+        let cleanup = terminate_group_kill_wait_status(&mut child, Duration::from_secs(2));
+        assert!(
+            matches!(cleanup, GroupKillWaitOutcome::Quiesced(_)),
+            "{cleanup:?}"
+        );
+        assert_eq!(child.id(), None, "successful retry must reap the leader");
     }
 
     #[cfg(unix)]

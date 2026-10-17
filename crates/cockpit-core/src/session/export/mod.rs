@@ -403,7 +403,7 @@ fn fs_safe(s: &str) -> String {
 /// and `*` collapse to `_`. The corresponding event `"file"`/`"output_file"`
 /// values are always set from the same emitted path, so references never dangle.
 fn fs_safe_scrubbed(s: &str, redactor: &RedactionTable) -> String {
-    fs_safe(&redactor.scrub(s))
+    fs_safe(&redactor.scrub_for_archive(s))
 }
 
 /// What a completed bundle write produced — surfaced so callers (CLI
@@ -2194,7 +2194,7 @@ fn restore_exported_tool_artifact_preview(
 fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable) {
     match value {
         Value::String(s) => {
-            let scrubbed = redactor.scrub(s);
+            let scrubbed = redactor.scrub_for_archive(s);
             if scrubbed != *s {
                 *s = scrubbed;
             }
@@ -2221,7 +2221,7 @@ fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable) {
             let mut rebuilt = serde_json::Map::with_capacity(map.len());
             let mut collided = false;
             for (key, item) in std::mem::take(map) {
-                let scrubbed_key = redactor.scrub(&key);
+                let scrubbed_key = redactor.scrub_for_archive(&key);
                 if rebuilt.insert(scrubbed_key, item).is_some() {
                     collided = true;
                     break;
@@ -2241,7 +2241,7 @@ fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable) {
 }
 
 fn redact_string_for_export(value: String, redactor: &RedactionTable) -> String {
-    redactor.scrub(&value)
+    redactor.scrub_for_archive(&value)
 }
 
 /// Deterministic archive-only redaction for immutable artifact bodies.
@@ -2568,7 +2568,7 @@ fn config_entries_from_layers(
         let pretty = serde_json::to_string_pretty(&merged).unwrap_or_else(|_| "{}".to_string());
         entries.push((
             "config/effective-config.json".to_string(),
-            redactor.scrub(&sanitize_config_json_text(&pretty)),
+            redactor.scrub_for_archive(&sanitize_config_json_text(&pretty)),
         ));
     }
     let provider_paths: Vec<PathBuf> = ordered_layers
@@ -2585,7 +2585,7 @@ fn config_entries_from_layers(
             serde_json::to_string_pretty(&effective_providers).unwrap_or_else(|_| "{}".to_string());
         entries.push((
             "config/effective-providers.json".to_string(),
-            redactor.scrub(&sanitize_config_json_text(&pretty)),
+            redactor.scrub_for_archive(&sanitize_config_json_text(&pretty)),
         ));
     }
     let mut effective_mcp = crate::mcp::config::McpConfig::default();
@@ -2606,7 +2606,7 @@ fn config_entries_from_layers(
             serde_json::to_string_pretty(&effective_mcp).unwrap_or_else(|_| "{}".to_string());
         entries.push((
             "config/effective-mcp.json".to_string(),
-            redactor.scrub(&sanitize_mcp_json_text(&pretty)),
+            redactor.scrub_for_archive(&sanitize_mcp_json_text(&pretty)),
         ));
     }
 
@@ -2723,7 +2723,7 @@ fn collect_layer_tree(
                         };
                         out.push((
                             format!("config/layers/{label}/{rel_str}"),
-                            redactor.scrub(&contents),
+                            redactor.scrub_for_archive(&contents),
                         ));
                     }
                     Ok(None) | Err(_) => {

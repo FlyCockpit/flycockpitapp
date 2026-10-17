@@ -1549,9 +1549,7 @@ impl SettingsCx {
     /// All provider side effects use the project selected for this dialog;
     /// config editing must never silently retarget to the process cwd.
     fn provider_fetch_root(&self) -> String {
-        self.active_project_root
-            .as_deref()
-            .or(self.picker_cwd.as_deref())
+        self.provider_project_context()
             .or_else(|| self.config_path.parent())
             .unwrap_or_else(|| std::path::Path::new("."))
             .display()
@@ -2434,9 +2432,7 @@ impl SettingsCx {
         }
         .to_string();
         let project_root = self
-            .active_project_root
-            .as_deref()
-            .or(self.picker_cwd.as_deref())
+            .provider_project_context()
             .or_else(|| self.config_path.parent())
             .ok_or_else(|| "resolving provider logout workspace: no project context".to_string())?;
         let project_root = super::canonical_project_root(project_root);
@@ -3424,9 +3420,7 @@ impl SettingsCx {
                 }
 
                 let Some(project_root) = self
-                    .active_project_root
-                    .as_deref()
-                    .or(self.picker_cwd.as_deref())
+                    .provider_project_context()
                     .or_else(|| self.config_path.parent())
                 else {
                     s.outcome = Some(Err("unable to resolve the provider workspace".into()));

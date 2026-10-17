@@ -1,6 +1,7 @@
 //! User-configured provider entries in per-provider config files.
 //!
-//! Layer-wide provider metadata stays in `<CONFIG_DIR>/config.json`.
+//! Layer-wide provider metadata stays in the selected config file:
+//! `config.json` by default, or the filename supplied by `COCKPIT_CONFIG`.
 //! Individual provider entries live in
 //! `<CONFIG_DIR>/providers/<provider-id>.json`, where the provider id is the
 //! filename stem and the file body is one [`ProviderEntry`] object:
@@ -224,9 +225,13 @@ pub fn provider_id_from_file_name(path: &Path) -> Option<String> {
     Some(id.to_string())
 }
 
-fn config_path_for_layer_path(path: &Path) -> PathBuf {
-    if path.file_name().and_then(|s| s.to_str()) == Some(crate::config::dirs::CONFIG_FILE) {
-        return path.to_path_buf();
+fn config_path_for_layer_path(path: &Path) -> Result<PathBuf> {
+    let explicit = crate::config::dirs::explicit_config_override()?;
+    // An explicit config file can itself be placed in a providers directory.
+    if let Some(target) = explicit.as_ref()
+        && (path == target || crate::config::dirs::same_logical_path(path, target))
+    {
+        return Ok(target.clone());
     }
     if path.extension().and_then(|s| s.to_str()) == Some("json")
         && path
@@ -236,9 +241,19 @@ fn config_path_for_layer_path(path: &Path) -> PathBuf {
             == Some(PROVIDERS_DIR)
         && let Some(config_dir) = path.parent().and_then(Path::parent)
     {
-        return config_dir.join(crate::config::dirs::CONFIG_FILE);
+        // Provider selectors return a sibling path. Preserve the operator's
+        // config filename when recovering its owning layer, including when
+        // the sibling was canonicalized through a directory alias.
+        if let Some(target) = explicit
+            && target
+                .parent()
+                .is_some_and(|parent| crate::config::dirs::same_logical_path(config_dir, parent))
+        {
+            return Ok(target);
+        }
+        return Ok(config_dir.join(crate::config::dirs::CONFIG_FILE));
     }
-    path.to_path_buf()
+    Ok(path.to_path_buf())
 }
 
 mod fetch_status;

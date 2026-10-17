@@ -47382,3 +47382,231 @@ async fn usage_success_final_wire_scrubs_decoded_nested_credentials() {
         }
     }
 }
+
+/// Exercise the RPCs used by terminal security/model setup with the canonical
+/// installation authority root and a differently named operator override.
+#[tokio::test]
+async fn setup_settings_and_provider_catalog_follow_cockpit_config_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let global = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+    let masked = "{\"name\":\"Masked global\"}\n";
+    std::fs::write(&global, masked).unwrap();
+    let target = tmp.path().join("operator/custom.json");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "{\"name\":\"Operator override\"}\n").unwrap();
+    env.set_cockpit_config(&target);
+    let ctx = production_test_ctx(false, tmp.path().join("credentials.json"));
+    let mut state = owner_state();
+    let root = global.parent().unwrap();
+    let project_root = root.display().to_string();
+    let snapshot_session_id = "override-security".to_string();
+    let Response::ExtendedConfigSnapshot { layers, .. } = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::GetExtendedConfigSnapshot {
+            project_root: project_root.clone(),
+            snapshot_session_id: snapshot_session_id.clone(),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("expected settings snapshot")
+    };
+    assert_eq!(layers.len(), 1, "override masks every ordinary layer");
+    let layer = layers.into_iter().next().unwrap();
+    assert_eq!(layer.display_path, target.display().to_string());
+    assert_eq!(layer.config.name.as_deref(), Some("Operator override"));
+    let saved = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ApplyExtendedConfigPatch {
+            client_operation_id: "override-security-save".into(),
+            project_root: project_root.clone(),
+            layer_id: layer.layer_id,
+            patch: cockpit_proto::ExtendedConfigPatch {
+                operations: vec![cockpit_proto::ExtendedConfigPathMutation::Set {
+                    path: vec!["name".into()],
+                    value: serde_json::json!("Saved override"),
+                }],
+                materialize: false,
+                denylist: Vec::new(),
+                redacted_mutations: Vec::new(),
+            },
+            expected_revision: layer.revision,
+            snapshot_session_id,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(saved, Response::ExtendedConfigSaved { .. }));
+
+    let catalog = take_onboarding_catalog(&ctx, &mut state, root, "override-model").await;
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "override-provider-save",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                model_patch: None,
+                provider_id: "onboard".into(),
+                entry: onboard_provider_entry(),
+                header_secrets: Vec::new(),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        },
+    )
+    .await;
+    let reread = take_onboarding_catalog(&ctx, &mut state, root, "override-model-reread").await;
+    assert!(reread.view.providers.contains_key("onboard"));
+    assert!(
+        target
+            .parent()
+            .unwrap()
+            .join("providers/onboard.json")
+            .is_file()
+    );
+
+    let saved = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ApplySetupWizard {
+            client_operation_id: "override-lifetime-save".into(),
+            project_root,
+            wizard_id: crate::wizard::LIFETIME_SETUP_WIZARD_ID.into(),
+            answers_json: crate::wizard::onboarding_lifetime_client_answers_json(false).unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        saved,
+        Response::SetupWizardApplied { changed: true, .. }
+    ));
+    let config = crate::config::extended::ExtendedConfigDoc::load(&target)
+        .unwrap()
+        .config();
+    assert_eq!(config.name.as_deref(), Some("Saved override"));
+    assert!(!config.daemon.background_agents);
+    assert_eq!(std::fs::read_to_string(&global).unwrap(), masked);
+}
+
+/// Reading an explicit override grants no write authority. Installation-root
+/// requests refuse it without a policy; trusted workspace requests may write it.
+#[tokio::test]
+async fn setup_settings_cockpit_config_override_requires_its_write_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let root = tmp.path().join("repo");
+    let target = root.join(".cockpit/custom.json");
+    std::fs::create_dir_all(&root).unwrap();
+    env.set_cockpit_config(&target);
+    let global = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+    let ctx = production_test_ctx(false, tmp.path().join("credentials.json"));
+    let mut state = owner_state();
+    let snapshot = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::GetExtendedConfigSnapshot {
+            project_root: global.parent().unwrap().display().to_string(),
+            snapshot_session_id: "missing-refused-override".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let Response::ExtendedConfigSnapshot { layers, .. } = snapshot else {
+        panic!("expected missing override snapshot");
+    };
+    assert_eq!(layers.len(), 1);
+    assert_eq!(layers[0].display_path, target.display().to_string());
+    assert!(
+        !target.parent().unwrap().exists(),
+        "a read must not scaffold a refused override's directory"
+    );
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "{}\n").unwrap();
+    for (request_root, permitted) in [(global.parent().unwrap(), false), (root.as_path(), true)] {
+        if permitted {
+            trust_workspace_root(&ctx, &root).await;
+        }
+        let project_root = request_root.display().to_string();
+        let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+        let Response::ExtendedConfigSnapshot { layers, .. } = dispatch_sealed_owner(
+            &ctx,
+            &mut state,
+            Request::GetExtendedConfigSnapshot {
+                project_root: project_root.clone(),
+                snapshot_session_id: snapshot_session_id.clone(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("expected settings snapshot")
+        };
+        assert_eq!(layers.len(), 1);
+        let layer = layers.into_iter().next().unwrap();
+        assert_eq!(layer.display_path, target.display().to_string());
+        let result = dispatch_sealed_owner(
+            &ctx,
+            &mut state,
+            Request::ApplyExtendedConfigPatch {
+                client_operation_id: uuid::Uuid::new_v4().to_string(),
+                project_root,
+                layer_id: layer.layer_id,
+                expected_revision: layer.revision,
+                snapshot_session_id,
+                patch: cockpit_proto::ExtendedConfigPatch {
+                    operations: vec![cockpit_proto::ExtendedConfigPathMutation::Set {
+                        path: vec!["name".into()],
+                        value: serde_json::json!("Trusted write"),
+                    }],
+                    materialize: false,
+                    denylist: Vec::new(),
+                    redacted_mutations: Vec::new(),
+                },
+            },
+        )
+        .await;
+        if permitted {
+            assert!(matches!(
+                result.unwrap(),
+                Response::ExtendedConfigSaved { .. }
+            ));
+            assert_eq!(
+                crate::config::extended::ExtendedConfigDoc::load(&target)
+                    .unwrap()
+                    .config()
+                    .name
+                    .as_deref(),
+                Some("Trusted write")
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, ErrorCode::WorkspaceTrust, "{error:?}");
+            assert!(error.message.contains("refusing to write"), "{error:?}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}\n");
+            let error = dispatch_sealed_owner(
+                &ctx,
+                &mut state,
+                Request::ApplySetupWizard {
+                    client_operation_id: "refused-override-lifetime".into(),
+                    project_root: request_root.display().to_string(),
+                    wizard_id: crate::wizard::LIFETIME_SETUP_WIZARD_ID.into(),
+                    answers_json: crate::wizard::onboarding_lifetime_client_answers_json(false)
+                        .unwrap(),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::WorkspaceTrust, "{error:?}");
+        }
+        assert!(
+            !global.exists(),
+            "refusal never falls back to the masked global layer"
+        );
+    }
+}

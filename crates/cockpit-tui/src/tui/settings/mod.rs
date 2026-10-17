@@ -91,7 +91,8 @@ use crate::tui::textfield::TextField;
 use crate::tui::theme::{FOG, FOG_INDEX, INK, INK_INDEX, YELLOW, YELLOW_INDEX, resolve_color};
 use cockpit_config::dirs::{
     CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
-    cwd_scoped_creatable_dirs, discover_config_dirs, ensure_config_layer_dir, global_config_dir,
+    cwd_scoped_creatable_dirs, discover_config_dirs, ensure_config_layer_dir,
+    explicit_config_override, global_config_dir, installation_config_read_target,
 };
 use cockpit_config::extended::ExtendedConfig;
 use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
@@ -2582,6 +2583,71 @@ use shell::{
 /// Height (in rows) the dialog wants when active.
 pub const DIALOG_HEIGHT: u16 = 20;
 
+/// A concrete settings file and its daemon authority root. Unlike a config
+/// directory, this can retain a custom COCKPIT_CONFIG basename.
+#[derive(Debug, Clone)]
+pub struct SettingsConfigFile {
+    pub(crate) kind: ConfigDirKind,
+    pub(crate) path: PathBuf,
+    pub(crate) request_root: PathBuf,
+}
+
+impl SettingsConfigFile {
+    fn installation() -> anyhow::Result<Self> {
+        Ok(Self {
+            kind: ConfigDirKind::HomeXdg,
+            path: installation_config_read_target()?,
+            // The selected file is not a workspace authority root. In
+            // particular, its parent must never become project_root.
+            request_root: global_config_dir()?,
+        })
+    }
+
+    fn open(&self, picker_cwd: PathBuf) -> SettingsDialog {
+        let mut settings =
+            SettingsDialog::open_from_picker(self.path.clone(), self.request_root.clone());
+        settings.picker_cwd = Some(picker_cwd);
+        settings
+    }
+
+    fn open_for_provider(
+        &self,
+        cwd: &std::path::Path,
+        provider_id: &str,
+    ) -> anyhow::Result<SettingsDialog> {
+        let provider_path = config_write_target_for_provider(cwd, provider_id)?;
+        let installation_provider_path =
+            cockpit_config::providers::provider_file_path_for_config(&self.path, provider_id)?;
+        let mut settings = self.open(cwd.to_path_buf());
+        if provider_path != installation_provider_path {
+            // Scoped providers retain their catalog/mutation context. Their
+            // entry file is never a typed settings document or authority root.
+            settings.provider_project_root = Some(cwd.to_path_buf());
+        }
+        Ok(settings)
+    }
+}
+
+fn settings_config_files(cwd: &std::path::Path) -> anyhow::Result<Vec<SettingsConfigFile>> {
+    if explicit_config_override()?.is_some() {
+        return Ok(vec![SettingsConfigFile::installation()?]);
+    }
+    discover_config_dirs(cwd)
+        .into_iter()
+        .map(|dir| {
+            let path = match dir.kind {
+                ConfigDirKind::HomeXdg => installation_config_read_target()?,
+                _ => dir.path.join(CONFIG_FILE),
+            };
+            Ok(SettingsConfigFile {
+                kind: dir.kind,
+                path,
+                request_root: cwd.to_path_buf(),
+            })
+        })
+        .collect()
+}
+
 pub enum Dialog {
     None,
     WorkspaceTrust {
@@ -2591,7 +2657,7 @@ pub enum Dialog {
         choice_rects: std::cell::Cell<[Rect; 3]>,
     },
     PickConfig {
-        dirs: Vec<ConfigDir>,
+        files: Vec<SettingsConfigFile>,
         cursor: usize,
         /// Held so the `a` affordance can scaffold a new scoped config
         /// in the right place.
@@ -3302,6 +3368,9 @@ pub struct SettingsCx {
     /// Active launch/session project root for side effects that must operate on
     /// a project while this dialog may be editing a home/global config file.
     pub(super) active_project_root: Option<PathBuf>,
+    /// A direct recovery entry may edit a scoped provider while typed settings
+    /// stay bound to the installation file and canonical global request root.
+    provider_project_root: Option<PathBuf>,
     /// Per-session launch policy (`false` for `--no-sandbox`) used by
     /// dependency applicability. This is runtime state, never persisted.
     pub(super) sandbox_enabled: bool,
@@ -3392,6 +3461,13 @@ struct ProviderEditAuthority {
 }
 
 impl SettingsCx {
+    fn provider_project_context(&self) -> Option<&std::path::Path> {
+        self.provider_project_root
+            .as_deref()
+            .or(self.active_project_root.as_deref())
+            .or(self.picker_cwd.as_deref())
+    }
+
     fn queue_guidance_trace(&mut self) {
         let target = SettingsEffectTarget {
             surface: "settings.guidance-trace",
@@ -4106,9 +4182,8 @@ impl SettingsCx {
         self.provider_edit_authority = None;
         self.provider_catalog_reload_required = true;
         let project_root = self
-            .active_project_root
-            .clone()
-            .or_else(|| self.picker_cwd.clone())
+            .provider_project_context()
+            .map(std::path::Path::to_path_buf)
             .or_else(|| config_cwd(&self.config_path))
             .unwrap_or_else(|| PathBuf::from("."))
             .display()
@@ -6289,22 +6364,7 @@ impl Dialog {
     }
 
     pub fn open(cwd: &std::path::Path) -> Self {
-        let dirs = discover_config_dirs(cwd);
-        if dirs.is_empty() {
-            Dialog::CreateConfig {
-                choices: creatable_config_dirs(),
-                cursor: 0,
-                cwd: cwd.to_path_buf(),
-                status: None,
-            }
-        } else {
-            Dialog::PickConfig {
-                dirs,
-                cursor: 0,
-                cwd: cwd.to_path_buf(),
-                status: None,
-            }
-        }
+        Self::reopen_picker(cwd, None)
     }
 
     pub fn open_workspace_trust(root: cockpit_config::trust::TrustRoot) -> Self {
@@ -6360,14 +6420,10 @@ impl Dialog {
     /// Open directly into the MCP page (`/mcp settings`, GOALS §18a).
     pub fn open_mcp(cwd: &std::path::Path) -> Self {
         let mut d = Self::open(cwd);
-        if let Dialog::PickConfig { dirs, .. } = &d
-            && let Some(dir) = dirs.first()
+        if let Dialog::PickConfig { files, .. } = &d
+            && let Some(file) = files.first()
         {
-            let path = dir.path.join(CONFIG_FILE);
-            d = Dialog::Settings(Box::new(SettingsDialog::open_from_picker(
-                path,
-                cwd.to_path_buf(),
-            )));
+            d = Dialog::Settings(Box::new(file.open(cwd.to_path_buf())));
             if let Dialog::Settings(s) = &mut d {
                 s.enter_mcp();
             }
@@ -6382,11 +6438,10 @@ impl Dialog {
     /// with an inline status explaining there's nothing selected.
     pub fn open_model_settings(cwd: &std::path::Path) -> Self {
         let mut d = Self::open(cwd);
-        if let Dialog::PickConfig { dirs, .. } = &d
-            && let Some(dir) = dirs.first()
+        if let Dialog::PickConfig { files, .. } = &d
+            && let Some(file) = files.first()
         {
-            let path = dir.path.join(CONFIG_FILE);
-            let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
+            let mut s = file.open(cwd.to_path_buf());
             s.enter_model_settings();
             d = Dialog::Settings(Box::new(s));
         }
@@ -6435,12 +6490,11 @@ impl Dialog {
         status: Option<String>,
         onboarding: bool,
     ) -> Self {
-        // The provider wizard is the first-run destination for the
-        // always-writable global layer, not the generic config-location
-        // picker. Opening (or cancelling) it must not create a config layer.
-        // The daemon creates the global target atomically when the user first
-        // saves a provider.
-        let path = global_config_dir().map(|root| (root.join(CONFIG_FILE), root));
+        // Onboarding edits the selected installation file under the canonical
+        // global authority root. Opening (or cancelling) creates no layer;
+        // the daemon authorizes and creates the selected target on save.
+        let path = global_config_dir()
+            .and_then(|root| installation_config_read_target().map(|path| (path, root)));
 
         match path {
             Ok((path, global_root)) => {
@@ -6638,10 +6692,11 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        let Ok(path) = config_write_target_for_provider(cwd, provider_id) else {
+        let Ok(mut settings) = SettingsConfigFile::installation()
+            .and_then(|file| file.open_for_provider(cwd, provider_id))
+        else {
             return Self::open(cwd);
         };
-        let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
         settings.page = providers_page(ProvidersPage::List {
             cursor: 0,
             status: Some(format!("loading `{provider_id}` from the daemon…")),
@@ -6660,10 +6715,11 @@ impl Dialog {
     /// Open the existing provider-model editor directly for one configured provider.
     /// This is the canonical add-model surface used by scoped model recovery.
     pub fn open_provider_models(cwd: &std::path::Path, provider_id: &str) -> Self {
-        let Ok(path) = config_write_target_for_provider(cwd, provider_id) else {
+        let Ok(mut settings) = SettingsConfigFile::installation()
+            .and_then(|file| file.open_for_provider(cwd, provider_id))
+        else {
             return Self::open(cwd);
         };
-        let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
         settings.page = providers_page(ProvidersPage::List {
             cursor: 0,
             status: Some(format!("loading models for `{provider_id}`…")),
@@ -6688,21 +6744,27 @@ impl Dialog {
     }
 
     fn reopen_picker(cwd: &std::path::Path, status: Option<String>) -> Self {
-        let dirs = discover_config_dirs(cwd);
-        if dirs.is_empty() {
-            Dialog::CreateConfig {
+        match settings_config_files(cwd) {
+            Ok(files) if !files.is_empty() => Dialog::PickConfig {
+                files,
+                cursor: 0,
+                cwd: cwd.to_path_buf(),
+                status,
+            },
+            Ok(_) => Dialog::CreateConfig {
                 choices: creatable_config_dirs(),
                 cursor: 0,
                 cwd: cwd.to_path_buf(),
                 status,
-            }
-        } else {
-            Dialog::PickConfig {
-                dirs,
+            },
+            Err(error) => Dialog::CreateConfig {
+                choices: Vec::new(),
                 cursor: 0,
                 cwd: cwd.to_path_buf(),
-                status,
-            }
+                status: Some(format!(
+                    "could not resolve the Cockpit settings file: {error}"
+                )),
+            },
         }
     }
 
@@ -6804,7 +6866,7 @@ impl Dialog {
                 }
             }
             Dialog::PickConfig {
-                dirs,
+                files,
                 cursor,
                 cwd,
                 status,
@@ -6821,15 +6883,11 @@ impl Dialog {
                     return false;
                 }
                 *status = None;
-                match list_key_action(key, cursor, dirs.len()) {
+                match list_key_action(key, cursor, files.len()) {
                     ListAction::Stay => false,
                     ListAction::Close => true,
                     ListAction::Select(idx) => {
-                        let chosen = dirs[idx].path.join(CONFIG_FILE);
-                        let cwd = cwd.clone();
-                        *self = Dialog::Settings(Box::new(SettingsDialog::open_from_picker(
-                            chosen, cwd,
-                        )));
+                        *self = Dialog::Settings(Box::new(files[idx].open(cwd.clone())));
                         false
                     }
                 }
@@ -7192,7 +7250,7 @@ impl Dialog {
                 choice_rects.set(render_workspace_trust(frame, area, root, *cursor));
             }
             Dialog::PickConfig {
-                dirs,
+                files,
                 cursor,
                 status,
                 ..
@@ -7200,7 +7258,7 @@ impl Dialog {
                 frame,
                 area,
                 "pick a config to edit",
-                dirs,
+                files.iter().map(|file| (&file.path, file.kind)),
                 *cursor,
                 status.as_deref(),
                 "↑/↓  enter: select  a: add scoped  esc: close",
@@ -7214,7 +7272,7 @@ impl Dialog {
                 frame,
                 area,
                 "no config found, create one?",
-                choices,
+                choices.iter().map(|dir| (&dir.path, dir.kind)),
                 *cursor,
                 status.as_deref(),
                 "↑/↓  enter: select  esc: cancel",
@@ -7225,7 +7283,7 @@ impl Dialog {
                 frame,
                 area,
                 "where should the new config live?",
-                choices,
+                choices.iter().map(|dir| (&dir.path, dir.kind)),
                 *cursor,
                 None,
                 "↑/↓  enter: select  esc: back to picker",
@@ -8171,6 +8229,7 @@ impl SettingsDialog {
                 mcp_revision: None,
                 picker_cwd: None,
                 active_project_root: None,
+                provider_project_root: None,
                 sandbox_enabled: true,
                 back_to_picker: false,
                 command_installed: |cmd| {
@@ -9685,14 +9744,8 @@ impl SettingsCx {
     }
 
     pub(super) fn effective_default_scope_label(&self) -> String {
-        let cwd = self
-            .active_project_root
-            .clone()
-            .or_else(|| self.picker_cwd.clone());
-        match cwd
-            .as_deref()
-            .map(cockpit_config::providers::resolve_effective_default_write_target)
-        {
+        let cwd = self.provider_project_context();
+        match cwd.map(cockpit_config::providers::resolve_effective_default_write_target) {
             Some(Ok(target)) => target.scope_label(),
             _ => "current configuration context".to_string(),
         }
@@ -10919,15 +10972,16 @@ fn render_workspace_trust(
     choice_rects
 }
 
-fn render_picker(
+fn render_picker<'a>(
     frame: &mut Frame,
     area: Rect,
     subtitle: &str,
-    entries: &[ConfigDir],
+    entries: impl Iterator<Item = (&'a PathBuf, ConfigDirKind)>,
     cursor: usize,
     status: Option<&str>,
     help: &str,
 ) {
+    let entries = entries.collect::<Vec<_>>();
     let block = product_dialog_block(format!(" Settings — {subtitle} "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -10942,15 +10996,15 @@ fn render_picker(
     } else {
         let path_w = entries
             .iter()
-            .map(|e| cockpit_core::welcome::display_path(&e.path).chars().count())
+            .map(|(path, _)| cockpit_core::welcome::display_path(path).chars().count())
             .max()
             .unwrap_or(0);
-        for (i, entry) in entries.iter().enumerate() {
+        for (i, (path, kind)) in entries.iter().enumerate() {
             let hovered = i == cursor;
             let marker = if hovered { "› " } else { "  " };
             let row = |style| crate::tui::chrome::chip_style(style, hovered);
-            let path_str = cockpit_core::welcome::display_path(&entry.path);
-            let kind_str = kind_label(&entry.kind);
+            let path_str = cockpit_core::welcome::display_path(path);
+            let kind_str = kind_label(kind);
             lines.push(Line::from(vec![
                 Span::styled(marker, row(product_ink())),
                 Span::styled(pad_right(&path_str, path_w), row(product_ink())),

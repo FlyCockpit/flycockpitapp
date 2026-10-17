@@ -80,7 +80,9 @@ pub(crate) fn default_effect() -> Arc<dyn SettingsDaemonEffect> {
 /// whose config lives in a temporary directory outside every discovered layer
 /// is invisible to the fake. Registering it restores the layer the fixture
 /// expects without loosening any authority check: the registered target is
-/// snapshotted, revisioned, and patched exactly like a discovered one.
+/// snapshotted, revisioned, and patched exactly like a discovered one. An
+/// installation-only inventory (global root or COCKPIT_CONFIG) still excludes
+/// every ordinary/registered layer, matching the production daemon.
 pub(crate) fn register_settings_layer_target(target: &Path) {
     if let Ok(mut targets) = extra_layer_targets().lock() {
         // Fixture configs live in `TempDir`s. Keeping a dead registration
@@ -483,13 +485,23 @@ fn layer_kind(root: &Path, target: &Path) -> CockpitConfigLayer {
     CockpitConfigLayer::Project
 }
 
-/// Every `config.json` the daemon would discover for `root`, plus the
-/// `COCKPIT_CONFIG` pin and any fixture target registered through
-/// [`register_settings_layer_target`]. Targets that do not exist yet are
-/// included: a snapshot of an absent layer is what lets `materialize` create
-/// it.
-fn discovered_layer_targets(root: &Path) -> Vec<(CockpitConfigLayer, PathBuf)> {
+/// Match the daemon's single installation target for a global root or explicit
+/// override. Otherwise include ordinary layers and fixture targets registered
+/// through [`register_settings_layer_target`]. Missing targets are included:
+/// a snapshot of an absent layer lets `materialize` create it.
+fn discovered_layer_targets(root: &Path) -> Result<Vec<(CockpitConfigLayer, PathBuf)>, String> {
     use cockpit_config::dirs::CONFIG_FILE;
+    if cockpit_config::dirs::is_global_config_dir(root).map_err(|error| error.to_string())?
+        || cockpit_config::dirs::explicit_config_override()
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Ok(vec![(
+            CockpitConfigLayer::HomeXdg,
+            cockpit_config::dirs::installation_config_read_target()
+                .map_err(|error| error.to_string())?,
+        )]);
+    }
     let mut candidates = Vec::new();
     for directory in cockpit_config::dirs::discover_config_dirs(root) {
         candidates.push(directory.path.join(CONFIG_FILE));
@@ -506,11 +518,11 @@ fn discovered_layer_targets(root: &Path) -> Vec<(CockpitConfigLayer, PathBuf)> {
         candidates.extend(targets.iter().cloned());
     }
     let mut seen = HashSet::new();
-    candidates
+    Ok(candidates
         .into_iter()
         .filter(|target| seen.insert(target.clone()))
         .map(|target| (layer_kind(root, &target), target))
-        .collect()
+        .collect())
 }
 
 /// Whether a discovered layer belongs to the test that asked for the snapshot:
@@ -568,7 +580,7 @@ fn authored_typed_paths(document: &serde_json::Value) -> Vec<Vec<String>> {
 fn extended_config_snapshot(root: &Path, session: &str) -> Result<Response, String> {
     let mut layers = Vec::new();
     let mut pending = Vec::new();
-    for (kind, target) in discovered_layer_targets(root) {
+    for (kind, target) in discovered_layer_targets(root)? {
         let requested = is_requested_layer(root, &target);
         let raw = match read_optional_config(&target) {
             Ok((raw, _)) => raw,

@@ -6370,6 +6370,561 @@ fn seed_workspace_trust(root: &std::path::Path) {
     });
 }
 
+/// Forward only the transport seam: discovery, snapshots, capabilities, writes,
+/// and the TUI completion reducer all run their production implementations.
+#[derive(Default)]
+struct RealSettingsDaemon {
+    settings_roots: Mutex<Vec<String>>,
+    provider_roots: Mutex<Vec<String>>,
+}
+
+impl SettingsDaemonEffect for RealSettingsDaemon {
+    fn request(&self, request: Request) -> Result<Response, String> {
+        if let Request::GetExtendedConfigSnapshot { project_root, .. }
+        | Request::ApplyExtendedConfigPatch { project_root, .. } = &request
+        {
+            self.settings_roots
+                .lock()
+                .unwrap()
+                .push(project_root.clone());
+        }
+        if let Request::GetProviderCatalogSnapshot { project_root, .. } = &request {
+            self.provider_roots
+                .lock()
+                .unwrap()
+                .push(project_root.clone());
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let lifecycle = test_lifecycle_client();
+            let client = settings_daemon_client(&lifecycle)
+                .await
+                .map_err(|error| error.to_string())?;
+            client
+                .request(request)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+#[test]
+fn settings_direct_provider_entries_adopt_override_layer_from_real_daemon() {
+    assert_direct_provider_entries_load_and_save(true, false);
+}
+
+#[test]
+fn settings_direct_provider_entries_without_override_load_and_save_from_real_daemon() {
+    assert_direct_provider_entries_load_and_save(false, false);
+}
+
+#[test]
+fn settings_direct_provider_entries_keep_scoped_catalog_separate_from_installation_settings() {
+    assert_direct_provider_entries_load_and_save(false, true);
+}
+
+fn assert_direct_provider_entries_load_and_save(explicit_override: bool, scoped_provider: bool) {
+    let tmp = TempDir::new().unwrap();
+    let env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    env.set_var("COCKPIT_TEST_NO_KEYRING", "1");
+    let global_root = cockpit_config::dirs::ensure_global_config_dir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let target = if explicit_override {
+        let target = tmp.path().join("operator-settings.json");
+        env.set_cockpit_config(&target);
+        assert_ne!(target.parent(), Some(global_root.as_path()));
+        target
+    } else {
+        env.remove_cockpit_config();
+        global_root.join(CONFIG_FILE)
+    };
+    assert_ne!(target.parent(), Some(workspace.as_path()));
+    std::fs::write(&target, "{\"name\":\"Installation settings\"}\n").unwrap();
+    let mut masked = vec![
+        workspace.join(".cockpit/config.json"),
+        cockpit_config::dirs::local_config_dir_for(&workspace)
+            .unwrap()
+            .join(CONFIG_FILE),
+    ];
+    if explicit_override {
+        masked.push(global_root.join(CONFIG_FILE));
+    }
+    for path in &masked {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{\"name\":\"Other layer\"}\n").unwrap();
+    }
+    let provider_config = if scoped_provider { &masked[0] } else { &target };
+    write_provider_file(
+        provider_config,
+        "vendor",
+        r#"{"url":"https://provider.example.invalid/v1","headers":[]}"#,
+    );
+    let provider_path =
+        cockpit_config::providers::provider_file_path_for_config(provider_config, "vendor")
+            .unwrap();
+    assert_eq!(
+        provider_path,
+        provider_config
+            .parent()
+            .unwrap()
+            .join("providers/vendor.json")
+    );
+    let provider_bytes = std::fs::read(&provider_path).unwrap();
+    let _trust = cockpit_config::trust::enter_workspace_trust_policy(
+        cockpit_config::trust::WorkspaceTrustPolicy {
+            root: cockpit_config::trust::resolve_trust_root(&workspace).unwrap(),
+            mode: cockpit_config::WorkspaceTrustMode::Trust,
+        },
+    );
+    let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
+    seed_workspace_trust(&workspace);
+    let effect = Arc::new(RealSettingsDaemon::default());
+    with_settings_daemon_effect(effect.clone(), || {
+        let mut failures = Vec::new();
+        let mut expected_name = "Installation settings".to_string();
+        // Construct each entry after the preceding save so its revision is fresh.
+        for (label, models) in [("provider settings", false), ("provider models", true)] {
+            let mut dialog = if models {
+                Dialog::open_provider_models(&workspace, "vendor")
+            } else {
+                Dialog::open_provider_settings(&workspace, "vendor", false)
+            };
+            dialog.flush_request_daemon_effects_for_test();
+            let Dialog::Settings(mut settings) = dialog else {
+                panic!("{label}: did not enter settings");
+            };
+            assert!(
+                settings.provider_edit_authority.is_some(),
+                "{label}: provider setup failed: {:?}",
+                settings.provider_warnings
+            );
+            assert_eq!(
+                settings.config.providers["vendor"].url, "https://provider.example.invalid/v1",
+                "{label}: catalog must still load the separate provider file"
+            );
+            match settings.test_page() {
+                TestPageRef::Providers(ProvidersPage::Edit(edit)) if !models => {
+                    assert_eq!(edit.provider_id, "vendor");
+                }
+                TestPageRef::Providers(ProvidersPage::Models { parent, .. }) if models => {
+                    assert_eq!(parent.provider_id, "vendor");
+                }
+                _ => panic!("{label}: provider-specific navigation was lost"),
+            }
+            // Collect both constructor failures like the reviewer probe. Under
+            // the production-only fault, the daemon rejects the provider file
+            // as a typed settings layer and leaves its revision absent.
+            if settings.extended_revision.is_none()
+                || settings.extended_path != target
+                || settings.config_path != target
+                || settings.active_project_root.as_deref() != Some(global_root.as_path())
+                || settings.extended.name.as_deref() != Some(expected_name.as_str())
+            {
+                failures.push(format!(
+                    "{label}: config_path={:?}; extended_path={:?}; revision={:?}; warnings={:?}; project_root={:?}; expected file={target:?}; expected root={global_root:?}",
+                    settings.config_path, settings.extended_path, settings.extended_revision,
+                    settings.extended_warnings, settings.active_project_root
+                ));
+            }
+            assert_eq!(settings.picker_cwd.as_deref(), Some(workspace.as_path()));
+            for _ in 0..5 {
+                if settings.page.downcast_ref::<RootPage>().is_some() {
+                    break;
+                }
+                assert!(
+                    !settings.handle_key(press(KeyCode::Esc)),
+                    "{label}: unexpectedly closed before reaching settings root"
+                );
+            }
+            assert!(
+                settings.page.downcast_ref::<RootPage>().is_some(),
+                "{label}: could not navigate back to settings root"
+            );
+            let loaded_revision = settings.extended_revision.clone();
+            let saved_name = format!("Saved via {label}");
+            settings.extended.name = Some(saved_name.clone());
+            match settings.save_extended() {
+                Ok(outcome) => {
+                    assert!(matches!(outcome, SettingsSaveOutcome::Saved));
+                    assert_ne!(settings.extended_revision, loaded_revision);
+                    assert_eq!(settings.extended.name.as_deref(), Some(saved_name.as_str()));
+                    expected_name = saved_name;
+                }
+                Err(error) => failures.push(format!("{label}: save failed: {error}")),
+            }
+            assert_eq!(
+                ExtendedConfigDoc::load(&target)
+                    .unwrap()
+                    .config()
+                    .name
+                    .as_deref(),
+                Some(expected_name.as_str()),
+                "{label}: typed settings must persist to the installation file"
+            );
+            assert_eq!(std::fs::read(&provider_path).unwrap(), provider_bytes);
+            for path in &masked {
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    "{\"name\":\"Other layer\"}\n"
+                );
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "direct provider entry did not adopt installation layer:\n{}",
+            failures.join("\n")
+        );
+    });
+    let roots = effect.settings_roots.lock().unwrap();
+    assert_eq!(roots.len(), 6, "both entries must load, save and refresh");
+    assert!(
+        roots
+            .iter()
+            .all(|root| root == &global_root.display().to_string()),
+        "all typed settings requests must use the canonical global root: {roots:?}"
+    );
+    let provider_roots = effect.provider_roots.lock().unwrap();
+    assert!(!provider_roots.is_empty());
+    if scoped_provider {
+        assert!(
+            provider_roots
+                .iter()
+                .any(|root| root == &workspace.display().to_string())
+        );
+        assert!(provider_roots.iter().all(|root| {
+            root == &global_root.display().to_string() || root == &workspace.display().to_string()
+        }));
+    } else {
+        assert!(
+            provider_roots
+                .iter()
+                .all(|root| root == &global_root.display().to_string())
+        );
+    }
+}
+
+#[test]
+fn settings_picker_override_load_save_from_real_daemon() {
+    let tmp = TempDir::new().unwrap();
+    let env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    env.set_var("COCKPIT_TEST_NO_KEYRING", "1");
+    let override_file = tmp.path().join("custom-installation.json");
+    std::fs::write(&override_file, "{\"name\":\"Operator override\"}\n").unwrap();
+    env.set_cockpit_config(&override_file);
+    let global_root = cockpit_config::dirs::ensure_global_config_dir().unwrap();
+    let global = global_root.join(CONFIG_FILE);
+    let project = tmp.path().join(".cockpit/config.json");
+    let local = cockpit_config::dirs::local_config_dir_for(tmp.path())
+        .unwrap()
+        .join(CONFIG_FILE);
+    let masked = [global, project, local];
+    for path in &masked {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{\"name\":\"Masked layer\"}\n").unwrap();
+    }
+    let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
+    seed_workspace_trust(tmp.path());
+    let effect = Arc::new(RealSettingsDaemon::default());
+    with_settings_daemon_effect(effect.clone(), || {
+        let mut dialog = Dialog::open(&global_root);
+        assert!(matches!(dialog, Dialog::PickConfig { .. }));
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.flush_request_daemon_effects_for_test();
+        let Dialog::Settings(settings) = &mut dialog else {
+            panic!("global picker should open settings");
+        };
+        // Keep this before path/inventory assertions: the R1 fault must reach
+        // the real daemon and fail at its rejected selected-file binding.
+        assert!(
+            settings.extended_revision.is_some(),
+            "real daemon snapshot was not adopted: {:?}",
+            settings.extended_warnings
+        );
+        assert_eq!(settings.extended.name.as_deref(), Some("Operator override"));
+        assert_eq!(settings.extended_path, override_file);
+        assert_eq!(settings.config_path, override_file);
+        let loaded_revision = settings.extended_revision.clone();
+        settings.extended.name = Some("Saved override".into());
+        assert!(matches!(
+            settings.save_extended().unwrap(),
+            SettingsSaveOutcome::Saved
+        ));
+        assert_ne!(settings.extended_revision, loaded_revision);
+        assert_eq!(settings.extended.name.as_deref(), Some("Saved override"));
+        let saved = ExtendedConfigDoc::load(&override_file).unwrap();
+        assert_eq!(saved.config().name.as_deref(), Some("Saved override"));
+        for path in &masked {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "{\"name\":\"Masked layer\"}\n"
+            );
+        }
+        dialog.handle_key(press(KeyCode::Char('h')));
+        let Dialog::PickConfig { files, .. } = dialog else {
+            panic!("back should reopen the installation picker");
+        };
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, override_file);
+        assert_eq!(files[0].request_root, global_root);
+
+        // Even fixture-registered ordinary files must not precede or supplement
+        // an override in the disk fake's inventory.
+        disk_daemon_fake::register_settings_layer_target(&masked[1]);
+        let request = Request::GetExtendedConfigSnapshot {
+            project_root: tmp.path().display().to_string(),
+            snapshot_session_id: settings_snapshot_session_id().into(),
+        };
+        for response in [
+            effect.request(request.clone()).unwrap(),
+            disk_daemon_fake::default_effect().request(request).unwrap(),
+        ] {
+            let Response::ExtendedConfigSnapshot { layers, .. } = response else {
+                panic!("expected settings snapshot");
+            };
+            assert_eq!(layers.len(), 1);
+            assert_eq!(layers[0].display_path, override_file.display().to_string());
+            assert_eq!(layers[0].kind, cockpit_proto::CockpitConfigLayer::HomeXdg);
+        }
+    });
+    let roots = effect.settings_roots.lock().unwrap();
+    assert!(
+        roots.len() >= 4,
+        "load, save, refresh and inventory must execute"
+    );
+    assert!(
+        roots[..roots.len() - 1]
+            .iter()
+            .all(|root| root == &global_root.display().to_string())
+    );
+}
+
+#[test]
+fn settings_picker_override_shortcuts_keep_global_root_without_global_layer() {
+    let tmp = TempDir::new().unwrap();
+    let env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    env.set_var("COCKPIT_TEST_NO_KEYRING", "1");
+    let override_file = tmp.path().join("operator-settings.json");
+    std::fs::write(&override_file, "{\"name\":\"External installation\"}\n").unwrap();
+    env.set_cockpit_config(&override_file);
+    let global_root = global_config_dir().unwrap();
+    assert!(!global_root.exists());
+    let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
+    seed_workspace_trust(tmp.path());
+    let effect = Arc::new(RealSettingsDaemon::default());
+    with_settings_daemon_effect(effect.clone(), || {
+        let mut picker = Dialog::open(tmp.path());
+        picker.handle_key(press(KeyCode::Enter));
+        for (index, mut dialog) in [
+            picker,
+            Dialog::open_mcp(tmp.path()),
+            Dialog::open_model_settings(tmp.path()),
+            Dialog::open_providers_add(tmp.path()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            dialog.flush_request_daemon_effects_for_test();
+            let Dialog::Settings(mut settings) = dialog else {
+                panic!("override should be editable without a global directory");
+            };
+            assert!(
+                settings.extended_revision.is_some(),
+                "{:?}",
+                settings.extended_warnings
+            );
+            assert!(
+                settings.provider_edit_authority.is_some(),
+                "{:?}",
+                settings.provider_warnings
+            );
+            assert_eq!(settings.extended_path, override_file);
+            assert_eq!(settings.config_path, override_file);
+            assert_eq!(
+                settings.extended.name.as_deref(),
+                Some("External installation")
+            );
+            assert_eq!(
+                settings.active_project_root.as_deref(),
+                Some(global_root.as_path())
+            );
+            if index == 3 {
+                settings.extended.name = Some("Saved external installation".into());
+                assert!(matches!(
+                    settings.save_extended().unwrap(),
+                    SettingsSaveOutcome::Saved
+                ));
+                assert_eq!(
+                    ExtendedConfigDoc::load(&override_file)
+                        .unwrap()
+                        .config()
+                        .name
+                        .as_deref(),
+                    Some("Saved external installation")
+                );
+            }
+        }
+    });
+    let roots = effect.settings_roots.lock().unwrap();
+    assert_eq!(roots.len(), 6);
+    assert!(
+        roots
+            .iter()
+            .all(|root| root == &global_root.display().to_string())
+    );
+    assert!(
+        !global_root.exists(),
+        "opening settings must not scaffold the masked global layer"
+    );
+    drop(roots);
+    let missing = tmp.path().join("missing-workspace");
+    let untrusted = tmp.path().join("untrusted-workspace");
+    std::fs::create_dir(&untrusted).unwrap();
+    let transport = RealSettingsDaemon::default();
+    for (root, expected_error) in [(&missing, "root_missing"), (&untrusted, "workspace_trust")] {
+        let error = transport
+            .request(Request::GetExtendedConfigSnapshot {
+                project_root: root.display().to_string(),
+                snapshot_session_id: settings_snapshot_session_id().into(),
+            })
+            .unwrap_err();
+        assert!(error.contains(expected_error), "{error}");
+    }
+    assert!(!missing.exists());
+    env.remove_cockpit_config();
+    let error = transport
+        .request(Request::GetExtendedConfigSnapshot {
+            project_root: global_root.display().to_string(),
+            snapshot_session_id: settings_snapshot_session_id().into(),
+        })
+        .unwrap_err();
+    assert!(error.contains("root_missing"), "{error}");
+    assert!(!global_root.exists());
+}
+
+#[test]
+fn settings_picker_without_override_loads_and_saves_ordinary_layers() {
+    let tmp = TempDir::new().unwrap();
+    let env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    env.set_var("COCKPIT_TEST_NO_KEYRING", "1");
+    let global_root = cockpit_config::dirs::ensure_global_config_dir().unwrap();
+    let global = global_root.join(CONFIG_FILE);
+    let local = cockpit_config::dirs::local_config_dir_for(tmp.path())
+        .unwrap()
+        .join(CONFIG_FILE);
+    let project = tmp.path().join(".cockpit/config.json");
+    let paths = [global, local, project];
+    for (index, path) in paths.iter().enumerate() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("{{\"name\":\"Layer {index}\"}}\n")).unwrap();
+    }
+    let policy = cockpit_config::trust::WorkspaceTrustPolicy {
+        root: cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: cockpit_config::WorkspaceTrustMode::Trust,
+    };
+    let _trust = cockpit_config::trust::enter_workspace_trust_policy(policy);
+    let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
+    seed_workspace_trust(tmp.path());
+    let effect = Arc::new(RealSettingsDaemon::default());
+    with_settings_daemon_effect(effect.clone(), || {
+        for (index, path) in paths.iter().enumerate() {
+            let mut dialog = Dialog::open(tmp.path());
+            let Dialog::PickConfig { files, .. } = &dialog else {
+                panic!("expected ordinary config picker");
+            };
+            assert_eq!(
+                files.iter().map(|file| &file.path).collect::<Vec<_>>(),
+                paths.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                files.iter().map(|file| file.kind).collect::<Vec<_>>(),
+                [
+                    ConfigDirKind::HomeXdg,
+                    ConfigDirKind::MachineLocal,
+                    ConfigDirKind::Project
+                ]
+            );
+            for _ in 0..index {
+                dialog.handle_key(press(KeyCode::Down));
+            }
+            dialog.handle_key(press(KeyCode::Enter));
+            dialog.flush_request_daemon_effects_for_test();
+            let Dialog::Settings(mut settings) = dialog else {
+                panic!("expected selected settings")
+            };
+            assert!(
+                settings.extended_revision.is_some(),
+                "{:?}",
+                settings.extended_warnings
+            );
+            assert_eq!(&settings.extended_path, path);
+            assert_eq!(settings.extended.name, Some(format!("Layer {index}")));
+            let before = paths
+                .iter()
+                .map(|file| std::fs::read(file).unwrap())
+                .collect::<Vec<_>>();
+            settings.extended.name = Some(format!("Saved {index}"));
+            assert!(matches!(
+                settings.save_extended().unwrap(),
+                SettingsSaveOutcome::Saved
+            ));
+            let saved = ExtendedConfigDoc::load(path).unwrap();
+            assert_eq!(saved.config().name, Some(format!("Saved {index}")));
+            for (other_index, other) in paths.iter().enumerate() {
+                if other_index != index {
+                    assert_eq!(std::fs::read(other).unwrap(), before[other_index]);
+                }
+            }
+        }
+        let mut global_picker = Dialog::open(&global_root);
+        global_picker.handle_key(press(KeyCode::Enter));
+        global_picker.flush_request_daemon_effects_for_test();
+        let Dialog::Settings(settings) = global_picker else {
+            panic!("expected global settings")
+        };
+        assert!(
+            settings.extended_revision.is_some(),
+            "{:?}",
+            settings.extended_warnings
+        );
+        assert_eq!(settings.extended_path, paths[0]);
+        assert_eq!(settings.extended.name.as_deref(), Some("Saved 0"));
+    });
+    assert_eq!(
+        effect.settings_roots.lock().unwrap().last(),
+        Some(&global_root.display().to_string())
+    );
+}
+
+#[test]
+fn settings_picker_relative_override_fails_closed() {
+    let env = TestEnvGuard::isolated_cockpit_home();
+    env.set_cockpit_config(std::path::Path::new("relative.json"));
+    let Dialog::CreateConfig {
+        choices, status, ..
+    } = Dialog::open(env.path().unwrap())
+    else {
+        panic!("an invalid explicit file must not offer ordinary config files");
+    };
+    assert!(choices.is_empty());
+    assert!(status.unwrap().contains("must be an absolute path"));
+    let request = Request::GetExtendedConfigSnapshot {
+        project_root: env.path().unwrap().display().to_string(),
+        snapshot_session_id: settings_snapshot_session_id().into(),
+    };
+    assert!(
+        disk_daemon_fake::default_effect()
+            .request(request)
+            .unwrap_err()
+            .contains("must be an absolute path")
+    );
+}
+
 #[test]
 fn save_config_preserves_untouched_provider_file_disk_edits() {
     let tmp = TempDir::new().unwrap();

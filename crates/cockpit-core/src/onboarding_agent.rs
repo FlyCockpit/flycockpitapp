@@ -1065,9 +1065,9 @@ pub fn publish_authored_sidecar_selection(
 pub fn publish_authored_sidecar_config(
     selection: &crate::config::image_sidecar::SidecarSelectionConfig,
 ) -> Result<()> {
-    let global_config =
-        crate::config::dirs::global_config_file().context("resolving sidecar config")?;
-    let mut extended_doc = crate::config::extended::ExtendedConfigDoc::load(&global_config)?;
+    let target = crate::config::dirs::installation_config_write_target()
+        .context("resolving onboarding sidecar config")?;
+    let mut extended_doc = crate::config::extended::ExtendedConfigDoc::load(&target)?;
     let mut extended = extended_doc.config();
     extended.image_sidecar = selection.clone();
     extended_doc.write(&extended)?;
@@ -1368,6 +1368,27 @@ mod tests {
         AuthoredAgentSource,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn onboarding_sidecar_follows_cockpit_config_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let target = tmp.path().join("explicit/custom.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "{\"name\":\"Preserved\"}\n").unwrap();
+        env.set_cockpit_config(&target);
+        let selection = crate::config::image_sidecar::SidecarSelectionConfig {
+            mode: crate::config::image_sidecar::SidecarMode::Never,
+            ..Default::default()
+        };
+        publish_authored_sidecar_config(&selection).unwrap();
+        let config = crate::config::extended::ExtendedConfigDoc::load(&target)
+            .unwrap()
+            .config();
+        assert_eq!(config.image_sidecar, selection);
+        assert_eq!(config.name.as_deref(), Some("Preserved"));
+        assert!(!crate::config::dirs::global_config_file().unwrap().exists());
+    }
 
     fn providers_with(model: &str, trust: Option<ModelTrust>) -> ProvidersConfig {
         let mut providers = BTreeMap::new();

@@ -19,12 +19,21 @@
 //! currently-resolved value leaves the existing override untouched; an
 //! answer equal to the inherited/base value clears the override; anything
 //! else writes an explicit override.
+//!
+//! Every global writer targets the *installation layer* — the `COCKPIT_CONFIG`
+//! explicit override when set, otherwise the canonical global layer — through
+//! the one selector in [`crate::config::dirs`] that sessions and the daemon
+//! also use for installation-wide policy. The wizard therefore never writes a
+//! layer that read masks, and a refused override surfaces the selector's
+//! typed refusal rather than falling back to the global layer.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::dirs::global_config_file;
+use crate::config::dirs::{
+    ensure_global_config_dir, installation_config_read_target, installation_config_write_target,
+};
 use crate::config::extended::ExtendedConfigDoc;
 use crate::config::providers::ConfigDoc;
 use crate::wizard::{
@@ -170,9 +179,9 @@ pub fn descriptor_for_cwd_with_caps(
     _cwd: &Path,
     caps: Option<&cockpit_proto::HostCapabilitySnapshot>,
 ) -> Option<WizardDescriptor> {
-    let global_config = global_config_file().ok()?;
+    let installation_layer = installation_config_read_target().ok()?;
     if id == crate::wizard::SECURITY_WIZARD_ID {
-        let current = ExtendedConfigDoc::load(&global_config)
+        let current = ExtendedConfigDoc::load(&installation_layer)
             .ok()
             .map(|doc| doc.config())
             .unwrap_or_default();
@@ -183,7 +192,7 @@ pub fn descriptor_for_cwd_with_caps(
         ));
     }
     if id == crate::wizard::MODEL_WIZARD_ID {
-        let current = ConfigDoc::load(&global_config)
+        let current = ConfigDoc::load(&installation_layer)
             .ok()
             .map(|doc| doc.providers())
             .unwrap_or_default();
@@ -192,7 +201,7 @@ pub fn descriptor_for_cwd_with_caps(
         ));
     }
     if id == MODEL_SETUP_WIZARD_ID {
-        let current = ConfigDoc::load(&global_config)
+        let current = ConfigDoc::load(&installation_layer)
             .ok()
             .map(|doc| doc.providers())
             .unwrap_or_default();
@@ -209,7 +218,7 @@ pub fn descriptor_for_cwd_with_caps(
 /// Model-wizard descriptor for `cwd`, optionally opening on a specific
 /// `(provider_id, model_id)` rather than the first entry.
 pub fn model_descriptor_for_cwd(_cwd: &Path, preselect: Option<(&str, &str)>) -> WizardDescriptor {
-    let current = global_config_file()
+    let current = installation_config_read_target()
         .ok()
         .and_then(|path| ConfigDoc::load(&path).ok())
         .map(|doc| doc.providers())
@@ -221,7 +230,7 @@ pub fn onboarding_model_descriptor_for_cwd(
     _cwd: &Path,
     preselect: Option<(&str, &str)>,
 ) -> WizardDescriptor {
-    let current = global_config_file()
+    let current = installation_config_read_target()
         .ok()
         .and_then(|path| ConfigDoc::load(&path).ok())
         .map(|doc| doc.providers())
@@ -229,10 +238,13 @@ pub fn onboarding_model_descriptor_for_cwd(
     crate::wizard::onboarding_model_descriptor_with_selection(&current, preselect)
 }
 
-/// Where onboarding security answers are written: the always-writable global
-/// layer. Workspace trust never selects or gates this path.
-pub fn security_config_path() -> Result<PathBuf> {
-    global_config_file().context("resolving global config for security setup")
+/// Scaffold the product-owned global directory only when the selected target
+/// needs it. Other parents are created by the typed document write helpers.
+fn prepare_installation_layer_for_write(target: &Path) -> Result<()> {
+    if crate::config::dirs::path_is_under_missing_global_config_dir(target) {
+        ensure_global_config_dir().context("creating the installation Cockpit config directory")?;
+    }
+    Ok(())
 }
 
 /// Persist the security wizard's answers: sandbox default mode, default
@@ -317,13 +329,8 @@ pub async fn apply_setup_wizard_answers_authoritative(
     ))
 }
 
-fn ensure_global_layer_for_write() -> Result<()> {
-    crate::config::dirs::ensure_global_config_dir()
-        .context("creating global Cockpit config directory for onboarding")?;
-    Ok(())
-}
-
-/// Persist the native onboarding profile display name through the global layer.
+/// Persist the native onboarding profile display name through the
+/// installation layer the wizard's readers use.
 pub fn apply_onboarding_profile_display_name(display_name: &str) -> Result<bool> {
     let trimmed = display_name.trim();
     if !trimmed.is_empty() {
@@ -335,20 +342,20 @@ pub fn apply_onboarding_profile_display_name(display_name: &str) -> Result<bool>
         }
     }
     let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
-    let target = global_config_file().context("resolving global config for onboarding profile")?;
+    let target = installation_config_write_target()?;
     let mut doc = ExtendedConfigDoc::load(&target)?;
     let mut config = doc.config();
     if config.name == next {
         return Ok(false);
     }
     config.name = next;
-    ensure_global_layer_for_write()?;
+    prepare_installation_layer_for_write(&target)?;
     doc.write(&config)?;
     Ok(true)
 }
 
 fn apply_onboarding_lifetime_answers(run: &WizardRun) -> Result<Option<PathBuf>> {
-    let target = global_config_file().context("resolving global config for onboarding lifetime")?;
+    let target = installation_config_write_target()?;
     let mut doc = ExtendedConfigDoc::load(&target)?;
     let mut config = doc.config();
     let background_agents =
@@ -357,7 +364,7 @@ fn apply_onboarding_lifetime_answers(run: &WizardRun) -> Result<Option<PathBuf>>
         return Ok(None);
     }
     config.daemon.background_agents = background_agents;
-    ensure_global_layer_for_write()?;
+    prepare_installation_layer_for_write(&target)?;
     doc.write(&config)?;
     // TODO(#274): a live ephemeral owner is not promoted in place when this
     // setting changes to persistent; the choice applies to later acquisition.
@@ -371,10 +378,12 @@ pub fn apply_security_answers_with_caps(
     run: &WizardRun,
     caps: Option<&cockpit_proto::HostCapabilitySnapshot>,
 ) -> Result<Option<PathBuf>> {
-    let target = security_config_path()?;
+    let target = installation_config_write_target()?;
     let mut doc = ExtendedConfigDoc::load(&target)?;
-    // Onboarding owns only the canonical global layer. A workspace overlay
-    // must neither suppress nor redirect a user-global choice.
+    // Security onboarding owns only the installation layer the wizard's
+    // readers use (the COCKPIT_CONFIG override or the canonical global
+    // layer). A workspace overlay must neither suppress nor redirect it, and
+    // a refused override is a typed error rather than a fallback.
     let effective = doc.config();
     let mut cfg = doc.config();
     let mut changed = false;
@@ -409,7 +418,7 @@ pub fn apply_security_answers_with_caps(
     if !changed {
         return Ok(None);
     }
-    ensure_global_layer_for_write()?;
+    prepare_installation_layer_for_write(&target)?;
     doc.write(&cfg)?;
     Ok(Some(target))
 }
@@ -440,21 +449,25 @@ impl ModelAnswersOutcome {
 /// trust, capability overrides, context/output token ceilings,
 /// default thinking mode, `subagent_invokable`/`can_delegate`, the system
 /// prompt, and optionally the active model. Onboarding model fields belong to
-/// the global config layer; workspace trust neither selects nor gates that
-/// user-owned target. The "make default" choice delegates to the one
+/// the installation layer the wizard's readers use (the `COCKPIT_CONFIG`
+/// override or the canonical global layer). Workspace overlays never select
+/// the target; the shared write gate can refuse an override in an untrusted
+/// project without falling back. The "make default" choice delegates to the one
 /// authoritative effective-default operation.
 pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOutcome> {
     let (provider_id, model_id) = model_ref_answer(run).context("model answer")?;
-    let global_config = global_config_file().context("resolving global config for model setup")?;
+    let installation_config = installation_config_write_target()?;
     // Provider-id resolution is the fail-closed gate for the model write:
     // an id that cannot name a provider config file must surface its own
     // `invalid provider id` error, not a generic wrapper message.
-    let model_target =
-        crate::config::providers::provider_file_path_for_config(&global_config, &provider_id)?;
-    // Model onboarding is authored against the global layer alone; resolving
-    // workspace overlays here would make an untrusted project influence the
-    // user's durable provider/model defaults.
-    let effective = ConfigDoc::load(&global_config)?.providers();
+    let model_target = crate::config::providers::provider_file_path_for_config(
+        &installation_config,
+        &provider_id,
+    )?;
+    // Model onboarding is authored against the installation layer alone;
+    // resolving workspace overlays here would make an untrusted project
+    // influence the user's durable provider/model defaults.
+    let effective = ConfigDoc::load(&installation_config)?.providers();
     let mut base = effective.clone();
     if let Some(model) = base.providers.get_mut(&provider_id).and_then(|provider| {
         provider
@@ -681,7 +694,7 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
         return Ok(ModelAnswersOutcome::default());
     }
 
-    ensure_global_layer_for_write()?;
+    prepare_installation_layer_for_write(&installation_config)?;
     if model_changed {
         model_doc.write_model_wizard_fields(&provider_id, model)?;
     }
@@ -697,9 +710,9 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
         // authoritative operation as Ctrl+Enter and `/settings`; there is no
         // parallel default-persistence API.
         let result = crate::config::providers::mutate_effective_default(
-            global_config
+            installation_config
                 .parent()
-                .context("global config file has no parent directory")?,
+                .context("installation config file has no parent directory")?,
             Some(&next),
             crate::config::providers::ActiveModelWriteMode::Replace,
             None,
@@ -771,33 +784,22 @@ mod tests {
             guard.set_var("COCKPIT_TEST_NO_KEYRING", "1");
             Self { _guard: guard }
         }
+
+        /// Isolated home with `COCKPIT_CONFIG` pinned at an explicit file, so
+        /// the wizard's installation layer is the override rather than the
+        /// canonical global directory.
+        fn with_override(root: &std::path::Path) -> (Self, PathBuf) {
+            let guard = Self::set(root);
+            let override_path = root.join("explicit/override.json");
+            std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+            guard._guard.set_var(COCKPIT_CONFIG_ENV, &override_path);
+            (guard, override_path)
+        }
     }
 
     fn write_model_wizard_provider(_cwd: &std::path::Path) -> PathBuf {
         let path = global_config_file().unwrap();
-        let Some(parent) = path.parent() else {
-            panic!("config target has no parent");
-        };
-        std::fs::create_dir_all(parent).unwrap();
-        std::fs::write(&path, "{}").unwrap();
-        let mut cfg = crate::config::providers::ProvidersConfig::default();
-        let mut provider = crate::config::providers::ProviderEntry {
-            url: "http://localhost:1/v1".to_string(),
-            subagent_invokable: Some(true),
-            can_delegate: Some(true),
-            ..Default::default()
-        };
-        provider.models.push(crate::config::providers::ModelEntry {
-            id: "m".to_string(),
-            capabilities: crate::config::providers::ModelCapabilities {
-                image_input: crate::config::providers::CapabilityStatus::Unsupported,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        cfg.providers.insert("p".to_string(), provider);
-        let mut doc = ConfigDoc::load(&path).unwrap();
-        doc.write(&cfg).unwrap();
+        write_model_wizard_provider_at(&path);
         path
     }
 
@@ -1181,6 +1183,163 @@ mod tests {
 
         assert_eq!(saved.as_deref(), Some(global_config.as_path()));
         assert_eq!(std::fs::read_to_string(&parent_config).unwrap(), before);
+    }
+
+    /// The installation layer is the `COCKPIT_CONFIG` override when set: the
+    /// security wizard writes exactly the layer sessions and the daemon read,
+    /// and never scaffolds or shadows the canonical global layer. Without the
+    /// fix the writer resolved `global_config_file()` and the override stayed
+    /// empty.
+    #[test]
+    fn security_wizard_writes_the_cockpit_config_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_guard, override_path) = CockpitConfigEnvGuard::with_override(tmp.path());
+        let global_dir = crate::config::dirs::global_config_dir().unwrap();
+        let mut run = security_run_for_cwd(tmp.path());
+        submit_security_wizard_until_save(
+            &mut run,
+            &[("sandbox", WizardAnswer::Select("container".to_string()))],
+        );
+
+        let saved = apply_security_answers(tmp.path(), &run).unwrap();
+
+        assert_eq!(saved.as_deref(), Some(override_path.as_path()));
+        let raw = read_json(&override_path);
+        assert_eq!(raw["sandbox"]["defaultMode"], "container");
+        assert!(
+            !global_dir.exists(),
+            "an explicit override must not scaffold the canonical global layer"
+        );
+    }
+
+    /// The override is the single layer load reads, so a refused override is
+    /// a typed refusal rather than a write to the global layer it masks. Under
+    /// IgnoreConfig an override inside the ignored project's `.cockpit` fails
+    /// and neither the override nor the global layer is touched.
+    #[test]
+    fn security_wizard_refuses_an_override_inside_an_ignored_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = CockpitConfigEnvGuard::set(tmp.path());
+        let project = tmp.path().join("repo");
+        let override_path = project.join(".cockpit/config.json");
+        std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        std::fs::write(&override_path, "{}\n").unwrap();
+        guard._guard.set_var(COCKPIT_CONFIG_ENV, &override_path);
+        let global_config = global_config_file().unwrap();
+        let policy = trust_policy_for(
+            &project,
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        );
+
+        let error = crate::config::trust::with_workspace_trust_policy(policy, || {
+            let mut run = security_run_for_cwd(&project);
+            submit_security_wizard_until_save(
+                &mut run,
+                &[("sandbox", WizardAnswer::Select("container".to_string()))],
+            );
+
+            apply_security_answers(&project, &run).unwrap_err()
+        });
+
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::config::dirs::ConfigWriteTargetError>(),
+                Some(crate::config::dirs::ConfigWriteTargetError::Refused(_))
+            ),
+            "a refused override must surface the typed refusal: {error}"
+        );
+        assert_eq!(std::fs::read_to_string(&override_path).unwrap(), "{}\n");
+        assert!(!global_config.exists());
+    }
+
+    /// A descriptor is seeded from the override too, so the wizard offers and
+    /// diffs against the same layer it will write.
+    #[test]
+    fn security_descriptor_reads_the_cockpit_config_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_guard, override_path) = CockpitConfigEnvGuard::with_override(tmp.path());
+        std::fs::write(&override_path, r#"{"sandbox":{"defaultMode":"container"}}"#).unwrap();
+        let caps = available_sandbox_caps();
+
+        let descriptor = descriptor_for_cwd_with_caps(
+            crate::wizard::SECURITY_WIZARD_ID,
+            tmp.path(),
+            Some(&caps),
+        )
+        .expect("security descriptor");
+
+        let mut run = WizardRun::new(descriptor).unwrap();
+        while run.current_step_id() != Some("sandbox") {
+            run.submit(run.prefill().expect("sandbox reached via prefill"))
+                .unwrap();
+        }
+        assert_eq!(
+            run.prefill(),
+            Some(WizardAnswer::Select("container".to_string())),
+            "the override's authored value must seed the descriptor"
+        );
+    }
+
+    /// The model wizard writes provider metadata beside the override and never
+    /// beside the canonical global layer.
+    #[test]
+    fn model_wizard_writes_the_cockpit_config_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_guard, override_path) = CockpitConfigEnvGuard::with_override(tmp.path());
+        let provider_path = write_model_wizard_provider_at(&override_path);
+        let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, tmp.path()).unwrap();
+        for descriptor in [
+            model_descriptor_for_cwd(tmp.path(), Some(("p", "m"))),
+            onboarding_model_descriptor_for_cwd(tmp.path(), Some(("p", "m"))),
+        ] {
+            assert_eq!(
+                WizardRun::new(descriptor).unwrap().prefill(),
+                Some(WizardAnswer::Select("p".into()))
+            );
+        }
+        let mut run = WizardRun::new(descriptor).unwrap();
+        submit_model_wizard_until_save(&mut run, vec!["images"], vec![]);
+
+        let saved = apply_model_answers(tmp.path(), &run).unwrap();
+
+        assert_eq!(saved.model_file.as_deref(), Some(provider_path.as_path()));
+        let providers = ConfigDoc::load(&override_path).unwrap().providers();
+        assert_eq!(
+            providers.providers["p"].models[0].trust,
+            Some(crate::config::providers::ModelTrust::Trusted)
+        );
+        assert_eq!(
+            providers.providers["p"].models[0]
+                .capability_overrides
+                .image_input,
+            Some(crate::config::providers::CapabilityStatus::Supported)
+        );
+        assert!(
+            !crate::config::dirs::global_config_dir().unwrap().exists(),
+            "the model wizard must not scaffold the canonical global layer"
+        );
+    }
+
+    /// Native onboarding profile and lifetime writes follow the override as
+    /// well, so onboarding never lands on a layer `COCKPIT_CONFIG` masks.
+    #[test]
+    fn onboarding_writers_follow_the_cockpit_config_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_guard, override_path) = CockpitConfigEnvGuard::with_override(tmp.path());
+
+        assert!(apply_onboarding_profile_display_name("Ada").unwrap());
+        let mut run = WizardRun::new(lifetime_setup_wizard_descriptor()).unwrap();
+        run.submit(WizardAnswer::Confirm(false)).unwrap();
+        let answers_json = run.answers_json().unwrap();
+        let (changed, _, _) =
+            apply_setup_wizard_answers(tmp.path(), LIFETIME_SETUP_WIZARD_ID, &answers_json)
+                .unwrap();
+        assert!(changed);
+
+        let config = ExtendedConfigDoc::load(&override_path).unwrap().config();
+        assert_eq!(config.name.as_deref(), Some("Ada"));
+        assert!(!config.daemon.background_agents);
+        assert!(!crate::config::dirs::global_config_dir().unwrap().exists());
     }
 
     #[test]

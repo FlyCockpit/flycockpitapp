@@ -500,9 +500,7 @@ impl SettingsCx {
                 KeyCode::Esc => return deep_fetch_back(parent, "deep fetch cancelled".into()),
                 KeyCode::Enter if state.cursor == 0 => {
                     let Some(project_root) = self
-                        .active_project_root
-                        .as_deref()
-                        .or(self.picker_cwd.as_deref())
+                        .provider_project_context()
                         .map(std::path::Path::to_path_buf)
                     else {
                         state.status =

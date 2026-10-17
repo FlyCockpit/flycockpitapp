@@ -355,7 +355,7 @@ pub async fn get_extended_config_snapshot(
     owner: String,
     snapshot_session_id: String,
 ) -> Result<Response, ErrorPayload> {
-    let root = settings_snapshot_root(ctx, &project_root).await?;
+    let (root, trust_policy) = settings_snapshot_root(ctx, &project_root).await?;
     let redaction = ctx.current_global_redaction().await.map_err(|reason| {
         internal(format!(
             "settings are unavailable because redaction coverage could not be established: {}",
@@ -380,12 +380,14 @@ pub async fn get_extended_config_snapshot(
             }
             for (kind, target) in discovered {
                 crate::daemon::server::refuse_ephemeral_missing_global_layer(ephemeral, &target)?;
-                // A missing global layer is a valid fresh-install read: do
-                // not take the mutation lock, which would otherwise have to
-                // create the directory. Ephemeral owners already failed
-                // closed above.
+                // Readability grants no authority to create a mutation lock
+                // or its parent. Read absent global layers and refused
+                // overrides without that lock; apply rechecks file identity
+                // and content before any commit.
                 let guard = if cockpit_config::config::dirs::path_is_under_missing_global_config_dir(
                     &target,
+                ) || !cockpit_config::config::dirs::config_layer_write_allowed_for_policy(
+                    &target, trust_policy.as_ref(),
                 ) {
                     None
                 } else {
@@ -750,7 +752,7 @@ pub async fn apply_extended_config_patch(
     snapshot_session_id: String,
 ) -> Result<Response, ErrorPayload> {
     let mutation_intent_hash = patch.sanitized_intent_hash().map_err(internal)?;
-    let root = settings_snapshot_root(ctx, &project_root).await?;
+    let (root, trust_policy) = settings_snapshot_root(ctx, &project_root).await?;
     let db = ctx.db.clone();
     let runtime = tokio::runtime::Handle::current();
     let settlement_owner = owner.clone();
@@ -761,6 +763,7 @@ pub async fn apply_extended_config_patch(
     let mut response = join_fs_handler(
         "apply_extended_config_patch",
         tokio::task::spawn_blocking(move || {
+            let _trust = trust_policy.map(crate::config::trust::enter_workspace_trust_policy);
             let id = Uuid::parse_str(&layer_id)
                 .map_err(|_| conflict("settings snapshot is absent, expired, or stale"))?;
             let capability = {
@@ -780,6 +783,16 @@ pub async fn apply_extended_config_patch(
                     ephemeral,
                     &capability.target,
                 )?;
+                // Installation writes use the same policy-gated selector as
+                // onboarding. Authorize the spelled override path as well as
+                // its resolved target; refusal never selects a masked layer.
+                if is_installation_layer(&capability.target) {
+                    let selected = cockpit_config::config::dirs::installation_config_write_target()
+                        .map_err(crate::daemon::server::config_write_target_error)?;
+                    if !same_file_path(&selected, &capability.target) {
+                        return Err(conflict("installation config target changed since snapshot"));
+                    }
+                }
                 crate::daemon::server::ensure_authorized_global_layer(&capability.target)?;
                 // One apply consumes the complete snapshot group atomically.
                 // This prevents unused sibling layer capabilities from
@@ -1074,10 +1087,10 @@ pub async fn apply_extended_config_patch(
 async fn settings_snapshot_root(
     ctx: &DaemonContext,
     project_root: &str,
-) -> Result<PathBuf, ErrorPayload> {
-    let root = canonical_project_root(project_root)?;
+) -> Result<(PathBuf, Option<crate::config::trust::WorkspaceTrustPolicy>), ErrorPayload> {
+    let root = canonical_config_root(project_root)?;
     if is_global_config_root(&root)? {
-        return Ok(root);
+        return Ok((root, None));
     }
     let policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &root)
         .await
@@ -1091,7 +1104,7 @@ async fn settings_snapshot_root(
             message: "settings mutation requires a trusted workspace".into(),
         });
     }
-    Ok(root)
+    Ok((root, Some(policy)))
 }
 
 /// Reconcile hash-only typed-settings publication intents before generic local
@@ -1223,10 +1236,14 @@ fn discovered_settings_layers(
     root: &Path,
 ) -> Result<Vec<(cockpit_proto::CockpitConfigLayer, PathBuf)>, ErrorPayload> {
     use cockpit_config::config::dirs::{CONFIG_FILE, ConfigDirKind as K};
-    if is_global_config_root(root)? {
+    if is_global_config_root(root)?
+        || cockpit_config::config::dirs::explicit_config_override()
+            .map_err(|error| bad_request(error.to_string()))?
+            .is_some()
+    {
         return Ok(vec![(
             cockpit_proto::CockpitConfigLayer::HomeXdg,
-            cockpit_config::config::dirs::global_config_file().map_err(internal)?,
+            cockpit_config::config::dirs::installation_config_read_target().map_err(internal)?,
         )]);
     }
     let mut layer_dirs = cockpit_config::config::dirs::discover_config_dirs(root);
@@ -2292,6 +2309,29 @@ fn sharee_secret_policy(
         dotenv_matcher: crate::gitignore::build_allowlist_matcher(root, &cfg.dotenv_patterns),
         gitignore_root: crate::gitignore::gitignore_stack_root(root),
     }))
+}
+
+/// Configuration authority remains the canonical global directory even when
+/// an explicit installation file makes that directory unnecessary. Resolve its
+/// missing tail without creating it; every workspace root still has to exist.
+/// This is deliberately separate from generic project/filesystem admission.
+pub(super) fn canonical_config_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {
+    let requested = Path::new(project_root);
+    if requested.is_absolute()
+        && is_global_config_root(requested)?
+        && cockpit_config::dirs::explicit_config_override()
+            .map_err(|error| bad_request(error.to_string()))?
+            .is_some()
+    {
+        match std::fs::symlink_metadata(requested) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return cockpit_host::path_containment::effective_path(requested).map_err(internal);
+            }
+            Err(error) => return Err(internal(error)),
+            Ok(_) => {}
+        }
+    }
+    canonical_project_root(project_root)
 }
 
 pub(crate) fn canonical_project_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {

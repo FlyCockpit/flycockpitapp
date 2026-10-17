@@ -334,19 +334,9 @@ mod tests {
             !out.contains(&tmp.path().display().to_string()),
             "the diagnostic must name a scope, never a path: {out}"
         );
-    }
-
-    #[test]
-    fn effective_default_line_states_an_explicit_unset_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-        let _ = &env;
-        let cwd = tmp.path().join("proj");
-        std::fs::create_dir_all(&cwd).unwrap();
-
-        let out = render_effective_default(&cwd, &ProvidersConfig::default());
-        assert!(out.contains("default model for new sessions: (unset)"));
-        assert!(out.contains("resolves its model at creation"));
+        let unset = render_effective_default(&cwd, &ProvidersConfig::default());
+        assert!(unset.contains("default model for new sessions: (unset)"));
+        assert!(unset.contains("resolves its model at creation"));
     }
 
     #[test]

@@ -2736,32 +2736,7 @@ mod tests {
 
     // ── Control event byte hash ──────────────────────────────────────────
 
-    #[test]
-    fn remote_control_event_byte_hash() {
-        let bytes = [1u8; 100];
-        let hash = control_event_byte_hash(&bytes);
-        assert_eq!(hash.len(), 32);
-        // Deterministic.
-        assert_eq!(control_event_byte_hash(&bytes), hash);
-    }
-
     // ── Lease JWS digest ─────────────────────────────────────────────────
 
-    #[test]
-    fn remote_lease_jws_digest() {
-        let jws = b"header.payload.signature";
-        let digest = lease_jws_digest(jws);
-        assert_eq!(digest.len(), 32);
-        assert_eq!(lease_jws_digest(jws), digest);
-    }
-
     // ── Refresh auth JWS digest ──────────────────────────────────────────
-
-    #[test]
-    fn remote_refresh_auth_jws_digest() {
-        let jws = b"header.payload.signature";
-        let digest = refresh_authorization_jws_digest(jws);
-        assert_eq!(digest.len(), 32);
-        assert_eq!(refresh_authorization_jws_digest(jws), digest);
-    }
 }

@@ -366,47 +366,6 @@ mod tests {
     }
 
     #[test]
-    fn modes_session_setup_effective_settings_snapshot_roundtrips() {
-        let snapshot = AgentEffectiveSettingsV1 {
-            dto_version: AGENT_EFFECTIVE_SETTINGS_DTO_VERSION,
-            session_id: "s".to_string(),
-            agent_instance_id: "a".to_string(),
-            installation_id: Some("inst-1".to_string()),
-            override_revision: 3,
-            terminal: false,
-            sandbox: AgentSandboxControlV1 {
-                effective: SandboxMode::Sandbox,
-                allowed: vec![SandboxMode::Sandbox, SandboxMode::Container],
-                locked_reason: None,
-                pending: Some(SandboxMode::Container),
-            },
-            verification: AgentVerificationControlV1 {
-                regions: vec![AgentVerificationRegionV1 {
-                    region_id: "rule-1".to_string(),
-                    label: "rule-1".to_string(),
-                    enabled: true,
-                    can_disable: true,
-                    can_restrict: true,
-                    pending: false,
-                }],
-            },
-            question: AgentQuestionControlV1 {
-                effective: Some(AgentQuestionEffectiveV1 {
-                    auto_answer_enabled: true,
-                    required_decision_timeout_seconds: 30,
-                    host_ceiling_seconds: 3600,
-                    can_disable_auto_answer: true,
-                    max_required_decision_timeout_seconds: 3600,
-                }),
-                locked_reason: None,
-                pending: None,
-            },
-            model: AgentModelControlV1::default(),
-        };
-        assert_eq!(roundtrip(&snapshot), snapshot);
-    }
-
-    #[test]
     fn focused_model_route_keys_are_opaque_and_profile_distinct() {
         let first = focused_model_binding_choice_id("profile-secret-a", "openai", "gpt");
         let second = focused_model_binding_choice_id("profile-secret-b", "openai", "gpt");

@@ -74,6 +74,20 @@ mod tests {
             format_kcl_import(&result),
             "Imported 3 package(s) from kcl."
         );
+
+        {
+            let imported: KclImportResult = serde_json::from_str(r#"{"imported":5}"#).unwrap();
+            assert_eq!(
+                format_kcl_import(&imported),
+                "Imported 5 package(s) from kcl."
+            );
+            let absent: KclImportResult =
+                serde_json::from_str(r#"{"no_kcl_db":"/tmp/kcl"}"#).unwrap();
+            assert_eq!(
+                format_kcl_import(&absent),
+                "No kcl registry found at /tmp/kcl — nothing to import."
+            );
+        }
     }
 
     #[test]
@@ -85,20 +99,6 @@ mod tests {
         assert_eq!(
             format_kcl_import(&result),
             "No kcl registry found at /home/u/.kcl/registry — nothing to import."
-        );
-    }
-
-    #[test]
-    fn result_parses_from_daemon_projection() {
-        let imported: KclImportResult = serde_json::from_str(r#"{"imported":5}"#).unwrap();
-        assert_eq!(
-            format_kcl_import(&imported),
-            "Imported 5 package(s) from kcl."
-        );
-        let absent: KclImportResult = serde_json::from_str(r#"{"no_kcl_db":"/tmp/kcl"}"#).unwrap();
-        assert_eq!(
-            format_kcl_import(&absent),
-            "No kcl registry found at /tmp/kcl — nothing to import."
         );
     }
 }

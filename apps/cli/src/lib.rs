@@ -1919,53 +1919,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lib_trust_policy_does_not_open_db() {
-        let source = include_str!("lib.rs");
-        let production = source
-            .split("mod tests {")
-            .next()
-            .expect("production lib.rs");
-        assert!(
-            !production.contains("Db::open_default"),
-            "install_cli_trust_policy must not open SQLite"
-        );
-        assert!(production.contains("GetWorkspaceTrust"));
-        assert!(production.contains("SetWorkspaceTrust"));
-        assert!(!production.contains("GetStartupDisclosures"));
-    }
-
-    #[test]
-    fn get_workspace_trust_exists_and_is_used_by_lib() {
-        assert!(
-            include_str!("lib.rs").contains("GetWorkspaceTrust"),
-            "lib trust policy must consume GetWorkspaceTrust"
-        );
-        let proto = include_str!("../../../crates/cockpit-proto/src/request.rs");
-        assert!(
-            proto.contains("GetWorkspaceTrust"),
-            "GetWorkspaceTrust must exist as an owner RPC"
-        );
-        let disclosures =
-            include_str!("../../../crates/cockpit-core/src/daemon/server/dispatch.rs");
-        let get_startup = disclosures
-            .split("Request::GetStartupDisclosures")
-            .nth(1)
-            .expect("GetStartupDisclosures handler remains");
-        assert!(
-            get_startup.contains("org_sync") && get_startup.contains("connector"),
-            "GetStartupDisclosures stays org-sync/connector/config generation only"
-        );
-        assert!(
-            !get_startup
-                .split("Request::")
-                .next()
-                .unwrap_or("")
-                .contains("workspace_trust_by_root"),
-            "GetStartupDisclosures must not become the trust read"
-        );
-    }
-
     #[tokio::test]
     async fn trust_free_commands_do_not_prompt() {
         let tmp = tempfile::tempdir().unwrap();

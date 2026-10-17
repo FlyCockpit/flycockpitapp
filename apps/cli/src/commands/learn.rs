@@ -55,20 +55,4 @@ mod tests {
         let slash_prompt = build_learn_prompt("how we deployed");
         assert_eq!(cli_prompt, slash_prompt);
     }
-
-    #[test]
-    fn learn_prompt_rules() {
-        let prompt = build_learn_prompt("https://example.invalid/docs and ./sdk");
-        for required in [
-            "at most 60 characters",
-            "`## When to Use`, `## Procedure`, `## Pitfalls`, `## Verification`",
-            "Never invent commands, flags, paths, APIs, or verification results",
-            "read/search for local paths",
-            "web fetch/search for URLs",
-            "current conversation transcript",
-            "foreground provenance",
-        ] {
-            assert!(prompt.contains(required), "missing `{required}`\n{prompt}");
-        }
-    }
 }

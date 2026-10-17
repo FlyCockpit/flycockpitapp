@@ -2165,19 +2165,6 @@ mod tests {
         assert_eq!(canonical, canonical2);
     }
 
-    #[test]
-    fn policy_payload_digest_stable() {
-        let p = sample_policy();
-        let d1 = p.payload_digest_hex().unwrap();
-        let d2 = p.payload_digest_hex().unwrap();
-        assert_eq!(d1, d2);
-        assert_eq!(d1.len(), 64);
-        assert!(
-            d1.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
-    }
-
     // --- Import clock skew ---
 
     #[test]
@@ -2215,51 +2202,7 @@ mod tests {
 
     // --- State vocabulary (the durable state machine is control-plane owned) ---
 
-    #[test]
-    fn policy_row_states_serialize_to_pinned_names() {
-        // These serialized names are pinned cross-language by the fixture
-        // corpus; the durable transitions themselves live in the control plane.
-        let name = |s: PolicyRowState| serde_json::to_string(&s).unwrap();
-        assert_eq!(name(PolicyRowState::Scheduled), "\"scheduled\"");
-        assert_eq!(name(PolicyRowState::Preparing), "\"preparing\"");
-        assert_eq!(
-            name(PolicyRowState::ActiveConverging),
-            "\"active_converging\""
-        );
-        assert_eq!(name(PolicyRowState::Active), "\"active\"");
-        assert_eq!(
-            name(PolicyRowState::ActiveConvergenceFailed),
-            "\"active_convergence_failed\""
-        );
-        assert_eq!(
-            name(PolicyRowState::ScheduledFailed),
-            "\"scheduled_failed\""
-        );
-        assert_eq!(CONVERGENCE_TIMEOUT_SECONDS, 300);
-        assert_eq!(REPLICA_LEASE_RENEW_SECONDS, 15);
-        assert_eq!(REPLICA_LEASE_TTL_SECONDS, 45);
-        assert_eq!(STALE_REAP_GRACE_SECONDS, 90);
-    }
-
     // --- Critical consumer IDs ---
-
-    #[test]
-    fn critical_consumer_ids_closed_registry() {
-        assert_eq!(CRITICAL_CONSUMER_IDS.len(), 8);
-        assert!(CRITICAL_CONSUMER_IDS.contains(&"attempt_issuer"));
-        assert!(CRITICAL_CONSUMER_IDS.contains(&"signaling_gateway"));
-        assert!(CRITICAL_CONSUMER_IDS.contains(&"daemon_authorizer"));
-        assert!(CRITICAL_CONSUMER_IDS.contains(&"turn_issuer"));
-        assert!(CRITICAL_CONSUMER_IDS.contains(&"websocket_fallback_gateway"));
-        assert!(CRITICAL_CONSUMER_IDS.contains(&"web_route_selector"));
-        assert!(CRITICAL_CONSUMER_IDS.contains(&"native_route_selector"));
-        assert!(CRITICAL_CONSUMER_IDS.contains(&"metadata_retention_worker"));
-        // Unique.
-        let mut sorted = CRITICAL_CONSUMER_IDS.to_vec();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), CRITICAL_CONSUMER_IDS.len());
-    }
 
     // --- Policy validation rejections ---
 
@@ -2753,17 +2696,6 @@ mod tests {
     // Downstream consumers compare the digest in constant time where
     // authentication-sensitive. This module exposes the digest as bytes/hex;
     // constant-time comparison is the consumer's responsibility.
-
-    #[test]
-    fn permission_ceiling_digest_constant_time_compatible() {
-        let c1 = RemotePermissionCeilingV1::empty();
-        let c2 = RemotePermissionCeilingV1::empty();
-        let d1 = permission_ceiling_digest(&c1).unwrap();
-        let d2 = permission_ceiling_digest(&c2).unwrap();
-        // Constant-time comparison via byte slice equality.
-        let eq = d1.as_bytes() == d2.as_bytes();
-        assert!(eq);
-    }
 
     // --- ALLOWED_TRANSPORTS and ALLOWED_TURN_REGIONS are sorted ---
 

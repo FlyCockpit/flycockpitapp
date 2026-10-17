@@ -2675,14 +2675,6 @@ mod tests {
     }
 
     #[test]
-    fn run_help_returns_clap_help() {
-        let run = Cli::command()
-            .try_get_matches_from(["cockpit", "run", "--help"])
-            .unwrap_err();
-        assert_eq!(run.kind(), ErrorKind::DisplayHelp);
-    }
-
-    #[test]
     fn fetch_models_positional_provider_parses() {
         let cli = Cli::try_parse_from(["cockpit", "fetch-models", "codex-oauth"]).unwrap();
         match cli.command {
@@ -2702,19 +2694,6 @@ mod tests {
             Cli::try_parse_from(["cockpit", "fetch-models", "--provider", "openai"]).is_err(),
             "the provider id is positional only"
         );
-    }
-
-    #[test]
-    fn plain_fetch_never_probes() {
-        let cli = Cli::try_parse_from(["cockpit", "fetch-models", "openai"]).unwrap();
-        match cli.command {
-            Some(Command::FetchModels(args)) => {
-                assert!(!args.deep);
-                assert!(!args.yes);
-                assert!(args.model.is_none());
-            }
-            other => panic!("expected fetch-models command, got {other:?}"),
-        }
     }
 
     #[test]

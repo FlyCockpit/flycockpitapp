@@ -180,22 +180,6 @@ mod tests {
         );
     }
 
-    /// AC2: the rewritten command opens no CLI-side SQLite. (The workspace
-    /// production-path ratchet enforces the same by dropping `ask.rs` from its
-    /// allow-list; this is the local mirror.)
-    #[test]
-    fn ask_rs_has_no_db_open() {
-        let production = production_ask_source();
-        assert!(
-            !production.contains("Db::open_default"),
-            "ask must not open SQLite"
-        );
-        assert!(
-            !production.contains("vault_for_db"),
-            "ask must not open an in-process vault"
-        );
-    }
-
     /// AC3: no standalone `SecureKeyActor` / redaction-key resolver is started;
     /// the daemon owns the secure-key actor.
     #[test]

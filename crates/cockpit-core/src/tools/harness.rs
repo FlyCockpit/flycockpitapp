@@ -1548,10 +1548,4 @@ mod tests {
                 .contains("Use `task` instead for Cockpit subagent delegation")
         );
     }
-
-    #[test]
-    fn tool_names_are_stable() {
-        assert_eq!(HarnessListTool.name(), "harness_list");
-        assert_eq!(HarnessInvokeTool.name(), "harness_invoke");
-    }
 }

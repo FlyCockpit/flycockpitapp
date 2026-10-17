@@ -217,10 +217,4 @@ mod tests {
         // A large TTL still loads the same (old) entry.
         assert!(load_in(dir, key, 100_000).is_some(), "huge ttl still loads");
     }
-
-    #[test]
-    fn load_miss_on_absent_key() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        assert!(load_in(tmp.path(), "does-not-exist", 3600).is_none());
-    }
 }

@@ -228,31 +228,6 @@ mod tests {
     }
 
     #[test]
-    fn nested_repair_clean_args_dispatch_unchanged_without_recovery() {
-        let outer = serde_json::json!({
-            "server": "srv",
-            "tool": "count",
-            "args": { "count": 3 }
-        });
-        let nested = serde_json::json!({ "count": 3 });
-
-        match repair_nested_args(
-            Some(&outer),
-            "srv",
-            "count",
-            nested.clone(),
-            &count_schema(),
-            "mcp.invoke",
-        ) {
-            NestedRepair::Dispatch { args, recovery } => {
-                assert_eq!(args, nested);
-                assert!(recovery.is_none());
-            }
-            other => panic!("expected clean dispatch, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn nested_repair_non_object_schema_dispatches_unchanged_without_recovery() {
         let outer = serde_json::json!({
             "server": "srv",

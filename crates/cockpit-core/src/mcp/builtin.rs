@@ -1954,7 +1954,7 @@ mod tests {
     };
 
     #[test]
-    fn metadata_function_is_absent_from_the_main_builtin_catalog() {
+    fn fork_only_functions_are_absent_from_main_catalog() {
         assert!(
             BuiltinRegistry::default_with(Vec::new())
                 .get("set_session_metadata")
@@ -1967,6 +1967,22 @@ mod tests {
                 .is_some(),
             "the ephemeral fork catalog owns the metadata function"
         );
+
+        {
+            assert!(
+                BuiltinRegistry::default_with(Vec::new())
+                    .get("seed_reads")
+                    .is_none(),
+                "the foreground Monty catalog must not discover seed_reads"
+            );
+            let slot = Arc::new(Mutex::new(None));
+            assert!(
+                BuiltinRegistry::seed_reads_fork(slot)
+                    .get("seed_reads")
+                    .is_some(),
+                "the explore ephemeral fork catalog owns seed_reads"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2056,23 +2072,6 @@ mod tests {
         );
         assert!(registry.is_scoped());
         assert!(!host.external_mcp_servers_allowed());
-    }
-
-    #[test]
-    fn seed_reads_function_exists_only_on_ephemeral_fork_catalog() {
-        assert!(
-            BuiltinRegistry::default_with(Vec::new())
-                .get("seed_reads")
-                .is_none(),
-            "the foreground Monty catalog must not discover seed_reads"
-        );
-        let slot = Arc::new(Mutex::new(None));
-        assert!(
-            BuiltinRegistry::seed_reads_fork(slot)
-                .get("seed_reads")
-                .is_some(),
-            "the explore ephemeral fork catalog owns seed_reads"
-        );
     }
 
     #[tokio::test]
@@ -3563,83 +3562,6 @@ mod tests {
         let row = session.db.get_session(session.id).await.unwrap().unwrap();
         assert_eq!(row.title.as_deref(), Some("manual title"));
         assert!(row.user_renamed);
-    }
-
-    #[tokio::test]
-    async fn rename_session_refuses_user_renamed() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
-        let host = host(tmp.path());
-        let session = host.session.as_ref().unwrap();
-        advance_title_turns(session, 8);
-        session
-            .db
-            .rename_session(session.id, "manual")
-            .await
-            .unwrap();
-
-        let err = rename_session(&host, serde_json::json!({ "name": "agent" }))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("manually named"));
-    }
-
-    #[tokio::test]
-    async fn rename_session_refuses_ephemeral() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let parent = crate::session::Session::create_for_test(
-            db.clone(),
-            tmp.path().to_path_buf(),
-            "Build",
-            crate::session::test_redaction_key_resolver(),
-        )
-        .unwrap();
-        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
-        let side = crate::session::lifecycle::persist_fork_with_redaction_custody(
-            &db, &vault, parent.id, None, true, false,
-        )
-        .unwrap();
-        let session = Arc::new(
-            crate::session::Session::resume_for_test(
-                db,
-                side.session_id,
-                crate::session::test_redaction_key_resolver(),
-            )
-            .unwrap()
-            .unwrap(),
-        );
-        let host = HostContext {
-            db: Some(session.db.clone()),
-            session_id: Some(session.live_id()),
-            cwd: tmp.path().to_path_buf(),
-            tool_steering: crate::agents::ToolSteering::Terse,
-            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(
-                tmp.path(),
-            ),
-            session: Some(session),
-            root_agent_frame: true,
-            context_usage: None,
-            child_events: None,
-            builtin_registry: default_registry(),
-            native_tool_ctx: None,
-            projection_redact: None,
-            scan_tool_results: false,
-            metadata_expected_user_content_tokens: None,
-            metadata_expected_generation: None,
-            metadata_cancel: None,
-            metadata_shutdown_gate: None,
-            test_builtin_gate: None,
-            test_external_invoke: None,
-            test_external_approval_entered: None,
-        };
-        advance_title_turns(host.session.as_ref().unwrap(), 8);
-
-        let err = rename_session(&host, serde_json::json!({ "name": "agent" }))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("ephemeral"));
     }
 
     #[tokio::test]

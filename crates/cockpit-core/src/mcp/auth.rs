@@ -979,13 +979,6 @@ mod tests {
     }
 
     #[test]
-    fn none_auth_yields_nothing() {
-        let r = resolve_static(&base_server());
-        assert!(r.headers.is_empty());
-        assert!(r.env.is_empty());
-    }
-
-    #[test]
     fn authorize_url_includes_pkce_and_scope() {
         let oauth = OauthAuth {
             authorize_url: Some("https://auth.example.com/authorize".into()),

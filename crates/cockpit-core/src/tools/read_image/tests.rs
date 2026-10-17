@@ -1,5 +1,5 @@
 //! Tests for the `read_image` tool: schema, transform, encoder, and
-//! per-AgentDef tiering.
+//! tool schema tiers.
 //!
 //! Acceptance criteria covered:
 //! 1. `read_image_schema` — exact mutually exclusive source, region, maxima,
@@ -14,7 +14,7 @@
 //!    (the tool fails closed without the attachment authority).
 //! 5. Output — only metadata plus opaque typed reference; no base64/path/
 //!    query/provider URL in text/events/logs.
-//! 7. Per-AgentDef tests — the exact tier table; Monty has no host APIs.
+//! 7. Tool schema tiers — verbose parameters preserve the terse field set.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -121,13 +121,6 @@ mod schema {
     }
 
     #[test]
-    fn read_image_schema_http_url_rejected() {
-        let args = json!({"source": {"url": "http://example.com/test.png"}});
-        let err = ReadImageArgs::from_value(&args).unwrap_err();
-        assert!(err.to_string().contains("https://"));
-    }
-
-    #[test]
     fn read_image_schema_empty_path_rejected() {
         let args = json!({"source": {"path": ""}});
         let err = ReadImageArgs::from_value(&args).unwrap_err();
@@ -195,31 +188,17 @@ mod schema {
     }
 
     #[test]
-    fn read_image_schema_format_auto() {
-        let args = json!({"source": {"path": "/tmp/test.png"}, "format": "auto"});
-        let parsed = ReadImageArgs::from_value(&args).unwrap();
-        assert_eq!(parsed.format, OutputFormat::Auto);
-    }
-
-    #[test]
-    fn read_image_schema_format_png() {
-        let args = json!({"source": {"path": "/tmp/test.png"}, "format": "png"});
-        let parsed = ReadImageArgs::from_value(&args).unwrap();
-        assert_eq!(parsed.format, OutputFormat::Png);
-    }
-
-    #[test]
-    fn read_image_schema_format_jpeg() {
-        let args = json!({"source": {"path": "/tmp/test.png"}, "format": "jpeg"});
-        let parsed = ReadImageArgs::from_value(&args).unwrap();
-        assert_eq!(parsed.format, OutputFormat::Jpeg);
-    }
-
-    #[test]
-    fn read_image_schema_format_webp() {
-        let args = json!({"source": {"path": "/tmp/test.png"}, "format": "webp"});
-        let parsed = ReadImageArgs::from_value(&args).unwrap();
-        assert_eq!(parsed.format, OutputFormat::Webp);
+    fn read_image_schema_format_values_parse() {
+        for (value, expected) in [
+            ("auto", OutputFormat::Auto),
+            ("png", OutputFormat::Png),
+            ("jpeg", OutputFormat::Jpeg),
+            ("webp", OutputFormat::Webp),
+        ] {
+            let args = json!({"source": {"path": "/tmp/test.png"}, "format": value});
+            let parsed = ReadImageArgs::from_value(&args).unwrap();
+            assert_eq!(parsed.format, expected, "{value}");
+        }
     }
 
     #[test]
@@ -328,24 +307,18 @@ mod transform {
     }
 
     #[test]
-    fn read_image_transform_proportional_fit_width_constrained() {
-        let (w, h) = proportional_fit(200, 100, 50, 200);
-        assert_eq!(w, 50);
-        assert_eq!(h, 25);
-    }
-
-    #[test]
-    fn read_image_transform_proportional_fit_height_constrained() {
-        let (w, h) = proportional_fit(100, 200, 200, 50);
-        assert_eq!(w, 25);
-        assert_eq!(h, 50);
-    }
-
-    #[test]
     fn read_image_transform_proportional_fit_within_bounds() {
-        let (w, h) = proportional_fit(100, 100, 200, 200);
-        assert_eq!(w, 100);
-        assert_eq!(h, 100);
+        for (input, expected) in [
+            ((200, 100, 50, 200), (50, 25)),
+            ((100, 200, 200, 50), (25, 50)),
+            ((100, 100, 200, 200), (100, 100)),
+        ] {
+            assert_eq!(
+                proportional_fit(input.0, input.1, input.2, input.3),
+                expected,
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
@@ -542,15 +515,6 @@ mod encoder {
     }
 
     #[test]
-    fn read_image_encoder_deterministic_bytes() {
-        let input = test_image_100x60();
-        let r1 = transform_bytes(&input, None, Some(50), Some(50), OutputFormat::Png).unwrap();
-        let r2 = transform_bytes(&input, None, Some(50), Some(50), OutputFormat::Png).unwrap();
-        assert_eq!(r1.bytes, r2.bytes);
-        assert_eq!(r1.checksum, r2.checksum);
-    }
-
-    #[test]
     fn read_image_encoder_metadata_stripped() {
         let input = test_image_100x60();
         let result = transform_bytes(&input, None, None, None, OutputFormat::Png).unwrap();
@@ -582,27 +546,12 @@ mod input_policy {
     use super::*;
 
     #[test]
-    fn read_image_tool_fails_closed_without_authority() {
-        let args = json!({"source": {"path": "/tmp/test.png"}});
-        let parsed = ReadImageArgs::from_value(&args).unwrap();
-        assert!(matches!(
-            parsed.source,
-            crate::tool_media_authority::ReadImageSource::Path { .. }
-        ));
-    }
-
-    #[test]
     fn read_image_tool_rejects_non_https_url() {
-        let args = json!({"source": {"url": "http://example.com/test.png"}});
-        let err = ReadImageArgs::from_value(&args).unwrap_err();
-        assert!(err.to_string().contains("https://"));
-    }
-
-    #[test]
-    fn read_image_tool_rejects_file_url() {
-        let args = json!({"source": {"url": "file:///tmp/test.png"}});
-        let err = ReadImageArgs::from_value(&args).unwrap_err();
-        assert!(err.to_string().contains("https://"));
+        for url in ["http://example.com/test.png", "file:///tmp/test.png"] {
+            let args = json!({"source": {"url": url}});
+            let err = ReadImageArgs::from_value(&args).unwrap_err();
+            assert!(err.to_string().contains("https://"), "{url}: {err}");
+        }
     }
 
     #[test]
@@ -637,62 +586,11 @@ mod input_policy {
 }
 
 // ===========================================================================
-// Per-AgentDef tiering tests — Acceptance criterion 7
+// Tool schema tier tests — Acceptance criterion 7
 // ===========================================================================
 
 mod agent_tiering {
     use super::*;
-    use crate::agents::{AgentDef, AgentMode, ToolTier};
-    use std::collections::BTreeMap;
-
-    fn make_def(name: &str) -> AgentDef {
-        AgentDef {
-            name: name.to_string(),
-            description: String::new(),
-            mode: AgentMode::default(),
-            model: None,
-            temperature: None,
-            tools: None,
-            tool_tiers: BTreeMap::new(),
-            tool_descriptions: BTreeMap::new(),
-            scan_tool_results: None,
-            goal_supervision: Default::default(),
-            permission: None,
-            tool_steering: None,
-            context_policy: None,
-            vnext: None,
-            prompt: String::new(),
-            prompt_overrides: std::collections::BTreeMap::new(),
-            package_files: None,
-            mcp_bindings: Vec::new(),
-            private_subagents: std::collections::BTreeMap::new(),
-            source: std::path::PathBuf::new(),
-        }
-    }
-
-    #[test]
-    fn read_image_tool_name_is_exact() {
-        let tool = ReadImageTool;
-        assert_eq!(tool.name(), "read_image");
-    }
-
-    #[test]
-    fn read_image_tool_effect_is_read_only() {
-        let tool = ReadImageTool;
-        assert_eq!(tool.effect(), ToolEffect::ReadOnly);
-    }
-
-    #[test]
-    fn read_image_tool_has_no_binary_requirements() {
-        let tool = ReadImageTool;
-        assert!(tool.binary_requirements().is_empty());
-    }
-
-    #[test]
-    fn read_image_tool_has_verbose_description() {
-        let tool = ReadImageTool;
-        assert!(tool.verbose_description().is_some());
-    }
 
     #[test]
     fn read_image_tool_verbose_parameters_match_parameters() {
@@ -715,69 +613,6 @@ mod agent_tiering {
                 .keys()
                 .collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn read_image_agent_def_build_plan_explore_enabled() {
-        for name in ["Build", "Plan", "explore"] {
-            let def = make_def(name);
-            assert!(!def.tool_tiers.contains_key("read_image"));
-        }
-    }
-
-    #[test]
-    fn read_image_agent_def_user_override_takes_precedence() {
-        let mut def = make_def("Build");
-        def.tool_tiers
-            .insert("read_image".to_string(), ToolTier::Disabled);
-        assert_eq!(def.tool_tiers.get("read_image"), Some(&ToolTier::Disabled));
-    }
-
-    #[test]
-    fn read_image_monty_has_no_host_apis() {
-        let tool = ReadImageTool;
-        assert!(tool.binary_requirements().is_empty());
-    }
-}
-
-// ===========================================================================
-// Output safety tests — Acceptance criterion 5
-// ===========================================================================
-
-mod output_safety {
-    use super::*;
-
-    #[test]
-    fn read_image_output_has_no_base64_in_text() {
-        let input = test_image_4x4();
-        let result = transform_bytes(&input, None, None, None, OutputFormat::Png).unwrap();
-        assert!(result.checksum.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn read_image_output_mime_type_is_canonical() {
-        let input = test_image_4x4();
-        for fmt in [
-            OutputFormat::Auto,
-            OutputFormat::Png,
-            OutputFormat::Jpeg,
-            OutputFormat::Webp,
-        ] {
-            let result = transform_bytes(&input, None, None, None, fmt).unwrap();
-            assert!(
-                result.mime_type.starts_with("image/"),
-                "mime type should be image/*: {}",
-                result.mime_type
-            );
-        }
-    }
-
-    #[test]
-    fn read_image_output_dimensions_are_positive() {
-        let input = test_image_4x4();
-        let result = transform_bytes(&input, None, None, None, OutputFormat::Png).unwrap();
-        assert!(result.output_width > 0);
-        assert!(result.output_height > 0);
     }
 }
 

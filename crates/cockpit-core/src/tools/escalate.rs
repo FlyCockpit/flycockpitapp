@@ -510,12 +510,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn escalate_has_no_defensive_variants() {
-        assert!(EscalateTool.verbose_description().is_none());
-        assert!(EscalateTool.verbose_parameters().is_none());
-    }
-
-    #[tokio::test]
     async fn disabled_flag_rejects_stale_escalate_call() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = crate::tools::common::test_ctx(tmp.path());

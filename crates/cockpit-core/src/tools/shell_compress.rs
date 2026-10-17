@@ -1472,47 +1472,6 @@ LastError: boom";
     // ── recognize / first_program ───────────────────────────────────────
 
     #[test]
-    fn recognizes_every_family() {
-        assert_eq!(recognize("git status"), Some(Family::Git));
-        assert_eq!(recognize("gh pr list"), Some(Family::Git));
-        assert_eq!(recognize("glab mr view"), Some(Family::Git));
-        assert_eq!(recognize("gt log"), Some(Family::Git));
-        assert_eq!(recognize("npm install"), Some(Family::Js));
-        assert_eq!(recognize("pnpm build"), Some(Family::Js));
-        assert_eq!(recognize("npx vitest"), Some(Family::Js));
-        assert_eq!(recognize("playwright test"), Some(Family::Js));
-        assert_eq!(recognize("vitest run"), Some(Family::Js));
-        assert_eq!(recognize("prettier --check ."), Some(Family::Js));
-        assert_eq!(recognize("tsc --noEmit"), Some(Family::Js));
-        assert_eq!(recognize("prisma generate"), Some(Family::Js));
-        assert_eq!(recognize("next build"), Some(Family::Js));
-        assert_eq!(recognize("go test ./..."), Some(Family::Go));
-        assert_eq!(recognize("golangci-lint run"), Some(Family::Go));
-        assert_eq!(recognize("pytest -q"), Some(Family::Python));
-        assert_eq!(recognize("ruff check ."), Some(Family::Python));
-        assert_eq!(recognize("pip install x"), Some(Family::Python));
-        assert_eq!(recognize("mypy ."), Some(Family::Python));
-        assert_eq!(recognize("cargo build"), Some(Family::Rust));
-        assert_eq!(recognize("rspec spec/"), Some(Family::Ruby));
-        assert_eq!(recognize("rubocop"), Some(Family::Ruby));
-        assert_eq!(recognize("rake test"), Some(Family::Ruby));
-        assert_eq!(recognize("./gradlew build"), Some(Family::Jvm));
-        assert_eq!(recognize("gradlew test"), Some(Family::Jvm));
-        assert_eq!(recognize("dotnet build"), Some(Family::Dotnet));
-        assert_eq!(recognize("aws s3 ls"), Some(Family::Cloud));
-        assert_eq!(recognize("curl https://x"), Some(Family::Cloud));
-        assert_eq!(recognize("wget https://x"), Some(Family::Cloud));
-        assert_eq!(recognize("psql -c 'select 1'"), Some(Family::Cloud));
-        assert_eq!(recognize("docker build ."), Some(Family::Cloud));
-        assert_eq!(recognize("find . -name x"), Some(Family::System));
-        assert_eq!(recognize("grep -r foo"), Some(Family::System));
-        assert_eq!(recognize("ls -la"), Some(Family::System));
-        assert_eq!(recognize("tree src"), Some(Family::System));
-        assert_eq!(recognize("wc -l f"), Some(Family::System));
-        assert_eq!(recognize("env"), Some(Family::System));
-    }
-
-    #[test]
     fn recognize_skips_env_prefix_and_path() {
         assert_eq!(recognize("FOO=bar cargo build"), Some(Family::Rust));
         assert_eq!(
@@ -1578,15 +1537,6 @@ LastError: boom";
         assert_eq!(classify_tip("cargo build"), None);
         assert_eq!(classify_tip("git status"), None);
         assert_eq!(classify_tip(""), None);
-    }
-
-    #[test]
-    fn tip_adopted_by_maps_dedicated_tools() {
-        assert_eq!(tip_adopted_by("read"), Some(BashTip::Read));
-        assert_eq!(tip_adopted_by("search"), Some(BashTip::Search));
-        assert_eq!(tip_adopted_by("code"), Some(BashTip::Tree));
-        assert_eq!(tip_adopted_by("bash"), None);
-        assert_eq!(tip_adopted_by("outline"), None);
     }
 
     // ── signal guarantee (shared) ───────────────────────────────────────

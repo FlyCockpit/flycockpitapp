@@ -486,9 +486,11 @@ async fn hot_lists_recently_modified_hidden_files() {
 }
 
 #[tokio::test]
-async fn tree_lists_files_including_unknown_language_files() {
+async fn tree_marks_grammarless_data_and_parsed_symbol_counts() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
+    write(tmp.path(), "Cargo.toml", "[package]\nname = \"demo\"\n");
+    write(tmp.path(), "Dockerfile", "FROM scratch\n");
     write(tmp.path(), "scratch.unknownext", "notes\n");
     let ctx = test_ctx(tmp.path());
 
@@ -508,21 +510,6 @@ async fn tree_lists_files_including_unknown_language_files() {
         "{}",
         tree.content
     );
-}
-
-#[tokio::test]
-async fn tree_marks_grammarless_data_and_parsed_symbol_counts() {
-    let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "src/lib.rs", "pub fn k() {}\n");
-    write(tmp.path(), "Cargo.toml", "[package]\nname = \"demo\"\n");
-    write(tmp.path(), "Dockerfile", "FROM scratch\n");
-    let ctx = test_ctx(tmp.path());
-
-    let tree = CodeTool
-        .call(code_args("tree", serde_json::json!({})), &ctx)
-        .await
-        .unwrap();
-
     assert!(
         tree.content.contains("Cargo.toml  toml"),
         "{}",

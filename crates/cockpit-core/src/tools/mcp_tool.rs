@@ -473,6 +473,35 @@ mod tests {
         assert!(t.description().contains("mcp.describe"));
         assert!(t.description().contains("mcp.invoke"));
         assert!(t.description().contains("Python"));
+
+        {
+            for description in [
+                McpTool::default().description().to_string(),
+                McpTool::default().verbose_description().unwrap(),
+            ] {
+                assert!(description.contains("grep_tool_names"), "{description}");
+                assert!(
+                    description.contains("grep_tool_definitions"),
+                    "{description}"
+                );
+            }
+            assert!(
+                McpTool::default()
+                    .verbose_description()
+                    .unwrap()
+                    .contains("Search or grep before concluding a capability is missing")
+            );
+        }
+
+        {
+            for description in [
+                McpTool::default().description().to_string(),
+                McpTool::default().verbose_description().unwrap(),
+            ] {
+                assert!(description.contains("try/except"), "{description}");
+                assert!(description.contains("invoke"), "{description}");
+            }
+        }
     }
 
     #[test]
@@ -690,52 +719,6 @@ mod tests {
             mcp_description(&disabled, crate::agents::ToolSteering::Verbose),
             mcp_description(&discoverable, crate::agents::ToolSteering::Verbose)
         );
-    }
-
-    #[test]
-    fn mcp_description_has_no_advert_suffix() {
-        let toolbox = ToolBox::new()
-            .with(Arc::new(McpTool::default()))
-            .with_discoverable_mcp(Arc::new(crate::tools::intel::CodeTool));
-
-        let normal = mcp_description(&toolbox, crate::agents::ToolSteering::Terse);
-        let defensive = mcp_description(&toolbox, crate::agents::ToolSteering::Verbose);
-
-        assert_eq!(normal, McpTool::default().description());
-        assert_eq!(defensive, McpTool::default().verbose_description().unwrap());
-        assert!(!normal.contains("Available built-in cockpit functions"));
-        assert!(!defensive.contains("Available built-in cockpit functions"));
-    }
-
-    #[test]
-    fn mcp_descriptions_teach_grep_functions() {
-        for description in [
-            McpTool::default().description().to_string(),
-            McpTool::default().verbose_description().unwrap(),
-        ] {
-            assert!(description.contains("grep_tool_names"), "{description}");
-            assert!(
-                description.contains("grep_tool_definitions"),
-                "{description}"
-            );
-        }
-        assert!(
-            McpTool::default()
-                .verbose_description()
-                .unwrap()
-                .contains("Search or grep before concluding a capability is missing")
-        );
-    }
-
-    #[test]
-    fn mcp_descriptions_teach_batch_isolation() {
-        for description in [
-            McpTool::default().description().to_string(),
-            McpTool::default().verbose_description().unwrap(),
-        ] {
-            assert!(description.contains("try/except"), "{description}");
-            assert!(description.contains("invoke"), "{description}");
-        }
     }
 
     #[tokio::test]

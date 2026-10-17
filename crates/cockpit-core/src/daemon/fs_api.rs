@@ -1088,7 +1088,7 @@ async fn settings_snapshot_root(
     ctx: &DaemonContext,
     project_root: &str,
 ) -> Result<(PathBuf, Option<crate::config::trust::WorkspaceTrustPolicy>), ErrorPayload> {
-    let root = canonical_project_root(project_root)?;
+    let root = canonical_config_root(project_root)?;
     if is_global_config_root(&root)? {
         return Ok((root, None));
     }
@@ -2309,6 +2309,29 @@ fn sharee_secret_policy(
         dotenv_matcher: crate::gitignore::build_allowlist_matcher(root, &cfg.dotenv_patterns),
         gitignore_root: crate::gitignore::gitignore_stack_root(root),
     }))
+}
+
+/// Configuration authority remains the canonical global directory even when
+/// an explicit installation file makes that directory unnecessary. Resolve its
+/// missing tail without creating it; every workspace root still has to exist.
+/// This is deliberately separate from generic project/filesystem admission.
+pub(super) fn canonical_config_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {
+    let requested = Path::new(project_root);
+    if requested.is_absolute()
+        && is_global_config_root(requested)?
+        && cockpit_config::dirs::explicit_config_override()
+            .map_err(|error| bad_request(error.to_string()))?
+            .is_some()
+    {
+        match std::fs::symlink_metadata(requested) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return cockpit_host::path_containment::effective_path(requested).map_err(internal);
+            }
+            Err(error) => return Err(internal(error)),
+            Ok(_) => {}
+        }
+    }
+    canonical_project_root(project_root)
 }
 
 pub(crate) fn canonical_project_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {

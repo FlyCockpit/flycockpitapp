@@ -21931,7 +21931,7 @@ async fn daemon_provider_config_with_warnings(
     if project_root.trim().is_empty() {
         return Err(bad_request("project_root must not be empty"));
     }
-    let cwd = crate::daemon::fs_api::canonical_project_root(project_root)?;
+    let cwd = crate::daemon::fs_api::canonical_config_root(project_root)?;
     let trust_policy = resolve_user_level_trust_policy(ctx, &cwd).await?;
     if global_config_root(&cwd)? {
         // The installation-layer catalog: the `COCKPIT_CONFIG` override when
@@ -21976,7 +21976,18 @@ async fn resolve_user_level_trust_policy(
     cwd: &std::path::Path,
 ) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
     if global_config_root(cwd)? {
-        let root = crate::config::trust::resolve_trust_root(cwd).map_err(internal)?;
+        let root = if cwd.try_exists().map_err(internal)? {
+            crate::config::trust::resolve_trust_root(cwd).map_err(internal)?
+        } else {
+            // Apply the same missing-root admission to every user-level
+            // policy caller, including MCP. No read may scaffold this root.
+            let root = crate::daemon::fs_api::canonical_config_root(&cwd.display().to_string())?;
+            crate::config::trust::TrustRoot {
+                opened_path: root.clone(),
+                root,
+                kind: crate::config::trust::TrustRootKind::Directory,
+            }
+        };
         return Ok(crate::config::trust::WorkspaceTrustPolicy {
             root,
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,

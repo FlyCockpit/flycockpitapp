@@ -469,9 +469,10 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         (
             "PickConfig",
             Dialog::PickConfig {
-                dirs: vec![cockpit_config::dirs::ConfigDir {
+                files: vec![crate::tui::settings::SettingsConfigFile {
                     kind: cockpit_config::dirs::ConfigDirKind::Project,
-                    path: tmp.path().to_path_buf(),
+                    path: tmp.path().join("config.json"),
+                    request_root: tmp.path().to_path_buf(),
                 }],
                 cursor: 0,
                 cwd: tmp.path().to_path_buf(),

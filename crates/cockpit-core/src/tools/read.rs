@@ -163,10 +163,12 @@ impl Tool for ReadTool {
                     .await?
                 {
                     Some(table) => table,
+                    // A hub that owns no table has no serialized writer: the
+                    // file's values scrub this read only. Persisting a union of
+                    // this tool's snapshot here would overwrite entries another
+                    // producer committed after it (H1).
                     None => {
-                        let table = ctx.redact.with_approved_secret_file(cfg, &checked)?;
-                        ctx.session.persist_redaction_table(&table)?;
-                        std::sync::Arc::new(table)
+                        std::sync::Arc::new(ctx.redact.with_approved_secret_file(cfg, &checked)?)
                     }
                 };
                 let ToolOutput { content, .. } = &mut output;
@@ -826,7 +828,14 @@ mod tests {
         let file = tmp.path().join(".env.production");
         let secret = "long-approved-secret";
         std::fs::write(&file, format!("TOKEN={secret}\n")).unwrap();
-        let ctx = test_ctx(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
+        // Registration persists only through the session's table owner (the
+        // single locked writer); a detached test hub owns no table.
+        ctx.interrupts =
+            std::sync::Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+                std::sync::Arc::new(std::sync::RwLock::new(ctx.redact.clone())),
+                ctx.session.clone(),
+            ));
         ctx.session.add_gitignore_session_allow(".env.production");
         let out = ReadTool
             .call(serde_json::json!({ "path": file }), &ctx)

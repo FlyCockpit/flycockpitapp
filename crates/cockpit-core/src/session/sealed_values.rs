@@ -196,22 +196,15 @@ impl Session {
         machine_scoped_sealed_redactions(&self.db, &self.secret_vault).await
     }
 
-    /// Create a session-scoped value in the agent-acquired namespace. This is
-    /// deliberately a separate host path from owner create/rotate: it accepts
-    /// an already-minted acquisition id, creates version one only, and cannot
-    /// replace either a scoped or legacy owner-authored slot.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn create_agent_acquired_sealed_value(
-        &self,
-        redaction: &crate::redact::RedactionTable,
-        acquisition_id: &str,
+    /// `base` plus the agent-acquired sealed literal (validated), the table
+    /// [`Self::create_agent_acquired_sealed_value`] then journals and
+    /// persists.
+    pub(crate) fn agent_acquired_sealed_table(
+        base: &crate::redact::RedactionTable,
         record_id: &str,
         name: &str,
-        description: &str,
         value: &str,
-        source_tool_call_id: &str,
-        now_ms: i64,
-    ) -> Result<()> {
+    ) -> Result<crate::redact::RedactionTable> {
         validate_agent_acquired_sealed_value(name, value).map_err(anyhow::Error::from)?;
         let identity = crate::sealed::identity::SealedRedactionIdentity {
             scope: crate::sealed::identity::SealedScopeKind::Session,
@@ -219,7 +212,36 @@ impl Session {
             name: crate::sealed::identity::SealedName::canonical(name)?,
             version: 1,
         };
-        let unioned = redaction.with_forced_sealed_literal(value.to_owned(), identity)?;
+        base.with_forced_sealed_literal(value.to_owned(), identity)
+    }
+
+    /// Create a session-scoped value in the agent-acquired namespace. This is
+    /// deliberately a separate host path from owner create/rotate: it accepts
+    /// an already-minted acquisition id, creates version one only, and cannot
+    /// replace either a scoped or legacy owner-authored slot. `unioned` is the
+    /// table from [`Self::agent_acquired_sealed_table`]; the caller publishes
+    /// it live BEFORE awaiting this write (a cancelled write must never leave
+    /// the durable table ahead of the live one).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_agent_acquired_sealed_value(
+        &self,
+        unioned: &crate::redact::RedactionTable,
+        acquisition_id: &str,
+        record_id: &str,
+        name: &str,
+        description: &str,
+        value: &str,
+        source_tool_call_id: &str,
+        now_ms: i64,
+        mirror: Option<(&Session, &crate::redact::RedactionTable)>,
+    ) -> Result<()> {
+        if let Some((owner, _)) = mirror {
+            anyhow::ensure!(
+                std::sync::Arc::ptr_eq(self.secret_vault(), owner.secret_vault()),
+                "fork capture mirror must share its session vault authority"
+            );
+        }
+        validate_agent_acquired_sealed_value(name, value).map_err(anyhow::Error::from)?;
         let protected = crate::redact::protected_redaction_history::ProtectedLiteral::new(
             value.to_owned(),
             crate::redact::protected_redaction_history::RedactionHistorySource::Sealed,
@@ -245,13 +267,21 @@ impl Session {
         let write_json = unioned.to_persisted_json()?;
         let cache_json = write_json.clone();
         let vault = self.secret_vault.clone();
-        let session_id = self.live_id();
+        let (session_id, pending_commit) = self.begin_redaction_commit();
+        let mirror_write = mirror
+            .map(|(owner, table)| -> Result<_> {
+                let json = table.to_persisted_json()?;
+                let (id, permit) = owner.begin_redaction_commit();
+                Ok((owner.secret_vault().clone(), id, json, permit))
+            })
+            .transpose()?;
         let item_id = crate::secure_key::session_sealed_item_id(&session_id.to_string(), name, 1);
         let literal = value.to_owned();
         let reason = description.to_owned();
         let acquisition_id = acquisition_id.to_owned();
         let source_tool_call_id = source_tool_call_id.to_owned();
-        self.db
+        let (pending_commit, mirror_commit) = self
+            .db
             .transaction(move |conn| {
                 let exists: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM sessions WHERE session_id = ?1",
@@ -271,6 +301,18 @@ impl Session {
                         write_json.as_bytes(),
                     )
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let mirror_commit = match mirror_write {
+                    Some((mirror_vault, id, json, permit)) => {
+                        super::lifecycle::persist_redaction_table_to_vault_on_conn(
+                            &mirror_vault,
+                            conn,
+                            id,
+                            json.as_bytes(),
+                        )?;
+                        Some((id, json, permit))
+                    }
+                    None => None,
+                };
                 let row = crate::db::sealed_scope::create_agent_acquired_session_sealed_value_conn(
                     conn,
                     &record,
@@ -300,12 +342,20 @@ impl Session {
                     row.active_version == 1,
                     "agent-acquired create did not publish version one"
                 );
-                Ok(())
+                Ok((pending_commit, mirror_commit))
             })
             .await?;
         // Persist-before-swap: advertise the union as persisted only after the
         // vault write commits, matching [`Session::persist_redaction_table`].
-        *self.redaction_table_json.lock().unwrap() = Some(cache_json);
+        self.commit_redaction_cache(session_id, cache_json)?;
+        if let Some((id, json, permit)) = mirror_commit {
+            mirror
+                .expect("mirror commit has an owner")
+                .0
+                .commit_redaction_cache(id, json)?;
+            drop(permit);
+        }
+        drop(pending_commit);
         Ok(())
     }
 
@@ -508,10 +558,10 @@ impl Session {
         use crate::redact::protected_redaction_history::append_and_attach_conn;
 
         let json = table.to_persisted_json()?;
-        let session_id = self.live_id();
+        let (session_id, pending_commit) = self.begin_redaction_commit();
         let write_json = json.clone();
         let vault = self.secret_vault.clone();
-        let metadata = self
+        let (metadata, pending_commit) = self
             .db
             .transaction(move |conn| {
                 let exists: i64 = conn.query_row(
@@ -564,13 +614,14 @@ impl Session {
                     }
                     None => None,
                 };
-                Ok(metadata)
+                Ok((metadata, pending_commit))
             })
             .await?;
         // Persist-before-swap: advertise the union as persisted only after the
         // transaction commits, so a rollback never leaves a cache ahead of the
         // durable table.
-        *self.redaction_table_json.lock().unwrap() = Some(json);
+        self.commit_redaction_cache(session_id, json)?;
+        drop(pending_commit);
         if let Some((authority, key, _policy_digest)) = self.redaction_coverage() {
             authority.invalidate_key(&key);
         }

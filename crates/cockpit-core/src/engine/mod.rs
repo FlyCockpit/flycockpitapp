@@ -44,6 +44,7 @@ pub mod predict;
 pub mod preflight;
 pub(crate) mod prompt_fence;
 pub mod prune;
+pub(crate) mod redaction_owner;
 pub mod rehydrate;
 pub mod repair;
 pub mod resource_scheduler;

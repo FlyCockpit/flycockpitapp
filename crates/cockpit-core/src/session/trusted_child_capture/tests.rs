@@ -144,6 +144,7 @@ async fn exact_live_authority_captures_installs_redaction_and_consumes_single_us
         .verify_and_capture(
             &session,
             &table,
+            None,
             &authority.to_ingress(),
             SealedCaptureValue::new(SECRET.to_owned()),
             NOW_MS,
@@ -199,6 +200,7 @@ async fn exact_live_authority_captures_installs_redaction_and_consumes_single_us
         .verify_and_capture(
             &session,
             &installed,
+            None,
             &authority.to_ingress(),
             SealedCaptureValue::new(SECRET.to_owned()),
             NOW_MS,
@@ -345,6 +347,7 @@ async fn agent_capture_cannot_replace_an_owner_authored_slot() {
         .verify_and_capture(
             &session,
             &table,
+            None,
             &authority.to_ingress(),
             SealedCaptureValue::new(SECRET.to_owned()),
             NOW_MS,
@@ -546,6 +549,7 @@ async fn replay_after_consume_is_denied() {
         .verify_and_capture(
             &session,
             &RedactionTable::empty(),
+            None,
             &claim,
             SealedCaptureValue::new(SECRET.to_owned()),
             NOW_MS,
@@ -574,6 +578,7 @@ async fn expired_authority_is_denied_before_store() {
         .verify_and_capture(
             &session,
             &RedactionTable::empty(),
+            None,
             &authority.to_ingress(),
             SealedCaptureValue::new(SECRET.to_owned()),
             past_expiry,
@@ -594,6 +599,7 @@ async fn cancelled_authority_is_denied_before_store() {
         .verify_and_capture(
             &session,
             &RedactionTable::empty(),
+            None,
             &authority.to_ingress(),
             SealedCaptureValue::new(SECRET.to_owned()),
             NOW_MS,
@@ -652,9 +658,258 @@ async fn verify(
     reg.verify_and_capture(
         session,
         &RedactionTable::empty(),
+        None,
         claim,
         SealedCaptureValue::new(SECRET.to_owned()),
         NOW_MS,
     )
     .await
+}
+
+/// Secrets r2 C9: trusted capture serializes on the session's redaction
+/// owner and unions onto its LATEST table, so an observed-output value the
+/// backstop registered after the caller's turn snapshot survives in the
+/// durable table (and the captured literal also reaches the live table).
+#[tokio::test]
+async fn trusted_capture_preserves_a_later_observed_registration() {
+    let session = new_session();
+    let registry = TrustedChildCaptureRegistry::new();
+    let authority = begin(&registry, &session);
+    publish_audit(&session).await;
+    let stale = std::sync::Arc::new(RedactionTable::empty());
+    let live = std::sync::Arc::new(std::sync::RwLock::new(stale.clone()));
+    let (events, _rx) = tokio::sync::broadcast::channel(16);
+    let hub = crate::engine::interrupt::InterruptHub::new(
+        events,
+        live.clone(),
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        session.db.clone(),
+        session.id,
+    );
+    let observed = ["NovelObserved515", "Registration78529"].concat();
+    crate::tools::output_backstop::scrub_command_output(
+        &hub,
+        &session,
+        &stale,
+        &crate::config::extended::RedactConfig::default(),
+        &format!("DB_SECRET={observed}"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !session
+            .persisted_redaction_table()
+            .unwrap()
+            .unwrap()
+            .scrub(&observed)
+            .contains(&observed),
+        "precondition: the observed value is durable before the capture"
+    );
+    let outcome = registry
+        .verify_and_capture(
+            &session,
+            &stale,
+            hub.redaction_owner().map(|owner| owner.as_ref()),
+            &authority.to_ingress(),
+            SealedCaptureValue::new(SECRET.to_owned()),
+            NOW_MS,
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        TrustedChildCaptureOutcome::Captured {
+            record_id: RECORD_ID.to_owned()
+        }
+    );
+    let durable = session.persisted_redaction_table().unwrap().unwrap();
+    assert!(
+        !durable.scrub(&observed).contains(&observed),
+        "trusted capture overwrote the durable observed entry from its stale snapshot"
+    );
+    assert!(!live.read().unwrap().scrub(SECRET).contains(SECRET));
+}
+
+#[tokio::test]
+async fn codex_r2_fork_capture_reaches_its_next_round_table() {
+    let parent = std::sync::Arc::new(new_session());
+    let table = std::sync::Arc::new(RedactionTable::empty());
+    parent.persist_redaction_table(&table).unwrap();
+    let live = std::sync::Arc::new(std::sync::RwLock::new(table.clone()));
+    let hub = crate::engine::interrupt::InterruptHub::detached_owning(live.clone(), parent.clone());
+    let child = Session::create_fork(
+        parent.db.clone(),
+        parent.id,
+        None,
+        parent.redaction_key_resolver().clone(),
+        parent.secret_vault().clone(),
+    )
+    .unwrap();
+    assert_ne!(parent.id, child.id);
+    let registry = TrustedChildCaptureRegistry::new();
+    let authority = begin(&registry, &child);
+    publish_audit(&child).await;
+    let leaf = hub.leaf_sharing_redaction();
+    let outcome = registry
+        .verify_and_capture(
+            &child,
+            &table,
+            leaf.redaction_owner().map(|o| o.as_ref()),
+            &authority.to_ingress(),
+            SealedCaptureValue::new(SECRET.to_owned()),
+            NOW_MS,
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        TrustedChildCaptureOutcome::Captured {
+            record_id: RECORD_ID.to_owned()
+        }
+    );
+    assert!(
+        !child
+            .persisted_redaction_table()
+            .unwrap()
+            .unwrap()
+            .scrub(SECRET)
+            .contains(SECRET)
+    );
+    let next_round = leaf.current_live_redaction().unwrap();
+    assert!(
+        !next_round.scrub(SECRET).contains(SECRET),
+        "fork capture persisted child table but loop adopts parent-only table next round"
+    );
+}
+
+#[tokio::test]
+async fn review_r5_cancelled_fork_capture_keeps_parent_durable_custody() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open(&tmp.path().join("fork-cancel.db")).unwrap();
+    let parent = std::sync::Arc::new(
+        Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
+    let table = std::sync::Arc::new(RedactionTable::empty());
+    parent.persist_redaction_table(&table).unwrap();
+    let hub = crate::engine::interrupt::InterruptHub::detached_owning(
+        std::sync::Arc::new(std::sync::RwLock::new(table.clone())),
+        parent.clone(),
+    );
+    let child = Session::create_fork(
+        db.clone(),
+        parent.id,
+        None,
+        parent.redaction_key_resolver().clone(),
+        parent.secret_vault().clone(),
+    )
+    .unwrap();
+    let registry = TrustedChildCaptureRegistry::new();
+    let authority = begin(&registry, &child);
+    publish_audit(&child).await;
+    let leaf = hub.leaf_sharing_redaction();
+    let claim = authority.to_ingress();
+    let stall = db.stall_writer_for_test().unwrap();
+    let mut capture = Box::pin(registry.verify_and_capture(
+        &child,
+        &table,
+        leaf.redaction_owner().map(|o| o.as_ref()),
+        &claim,
+        SealedCaptureValue::new(SECRET.to_owned()),
+        NOW_MS,
+    ));
+    // Drive the asynchronous vault read and stop only once the real child
+    // transaction owns its commit permit behind the parked writer.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            assert!(futures::poll!(capture.as_mut()).is_pending());
+            if child
+                .pending_redaction_commits
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("capture must enqueue without blocking the runtime");
+    assert!(
+        !leaf
+            .current_live_redaction()
+            .unwrap()
+            .scrub(SECRET)
+            .contains(SECRET),
+        "precondition: mirror published before transaction await"
+    );
+    drop(capture);
+    drop(stall);
+    db.write(|_| Ok(())).await.unwrap();
+    assert!(
+        !child
+            .persisted_redaction_table()
+            .unwrap()
+            .unwrap()
+            .scrub(SECRET)
+            .contains(SECRET),
+        "precondition: cancelled child transaction committed"
+    );
+    assert!(
+        !parent
+            .persisted_redaction_table()
+            .unwrap()
+            .unwrap()
+            .scrub(SECRET)
+            .contains(SECRET),
+        "cancelled fork capture committed child custody but lost owning parent's durable mirror"
+    );
+}
+
+#[tokio::test]
+async fn review_r5_fork_mirror_failure_rolls_back_both_vaults() {
+    let parent = std::sync::Arc::new(new_session());
+    let table = std::sync::Arc::new(RedactionTable::empty());
+    parent.persist_redaction_table(&table).unwrap();
+    let hub = crate::engine::interrupt::InterruptHub::detached_owning(
+        std::sync::Arc::new(std::sync::RwLock::new(table.clone())),
+        parent.clone(),
+    );
+    let child = Session::create_fork(
+        parent.db.clone(),
+        parent.id,
+        None,
+        parent.redaction_key_resolver().clone(),
+        parent.secret_vault().clone(),
+    )
+    .unwrap();
+    let registry = TrustedChildCaptureRegistry::new();
+    let authority = begin(&registry, &child);
+    publish_audit(&child).await;
+    crate::session::lifecycle::fail_next_redaction_vault_write_for_test();
+    let outcome = registry
+        .verify_and_capture(
+            &child,
+            &table,
+            hub.redaction_owner().map(|owner| owner.as_ref()),
+            &authority.to_ingress(),
+            SealedCaptureValue::new(SECRET.to_owned()),
+            NOW_MS,
+        )
+        .await;
+    assert_eq!(outcome, TrustedChildCaptureOutcome::Denied);
+    assert!(!crate::session::lifecycle::redaction_vault_write_failure_armed_for_test());
+    assert_no_store(&child).await;
+    assert_eq!(
+        parent
+            .persisted_redaction_table()
+            .unwrap()
+            .unwrap()
+            .scrub(SECRET),
+        SECRET
+    );
+    assert_eq!(hub.current_live_redaction().unwrap().scrub(SECRET), SECRET);
 }

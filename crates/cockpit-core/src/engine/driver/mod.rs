@@ -2311,7 +2311,7 @@ impl Driver {
         if let Some(agent_instance_id) = agent_instance_id {
             driver.set_root_agent_instance_id(agent_instance_id);
         }
-        driver.interrupts = interrupts;
+        driver.set_interrupt_hub(interrupts);
         driver.approver = approver;
         driver.resource_scheduler = resource_scheduler;
         driver.set_vnext_local_installation_resolver(local_installations);
@@ -2418,6 +2418,7 @@ impl Driver {
             write_scope: self.write_scope.clone(),
             dream_read_scope: self.dream_read_scope.clone(),
             budget: self.budget.clone(),
+            interrupts: self.interrupts.clone(),
         };
         let schedule = ScheduleAuthority::new(
             job_event_tx,
@@ -2808,6 +2809,18 @@ impl Driver {
         let (noninteractive_complete_tx, noninteractive_complete_rx) =
             mpsc::channel::<BackgroundNoninteractiveCompletion>(JOB_CHANNEL_CAPACITY);
         let dream_read_scope = session.dream_read_scope();
+        // Until the session worker installs its hub ([`Self::set_interrupt_hub`]
+        // updates the schedule context too), the driver owns its session's
+        // accumulated redaction table through a detached, owner-bound hub: its
+        // refreshes and its tools' registrations still go through one locked
+        // writer persisting to this session.
+        let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(redact.clone())),
+            session.clone(),
+        ));
+        // Every consumer holds the owner-published (live-linked) table, so any
+        // scrub through a snapshot resolves to the owner's newest generation.
+        let redact = interrupts.current_live_redaction().unwrap_or(redact);
         let ctx = crate::engine::schedule::authority::ScheduleContext {
             session: session.clone(),
             locks: locks.clone(),
@@ -2822,6 +2835,7 @@ impl Driver {
             write_scope: None,
             dream_read_scope: dream_read_scope.clone(),
             budget: crate::engine::delegation_budget::BudgetPool::defaults(),
+            interrupts: interrupts.clone(),
         };
         let shared_budget = ctx.budget.share();
         // The authority needs the engine UI-event channel (`tx`) to emit
@@ -2847,7 +2861,8 @@ impl Driver {
             );
         }
         let root_target = crate::engine::message::QueueTarget::root(root.name.clone());
-        Self {
+        let linked_redact = redact.clone();
+        let mut driver = Self {
             session,
             locks,
             redact,
@@ -2931,7 +2946,7 @@ impl Driver {
             goal_scratch: None,
             pending_idle_reason: None,
             tool_recovery_projection_pending: false,
-            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            interrupts,
             skills_no_utility_model_logged: false,
             injection_no_scan_logged: false,
             preflight_override: None,
@@ -3003,7 +3018,14 @@ impl Driver {
             redaction_scan_dotenv_override: None,
             redaction_scan_ssh_keys_override: None,
             redaction_unsupported_notified: HashSet::new(),
-        }
+        };
+        // The root model was built on the caller's (unlinked) table: rebuild
+        // every model view on the owner-published one, so every send resolves
+        // through the owner's newest table.
+        driver
+            .set_redaction_table(linked_redact)
+            .expect("initial model redaction must bind to its session owner");
+        driver
     }
 
     /// Install a legacy plan-level model override before the main loop starts.
@@ -3024,6 +3046,25 @@ impl Driver {
         model.set_redact_table_for_config(providers, table)?;
         refreshed.model = Arc::new(model);
         Ok(Arc::new(refreshed))
+    }
+
+    /// Adopt every table write committed through this session's redaction
+    /// owner since the driver's snapshot (shell output backstop observations,
+    /// approved secret files, sealed adoptions) before the next provider
+    /// round. Egress (which re-scrubs the whole history) and the next round's
+    /// tools then cover a value registered earlier in the SAME turn, not only
+    /// from the next turn's refresh on. The owner's table is always a
+    /// monotonic union over the driver's own refreshes, so adopting it never
+    /// drops coverage.
+    fn adopt_live_redaction(&mut self) {
+        let Some(current) = self.interrupts.current_live_redaction() else {
+            return;
+        };
+        if !Arc::ptr_eq(&current, &self.redact) {
+            if let Err(err) = self.set_redaction_table(current) {
+                tracing::warn!(error = %err, "failed to adopt live redaction table");
+            }
+        }
     }
 
     fn set_redaction_table(&mut self, table: Arc<RedactionTable>) -> anyhow::Result<()> {
@@ -3048,6 +3089,7 @@ impl Driver {
                 Ok::<_, anyhow::Error>(Arc::new(refreshed))
             })
             .transpose()?;
+        self.tandem_set.refresh_redaction(providers, &table)?;
         for (frame, agent) in self.stack.iter_mut().zip(agents) {
             frame.agent = agent;
         }
@@ -3690,11 +3732,11 @@ impl Driver {
                     .await
                 {
                     Ok(Some(table)) => table,
+                    // A hub without a table owner has no serialized writer: an
+                    // unlocked union-and-persist here could overwrite entries
+                    // another producer committed. Fail closed instead.
                     Ok(None) => {
-                        let table = self.redact.union(&new_table)?;
-                        let table = Arc::new(table);
-                        self.session.persist_redaction_table(&table)?;
-                        table
+                        return Self::refuse_unredacted_send(tx, "coverage_unavailable").await;
                     }
                     Err(error) => return Self::refuse_unredacted_send(tx, error).await,
                 };
@@ -3738,7 +3780,12 @@ impl Driver {
     /// `set_turn_tx`: the channel-bearing dependency isn't known at
     /// construction.
     pub fn set_interrupt_hub(&mut self, hub: Arc<crate::engine::interrupt::InterruptHub>) {
+        self.schedule.set_interrupt_hub(hub.clone());
         self.interrupts = hub;
+        // Adopt the new owner's published (live-linked) table at once, so
+        // nothing between this swap and the next round scrubs through the
+        // detached hub's table.
+        self.adopt_live_redaction();
     }
 
     pub(crate) fn set_adopted_process_registry(
@@ -5876,6 +5923,7 @@ impl Driver {
                 self.maybe_auto_prune(tx).await;
             }
             self.open_native_computer_for_active_frame().await?;
+            self.adopt_live_redaction();
             let agent = {
                 let top = self.stack.last().expect("stack never empty");
                 top.agent.clone()
@@ -14441,6 +14489,7 @@ impl Driver {
                 self.maybe_auto_prune(tx).await;
             }
             self.open_native_computer_for_active_frame().await?;
+            self.adopt_live_redaction();
 
             let agent = {
                 let top = self.stack.last().expect("stack never empty");

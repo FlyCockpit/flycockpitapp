@@ -946,6 +946,224 @@ fn capture_schedule_events(driver: &mut Driver) -> mpsc::Receiver<TurnEvent> {
     rx
 }
 
+/// Secrets I2 through the driver's background completion path: a background
+/// job that prints another project's dotenv has the secret-keyed value
+/// replaced and REGISTERED in the session worker's live table when its
+/// `Completed` event is drained, so later echoes (keyless, encoded) are
+/// table-scrubbed at every boundary. The session worker's hub also reaches
+/// the schedule context scheduled forks mint their leaf hubs from.
+#[test]
+fn background_output_secret_is_scrubbed_and_registered_for_later_turns() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let (mut driver, _tmp) = test_driver_without_network(8);
+        driver.session.set_sandbox_enabled(false);
+        let live: crate::daemon::SharedRedactionTable =
+            Arc::new(std::sync::RwLock::new(driver.redact.clone()));
+        let (events, _events_rx) = tokio::sync::broadcast::channel(16);
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            live.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            driver.session.db.clone(),
+            driver.session.id,
+        ));
+        driver.set_interrupt_hub(hub.clone());
+        assert!(
+            Arc::ptr_eq(
+                &driver.schedule.schedule_context_for_tests().interrupts,
+                &hub
+            ),
+            "scheduled forks must reach the session worker's hub"
+        );
+
+        let stripe = ["zq8Hc2Lm", "N4pR7tV1wX3y"].concat();
+        // Another project, outside this session's workspace: no table
+        // source (env, workspace dotenv walk) ever sees the value.
+        let other = tempfile::tempdir().unwrap();
+        let other_env = other.path().join(".env");
+        std::fs::write(
+            &other_env,
+            format!("NODE_ENV=production\nSTRIPE_SECRET_KEY={stripe}\n"),
+        )
+        .unwrap();
+        let echo = format!("a log line also showed {stripe}");
+        assert!(
+            live.read().unwrap().scrub(&echo).contains(&stripe),
+            "precondition: the session table has never seen the value"
+        );
+        let (approver, _approval_hub) = install_background_approver(&mut driver);
+        let command = format!("cat '{}'", other_env.display());
+        grant_background_command(&approver, &command).await;
+        let out = driver
+            .dispatch_schedule_action(&serde_json::json!({
+                "action": "background.start",
+                "args": { "command": command }
+            }))
+            .await
+            .unwrap();
+        assert!(out.starts_with("started background"), "got {out}");
+        let completed = driver
+            .job_event_rx
+            .recv()
+            .await
+            .expect("background runner sends one terminal event");
+        let crate::engine::schedule::ScheduleEvent::Completed { result, .. } = &completed else {
+            panic!("background runner must complete: {completed:?}");
+        };
+        // Scrubbed at intake (r2 C7): the job result never carries the value.
+        assert!(!result.contains(&stripe), "{result}");
+
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+        let (tx, _rx) = mpsc::channel(4096);
+        // The injected turn itself may be refused downstream (no provider);
+        // the backstop runs before injection either way.
+        let _ = driver.run_job_event(completed, &queue, &tx).await;
+
+        let live = live.read().unwrap().clone();
+        assert!(
+            !live.scrub(&echo).contains(&stripe),
+            "the drained background result registered the value"
+        );
+        let durable = driver.session.persisted_redaction_table().unwrap().unwrap();
+        assert!(!durable.scrub(&echo).contains(&stripe));
+    });
+}
+
+/// Secrets r2 C7: a background job that prints a novel PEM private key is
+/// scrubbed AS IT ARRIVES, so a short `background.tail` (whose window would
+/// omit the BEGIN fence) and the completion result never carry a body line.
+#[test]
+fn background_tail_never_returns_novel_pem_body_lines() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let (mut driver, _tmp) = test_driver_without_network(8);
+        driver
+            .set_redaction_table(Arc::new(crate::redact::RedactionTable::empty()))
+            .unwrap();
+        driver.session.set_sandbox_enabled(false);
+        let live: crate::daemon::SharedRedactionTable =
+            Arc::new(std::sync::RwLock::new(driver.redact.clone()));
+        let (events, _events_rx) = tokio::sync::broadcast::channel(16);
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            live.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            driver.session.db.clone(),
+            driver.session.id,
+        ));
+        driver.set_interrupt_hub(hub);
+        let other = tempfile::tempdir().unwrap();
+        let path = other.path().join("key.txt");
+        let secret = ["b3BlbnNzaC1rZXktdjEAAAAA", "Novel515PrivateKeyBody78529"].concat();
+        std::fs::write(
+            &path,
+            format!(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nFirst515Base64BodyLineNotKnown78529\nSecond515Base64BodyLineNotKnown78529\n{secret}\n-----END OPENSSH PRIVATE KEY-----\n" // pragma: allowlist secret
+            ),
+        )
+        .unwrap();
+        let command = format!("cat '{}'", path.display());
+        let (approver, _approval_hub) = install_background_approver(&mut driver);
+        grant_background_command(&approver, &command).await;
+        let out = driver
+            .dispatch_schedule_action(&serde_json::json!({
+                "action": "background.start",
+                "args": { "command": command }
+            }))
+            .await
+            .unwrap();
+        let job_id = out.split('`').nth(1).unwrap().to_string();
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            driver.job_event_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let crate::engine::schedule::ScheduleEvent::Completed { result, .. } = &completed else {
+            panic!("expected completed: {completed:?}");
+        };
+        assert!(!result.contains(&secret), "{result}");
+        assert!(
+            !result.contains("First515Base64BodyLineNotKnown78529"),
+            "{result}"
+        );
+        let tail = driver
+            .dispatch_schedule_action(&serde_json::json!({
+                "action": "background.tail",
+                "args": { "job_id": job_id, "lines": 3 }
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !tail.contains(&secret),
+            "PEM body leaked through tail: {tail}"
+        );
+        assert!(
+            !tail.contains("Second515Base64BodyLineNotKnown78529"),
+            "{tail}"
+        );
+        assert!(
+            !live.read().unwrap().scrub(&secret).contains(&secret),
+            "the body line was registered at intake"
+        );
+    });
+}
+
+/// Secrets r2 C3: a registration committed through the session's redaction
+/// owner mid-turn is adopted before the driver's next provider round, so the
+/// round's egress table (which re-scrubs the whole history) and its tools'
+/// tables cover the value within the SAME turn.
+#[tokio::test]
+async fn mid_turn_registrations_reach_the_next_round_egress_table() {
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let live: crate::daemon::SharedRedactionTable =
+        Arc::new(std::sync::RwLock::new(driver.redact.clone()));
+    let (events, _events_rx) = tokio::sync::broadcast::channel(16);
+    let hub = Arc::new(crate::engine::interrupt::InterruptHub::new(
+        events,
+        live,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        driver.session.db.clone(),
+        driver.session.id,
+    ));
+    driver.set_interrupt_hub(hub.clone());
+    let secret = ["NovelMidTurn515", "Secret78529"].concat();
+    let echo = format!("history line with {secret}");
+    let snapshot = driver.redact.clone();
+    crate::tools::output_backstop::scrub_command_output(
+        &hub,
+        &driver.session,
+        &driver.redact,
+        &crate::config::extended::RedactConfig::default(),
+        &format!("DB_SECRET={secret}"),
+    )
+    .await
+    .unwrap();
+    // r3 (R2): the round snapshot is the owner-published table; without any
+    // adoption it already resolves the later registration through its live
+    // link, so no send path holding it can render stale.
+    assert!(
+        Arc::ptr_eq(&snapshot, &driver.redact),
+        "precondition: nothing adopted yet"
+    );
+    assert!(
+        !snapshot.scrub(&echo).contains(&secret),
+        "round snapshot rendered with a stale table"
+    );
+    driver.adopt_live_redaction();
+    assert!(!driver.redact.scrub(&echo).contains(&secret));
+    let egress = driver.stack[0].agent.model.session_redact_table();
+    assert!(!egress.scrub(&echo).contains(&secret), "model egress table");
+    assert!(
+        !driver
+            .schedule
+            .redaction_table()
+            .scrub(&echo)
+            .contains(&secret)
+    );
+}
+
 fn install_background_approver(
     driver: &mut Driver,
 ) -> (
@@ -1585,5 +1803,152 @@ async fn followup_reuse_decision_no_cache_provider() {
     assert_eq!(
         driver.followup_reuse_decision(),
         crate::engine::prune::FollowupReuse::NoCacheReuse
+    );
+}
+
+#[tokio::test]
+async fn codex_r2_compaction_provider_uses_current_owner_table() {
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text(
+            "A sufficiently detailed compact brief with several useful facts and no repetition."
+                .repeat(40),
+        ))
+        .start()
+        .await;
+    let (mut driver, _tmp) = test_driver_with_url(8, provider.base_url());
+    driver.test_compact_brief_calls = None;
+    driver.test_compact_brief_script = None;
+    let secret = "NovelCompact515Secret78529";
+    let hub = driver.interrupts.clone();
+    crate::tools::output_backstop::scrub_command_output(
+        &hub,
+        &driver.session,
+        &driver.redact,
+        &crate::config::extended::RedactConfig::default(),
+        &format!("DB_SECRET={secret}"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !hub.current_live_redaction()
+            .unwrap()
+            .scrub(secret)
+            .contains(secret)
+    );
+    assert!(
+        !driver.redact.scrub(secret).contains(secret),
+        "snapshot table must resolve through the owner live link"
+    );
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let draft = driver
+        .compact_brief_draft(
+            &tx,
+            vec![Message::user(format!(
+                "earlier ordinary read contains {secret}"
+            ))],
+            Arc::new(std::sync::Mutex::new(
+                crate::engine::driver::context_reduction::CompactPreparationQuota::default(),
+            )),
+        )
+        .await;
+    let _outcome = crate::engine::driver::context_reduction::execute_compact_brief(
+        draft,
+        "summarize".into(),
+        "codex_r2_compact_probe",
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let requests: Vec<_> = provider
+        .captured()
+        .into_iter()
+        .filter(|r| r.request_line.starts_with("POST "))
+        .collect();
+    assert_eq!(
+        requests.len(),
+        1,
+        "precondition: a real compact utility request must be sent"
+    );
+    let payload = serde_json::to_string(&requests[0].body).unwrap();
+    assert!(
+        !payload.contains(secret),
+        "compaction sent registered value using old model table: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn codex_r2_tandem_provider_uses_current_owner_table() {
+    use crate::engine::schedule::tandem::{TandemDispatch, TandemSet, TandemTarget};
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("shadow completed".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = test_driver_with_url(8, provider.base_url());
+    let old_model = driver.stack[0].agent.model.clone();
+    let mut tandem = TandemSet::default();
+    tandem.set(vec![TandemTarget {
+        provider: "lmstudio".into(),
+        model: "local".into(),
+        handle: old_model,
+    }]);
+    let secret = "NovelTandem515Secret78529";
+    let hub = driver.interrupts.clone();
+    crate::tools::output_backstop::scrub_command_output(
+        &hub,
+        &driver.session,
+        &driver.redact,
+        &crate::config::extended::RedactConfig::default(),
+        &format!("DB_SECRET={secret}"),
+    )
+    .await
+    .unwrap();
+    driver.adopt_live_redaction();
+    let prompt = Message::user(format!("ordinary raw history read contains {secret}"));
+    let current_main = driver.stack[0]
+        .agent
+        .model
+        .assemble_dispatch_request(
+            "",
+            &[],
+            &prompt,
+            &[],
+            &crate::engine::model::ModelParams::default(),
+        )
+        .unwrap();
+    assert!(
+        !current_main.to_string().contains(secret),
+        "precondition: current primary redacts"
+    );
+    crate::engine::schedule::tandem::dispatch_turn(
+        &driver.session,
+        &tandem,
+        TandemDispatch {
+            parent_call_id: uuid::Uuid::new_v4().to_string(),
+            agent: "Build".into(),
+            system: String::new(),
+            history: vec![],
+            prompt,
+            tools: vec![],
+            params: crate::engine::model::ModelParams::default(),
+        },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), provider.next_request())
+        .await
+        .unwrap();
+    let requests: Vec<_> = provider
+        .captured()
+        .into_iter()
+        .filter(|r| r.request_line.starts_with("POST "))
+        .collect();
+    assert_eq!(
+        requests.len(),
+        1,
+        "precondition: actual shadow request captured"
+    );
+    let body = serde_json::to_string(&requests[0].body).unwrap();
+    assert!(
+        !body.contains(secret),
+        "current primary redacted but pinned tandem sent registered value: {body}"
     );
 }

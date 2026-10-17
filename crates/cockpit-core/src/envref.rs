@@ -17,7 +17,7 @@
 
 use std::env;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct Resolved {
     pub value: String,
     /// References that were not found, in encounter order. Environment refs
@@ -29,6 +29,20 @@ pub struct Resolved {
     /// Syntax errors in env references. Callers that send requests with
     /// resolved values should fail rather than forwarding literals.
     pub errors: Vec<String>,
+}
+
+// `value` is the expanded string: it routinely carries the resolved secret
+// (`Bearer <token>`). Diagnostics get its length and the reference names only.
+impl std::fmt::Debug for Resolved {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Resolved")
+            .field("value_len", &self.value.len())
+            .field("missing", &self.missing)
+            .field("referenced", &self.referenced)
+            .field("errors", &self.errors)
+            .finish()
+    }
 }
 
 impl Resolved {
@@ -239,8 +253,12 @@ fn take_braced_var_name(rest: &[u8], offset: usize) -> Result<Option<(&str, usiz
     let name = std::str::from_utf8(name_bytes)
         .map_err(|_| format!("invalid braced env reference at byte {offset}"))?;
     if !valid_var_name(name.as_bytes()) {
+        // Never echo the braced text: an invalid "name" such as
+        // `X:-<literal default>` can be the very credential the owner typed.
+        // The error carries the byte offset and length only.
         return Err(format!(
-            "invalid braced env variable name `{name}` at byte {offset}"
+            "invalid braced env variable name ({} bytes) at byte {offset}",
+            name.len()
         ));
     }
     Ok(Some((name, end + 3)))
@@ -444,5 +462,28 @@ mod tests {
             r.value
         );
         assert!(r.has_missing() || r.value.contains("$SEALED_PROD_TOKEN"));
+    }
+}
+
+#[cfg(test)]
+mod value_free_tests {
+    use super::*;
+
+    /// Secrets r2 C1/C8: the resolved value and invalid-reference errors
+    /// never carry the resolved or literal credential.
+    #[test]
+    fn resolved_debug_and_errors_are_value_free() {
+        let secret = ["NovelEnv515", "Secret78529"].concat();
+        let resolved = resolve_with_sources("Bearer $TOKEN", |_| Some(secret.clone()), |_| None);
+        assert_eq!(resolved.value, format!("Bearer {secret}"));
+        assert!(!format!("{resolved:?}").contains(&secret));
+        let literal = ["NovelDefault515", "Secret78529"].concat();
+        let invalid =
+            resolve_with_sources(&format!("Bearer ${{X:-{literal}}}"), |_| None, |_| None);
+        assert!(invalid.has_errors());
+        for error in &invalid.errors {
+            assert!(!error.contains(&literal), "{error}");
+        }
+        assert!(!format!("{invalid:?}").contains(&literal));
     }
 }

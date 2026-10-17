@@ -99,7 +99,7 @@ pub struct OauthAuth {
 
 /// Static-header config: a header name + value. The value may carry
 /// `$VAR` references resolved through `envref.rs` at launch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeaderAuth {
     /// Header name. Defaults to `Authorization`.
     #[serde(default = "default_header_name")]
@@ -112,13 +112,26 @@ pub struct HeaderAuth {
     pub credential_ref: Option<String>,
 }
 
+// The header value is routinely a literal bearer token: diagnostics get the
+// header name and whether a value is present, never the value.
+impl std::fmt::Debug for HeaderAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HeaderAuth")
+            .field("header", &self.header)
+            .field("value_present", &!self.value.is_empty())
+            .field("credential_ref", &self.credential_ref)
+            .finish()
+    }
+}
+
 fn default_header_name() -> String {
     "Authorization".to_string()
 }
 
 /// Env-injection config: a map of env-var name → value (values may carry
 /// `$VAR` references resolved at launch). Primarily for stdio servers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct EnvAuth {
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
@@ -127,8 +140,20 @@ pub struct EnvAuth {
     pub credential_refs: BTreeMap<String, String>,
 }
 
+// Env values are credentials or `$VAR` references: diagnostics get the
+// variable names only.
+impl std::fmt::Debug for EnvAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvAuth")
+            .field("var_names", &self.vars.keys().collect::<Vec<_>>())
+            .field("credential_refs", &self.credential_refs)
+            .finish()
+    }
+}
+
 /// One configured MCP server.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub transport: Transport,
 
@@ -182,6 +207,36 @@ pub struct ServerConfig {
     /// [`Self::auth`] block is the implicit `default` profile.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Auth>,
+}
+
+// Subprocess env values (and arguments, which can carry `--api-key=…`) are
+// credentials or `$VAR` references: diagnostics get the variable names and an
+// argument count only. `auth` / `profiles` print through their own
+// value-free `Debug`.
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerConfig")
+            .field("transport", &self.transport)
+            .field(
+                "endpoint",
+                &self
+                    .endpoint
+                    .as_deref()
+                    .map(crate::config::value_free::redacted_url),
+            )
+            .field("command", &self.command)
+            .field("argument_count", &self.args.len())
+            .field("env_names", &self.env.keys().collect::<Vec<_>>())
+            .field("env_credential_refs", &self.env_credential_refs)
+            .field("auth", &self.auth)
+            .field("enabled", &self.enabled)
+            .field("cache_ttl_secs", &self.cache_ttl_secs)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("profiles", &self.profiles)
+            .finish()
+    }
 }
 
 /// Whether this server carries credential-store references, OAuth state, or
@@ -402,10 +457,16 @@ impl McpConfig {
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
-        let value: serde_json::Value = serde_json::from_str(raw).context("parsing mcp.json")?;
+        // Errors are value-free: a malformed credential field must not echo its
+        // bytes (`invalid type: string "<secret>"`) into the error chain.
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| crate::config::value_free::json_error(&error))
+            .context("parsing mcp.json")?;
         reject_sealed_env_keys_in_mcp_value(&value)?;
         reject_reserved_builtin_server(&value)?;
-        serde_json::from_value(value).context("parsing mcp.json")
+        serde_json::from_value(value)
+            .map_err(|error| crate::config::value_free::json_error(&error))
+            .context("parsing mcp.json")
     }
 
     /// Load and merge every parseable `mcp.json` layer for `cwd`, or defaults
@@ -686,6 +747,50 @@ pub fn restore_owner_view_redactions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Secrets I1 class sweep: configured MCP env values, `Auth::Env` vars,
+    /// static header values and stdio arguments never reach `{:?}` output of
+    /// the config types (or of `McpConfig`, which derives through them).
+    #[test]
+    fn mcp_config_debug_never_prints_env_or_secret_values() {
+        const SENTINEL: &str = "mcpDebugSentinel7f3a9c";
+        let env_auth = Auth::Env(EnvAuth {
+            vars: BTreeMap::from([("API_TOKEN".to_string(), format!("env-auth-{SENTINEL}"))]),
+            credential_refs: BTreeMap::new(),
+        });
+        let header_auth = Auth::Header(HeaderAuth {
+            header: "Authorization".to_string(),
+            value: format!("Bearer header-{SENTINEL}"),
+            credential_ref: None,
+        });
+        let server = ServerConfig {
+            transport: Transport::Stdio,
+            endpoint: None,
+            command: Some("mcp-server".to_string()),
+            args: vec![format!("--api-key=arg-{SENTINEL}")],
+            env: BTreeMap::from([("SERVICE_URL".to_string(), format!("env-{SENTINEL}"))]),
+            env_credential_refs: BTreeMap::new(),
+            auth: env_auth,
+            enabled: true,
+            cache_ttl_secs: 3600,
+            connect_timeout_secs: None,
+            timeout_secs: None,
+            profiles: BTreeMap::from([("alt".to_string(), header_auth)]),
+        };
+        let config = McpConfig {
+            servers: BTreeMap::from([("demo".to_string(), server.clone())]),
+        };
+        for rendered in [
+            format!("{server:?}"),
+            format!("{server:#?}"),
+            format!("{config:?}"),
+        ] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+            // Names stay diagnosable.
+            assert!(rendered.contains("SERVICE_URL"), "{rendered}");
+            assert!(rendered.contains("API_TOKEN"), "{rendered}");
+        }
+    }
 
     fn server(auth: Auth) -> ServerConfig {
         ServerConfig {
@@ -1227,6 +1332,67 @@ mod tests {
         assert!(
             !cfg.servers.contains_key("override"),
             "COCKPIT_CONFIG points at config.json only, not sibling mcp.json"
+        );
+    }
+}
+
+#[cfg(test)]
+mod value_free_tests {
+    use super::*;
+
+    /// Secrets r2 C8: a malformed credential-bearing field never echoes its
+    /// value through the parse error chain.
+    #[test]
+    fn malformed_env_parse_error_does_not_print_the_value() {
+        let secret = ["NovelConfigError515", "Secret78529"].concat();
+        let error = McpConfig::parse(&format!(
+            r#"{{"servers":{{"demo":{{"transport":"stdio","command":"server","env":"{secret}"}}}}}}"#
+        ))
+        .unwrap_err();
+        let diagnostic = format!("{error:#} / {error:?}");
+        assert!(!diagnostic.contains(&secret), "{diagnostic}");
+        assert!(diagnostic.contains("parsing mcp.json"), "{diagnostic}");
+    }
+
+    /// Secrets r2 C1: a credential-bearing endpoint (userinfo, query token)
+    /// prints redacted.
+    #[test]
+    fn server_endpoint_debug_is_redacted() {
+        let secret = ["NovelEndpoint515", "Secret78529"].concat();
+        let server = ServerConfig {
+            transport: Transport::Streamable,
+            endpoint: Some(format!(
+                "https://u:{secret}@mcp.example.test/sse?key={secret}"
+            )),
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            env_credential_refs: BTreeMap::new(),
+            auth: Auth::None,
+            enabled: true,
+            cache_ttl_secs: 3600,
+            connect_timeout_secs: None,
+            timeout_secs: None,
+            profiles: BTreeMap::new(),
+        };
+        let rendered = format!("{server:?}");
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(rendered.contains("mcp.example.test/sse"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod codex_r2_error_probe {
+    use super::*;
+    #[test]
+    fn codex_r2_escaped_quote_error_is_value_free() {
+        let secret = "NovelQuotedError515Secret78529";
+        let input=serde_json::json!({"servers":{"demo":{"transport":"stdio","command":"server","env":format!("prefix\"{secret}\"suffix")}}}).to_string();
+        let error = McpConfig::parse(&input).unwrap_err();
+        let diagnostic = format!("{error:#} / {error:?}");
+        assert!(
+            !diagnostic.contains(secret),
+            "parse diagnostic leaked: {diagnostic}"
         );
     }
 }

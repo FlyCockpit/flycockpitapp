@@ -404,11 +404,24 @@ pub enum AgentDecisionAnswer {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSnapshotWire {
     pub source: EnvSnapshotSource,
     pub digest: String,
     pub vars: HashMap<String, String>,
+}
+
+impl fmt::Debug for EnvSnapshotWire {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Environment values routinely carry credentials. Diagnostics get the
+        // source, digest and a key count, never names-to-values.
+        formatter
+            .debug_struct("EnvSnapshotWire")
+            .field("source", &self.source)
+            .field("digest", &self.digest)
+            .field("key_count", &self.vars.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,12 +522,23 @@ pub enum McpConfigPatchOperation {
     DeleteAuthoredServer { name: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderHeaderView {
     pub name: String,
     pub value: String,
     #[serde(default)]
     pub redacted: bool,
+}
+
+// An owner's provider view may carry the literal header value: name only.
+impl std::fmt::Debug for ProviderHeaderView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderHeaderView")
+            .field("name", &self.name)
+            .field("redacted", &self.redacted)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1944,12 +1968,24 @@ pub struct RemoteReplayResponse {
 }
 
 #[cfg(feature = "remote")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReplayAck {
     pub id: Uuid,
     pub delivery_id: CanonicalRfcUuidV1,
     pub lease_token: CanonicalRfcUuidV1,
+}
+
+#[cfg(feature = "remote")]
+impl std::fmt::Debug for RemoteReplayAck {
+    /// The lease token authorizes acknowledging the delivery: not printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteReplayAck")
+            .field("id", &self.id)
+            .field("delivery_id", &self.delivery_id)
+            .field("lease_token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[cfg(feature = "remote")]
@@ -1961,7 +1997,7 @@ pub struct RemoteReplayAckResponse {
 }
 
 #[cfg(feature = "remote")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteOutboxDeliveryV1 {
     pub event_seq: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
@@ -1970,6 +2006,22 @@ pub struct RemoteOutboxDeliveryV1 {
     pub canonical_payload: Vec<u8>,
     pub lease_token: CanonicalRfcUuidV1,
     pub lease_expires_at_ms: i64,
+}
+
+#[cfg(feature = "remote")]
+impl std::fmt::Debug for RemoteOutboxDeliveryV1 {
+    /// The lease token authorizes acknowledging the delivery, and the
+    /// payload is session content: neither is printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteOutboxDeliveryV1")
+            .field("event_seq", &self.event_seq)
+            .field("delivery_id", &self.delivery_id)
+            .field("kind", &self.kind)
+            .field("canonical_payload_len", &self.canonical_payload.len())
+            .field("lease_token", &"<redacted>")
+            .field("lease_expires_at_ms", &self.lease_expires_at_ms)
+            .finish()
+    }
 }
 
 #[cfg(feature = "remote")]
@@ -6038,6 +6090,50 @@ mod proto_fixture_files {
 mod tests {
     use super::*;
     use crate::send_user_message::MessageIngress;
+
+    #[test]
+    fn env_snapshot_wire_debug_never_prints_values() {
+        const SENTINEL: &str = "sk-live-debug-sentinel-7f3a9c";
+        let wire = EnvSnapshotWire {
+            source: EnvSnapshotSource::TuiShell,
+            digest: "digest".to_string(),
+            vars: HashMap::from([
+                ("OPENAI_API_KEY".to_string(), SENTINEL.to_string()),
+                ("PLAIN".to_string(), format!("prefix-{SENTINEL}")),
+            ]),
+        };
+        let rendered = format!("{wire:?}");
+        assert!(!rendered.contains(SENTINEL), "{rendered}");
+        assert!(rendered.contains("key_count: 2"), "{rendered}");
+        let pretty = format!("{wire:#?}");
+        assert!(!pretty.contains(SENTINEL), "{pretty}");
+
+        let request = crate::Request::Attach {
+            session_id: None,
+            since_seq: None,
+            project_root: None,
+            initial_model: None,
+            no_sandbox: false,
+            interactive: true,
+            session_entry_mode: NonCodeSessionEntryMode::Assistant,
+            model_override: None,
+            env_snapshot: Some(wire.clone()),
+            env_policy: EnvDriftPolicy::Client,
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(SENTINEL), "{rendered}");
+
+        let options = crate::acp::CodeRootAttachOptionsV1 {
+            initial_model: None,
+            model_override: None,
+            no_sandbox: false,
+            interactive: true,
+            env_snapshot: Some(wire),
+            env_policy: EnvDriftPolicy::Client,
+        };
+        let rendered = format!("{options:?}");
+        assert!(!rendered.contains(SENTINEL), "{rendered}");
+    }
 
     #[cfg(feature = "remote")]
     #[test]

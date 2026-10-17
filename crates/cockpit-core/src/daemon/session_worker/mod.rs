@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::daemon::proto;
 use crate::daemon::{
     EventReceiver, EventSender, SharedRedactionTable, current_redaction, send_current_event,
-    send_event, set_current_redaction,
+    send_event,
 };
 use crate::engine::builtin::{self, SpawnArgs};
 use crate::engine::model::{Model, ModelParams};
@@ -601,25 +601,19 @@ async fn refresh_redaction_for_turn(
             .await
         {
             Ok(new_table) => {
-                let _redaction_guard = interrupts.lock_redaction_table_write().await;
-                let base = current_redaction(&accumulated_redact);
-                match base.union(&new_table) {
+                match interrupts
+                    .refresh_owned_redaction(accumulated_redact, session, &new_table)
+                    .await
+                {
                     Ok(unioned) => {
-                        let unioned = std::sync::Arc::new(unioned);
-                        match session.persist_redaction_table(&unioned) {
-                            Ok(()) => {
-                                set_current_redaction(&accumulated_redact, unioned.clone());
-                                session.set_redaction_coverage(
-                                    authority.clone(),
-                                    coverage_key,
-                                    policy_digest,
-                                );
-                                Ok(unioned)
-                            }
-                            Err(error) => Err(anyhow::anyhow!(error)),
-                        }
+                        session.set_redaction_coverage(
+                            authority.clone(),
+                            coverage_key,
+                            policy_digest,
+                        );
+                        Ok(unioned)
                     }
-                    Err(error) => Err(anyhow::anyhow!(error)),
+                    Err(error) => Err(error),
                 }
             }
             Err(error) => Err(anyhow::anyhow!(error.to_string())),

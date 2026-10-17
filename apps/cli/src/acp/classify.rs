@@ -50,7 +50,7 @@ pub enum InboundMessage {
     Response(InboundResponse),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InboundRequest {
     pub id: JsonRpcId,
     pub method: String,
@@ -59,7 +59,7 @@ pub struct InboundRequest {
     pub raw: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InboundNotification {
     pub method: String,
     pub raw_params: Option<String>,
@@ -67,12 +67,51 @@ pub struct InboundNotification {
     pub raw: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InboundResponse {
     pub id: JsonRpcId,
     pub result: Option<RawNode>,
     pub error: Option<RawNode>,
     pub raw: String,
+}
+
+// The raw frame and raw params carry forwarded MCP env/header values
+// verbatim: Debug shows the id, method, structure and lengths only.
+impl std::fmt::Debug for InboundRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InboundRequest")
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("raw_params_len", &self.raw_params.as_ref().map(String::len))
+            .field("params", &self.params)
+            .field("raw_len", &self.raw.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for InboundNotification {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InboundNotification")
+            .field("method", &self.method)
+            .field("raw_params_len", &self.raw_params.as_ref().map(String::len))
+            .field("params", &self.params)
+            .field("raw_len", &self.raw.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for InboundResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InboundResponse")
+            .field("id", &self.id)
+            .field("result", &self.result)
+            .field("error", &self.error)
+            .field("raw_len", &self.raw.len())
+            .finish()
+    }
 }
 
 pub fn classify(frame: &str) -> Result<InboundMessage, ClassifyError> {
@@ -193,5 +232,20 @@ fn jsonrpsee_supports_id(id: &JsonRpcId) -> bool {
     match id {
         JsonRpcId::Number(number) => number.parse::<u64>().is_ok(),
         JsonRpcId::Null | JsonRpcId::String(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod codex_r2_ingress_probe {
+    use super::*;
+    #[test]
+    fn codex_r2_admission_ingress_debug_is_value_free() {
+        let secret = "NovelIngress515Secret78529";
+        let frame=serde_json::json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/workspace","mcpServers":[{"name":"sample","command":"server","args":[],"env":[{"name":"API_TOKEN","value":secret}]}]}}).to_string();
+        let inbound = classify(&frame).unwrap();
+        assert!(
+            !format!("{inbound:?}").contains(secret),
+            "ACP raw admission Debug leaks env value"
+        );
     }
 }

@@ -20,7 +20,7 @@ use super::types::WriteScopeError;
 /// the constructor would make a daemon-lifetime barrier impossible, and the
 /// barrier must be daemon-lifetime because `recover` and the shutdown drain are
 /// daemon-global.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ExecutionLaunch {
     /// Native host process.
     Native {
@@ -35,6 +35,31 @@ pub enum ExecutionLaunch {
         installation_id: String,
         nonce: String,
     },
+}
+
+// Argv / container command words can carry inline credentials: counts only.
+impl std::fmt::Debug for ExecutionLaunch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native { program, args, cwd } => formatter
+                .debug_struct("Native")
+                .field("program", program)
+                .field("argument_count", &args.len())
+                .field("cwd", cwd)
+                .finish(),
+            Self::Container {
+                image,
+                command,
+                installation_id,
+                ..
+            } => formatter
+                .debug_struct("Container")
+                .field("image", image)
+                .field("command_word_count", &command.len())
+                .field("installation_id", installation_id)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// A created containment generation.

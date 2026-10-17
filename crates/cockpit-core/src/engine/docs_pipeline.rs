@@ -120,8 +120,12 @@ pub async fn run(
     // hub satisfies the shared tool-call signature without wiring a client
     // fan-out. The package-add gate is the lone exception: it raises its
     // approval through the driver's REAL `package_add_interrupts` hub, wired
-    // directly into the `add-package` tool below.
-    let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+    // directly into the `add-package` tool below. The stage hub is still a
+    // leaf of that hub's redaction owner: an approved secret-file read or a
+    // shell output registration in a docs stage lands in the caller's live and
+    // durable table under its single writer, never as an unlocked write from
+    // this stage's table snapshot.
+    let interrupts = Arc::new(package_add_interrupts.leaf_sharing_redaction());
 
     // ---- Stage 1: resolver, in the caller's cwd, sees only `package`.
     let resolution = DocsResolution::new();

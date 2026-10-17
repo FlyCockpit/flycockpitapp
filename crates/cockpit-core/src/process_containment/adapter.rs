@@ -21,7 +21,7 @@ use super::types::{
 /// `program` / `args` / `cwd` identify the intended child for audit; adapters
 /// must not execute them. The caller spawns the real process (with its own
 /// env and stdio) into [`ContainmentAdapter::process_tree_guard`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NativeSpawnRequest {
     pub containment_id: Uuid,
     pub session_id: Uuid,
@@ -34,8 +34,25 @@ pub struct NativeSpawnRequest {
     pub require_proven: bool,
 }
 
+// Argv can carry inline credentials (`--token=…`): an argument count only.
+impl std::fmt::Debug for NativeSpawnRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeSpawnRequest")
+            .field("containment_id", &self.containment_id)
+            .field("session_id", &self.session_id)
+            .field("generation", &self.generation)
+            .field("operation_id", &self.operation_id)
+            .field("program", &self.program)
+            .field("argument_count", &self.args.len())
+            .field("cwd", &self.cwd)
+            .field("require_proven", &self.require_proven)
+            .finish()
+    }
+}
+
 /// Request to allocate a fresh Docker/Podman container generation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ContainerExecRequest {
     pub containment_id: Uuid,
     pub session_id: Uuid,
@@ -47,6 +64,22 @@ pub struct ContainerExecRequest {
     /// Installation identity hex for labels.
     pub installation_id: String,
     pub nonce: String,
+}
+
+impl std::fmt::Debug for ContainerExecRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ContainerExecRequest")
+            .field("containment_id", &self.containment_id)
+            .field("session_id", &self.session_id)
+            .field("generation", &self.generation)
+            .field("operation_id", &self.operation_id)
+            .field("image", &self.image)
+            .field("command_word_count", &self.command.len())
+            .field("require_proven", &self.require_proven)
+            .field("installation_id", &self.installation_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Result of a successful platform allocation. Membership is not proven here:
@@ -135,3 +168,26 @@ pub trait ContainmentAdapter: Send + Sync + 'static {
 }
 
 pub type SharedAdapter = Arc<dyn ContainmentAdapter>;
+
+#[cfg(test)]
+mod value_free_debug_tests {
+    use super::*;
+
+    /// Secrets r2 C1: containment requests print argument counts, not argv.
+    #[test]
+    fn spawn_request_debug_hides_argv() {
+        let secret = ["NovelArgv515", "Secret78529"].concat();
+        let request = NativeSpawnRequest {
+            containment_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            generation: 1,
+            operation_id: "op".into(),
+            program: PathBuf::from("/bin/tool"),
+            args: vec![format!("--token={secret}")],
+            cwd: PathBuf::from("/tmp"),
+            require_proven: false,
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(&secret), "{rendered}");
+    }
+}

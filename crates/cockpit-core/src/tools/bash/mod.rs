@@ -540,7 +540,14 @@ async fn call_bash_inner(
         }
     };
 
-    tracing::debug!(command, timeout_ms, "bash: spawning");
+    // Never log the command text: inline `API_KEY=… cmd` assignments and
+    // `--token=…` arguments are credentials the table may not know yet.
+    tracing::debug!(
+        command = %shell_command_log_identity(command),
+        command_bytes = command.len(),
+        timeout_ms,
+        "bash: spawning"
+    );
 
     // Resolve whether to confine this run (sandboxing part 2):
     //
@@ -1086,6 +1093,15 @@ async fn call_bash_inner(
         final_outcome.stderr.push(b'\n');
     }
 
+    // Narrow novel-secret backstop (secrets I2): a secret the session table
+    // has never seen (`cat ~/other/.env` from an unconfined shell, a JSON
+    // config with an `"api_key"` member, a PEM key) is replaced in the raw
+    // streams before anything is rendered — body, compression, artifact
+    // capture, sidecar and KB scan all see the scrubbed text — and registered
+    // in the live session table so later echoes are caught too. Git SHAs,
+    // UUIDs and digests survive (no keyless opaque-token rule here).
+    scrub_shell_outcome_novel_secrets(ctx, &extended_config.redact, &mut final_outcome).await?;
+
     // Native shell-output compression (implementation note):
     // when the session has the `shell compression` setting enabled, run
     // each stream through cockpit's rtk-native filter (generic noise strip
@@ -1187,6 +1203,19 @@ async fn call_bash_inner(
             .await;
     }
     Ok(out)
+}
+
+/// A value-free identity of a shell command for diagnostics: what is
+/// launched (`sh -c`, never a token of the command, whose first word can be
+/// an `AUTH='Bearer …'` assignment) plus content-free counts — bytes, lines
+/// and whitespace-separated words. No part of the command text is included.
+pub(crate) fn shell_command_log_identity(command: &str) -> String {
+    format!(
+        "sh -c <command: {} bytes, {} lines, {} words>",
+        command.len(),
+        command.lines().count().max(1),
+        command.split_whitespace().count()
+    )
 }
 
 async fn approve_outside_working_directory(
@@ -1964,6 +1993,9 @@ struct ShellOutcome {
     exit: i32,
     signaled: bool,
     success: bool,
+    /// What the narrow scanner replaced while the pipes were read, before
+    /// the bounded capture dropped anything (registered by the backstop).
+    intake_observed: Vec<crate::redact::ObservedSecret>,
 }
 
 /// Internal run result, distinguishing the abort paths from a completed
@@ -2658,7 +2690,7 @@ async fn run_container_bash(
         approved_access_effects,
     )
     .await;
-    let final_outcome = match attempt {
+    let mut final_outcome = match attempt {
         RunOutcome::Backgrounded(job_id) => {
             return Ok(ToolOutput::text(format!(
                 "bash moved to async completion ({job_id}); its result will be attached when the process exits"
@@ -2701,6 +2733,8 @@ async fn run_container_bash(
         }
         RunOutcome::Done(o) => o,
     };
+    // Narrow novel-secret backstop (secrets I2), as on the host path.
+    scrub_shell_outcome_novel_secrets(ctx, &extended_config.redact, &mut final_outcome).await?;
     Ok(render_bash_outcome(
         command,
         cwd,
@@ -2809,6 +2843,30 @@ async fn run_container_shell(
         resource_lease,
         false,
         identity_accounting,
+    )
+    .await
+}
+
+/// Apply the narrow novel-secret backstop
+/// ([`crate::tools::output_backstop`]) to both captured streams of a
+/// completed shell run, registering every replaced value in the session
+/// redaction table.
+async fn scrub_shell_outcome_novel_secrets(
+    ctx: &ToolCtx,
+    cfg: &crate::config::extended::RedactConfig,
+    outcome: &mut ShellOutcome,
+) -> Result<()> {
+    if crate::tools::trusted_child_acquisition::acquisition_quarantines_shell_output() {
+        return Ok(());
+    }
+    let intake = std::mem::take(&mut outcome.intake_observed);
+    crate::tools::output_backstop::scrub_command_byte_streams_with_intake(
+        &ctx.interrupts,
+        &ctx.session,
+        &ctx.redact,
+        cfg,
+        &mut [&mut outcome.stdout, &mut outcome.stderr],
+        intake,
     )
     .await
 }
@@ -3075,15 +3133,21 @@ async fn run_prepared_command(
     };
     let child_pid = child.id();
 
-    let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain(
+    // Narrow novel-secret backstop at PIPE INTAKE (secrets I2): the scanner
+    // sees every byte before the head/tail bound omits the middle, so secret
+    // context in the omitted part still governs the retained lines.
+    let intake = crate::tools::output_backstop::IntakeObservations::default();
+    let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain_filtered(
         child.stdout.take(),
         CHILD_PIPE_CAPTURE_HEAD_BYTES,
         CHILD_PIPE_CAPTURE_TAIL_BYTES,
+        intake.filter(&ctx.redact),
     );
-    let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain(
+    let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain_filtered(
         child.stderr.take(),
         CHILD_PIPE_CAPTURE_HEAD_BYTES,
         CHILD_PIPE_CAPTURE_TAIL_BYTES,
+        intake.filter(&ctx.redact),
     );
 
     let timeout = std::time::Duration::from_millis(timeout_ms);
@@ -3182,6 +3246,12 @@ async fn run_prepared_command(
                 identity_accounting,
                 ctx.redact.clone(),
                 utility_guard,
+                AdoptedOutputBackstop {
+                    interrupts: ctx.interrupts.clone(),
+                    session: ctx.session.clone(),
+                    redact_config: ctx.config.extended().redact,
+                    intake: intake.clone(),
+                },
             )
             .await;
             return RunOutcome::Backgrounded(job_id);
@@ -3212,9 +3282,50 @@ async fn run_prepared_command(
         exit,
         signaled,
         success: status.success(),
+        intake_observed: intake.take(),
     })
 }
 
+/// What the detached adopted-completion task needs to run the narrow
+/// novel-secret backstop ([`crate::tools::output_backstop`]) and register
+/// what it finds, captured at the adopting turn.
+struct AdoptedOutputBackstop {
+    interrupts: std::sync::Arc<crate::engine::interrupt::InterruptHub>,
+    session: std::sync::Arc<crate::session::Session>,
+    redact_config: crate::config::extended::RedactConfig,
+    intake: crate::tools::output_backstop::IntakeObservations,
+}
+
+impl AdoptedOutputBackstop {
+    /// Scrub both captured streams together. Fail-closed: when registration
+    /// fails both streams are withheld rather than delivered with an
+    /// unregistered secret.
+    async fn apply(
+        &self,
+        redact: &crate::redact::RedactionTable,
+        mut stdout: String,
+        mut stderr: String,
+    ) -> (String, String) {
+        match crate::tools::output_backstop::scrub_command_streams_with_intake(
+            &self.interrupts,
+            &self.session,
+            redact,
+            &self.redact_config,
+            &mut [&mut stdout, &mut stderr],
+            self.intake.take(),
+        )
+        .await
+        {
+            Ok(()) => (stdout, stderr),
+            Err(_) => (
+                "[output withheld: registering a secret found in it failed]".to_string(),
+                String::new(),
+            ),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn spawn_adopted_shell_completion(
     mut child: tokio::process::Child,
     child_pid: Option<u32>,
@@ -3229,6 +3340,7 @@ async fn spawn_adopted_shell_completion(
     identity_accounting: Option<crate::assistants::identity::IdentityShellAccounting>,
     redact: std::sync::Arc<crate::redact::RedactionTable>,
     utility_guard: crate::knowledge::KbUtilityGuard,
+    backstop: AdoptedOutputBackstop,
 ) {
     let adopted_cancel = cancel.child_token();
     let waiter_cancel = adopted_cancel.clone();
@@ -3269,6 +3381,9 @@ async fn spawn_adopted_shell_completion(
                         // junction (issue #294), mirroring the foreground path.
                         let stdout = boundary_safe_join(&redact, stdout_task.join().await);
                         let stderr = boundary_safe_join(&redact, stderr_task.join().await);
+                        // Narrow novel-secret backstop (secrets I2): this
+                        // result lands as model-facing steering text.
+                        let (stdout, stderr) = backstop.apply(&redact, stdout, stderr).await;
                         let exit = status.code().unwrap_or(-1);
                         let signaled = !status.success() && status.code().is_none();
                         format_combined(&stdout, &stderr, exit, signaled)

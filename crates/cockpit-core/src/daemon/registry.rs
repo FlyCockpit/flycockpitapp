@@ -7222,10 +7222,24 @@ mod tests {
         let reg = test_registry();
         let session = persisted_test_session(&reg);
         let spawn_id = session.id;
+        let next_id = Uuid::new_v4();
+        let vault = session.secret_vault().clone();
+        // This fixture exercises registry reservation/adoption separately;
+        // seed the same transactional custody required by real publication.
         let successor = reg
             .inner
             .db
-            .create_compaction_successor(spawn_id)
+            .transaction(move |conn| {
+                crate::session::lifecycle::copy_vault_session_secrets_on_conn(
+                    conn, &vault, spawn_id, next_id,
+                )?;
+                Db::create_compaction_successor_conn(
+                    conn,
+                    spawn_id,
+                    next_id,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            })
             .await
             .unwrap();
         let successor_id = successor.session_id;
@@ -7244,7 +7258,9 @@ mod tests {
         assert_eq!(reg.activation_leases(spawn_id), Some(1));
         assert!(claim.handle().same_worker_as(&handle));
 
-        session.adopt_compaction_successor(successor_id, successor_short);
+        session
+            .adopt_compaction_successor(successor_id, successor_short)
+            .unwrap();
         assert_eq!(session.live_id(), successor_id);
         assert_eq!(handle.session_id(), successor_id);
         assert!(

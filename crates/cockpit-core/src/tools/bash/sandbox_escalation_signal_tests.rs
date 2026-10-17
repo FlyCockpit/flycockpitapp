@@ -7,6 +7,7 @@ fn failed(stderr: &'static [u8]) -> ShellOutcome {
         exit: 1,
         signaled: false,
         success: false,
+        intake_observed: Vec::new(),
     }
 }
 

@@ -13836,43 +13836,13 @@ pub(super) async fn run_worker(
                                                                     .await
                                                                 {
                                                                     Ok(new_table) => {
-                                                                        let _redaction_guard =
-                                                                            interrupts
-                                                                                .lock_redaction_table_write()
-                                                                                .await;
-                                                                        let base = current_redaction(
-                                                                            &redaction,
-                                                                        );
-                                                                        match base.union(&new_table) {
-                                                                            Ok(unioned) => {
-                                                                                let unioned =
-                                                                                    Arc::new(unioned);
-                                                                                match session
-                                                                                    .persist_redaction_table(
-                                                                                        &unioned,
-                                                                                    )
-                                                                                {
-                                                                                    Ok(()) => {
-                                                                                        set_current_redaction(
-                                                                                            &redaction,
-                                                                                            unioned.clone(),
-                                                                                        );
-                                                                                        session.set_redaction_coverage(
-                                                                                            authority.clone(),
-                                                                                            coverage_key,
-                                                                                            policy_digest,
-                                                                                        );
-                                                                                        Ok(unioned)
-                                                                                    }
-                                                                                    Err(error) => {
-                                                                                        Err(error)
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                            Err(error) => {
-                                                                                Err(error)
-                                                                            }
-                                                                        }
+                                                                        match interrupts.refresh_owned_redaction(&redaction, &session, &new_table).await {
+ Ok(unioned) => {
+ session.set_redaction_coverage( authority.clone(), coverage_key, policy_digest, );
+ Ok(unioned)
+ }
+ Err(error) => Err(error),
+ }
                                                                     }
                                                                     Err(error) => Err(
                                                                         anyhow::anyhow!(

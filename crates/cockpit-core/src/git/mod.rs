@@ -155,7 +155,8 @@ fn run_optional_command(command: &str, cwd: &Path, args: &[&str]) -> Option<Outp
         Ok(output) => Some(output),
         Err(error) => {
             tracing::debug!(
-                command = %format!("{} {}", command, args.join(" ")),
+                command = %command,
+                argument_count = args.len(),
                 cwd = %cwd.display(),
                 %error,
                 "failed to launch optional git command"

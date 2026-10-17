@@ -328,15 +328,19 @@ impl Tool for CustomBashTool {
         .await?;
         let mut child = cockpit_host::process::spawn_pinned(command)?;
         let child_pid = child.id();
-        let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain(
+        // Narrow backstop at pipe intake, before the head/tail bound.
+        let intake = crate::tools::output_backstop::IntakeObservations::default();
+        let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain_filtered(
             child.stdout.take(),
             CHILD_PIPE_CAPTURE_HEAD_BYTES,
             CHILD_PIPE_CAPTURE_TAIL_BYTES,
+            intake.filter(&ctx.redact),
         );
-        let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain(
+        let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain_filtered(
             child.stderr.take(),
             CHILD_PIPE_CAPTURE_HEAD_BYTES,
             CHILD_PIPE_CAPTURE_TAIL_BYTES,
+            intake.filter(&ctx.redact),
         );
         let status = match tokio::time::timeout(
             std::time::Duration::from_secs(SHELL_TIMEOUT_SECS),
@@ -377,8 +381,21 @@ impl Tool for CustomBashTool {
         // right margin. (A trusted model gets an empty egress table and raw
         // custody — no downstream scrub to protect, and an empty table here is a
         // no-op passthrough.)
-        let stdout = boundary_safe_join(&ctx.redact, stdout_task.join().await);
-        let stderr = boundary_safe_join(&ctx.redact, stderr_task.join().await);
+        let mut stdout = boundary_safe_join(&ctx.redact, stdout_task.join().await);
+        let mut stderr = boundary_safe_join(&ctx.redact, stderr_task.join().await);
+        // Narrow novel-secret backstop (secrets I2): replace secret-shaped
+        // values the session table has never seen and register them, before
+        // the output is assembled for the model.
+        let redact_config = ctx.config.extended().redact;
+        crate::tools::output_backstop::scrub_command_streams_with_intake(
+            &ctx.interrupts,
+            &ctx.session,
+            &ctx.redact,
+            &redact_config,
+            &mut [&mut stdout, &mut stderr],
+            intake.take(),
+        )
+        .await?;
 
         let mut combined = String::new();
         combined.push_str(&stdout);
@@ -676,6 +693,64 @@ mod tests {
         let tpl = "echo {a b} {valid} {}";
         let p = extract_placeholders(tpl);
         assert_eq!(p, vec!["valid".to_string()]);
+    }
+
+    /// Secrets I2: a configured custom tool that prints another project's
+    /// dotenv reaches the model with the secret-keyed value replaced and the
+    /// value registered in the session's live table; plain assignments stay.
+    #[tokio::test]
+    async fn custom_tool_output_secret_is_scrubbed_and_registered() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("other")).unwrap();
+        let stripe = ["zq8Hc2Lm", "N4pR7tV1wX3y"].concat();
+        std::fs::write(
+            temp.path().join("other").join(".env"),
+            format!("NODE_ENV=production\nSTRIPE_SECRET_KEY={stripe}\n"),
+        )
+        .unwrap();
+        let template = ToolCommandTemplate {
+            enabled: true,
+            command: "cat other/.env".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "show_env",
+            &template,
+            ToolTemplateProvenance::Configured {
+                source: "test".into(),
+            },
+        );
+        let mut ctx = crate::tools::common::test_ctx(temp.path());
+        let live: crate::daemon::SharedRedactionTable =
+            std::sync::Arc::new(std::sync::RwLock::new(ctx.redact.clone()));
+        let (events, _rx) = tokio::sync::broadcast::channel(16);
+        ctx.interrupts = std::sync::Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            live.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ctx.session.db.clone(),
+            ctx.session.id,
+        ));
+
+        let output = tool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+        assert!(!output.content.contains(&stripe), "{}", output.content);
+        assert!(
+            output.content.contains("NODE_ENV=production"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("STRIPE_SECRET_KEY="),
+            "{}",
+            output.content
+        );
+        let live = live.read().unwrap().clone();
+        assert!(
+            !live
+                .scrub(&format!("echo {stripe}"))
+                .contains(stripe.as_str())
+        );
     }
 
     #[tokio::test]

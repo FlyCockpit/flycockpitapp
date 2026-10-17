@@ -42,7 +42,7 @@ pub struct RawNode {
     pub end: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum RawKind {
     Null,
     Bool(bool),
@@ -50,6 +50,25 @@ pub enum RawKind {
     String(String),
     Array(Vec<RawNode>),
     Object(Vec<(String, RawNode)>),
+}
+
+// String scalars of an ACP frame carry the editor's forwarded MCP env and
+// header values verbatim: Debug shows structure (kinds, member names, string
+// lengths) and never string contents.
+impl std::fmt::Debug for RawKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Null => formatter.write_str("Null"),
+            Self::Bool(value) => formatter.debug_tuple("Bool").field(value).finish(),
+            Self::Number => formatter.write_str("Number"),
+            Self::String(value) => write!(formatter, "String(<{} bytes>)", value.len()),
+            Self::Array(items) => formatter.debug_tuple("Array").field(items).finish(),
+            Self::Object(members) => formatter
+                .debug_map()
+                .entries(members.iter().map(|(name, node)| (name, node)))
+                .finish(),
+        }
+    }
 }
 
 impl RawNode {

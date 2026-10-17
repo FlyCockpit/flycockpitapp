@@ -28,8 +28,13 @@ pub async fn fetch_all_provider_usage(
     config: &ProvidersConfig,
     provider_filter: Option<&str>,
 ) -> Result<Vec<ProviderUsageSnapshot>> {
-    fetch_all_provider_usage_with_store(config, provider_filter, None, std::env::vars().collect())
-        .await
+    fetch_all_provider_usage_with_store(
+        config,
+        provider_filter,
+        None,
+        crate::env_snapshot::process_env_vars(),
+    )
+    .await
 }
 
 pub async fn fetch_all_provider_usage_with_store(
@@ -58,7 +63,7 @@ pub async fn fetch_all_provider_usage_with_registry(
         provider_filter,
         registry,
         None,
-        std::env::vars().collect(),
+        crate::env_snapshot::process_env_vars(),
     )
     .await
 }
@@ -259,8 +264,13 @@ impl DeclarativeUsageProbe {
 #[async_trait]
 impl ProviderUsageProbe for DeclarativeUsageProbe {
     async fn fetch(&self, provider_id: &str, entry: &ProviderEntry) -> ProviderUsageSnapshot {
-        self.fetch_with_store(provider_id, entry, None, std::env::vars().collect())
-            .await
+        self.fetch_with_store(
+            provider_id,
+            entry,
+            None,
+            crate::env_snapshot::process_env_vars(),
+        )
+        .await
     }
 }
 
@@ -372,7 +382,13 @@ async fn fetch_codex_usage(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<(Option<String>, Vec<UsageWindow>, Vec<String>)> {
-    fetch_codex_usage_with_store(provider_id, entry, None, std::env::vars().collect()).await
+    fetch_codex_usage_with_store(
+        provider_id,
+        entry,
+        None,
+        crate::env_snapshot::process_env_vars(),
+    )
+    .await
 }
 
 async fn fetch_codex_usage_with_store(

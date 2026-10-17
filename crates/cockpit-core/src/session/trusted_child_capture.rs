@@ -232,6 +232,30 @@ pub struct TrustedChildCaptureRegistry {
     pending: Mutex<HashMap<String, PendingCapture>>,
 }
 
+/// The capture base for a session no live owner writes: its latest durable
+/// table (so a capture never rewrites the vault item from an older turn
+/// snapshot), unioned with the caller's snapshot.
+async fn own_durable_base(
+    session: &Session,
+    snapshot: &RedactionTable,
+) -> anyhow::Result<std::sync::Arc<RedactionTable>> {
+    let vault = session.secret_vault().clone();
+    let session_id = session.live_id();
+    let json = session
+        .db
+        .read(move |conn| {
+            super::lifecycle::require_redaction_table_json_from_vault_on_conn(
+                &vault,
+                conn,
+                session_id,
+                "loading trusted-child capture custody",
+            )
+        })
+        .await?;
+    let durable = RedactionTable::from_persisted_json(&json)?;
+    Ok(std::sync::Arc::new(durable.union(snapshot)?))
+}
+
 impl TrustedChildCaptureRegistry {
     /// A fresh, empty registry.
     pub fn new() -> Self {
@@ -415,6 +439,7 @@ impl TrustedChildCaptureRegistry {
         &self,
         session: &Session,
         redaction: &RedactionTable,
+        owner: Option<&crate::engine::redaction_owner::SessionRedactionOwner>,
         claimed: &ProtectedSensitiveIngress,
         value: SealedCaptureValue,
         now_ms: i64,
@@ -438,20 +463,119 @@ impl TrustedChildCaptureRegistry {
         // transaction. It is the ONLY consumer of the literal — no generic
         // MCP/Tool/event/transcript path sees it. A write failure fails closed
         // (the record is already consumed; the host must begin a new capture).
-        match session
-            .create_agent_acquired_sealed_value(
-                redaction,
-                &proceed.acquisition_id,
+        //
+        // The table write goes through the session's single redaction writer:
+        // under the owner's lock, the base is the owner's LATEST committed
+        // table (never the caller's turn snapshot, which could predate an
+        // observed-output registration), and the committed union is swapped
+        // live after the transaction. Lock order: table lock, then journal
+        // preparation, then the DB transaction; the lock is never taken inside
+        // the transaction.
+        // Publish-before-await: the owner swaps the new table live BEFORE the
+        // journaled transaction is awaited, so a write cancelled after its
+        // enqueue (the DB writer may still commit it) can never leave the
+        // durable table ahead of the live one. A failed write restores the
+        // previous table; an extra live literal is the fail-closed direction.
+        let create = |table: std::sync::Arc<RedactionTable>, mirror| {
+            let proceed = &proceed;
+            let value = &value;
+            async move {
+                session
+                    .create_agent_acquired_sealed_value(
+                        &table,
+                        &proceed.acquisition_id,
+                        &proceed.record_id,
+                        &proceed.value_id,
+                        &proceed.reason,
+                        value.as_str(),
+                        &proceed.source_tool_call_id,
+                        now_ms,
+                        mirror,
+                    )
+                    .await
+            }
+        };
+        let sealed_table = |base: &RedactionTable| {
+            Session::agent_acquired_sealed_table(
+                base,
                 &proceed.record_id,
                 &proceed.value_id,
-                &proceed.reason,
                 value.as_str(),
-                &proceed.source_tool_call_id,
-                now_ms,
             )
-            .await
-        {
-            Ok(_) => TrustedChildCaptureOutcome::Captured {
+        };
+        let result: anyhow::Result<()> = match owner {
+            Some(owner) => {
+                let guard = owner.lock().await;
+                let durable = match guard.durable(session) {
+                    Ok(durable) => durable,
+                    Err(_) => return TrustedChildCaptureOutcome::Denied,
+                };
+                if durable.live_id() == session.live_id() {
+                    let previous = guard.current();
+                    match sealed_table(&previous) {
+                        Ok(table) => {
+                            let table = guard.link(table);
+                            guard.publish_persisted(table.clone());
+                            let created = create(table, None).await;
+                            if created.is_err() {
+                                guard.publish_persisted(previous);
+                            }
+                            created
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    // A fork's child session owns its own durable table (the
+                    // shared owner persists to the parent): capture onto that
+                    // table's latest durable state, then mirror the literal
+                    // into the shared owner so the fork's NEXT round (which
+                    // adopts the owner's table) still redacts it. The mirror
+                    // is a forced credential literal persisted to the owner's
+                    // durable session; failing it fails the capture closed.
+                    // Publish live before awaiting, and commit both vaults
+                    // in the SAME child transaction. Cancellation cannot leave
+                    // a committed child without its parent's durable mirror.
+                    let mirrored = guard.current().with_forced_credential_literal(
+                        value.as_str().to_owned(),
+                        format!("$secret:fork-capture:{}", proceed.record_id),
+                    );
+                    match mirrored {
+                        Ok(mirrored) => {
+                            let previous = guard.current();
+                            let mirrored = guard.link(mirrored);
+                            guard.publish_persisted(mirrored.clone());
+                            let persisted = match own_durable_base(session, redaction)
+                                .await
+                                .and_then(|base| sealed_table(&base))
+                            {
+                                Ok(table) => {
+                                    create(
+                                        std::sync::Arc::new(table),
+                                        Some((durable, mirrored.as_ref())),
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            if persisted.is_err() {
+                                guard.publish_persisted(previous);
+                            }
+                            persisted
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+            None => match own_durable_base(session, redaction)
+                .await
+                .and_then(|base| sealed_table(&base))
+            {
+                Ok(table) => create(std::sync::Arc::new(table), None).await,
+                Err(error) => Err(error),
+            },
+        };
+        match result {
+            Ok(()) => TrustedChildCaptureOutcome::Captured {
                 record_id: proceed.record_id,
             },
             Err(_) => TrustedChildCaptureOutcome::Denied,

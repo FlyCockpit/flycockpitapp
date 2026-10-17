@@ -330,7 +330,7 @@ async fn run_swarm_loop(
         pinned,
     } = build_swarm_child(spec, ctx)?;
     agent.bind_retry_budget(&ctx.budget);
-    let agent = Arc::new(agent);
+    let mut agent = Arc::new(agent);
     let mut history: Vec<Message> = Vec::new();
     let brief = swarm_child_brief(spec, &custody);
     tracing::debug!(
@@ -345,8 +345,9 @@ async fn run_swarm_loop(
     // as the loop-fork runner). Cancellation is the session-work child the
     // authority minted — TUI Ctrl+C does not fire it, Stop does. No approver →
     // native tools skip the boundary prompt (never deny); the loop guard is
-    // inert without one.
-    let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+    // inert without one. The leaf still shares the owning session's live
+    // redaction table, so secrets the child's tools register are not dropped.
+    let interrupts = ctx.fork_interrupts();
     let deferred_log = crate::engine::deferred::DeferredLog::new();
 
     // This detached child owns its `subagentStop` continuation budget for its
@@ -396,7 +397,15 @@ async fn run_swarm_loop(
     scheduled_lane_driver.bind_active_retry_budget();
 
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
+    let mut round_redact = ctx.redact.clone();
     for _ in 0..SWARM_MAX_TURNS {
+        // Same-turn redaction: adopt what an earlier round's tools registered.
+        crate::engine::redaction_owner::adopt_live_redaction_for_round(
+            &interrupts,
+            &pinned.providers(),
+            &mut round_redact,
+            &mut agent,
+        )?;
         // Round reservation before dispatch: same gate as the interactive
         // driver (`admit_provider_round`) and the schedule/noninteractive loops.
         if let Err(exhaustion) = ctx.budget.charge_round() {
@@ -458,7 +467,7 @@ async fn run_swarm_loop(
                         next_prompt,
                         ctx.session.clone(),
                         ctx.locks.clone(),
-                        ctx.redact.clone(),
+                        round_redact.clone(),
                         ctx.cwd.clone(),
                         pinned.clone(),
                         interrupts.clone(),
@@ -1341,6 +1350,7 @@ mod tests {
             // is the same value the sibling authority test uses.
             write_scope: None,
             budget: crate::engine::delegation_budget::BudgetPool::defaults(),
+            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
         };
 
         let mut spec = spec(1, 3);
@@ -1537,6 +1547,7 @@ mod tests {
             agent: Arc::new(parent),
             write_scope: None,
             budget: crate::engine::delegation_budget::BudgetPool::defaults(),
+            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
         };
 
         let mut spec = spec(1, 3);
@@ -1700,6 +1711,7 @@ mod tests {
             agent: Arc::new(parent),
             write_scope: None,
             budget: crate::engine::delegation_budget::BudgetPool::defaults(),
+            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
         };
 
         let mut spec = spec(1, 3);
@@ -1835,6 +1847,7 @@ mod tests {
             agent,
             write_scope: None,
             budget: crate::engine::delegation_budget::BudgetPool::defaults(),
+            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
         };
 
         let pinned_with_stop_hook = |matcher: &str| -> SessionConfigHandle {
@@ -2001,6 +2014,7 @@ mod tests {
                 mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
             };
             let ctx = ScheduleContext {
+                interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
                 dream_read_scope: session.dream_read_scope(),
                 session,
                 locks: Arc::new(crate::locks::LockManager::in_memory(

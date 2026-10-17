@@ -187,7 +187,7 @@ impl StoredTokens {
 
 /// Resolved auth artifacts for a single client construction: request
 /// headers (remote transports) and extra subprocess env (stdio).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ResolvedAuth {
     pub headers: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
@@ -196,6 +196,20 @@ pub struct ResolvedAuth {
     /// remote transports and are reported through `header_errors`.
     pub missing_env: Vec<String>,
     pub header_errors: Vec<String>,
+}
+
+// Resolved header and env values are live credentials: diagnostics get the
+// header / variable names only.
+impl std::fmt::Debug for ResolvedAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedAuth")
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("env_names", &self.env.keys().collect::<Vec<_>>())
+            .field("missing_env", &self.missing_env)
+            .field("header_errors", &self.header_errors)
+            .finish()
+    }
 }
 
 /// Resolve the non-OAuth parts of a server's auth into headers + env.
@@ -381,7 +395,7 @@ fn stored_tokens_from_store(
     store
         .named_secret(key)
         .map(|raw| {
-            serde_json::from_str(raw)
+            crate::config::value_free::from_str(raw)
                 .with_context(|| format!("parsing stored MCP OAuth tokens for {key}"))
         })
         .transpose()
@@ -627,7 +641,7 @@ async fn exchange_code(
         return Err(oauth_token_endpoint_error("exchange", status));
     }
     let response_body = zeroize::Zeroizing::new(resp.bytes().await?.to_vec());
-    let parsed: TokenResp = serde_json::from_slice(&response_body)?;
+    let parsed: TokenResp = crate::config::value_free::from_slice(&response_body)?;
     Ok(into_stored(parsed))
 }
 
@@ -654,7 +668,7 @@ async fn refresh_token(oauth: &OauthAuth, refresh: &str) -> Result<StoredTokens>
         return Err(oauth_token_endpoint_error("refresh", status));
     }
     let response_body = zeroize::Zeroizing::new(resp.bytes().await?.to_vec());
-    let parsed: TokenResp = serde_json::from_slice(&response_body)?;
+    let parsed: TokenResp = crate::config::value_free::from_slice(&response_body)?;
     let mut tokens = into_stored(parsed);
     // Some servers omit the refresh token on refresh — keep the old one.
     if tokens.refresh_token.is_none() {
@@ -743,6 +757,24 @@ mod tests {
     use super::*;
     use crate::mcp::config::{HeaderAuth, ServerConfig, Transport};
     use std::collections::BTreeMap;
+
+    /// Secrets I1 class sweep: resolved header and env values (live
+    /// credentials) never reach `{:?}` output.
+    #[test]
+    fn resolved_auth_debug_never_prints_env_or_secret_values() {
+        const SENTINEL: &str = "resolvedDebugSentinel41b2";
+        let resolved = ResolvedAuth {
+            headers: BTreeMap::from([("Authorization".to_string(), format!("Bearer {SENTINEL}"))]),
+            env: BTreeMap::from([("GITHUB_TOKEN".to_string(), SENTINEL.to_string())]),
+            missing_env: vec![],
+            header_errors: vec![],
+        };
+        for rendered in [format!("{resolved:?}"), format!("{resolved:#?}")] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+            assert!(rendered.contains("GITHUB_TOKEN"), "{rendered}");
+            assert!(rendered.contains("Authorization"), "{rendered}");
+        }
+    }
 
     fn base_server() -> ServerConfig {
         ServerConfig {
@@ -1018,5 +1050,65 @@ mod tests {
             store.get(&key).is_none(),
             "OAuth must not require credential_record"
         );
+    }
+}
+
+#[cfg(test)]
+mod value_free_error_tests {
+    use super::*;
+
+    /// Secrets r2 C8: a header value with an invalid reference default
+    /// (`Bearer ${X:-<literal>}`) never reaches `header_errors` or Debug.
+    #[test]
+    fn resolved_auth_errors_never_carry_the_literal() {
+        let secret = ["NovelErrorDebug515", "Secret78529"].concat();
+        let config = super::super::config::McpConfig::parse(&format!(
+            r#"{{"servers":{{"demo":{{"transport":"streamable","endpoint":"https://mcp.example.test","auth":{{"kind":"header","value":"Bearer ${{X:-{secret}}}"}}}}}}}}"#
+        ))
+        .unwrap();
+        let resolved = resolve_static_for_server("demo", &config.servers["demo"]);
+        assert!(
+            !resolved.header_errors.is_empty(),
+            "precondition: the reference is invalid"
+        );
+        for error in &resolved.header_errors {
+            assert!(!error.contains(&secret), "{error}");
+        }
+        assert!(!format!("{resolved:?}").contains(&secret));
+    }
+}
+
+#[cfg(test)]
+mod security_r4_diagnostics {
+    use super::*;
+    #[tokio::test]
+    async fn r4_malformed_mcp_token_response_is_value_free() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for body in [
+                r#"{"access_token":"NovelMcp515Secret78529","expires_in":"NovelMcp515Secret78529"}"#,
+                r#"{"access_token":"valid-token","expires_in":3600}"#,
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let received = stream.read(&mut request).await.unwrap();
+                assert!(received > 0, "mock token server must receive a request");
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let oauth = OauthAuth {
+            token_url: Some(format!("http://{address}/token")),
+            ..Default::default()
+        };
+        let error = refresh_token(&oauth, "fake-refresh")
+            .await
+            .err()
+            .expect("malformed response must fail");
+        assert!(!format!("{error:#} / {error:?}").contains("NovelMcp515Secret78529"));
+        let valid = refresh_token(&oauth, "fake-refresh").await.unwrap();
+        assert_eq!(valid.access_token, "valid-token");
+        server.await.unwrap();
     }
 }

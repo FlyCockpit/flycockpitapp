@@ -165,8 +165,8 @@ pub async fn begin_device_code_login(descriptor: &OAuthDescriptor) -> Result<Dev
         .error_for_status()
         .context("OAuth device-code request failed")?;
     let body = bounded_response_body(response).await?;
-    let parsed: DeviceAuthorizationResponse =
-        serde_json::from_str(&body).context("OAuth device-code response is malformed")?;
+    let parsed: DeviceAuthorizationResponse = crate::config::value_free::from_str(&body)
+        .context("OAuth device-code response is malformed")?;
     ensure_nonempty(&parsed.device_code, "device_code")?;
     ensure_nonempty(&parsed.user_code, "user_code")?;
     let verification_uri = parsed
@@ -505,7 +505,7 @@ fn load_cached_record(
     store
         .get_owned(record_id)?
         .and_then(|record| record.get("oauth").cloned())
-        .map(serde_json::from_value::<StoredCredential>)
+        .map(crate::config::value_free::from_value::<StoredCredential>)
         .transpose()
         .with_context(|| format!("stored OAuth credential `{record_id}` is malformed"))
         .map(|cached| cached.filter(|cached| cached.configuration_identity == identity))
@@ -667,7 +667,7 @@ fn oauth_client() -> Result<reqwest::Client> {
 
 fn parse_token_response(body: &str) -> Result<Map<String, Value>> {
     let Value::Object(token) =
-        serde_json::from_str(body).context("OAuth token response is malformed")?
+        crate::config::value_free::from_str(body).context("OAuth token response is malformed")?
     else {
         anyhow::bail!("OAuth token response must be a JSON object");
     };
@@ -1238,5 +1238,42 @@ mod tests {
         let reloaded = store.reopen().unwrap();
         assert_eq!(reloaded.api_key("firecrawl").as_deref(), Some("web-key"));
         assert!(reloaded.get(&credential_record_id("firecrawl")).is_some());
+    }
+}
+
+#[cfg(test)]
+mod security_r4_cached_oauth {
+    use super::*;
+    #[test]
+    fn r4_cached_oauth_error_is_value_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::open(tmp.path().join("credentials.json")).unwrap();
+        store
+            .save_record_merged(
+                "r4-cache",
+                serde_json::json!({"oauth": {
+                    "configuration_identity":"r4", "refresh_generation":1,
+                    "token":"NovelCachedOauth515Secret78529", "expires_at":null,
+                }}),
+            )
+            .unwrap();
+        let error = load_cached_record(&store, "r4-cache", "r4")
+            .err()
+            .expect("wrong token shape must fail");
+        assert!(!format!("{error:#} / {error:?}").contains("NovelCachedOauth515Secret78529"));
+        store
+            .save_record_merged(
+                "r4-cache",
+                serde_json::json!({"oauth": {
+                    "configuration_identity":"r4", "refresh_generation":1,
+                    "token":{"access_token":"valid-token"}, "expires_at":null,
+                }}),
+            )
+            .unwrap();
+        assert!(
+            load_cached_record(&store, "r4-cache", "r4")
+                .unwrap()
+                .is_some()
+        );
     }
 }

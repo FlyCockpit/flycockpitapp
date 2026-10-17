@@ -1676,6 +1676,29 @@ impl Session {
         frame: Option<SessionEventModelFrame<'_>>,
         data: &Value,
     ) -> Result<i64> {
+        self.record_event_at_window(
+            self.live_id(),
+            kind,
+            agent,
+            call_id,
+            origin_principal,
+            frame,
+            data,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_event_at_window(
+        &self,
+        window_id: Uuid,
+        kind: crate::db::session_log::SessionEventKind,
+        agent: Option<&str>,
+        call_id: Option<&str>,
+        origin_principal: Option<&str>,
+        frame: Option<SessionEventModelFrame<'_>>,
+        data: &Value,
+    ) -> Result<i64> {
         let lineage = current_session_event_lineage();
         let provenance = self.session_event_provenance_for(kind, frame, data);
         let provenance_fields = provenance
@@ -1704,6 +1727,7 @@ impl Session {
         {
             return self
                 .record_trusted_event_journaled(
+                    window_id,
                     kind,
                     agent,
                     call_id,
@@ -1715,7 +1739,7 @@ impl Session {
         }
 
         self.db
-            .insert_session_event_with_context(self.live_id(), kind, agent, call_id, context, data)
+            .insert_session_event_with_context(window_id, kind, agent, call_id, context, data)
             .await
             .context("inserting session_event")
     }
@@ -1728,8 +1752,10 @@ impl Session {
     /// existing conn-scoped [`Db::insert_session_event_json_conn`] to obtain its
     /// `seq`, then every prepared append is attached to that `seq` — all committed
     /// together or rolled back together.
+    #[allow(clippy::too_many_arguments)]
     async fn record_trusted_event_journaled(
         &self,
+        window_id: Uuid,
         kind: crate::db::session_log::SessionEventKind,
         agent: Option<&str>,
         call_id: Option<&str>,
@@ -1743,14 +1769,7 @@ impl Session {
         if matches.is_empty() {
             return self
                 .db
-                .insert_session_event_with_context(
-                    self.live_id(),
-                    kind,
-                    agent,
-                    call_id,
-                    context,
-                    data,
-                )
+                .insert_session_event_with_context(window_id, kind, agent, call_id, context, data)
                 .await
                 .context("inserting session_event");
         }
@@ -1761,7 +1780,7 @@ impl Session {
             &self.db,
             resolver.as_ref(),
         );
-        let session_id_str = self.live_id().to_string();
+        let session_id_str = window_id.to_string();
         let mut prepared = Vec::with_capacity(matches.len());
         for m in &matches {
             let literal = match matched_to_protected_literal(m) {
@@ -1772,7 +1791,15 @@ impl Session {
                         "trusted event journaling: literal rejected; persisting redacted event"
                     );
                     return self
-                        .persist_redacted_event(kind, agent, call_id, context, data, session_table)
+                        .persist_redacted_event(
+                            window_id,
+                            kind,
+                            agent,
+                            call_id,
+                            context,
+                            data,
+                            session_table,
+                        )
                         .await;
                 }
             };
@@ -1784,14 +1811,22 @@ impl Session {
                         "trusted event journaling: prepare_append failed; persisting redacted event"
                     );
                     return self
-                        .persist_redacted_event(kind, agent, call_id, context, data, session_table)
+                        .persist_redacted_event(
+                            window_id,
+                            kind,
+                            agent,
+                            call_id,
+                            context,
+                            data,
+                            session_table,
+                        )
                         .await;
                 }
             }
         }
 
         let artifact_kind = event_artifact_kind(kind);
-        let session_id = self.live_id();
+        let session_id = window_id;
         // Owned copies for the `move` closure. Named distinctly so the original
         // borrowed `agent`/`call_id`/`context` params stay available for the
         // decision-12 fallback below (F1).
@@ -1856,8 +1891,16 @@ impl Session {
                     error = %e,
                     "trusted event journaling: transaction failed; persisting redacted event"
                 );
-                self.persist_redacted_event(kind, agent, call_id, context, data, session_table)
-                    .await
+                self.persist_redacted_event(
+                    window_id,
+                    kind,
+                    agent,
+                    call_id,
+                    context,
+                    data,
+                    session_table,
+                )
+                .await
             }
         }
     }
@@ -1866,8 +1909,10 @@ impl Session {
     /// WITHIN the parsed JSON string values/keys/scalar leaves with the table's
     /// overlap-safe production scrub (F2 escape-safe), then persist the
     /// re-serialized body through the normal insert with NO history rows.
+    #[allow(clippy::too_many_arguments)]
     async fn persist_redacted_event(
         &self,
+        window_id: Uuid,
         kind: crate::db::session_log::SessionEventKind,
         agent: Option<&str>,
         call_id: Option<&str>,
@@ -1877,14 +1922,7 @@ impl Session {
     ) -> Result<i64> {
         let redacted = scrub_body_fail_closed(data, session_table);
         self.db
-            .insert_session_event_with_context(
-                self.live_id(),
-                kind,
-                agent,
-                call_id,
-                context,
-                &redacted,
-            )
+            .insert_session_event_with_context(window_id, kind, agent, call_id, context, &redacted)
             .await
             .context("inserting redacted session_event")
     }
@@ -2060,6 +2098,24 @@ impl Session {
         record: SessionCompactionRecord<'_>,
         frame: Option<SessionEventModelFrame<'_>>,
     ) -> Result<i64> {
+        self.record_session_compacted_at_window(self.live_id(), agent, record, frame)
+            .await
+    }
+
+    /// Pin the predecessor timeline explicitly after custody and identity have
+    /// atomically moved to the successor. Both events use the same journaling
+    /// and fail-closed fallback as normal live-window recording.
+    pub(crate) async fn record_session_compacted_at_window(
+        &self,
+        window_id: Uuid,
+        agent: &str,
+        record: SessionCompactionRecord<'_>,
+        frame: Option<SessionEventModelFrame<'_>>,
+    ) -> Result<i64> {
+        anyhow::ensure!(
+            window_id == record.predecessor_session_id || window_id == record.successor_session_id,
+            "compaction event window is outside its boundary"
+        );
         const INLINE_HANDOFF_MAX_BYTES: usize = 16 * 1024;
         let successor = self
             .db
@@ -2093,7 +2149,7 @@ impl Session {
             // The full model-authored payload is offloaded to
             // `compaction_handoffs`; journal (or fail-closed scrub) its trusted
             // table-matched literals so none is stored raw there (K1).
-            self.store_compaction_payload_journaled(handoff_id, &data, frame)
+            self.store_compaction_payload_journaled(window_id, handoff_id, &data, frame)
                 .await?;
             let trimmed = serde_json::json!({
                 "kind": "compaction",
@@ -2115,7 +2171,8 @@ impl Session {
             // brief/handoff/tail), so its own frame scan matches nothing; still
             // route it through the frame path for provenance/trust consistency.
             return self
-                .record_event_with_origin_and_frame(
+                .record_event_at_window(
+                    window_id,
                     crate::db::session_log::SessionEventKind::SessionCompacted,
                     Some(agent),
                     None,
@@ -2128,7 +2185,8 @@ impl Session {
         // Inline: the event body carries the full model-authored record, so the
         // frame path journals its trusted table-matched literals against the
         // committed event `seq` (or fail-closed scrubs the body).
-        self.record_event_with_origin_and_frame(
+        self.record_event_at_window(
+            window_id,
             crate::db::session_log::SessionEventKind::SessionCompacted,
             Some(agent),
             None,
@@ -2168,7 +2226,7 @@ impl Session {
         });
         if data.to_string().len() > INLINE_HANDOFF_MAX_BYTES {
             let handoff_id = Uuid::new_v4();
-            self.store_compaction_payload_journaled(handoff_id, &data, frame)
+            self.store_compaction_payload_journaled(self.live_id(), handoff_id, &data, frame)
                 .await?;
             let trimmed = serde_json::json!({
                 "kind": "subagent_compaction",
@@ -2215,6 +2273,7 @@ impl Session {
     /// instead (decision 12), the turn is not aborted.
     async fn store_compaction_payload_journaled(
         &self,
+        window_id: Uuid,
         handoff_id: Uuid,
         data: &Value,
         frame: Option<SessionEventModelFrame<'_>>,
@@ -2234,7 +2293,7 @@ impl Session {
         else {
             return self
                 .db
-                .store_compaction_payload(handoff_id, self.live_id(), &data.to_string())
+                .store_compaction_payload(handoff_id, window_id, &data.to_string())
                 .await;
         };
 
@@ -2243,7 +2302,7 @@ impl Session {
         if matches.is_empty() {
             return self
                 .db
-                .store_compaction_payload(handoff_id, self.live_id(), &data.to_string())
+                .store_compaction_payload(handoff_id, window_id, &data.to_string())
                 .await;
         }
         let payload_json =
@@ -2254,7 +2313,7 @@ impl Session {
             &self.db,
             resolver.as_ref(),
         );
-        let session_id_str = self.live_id().to_string();
+        let session_id_str = window_id.to_string();
         let mut prepared = Vec::with_capacity(matches.len());
         for m in &matches {
             let literal = match matched_to_protected_literal(m) {
@@ -2265,7 +2324,12 @@ impl Session {
                         "compaction journaling: literal rejected; storing redacted payload"
                     );
                     return self
-                        .store_compaction_payload_redacted(handoff_id, data, session_table)
+                        .store_compaction_payload_redacted(
+                            window_id,
+                            handoff_id,
+                            data,
+                            session_table,
+                        )
                         .await;
                 }
             };
@@ -2277,13 +2341,18 @@ impl Session {
                         "compaction journaling: prepare_append failed; storing redacted payload"
                     );
                     return self
-                        .store_compaction_payload_redacted(handoff_id, data, session_table)
+                        .store_compaction_payload_redacted(
+                            window_id,
+                            handoff_id,
+                            data,
+                            session_table,
+                        )
                         .await;
                 }
             }
         }
 
-        let session_id = self.live_id();
+        let session_id = window_id;
         let refs = [
             crate::redact::protected_redaction_history::ArtifactRef::new(
                 crate::redact::protected_redaction_history::RedactionArtifactKind::Event,
@@ -2319,7 +2388,7 @@ impl Session {
                 "compaction journaling: transaction failed; storing redacted payload"
             );
             return self
-                .store_compaction_payload_redacted(handoff_id, data, session_table)
+                .store_compaction_payload_redacted(window_id, handoff_id, data, session_table)
                 .await;
         }
         Ok(())
@@ -2330,13 +2399,14 @@ impl Session {
     /// production scrub, then store the re-serialized body with no history rows.
     async fn store_compaction_payload_redacted(
         &self,
+        window_id: Uuid,
         handoff_id: Uuid,
         data: &Value,
         session_table: &crate::redact::RedactionTable,
     ) -> Result<()> {
         let redacted = scrub_body_fail_closed(data, session_table);
         self.db
-            .store_compaction_payload(handoff_id, self.live_id(), &redacted.to_string())
+            .store_compaction_payload(handoff_id, window_id, &redacted.to_string())
             .await
     }
 
@@ -3232,7 +3302,9 @@ mod trusted_journaling_tests {
         let window1 = session.id;
         let window2 = db.create_compaction_successor(window1).await.unwrap();
         let window2_short = window2.short_id.clone();
-        session.adopt_compaction_successor(window2.session_id, window2_short.clone());
+        session
+            .adopt_compaction_successor(window2.session_id, window2_short.clone())
+            .unwrap();
         let window3 = db
             .create_compaction_successor(window2.session_id)
             .await

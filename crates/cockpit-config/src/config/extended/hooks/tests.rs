@@ -545,3 +545,20 @@ fn hooks_config_error_class_matcher_is_a_closed_vocabulary() {
     assert!(rejected.hooks.is_empty());
     assert!(!rejected.warnings.is_empty());
 }
+
+/// Secrets I1 class sweep: a parsed-but-unresolved hook's env values and
+/// arguments never reach `{:?}` output.
+#[test]
+fn raw_hook_debug_never_prints_env_or_secret_values() {
+    const SENTINEL: &str = "rawHookDebugSentinel8e41";
+    let hook = RawHook {
+        matcher: None,
+        command: vec!["notify".to_string(), format!("--token={SENTINEL}")],
+        timeout_secs: None,
+        env: BTreeMap::from([("WEBHOOK_SECRET".to_string(), SENTINEL.to_string())]),
+    };
+    for rendered in [format!("{hook:?}"), format!("{hook:#?}")] {
+        assert!(!rendered.contains(SENTINEL), "{rendered}");
+        assert!(rendered.contains("WEBHOOK_SECRET"), "{rendered}");
+    }
+}

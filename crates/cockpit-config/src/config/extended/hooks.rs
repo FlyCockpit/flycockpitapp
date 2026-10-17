@@ -598,7 +598,7 @@ pub fn resolve_hooks_from_captured_sources(
     registry
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHook {
     #[serde(default)]
@@ -610,8 +610,33 @@ struct RawHook {
     env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Default)]
+// Hook env values and arguments may be literal credentials: env names and an
+// argument count only, like [`ResolvedHook`]'s `Debug`.
+impl fmt::Debug for RawHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawHook")
+            .field("matcher", &self.matcher)
+            .field("executable", &self.command.first())
+            .field("argument_count", &self.command.len().saturating_sub(1))
+            .field("timeout_secs", &self.timeout_secs)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+#[derive(Default)]
 struct RawHooks(Vec<(String, Value)>);
+
+// Raw hook JSON carries env literals: event names and entry counts only.
+impl fmt::Debug for RawHooks {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.0.iter().map(|(event, _)| event))
+            .finish()
+    }
+}
 
 impl<'de> Deserialize<'de> for RawHooks {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -997,4 +1022,19 @@ fn warn(
         event,
         message,
     });
+}
+
+#[cfg(test)]
+mod codex_r2_hook_probe {
+    use super::*;
+    #[test]
+    fn codex_r2_raw_hook_debug_is_value_free() {
+        let secret = "NovelRawHook515Secret78529";
+        let input = serde_json::json!({"hooks":{"SessionStart":[{"command":["echo"],"env":{"API_TOKEN":secret}}]}});
+        let raw: RawConfig = serde_json::from_value(input).unwrap();
+        assert!(
+            !format!("{raw:?}").contains(secret),
+            "raw hook config Debug leaks env value"
+        );
+    }
 }

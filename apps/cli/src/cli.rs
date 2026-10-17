@@ -1059,6 +1059,26 @@ impl From<AgentRoleArg> for cockpit_proto::AgentInstallationRoleV1 {
     }
 }
 
+/// A daemon-issued installation continuation token on the command line.
+/// It is the authority to complete the pending choice, so the derived
+/// `Debug` of [`AgentCommand`] prints it as `<redacted>`.
+#[derive(Clone)]
+pub struct ContinuationTokenArg(pub String);
+
+impl std::str::FromStr for ContinuationTokenArg {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_string()))
+    }
+}
+
+impl std::fmt::Debug for ContinuationTokenArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Subcommand)]
 #[command(
     after_help = "Agent operation exit codes:\n  3  daemon choice required\n  4  acknowledgement required\n  5  primary slot unusable\n  6  optional slot unbound\n  7  rebind required\n  8  conflict"
@@ -1143,7 +1163,7 @@ pub enum AgentCommand {
     /// Submit one daemon-issued agent binding choice.
     SubmitChoice {
         #[arg(value_name = "CONTINUATION_TOKEN")]
-        continuation_token: String,
+        continuation_token: ContinuationTokenArg,
         #[arg(value_name = "CHOICE_ID", required_unless_present = "defer")]
         choice_id: Option<String>,
         /// Leave the selected slot unbound without exposing a provider route.
@@ -1803,7 +1823,7 @@ pub enum McpCommand {
     Test(McpTestArgs),
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(clap::Args)]
 pub struct McpAddArgs {
     /// Server name (the catalog/`mcp.invoke` identifier).
     pub name: String,
@@ -1837,6 +1857,33 @@ pub struct McpAddArgs {
     /// Credential profile name (implicit `default` when omitted).
     #[arg(long, value_name = "PROFILE")]
     pub profile: Option<String>,
+}
+
+// `--header-value` is a literal credential and stdio `--arg`s can be too:
+// the top-level CLI `Debug` chain shows presence and counts only.
+impl std::fmt::Debug for McpAddArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpAddArgs")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field(
+                "endpoint",
+                &self
+                    .endpoint
+                    .as_deref()
+                    .map(cockpit_config::config::value_free::redacted_url),
+            )
+            .field("command", &self.command)
+            .field("argument_count", &self.args.len())
+            .field("auth", &self.auth)
+            .field("header_value_present", &self.header_value.is_some())
+            .field("header_name", &self.header_name)
+            .field("disabled", &self.disabled)
+            .field("scope", &self.scope)
+            .field("profile", &self.profile)
+            .finish()
+    }
 }
 
 #[derive(Debug, clap::Args)]

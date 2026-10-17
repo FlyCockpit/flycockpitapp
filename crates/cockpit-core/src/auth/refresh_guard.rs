@@ -223,7 +223,7 @@ where
     Missing: Fn() -> anyhow::Error,
 {
     let raw = store.get_owned(key)?.ok_or_else(missing_auth_error)?;
-    serde_json::from_value(raw).context(parse_context)
+    crate::config::value_free::from_value(raw).context(parse_context)
 }
 
 /// Like [`load_tokens_from_store`] but the read bypasses the store snapshot
@@ -240,7 +240,7 @@ where
     Missing: Fn() -> anyhow::Error,
 {
     let raw = store.reread_owned(key)?.ok_or_else(missing_auth_error)?;
-    serde_json::from_value(raw).context(parse_context)
+    crate::config::value_free::from_value(raw).context(parse_context)
 }
 
 fn unix_now() -> i64 {

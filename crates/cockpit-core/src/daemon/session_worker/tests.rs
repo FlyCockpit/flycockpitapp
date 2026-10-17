@@ -3363,7 +3363,10 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
             &RedactionSourceOverrides::default(),
             &mut notified,
             &redaction,
-            &std::sync::Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            &std::sync::Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+                redaction.clone(),
+                session.clone(),
+            )),
             &event_tx,
             &driver_tx,
             env_overlay,
@@ -5993,7 +5996,9 @@ async fn shutdown_durability_commit_parks_interrupt_and_writes_paused_work_atomi
         .await
         .unwrap()
         .session_id;
-    session.adopt_compaction_successor(successor_id, "successor".to_string());
+    session
+        .adopt_compaction_successor(successor_id, "successor".to_string())
+        .unwrap();
     assert_eq!(session.live_id(), successor_id);
     let open = db
         .raise_interrupt_questions(successor_id, "Build", "open", &set)

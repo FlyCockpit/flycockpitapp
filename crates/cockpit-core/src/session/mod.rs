@@ -652,6 +652,10 @@ pub struct Session {
     tool_surface_override_json: Mutex<Option<String>>,
     goal_settings_override_json: Mutex<Option<String>>,
     redaction_table_json: Mutex<Option<String>>,
+    /// A queued journal transaction owns this permit through commit and reply
+    /// delivery, even if the awaiting caller is cancelled. Identity changes
+    /// refuse while it exists; they then reconcile from the vault, not cache.
+    pending_redaction_commits: Arc<std::sync::atomic::AtomicUsize>,
     secret_path_matcher: OnceLock<crate::secret_paths::SecretPathMatcher>,
     model_system_prompt_snapshot: Arc<ModelSystemPromptSnapshot>,
     /// KB identity/freshness facts bound to the active root definition and
@@ -1329,12 +1333,44 @@ impl Session {
     /// Bind this in-memory session to a newly created compaction successor.
     /// Subsequent recording, custody, lifecycle, and wire events use
     /// [`Self::live_id`].
-    pub fn adopt_compaction_successor(&self, successor_id: Uuid, successor_short_id: String) {
-        let from = self.live_id();
-        *self
-            .live_id
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = successor_id;
+    ///
+    /// Redaction custody moves with the identity: under the redaction cache
+    /// lock (which every committed table write holds or re-checks), the last
+    /// committed table is merged into the successor's vault item (or seeds
+    /// it for an independently constructed test fixture), so a
+    /// registration committed between the predecessor→successor custody copy
+    /// and this adoption is never missing from the resumed successor.
+    // Test fixtures may construct a successor independently. Production must
+    // use publish_compaction_successor, which cannot expose a partial transfer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn adopt_compaction_successor(
+        &self,
+        successor_id: Uuid,
+        successor_short_id: String,
+    ) -> Result<()> {
+        let from;
+        {
+            let mut cache = self
+                .redaction_table_json
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            anyhow::ensure!(
+                self.pending_redaction_commits
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 0,
+                "cannot adopt compaction successor while redaction custody is committing"
+            );
+            from = self.live_id();
+            if from != successor_id {
+                // Reconcile cancelled commits before any overwrite, and commit
+                // the transfer before publishing the successor identity.
+                *cache = Some(self.retarget_redaction_custody(from, successor_id)?);
+                *self
+                    .live_id
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = successor_id;
+            }
+        }
         *self
             .short_id
             .lock()
@@ -1347,6 +1383,7 @@ impl Session {
         {
             hook(from, successor_id);
         }
+        Ok(())
     }
 
     pub(crate) fn set_compaction_successor_begin_hook(

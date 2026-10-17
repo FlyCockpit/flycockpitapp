@@ -131,7 +131,7 @@ pub async fn run(cmd: AgentCommand) -> Result<()> {
             continuation_token,
             choice_id,
             defer,
-        } => submit_choice(continuation_token, choice_id, defer).await,
+        } => submit_choice(continuation_token.0, choice_id, defer).await,
         AgentCommand::Inspect {
             installation_id,
             scope,

@@ -91,6 +91,29 @@ impl TandemSet {
         self.targets = cap_tandem_targets(targets);
     }
 
+    /// Rebuild every target's model handle on `table` (the driver's adopted
+    /// session table), so a shadow send renders with the same table as the
+    /// primary round.
+    pub(crate) fn refresh_redaction(
+        &mut self,
+        providers: &crate::config::providers::ProvidersConfig,
+        table: &Arc<crate::redact::RedactionTable>,
+    ) -> anyhow::Result<()> {
+        let refreshed = self
+            .targets
+            .iter()
+            .map(|target| {
+                let mut model = (*target.handle).clone();
+                model.set_redact_table_for_config(providers, table.clone())?;
+                Ok(Arc::new(model))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for (target, handle) in self.targets.iter_mut().zip(refreshed) {
+            target.handle = handle;
+        }
+        Ok(())
+    }
+
     /// `true` when at least one tandem model is selected — i.e. the feature is
     /// on for this session.
     pub fn is_enabled(&self) -> bool {

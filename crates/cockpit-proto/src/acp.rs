@@ -514,7 +514,7 @@ pub struct AcpForwardedMcpDeclarationV1 {
 }
 
 /// Transport discriminant for a forwarded MCP declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AcpForwardedMcpTransportV1 {
     Stdio {
@@ -532,12 +532,52 @@ pub enum AcpForwardedMcpTransportV1 {
     },
 }
 
+// Stdio argv can carry `--token=…`; URLs can carry userinfo or query tokens.
+impl std::fmt::Debug for AcpForwardedMcpTransportV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdio { command, args, env } => formatter
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("argument_count", &args.len())
+                .field("env", env)
+                .finish(),
+            Self::Http { url, headers } => formatter
+                .debug_struct("Http")
+                .field(
+                    "url",
+                    &cockpit_config::config::value_free::redacted_url(url),
+                )
+                .field("headers", headers)
+                .finish(),
+            Self::Sse { url, headers } => formatter
+                .debug_struct("Sse")
+                .field(
+                    "url",
+                    &cockpit_config::config::value_free::redacted_url(url),
+                )
+                .field("headers", headers)
+                .finish(),
+        }
+    }
+}
+
 /// Explicit name/value pair used for env and headers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpForwardedMcpNameValuePairV1 {
     pub name: String,
     pub value: String,
+}
+
+// Env and header values carry credentials: diagnostics get the name only.
+impl std::fmt::Debug for AcpForwardedMcpNameValuePairV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcpForwardedMcpNameValuePairV1")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Deserialize)]
@@ -822,6 +862,30 @@ pub enum ResolveCodeRootInterruptResultV1 {
 mod forwarded_mcp_tests {
     use super::*;
     use serde_json::json;
+
+    /// Secrets I1 class sweep: forwarded env / header values never reach
+    /// `{:?}` output of the pair or of the declarations holding it.
+    #[test]
+    fn forwarded_pair_debug_never_prints_env_or_secret_values() {
+        const SENTINEL: &str = "pairDebugSentinel5d0e";
+        let declaration = AcpForwardedMcpDeclarationV1 {
+            name: "demo".to_string(),
+            transport: AcpForwardedMcpTransportV1::Stdio {
+                command: "/usr/bin/server".to_string(),
+                args: vec![],
+                env: vec![pair("API_TOKEN", SENTINEL)],
+            },
+        };
+        let header = pair("Authorization", &format!("Bearer {SENTINEL}"));
+        for rendered in [
+            format!("{declaration:?}"),
+            format!("{declaration:#?}"),
+            format!("{header:?}"),
+        ] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+        }
+        assert!(format!("{declaration:?}").contains("API_TOKEN"));
+    }
 
     fn pair(name: &str, value: &str) -> AcpForwardedMcpNameValuePairV1 {
         AcpForwardedMcpNameValuePairV1 {
@@ -1210,5 +1274,29 @@ mod forwarded_mcp_tests {
         args.last_mut().unwrap().push('x');
         assert!(over_vector.declarations.last().unwrap().validate().is_ok());
         assert!(over_vector.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod value_free_transport_tests {
+    use super::*;
+
+    /// Secrets r2 C1: forwarded stdio argv and credential-bearing URLs never
+    /// print through the wire transport Debug.
+    #[test]
+    fn forwarded_transport_debug_hides_argv_and_url_secrets() {
+        let secret = ["NovelDebug515", "Secret78529"].concat();
+        let stdio = AcpForwardedMcpTransportV1::Stdio {
+            command: "/usr/bin/server".into(),
+            args: vec![format!("--token={secret}")],
+            env: vec![],
+        };
+        let http = AcpForwardedMcpTransportV1::Http {
+            url: format!("https://mcp.example.test/x?token={secret}"),
+            headers: vec![],
+        };
+        for rendered in [format!("{stdio:?}"), format!("{http:#?}")] {
+            assert!(!rendered.contains(&secret), "{rendered}");
+        }
     }
 }

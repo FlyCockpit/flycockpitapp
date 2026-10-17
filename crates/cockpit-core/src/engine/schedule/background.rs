@@ -53,9 +53,167 @@ pub struct BackgroundHandle {
     /// is spawned. `kill()` SIGTERMs this group even if the runner has
     /// already been aborted and cannot poll `cancel` / `kill_rx`.
     pgid: Arc<Mutex<Option<u32>>>,
+    /// Registration custody of the job's intake observations, shared with
+    /// the runner: while any observation is not durably registered, EVERY
+    /// output consumer (tail, completion) is withheld.
+    custody: Arc<BackgroundCustody>,
 }
 
-#[derive(Debug, Clone)]
+/// Registration custody shared by a background runner and every consumer of
+/// its output. Observations whose registration failed stay pending (never
+/// dropped) and latch `failed`; consumers retry, and withhold their output
+/// until the retry succeeds.
+#[derive(Default)]
+pub(crate) struct BackgroundCustody {
+    pending: Mutex<crate::redact::ObservedSet>,
+    registration: tokio::sync::Mutex<()>,
+    /// Unfinished semantic values cannot yet yield complete observations.
+    /// Their custody also survives runner cancellation, which leaves the tail
+    /// withheld rather than declaring a dropped parser settled.
+    open_constructs: std::sync::atomic::AtomicUsize,
+    failed: std::sync::atomic::AtomicBool,
+    /// When the last registration ran: arriving observations register at
+    /// once unless one ran within [`REGISTRATION_BATCH_INTERVAL`], so a burst
+    /// of secret-bearing lines costs one owner commit per interval (each
+    /// commit persists the whole table), not one per line.
+    last_registration: Mutex<Option<std::time::Instant>>,
+    sink: Mutex<Option<ObservedOutputSink>>,
+}
+
+/// Batching window for background registrations (see
+/// [`BackgroundCustody::last_registration`]).
+const REGISTRATION_BATCH_INTERVAL: Duration = Duration::from_millis(200);
+
+impl BackgroundCustody {
+    /// Queue `found` (deduplicated, bounded) without registering it yet.
+    fn defer(&self, found: Vec<crate::redact::ObservedSecret>) {
+        if found.is_empty() {
+            return;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(found);
+    }
+
+    fn has_pending(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Register what is pending unless a registration ran within the batch
+    /// interval (the select loop's flush tick registers the remainder).
+    async fn register_if_due(&self) {
+        let due = self
+            .last_registration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none_or(|at| at.elapsed() >= REGISTRATION_BATCH_INTERVAL);
+        if due {
+            self.register(Vec::new()).await;
+        }
+    }
+
+    /// Register `found` plus anything still pending. On failure everything
+    /// stays pending and the latch is set; on success it is cleared.
+    async fn register(&self, found: Vec<crate::redact::ObservedSecret>) {
+        self.defer(found);
+        let _registration = self.registration.lock().await;
+        let sink = self
+            .sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(sink) = sink else {
+            return;
+        };
+        let all = {
+            let pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.snapshot()
+        };
+        if all.is_empty() {
+            return;
+        }
+        *self
+            .last_registration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+        match sink
+            .interrupts
+            .register_observed_output_secrets(&sink.session, &sink.cfg, &all)
+            .await
+        {
+            Ok(_) => {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .acknowledge(&all);
+                self.failed
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            Err(_) => {
+                self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// The table a consumer scrubs this job's output with once settled: the
+    /// caller's table merged with the owner's current one. Lines that reached
+    /// the ring BEFORE their registration committed (another stream's keyless
+    /// echo, or anything ingested while a registration was failing) are
+    /// therefore scrubbed with the registered values even when the caller
+    /// holds an older table. `None` when there is no owner (the caller's
+    /// table is all there is).
+    fn consumer_table(&self, redact: &RedactionTable) -> Option<RedactionTable> {
+        let sink = self
+            .sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let current = sink.interrupts.current_live_redaction()?;
+        match redact.scrub_only_union(&current) {
+            Ok(merged) => Some(merged),
+            // Neither operand alone covers the combined credentials.
+            Err(_) => Some(RedactionTable::withholding_all()),
+        }
+    }
+
+    /// `true` when every observation is registered (registering pending
+    /// ones first, and retrying failed ones).
+    async fn settled(&self) -> bool {
+        if self
+            .open_constructs
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+        {
+            return false;
+        }
+        if self.failed.load(std::sync::atomic::Ordering::SeqCst) || self.has_pending() {
+            self.register(Vec::new()).await;
+        }
+        self.ready_for_release()
+    }
+
+    /// A snapshot may be released only if intake still has no unsettled
+    /// custody. Unlike `settled`, this never starts a new registration against
+    /// a table the consumer has already sampled.
+    fn ready_for_release(&self) -> bool {
+        !self.failed.load(std::sync::atomic::Ordering::SeqCst)
+            && !self.has_pending()
+            && self
+                .open_constructs
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+    }
+}
+
+#[derive(Clone)]
 pub struct BackgroundLaunch {
     pub confine: bool,
     pub tmp_dir: Option<PathBuf>,
@@ -70,6 +228,25 @@ pub struct BackgroundLaunch {
     write_denied_knowledge_paths: Vec<PathBuf>,
     #[cfg(test)]
     test_sandbox_build: Option<TestSandboxBuild>,
+}
+
+impl std::fmt::Debug for BackgroundLaunch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The session env carries credentials: print a key count, not values.
+        formatter
+            .debug_struct("BackgroundLaunch")
+            .field("confine", &self.confine)
+            .field("tmp_dir", &self.tmp_dir)
+            .field("workspace_scratch_dir", &self.workspace_scratch_dir)
+            .field("session_env_key_count", &self.session_env.len())
+            .field("attached_knowledge_paths", &self.attached_knowledge_paths)
+            .field("denied_knowledge_paths", &self.denied_knowledge_paths)
+            .field(
+                "write_denied_knowledge_paths",
+                &self.write_denied_knowledge_paths,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl BackgroundLaunch {
@@ -159,10 +336,28 @@ impl BackgroundHandle {
     /// deterministic floor first, then the utility-model second layer when
     /// the guard is enabled.
     pub async fn tail(&self, lines: usize, redact: &RedactionTable) -> String {
+        if !self.custody.settled().await {
+            return format!(
+                "`{}` output is withheld: registering a secret found in it failed",
+                self.label
+            );
+        }
+        let merged = self.custody.consumer_table(redact);
+        let redact = merged.as_ref().unwrap_or(redact);
         let snap: RingSnapshot = {
             let ring = self.ring.lock().unwrap();
             ring.snapshot_tail(lines)
         };
+        // Intake can advance while consumer_table reads the shared owner or
+        // while we wait for the ring. Check AFTER capturing all released bytes.
+        // Later intake cannot change this snapshot, and the merged table keeps
+        // its live owner link for registrations that have already committed.
+        if !self.custody.ready_for_release() {
+            return format!(
+                "`{}` output is withheld: secret registration is pending",
+                self.label
+            );
+        }
         let mut writer = BudgetedWriter::new(TAIL_TOKEN_CAP);
         // Tail: keep the most recent lines. The window is a SUFFIX of the
         // stream — requested-tail slicing, ring eviction, and the token cap
@@ -175,6 +370,15 @@ impl BackgroundHandle {
         // The tail budget can cut the last retained line mid-line; elide the
         // cut's back margin under that same current session table.
         let body = writer.into_string_redacted(redact);
+        // The budget writer only elides cut margins; the lines themselves
+        // were scrubbed at intake under the stream's table. Re-scrub under
+        // the consumer table so an echo ingested before its registration
+        // committed is caught.
+        let body = if merged.is_some() {
+            redact.scrub(&body)
+        } else {
+            body
+        };
         if body.is_empty() {
             format!("`{}` has produced no output yet", self.label)
         } else if self.attached_knowledge_read {
@@ -544,8 +748,13 @@ pub fn spawn(
         turn_tx,
         event_tx,
         cancel,
+        observed_sink,
     }: BackgroundSpawn,
 ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
+    let custody = Arc::new(BackgroundCustody {
+        sink: Mutex::new(observed_sink),
+        ..BackgroundCustody::default()
+    });
     let ring: Arc<Mutex<BoundedOutputRing>> =
         Arc::new(Mutex::new(BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP)));
     let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
@@ -559,6 +768,7 @@ pub fn spawn(
         utility_guard_probe: Arc::clone(&utility_guard_probe),
         kill_tx,
         pgid: pgid.clone(),
+        custody: custody.clone(),
     };
 
     let task = spawn_guarded_background(
@@ -576,6 +786,7 @@ pub fn spawn(
             kill_rx,
             cancel,
             pgid,
+            custody,
         ),
         event_tx,
         job_id,
@@ -613,6 +824,52 @@ pub struct BackgroundSpawn {
     /// kills the subprocess; [`BackgroundHandle::kill`] group-kills even if
     /// the runner is aborted first.
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Where the job's novel-secret observations are registered: the owning
+    /// session's redaction owner (`None` registers nothing, e.g. tests).
+    pub observed_sink: Option<ObservedOutputSink>,
+}
+
+/// Registration target for the novel-secret backstop run on background
+/// output as it arrives (see [`run_background`]).
+#[derive(Clone)]
+pub struct ObservedOutputSink {
+    pub interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    pub session: Arc<crate::session::Session>,
+    pub cfg: crate::config::extended::RedactConfig,
+}
+
+/// Scrub one arriving background line with the stream's novel-secret
+/// state, register what it replaced through the job's custody, and return
+/// the line to store (`None`: the line is dropped, inside a collapsed PEM
+/// block or multiline secret). A cap-truncated physical line makes the
+/// stream fail closed for the context its discarded remainder could open.
+async fn ingest_background_line(
+    stream: &mut crate::redact::NovelScrubStream,
+    line: &str,
+    truncated: bool,
+    terminated: bool,
+    custody: &BackgroundCustody,
+) -> Option<String> {
+    let was_open = stream.has_unfinished_value();
+    let scrubbed = if truncated {
+        stream.push_truncated_line(line)
+    } else {
+        stream.push_line_with_ending(line, terminated)
+    };
+    custody.defer(stream.take_found());
+    if stream.has_unfinished_value() != was_open {
+        if was_open {
+            custody
+                .open_constructs
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            custody
+                .open_constructs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    custody.register_if_due().await;
+    scrubbed
 }
 
 fn spawn_guarded_background<F>(
@@ -693,6 +950,9 @@ struct CappedLineReader<R> {
     /// True while discarding the tail of an over-cap physical line (whose capped
     /// head was already emitted) up to and including the next newline.
     discarding: bool,
+    /// The line most recently returned was cut at the cap.
+    last_truncated: bool,
+    last_terminated: bool,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> CappedLineReader<R> {
@@ -702,10 +962,20 @@ impl<R: tokio::io::AsyncRead + Unpin> CappedLineReader<R> {
             pending: Vec::new(),
             cap: cap.max(1),
             discarding: false,
+            last_truncated: false,
+            last_terminated: false,
         }
     }
 
+    /// Whether the line most recently returned by [`Self::next_line`] was
+    /// cut at the cap (its remainder discarded unseen).
+    fn last_was_truncated(&self) -> bool {
+        self.last_truncated
+    }
+
     async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        self.last_truncated = false;
+        self.last_terminated = false;
         loop {
             let chunk = self.reader.fill_buf().await?;
             if chunk.is_empty() {
@@ -735,6 +1005,8 @@ impl<R: tokio::io::AsyncRead + Unpin> CappedLineReader<R> {
                     // The whole line fit within the cap iff we took all of it;
                     // only then is a trailing `\r` a genuine CRLF terminator.
                     let complete = take == nl;
+                    self.last_truncated = !complete;
+                    self.last_terminated = complete;
                     self.pending.extend_from_slice(&chunk[..take]);
                     // Consume through the newline, dropping any bytes in
                     // `chunk[take..nl]` that overflowed the cap.
@@ -756,6 +1028,7 @@ impl<R: tokio::io::AsyncRead + Unpin> CappedLineReader<R> {
                     self.reader.consume(len);
                     if self.pending.len() >= self.cap {
                         self.discarding = true;
+                        self.last_truncated = true;
                         // Cap-truncated head, no newline: never strip a `\r`.
                         return Ok(Some(take_capped_line(&mut self.pending, false)));
                     }
@@ -780,6 +1053,7 @@ async fn run_background(
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
     cancel: tokio_util::sync::CancellationToken,
     pgid: Arc<Mutex<Option<u32>>>,
+    custody: Arc<BackgroundCustody>,
 ) {
     if cancel.is_cancelled() {
         let _ = event_tx
@@ -852,6 +1126,23 @@ async fn run_background(
     let push = |ring: &Arc<Mutex<BoundedOutputRing>>, line: String| {
         ring.lock().unwrap().push(line);
     };
+    // Narrow novel-secret backstop (secrets I2) AT INTAKE: every line passes
+    // a per-stream scrubber before it enters the ring, so tail slicing, ring
+    // eviction and the completion token cap only ever cut already-scrubbed
+    // text. A tail of PEM body lines whose BEGIN fence fell outside the
+    // window, or YAML block-scalar lines whose key line was evicted, can no
+    // longer reach the model raw. What the scrubber replaces is registered in
+    // the owning session's table as it is found.
+    let intake_table = redact_probe();
+    let scrub_intake = !intake_table.disabled();
+    let mut out_scrub = crate::redact::NovelScrubStream::new(
+        intake_table.placeholder(),
+        crate::redact::NovelScrubMode::KeyedNarrow,
+    );
+    let mut err_scrub = crate::redact::NovelScrubStream::new(
+        intake_table.placeholder(),
+        crate::redact::NovelScrubMode::KeyedNarrow,
+    );
 
     let mut stdout_done = false;
     let mut stderr_done = false;
@@ -862,6 +1153,8 @@ async fn run_background(
     // stdout/stderr are pending, spinning the task at 100% CPU. Disarm the arm
     // on close so the loop only awaits real output afterwards.
     let mut kill_watch_closed = false;
+    let mut registration_flush = tokio::time::interval(REGISTRATION_BATCH_INTERVAL);
+    registration_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -897,10 +1190,28 @@ async fn run_background(
                     Err(_) => kill_watch_closed = true,
                 }
             }
+            // Batched registrations: flush what arrived inside the interval.
+            _ = registration_flush.tick(), if custody.has_pending() => {
+                custody.register(Vec::new()).await;
+            }
             line = out_lines.next_line(), if !stdout_done => {
                 match line {
                     Ok(Some(l)) => {
-                        push(&ring, l);
+                        let l = if scrub_intake {
+                            ingest_background_line(
+                                &mut out_scrub,
+                                &l,
+                                out_lines.last_was_truncated(),
+                                out_lines.last_terminated,
+                                &custody,
+                            )
+                            .await
+                        } else {
+                            Some(l)
+                        };
+                        if let Some(l) = l {
+                            push(&ring, l);
+                        }
                         let _ = turn_tx.try_send(TurnEvent::ScheduleProgress {
                             job_id: job_id.clone(),
                         });
@@ -911,7 +1222,21 @@ async fn run_background(
             line = err_lines.next_line(), if !stderr_done => {
                 match line {
                     Ok(Some(l)) => {
-                        push(&ring, l);
+                        let l = if scrub_intake {
+                            ingest_background_line(
+                                &mut err_scrub,
+                                &l,
+                                err_lines.last_was_truncated(),
+                                err_lines.last_terminated,
+                                &custody,
+                            )
+                            .await
+                        } else {
+                            Some(l)
+                        };
+                        if let Some(l) = l {
+                            push(&ring, l);
+                        }
                         let _ = turn_tx.try_send(TurnEvent::ScheduleProgress {
                             job_id: job_id.clone(),
                         });
@@ -924,6 +1249,18 @@ async fn run_background(
         if stdout_done && stderr_done {
             break;
         }
+    }
+
+    for stream in [&mut out_scrub, &mut err_scrub] {
+        let was_open = stream.has_unfinished_value();
+        stream.finish();
+        custody.defer(stream.take_found());
+        if was_open {
+            custody
+                .open_constructs
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        custody.register(Vec::new()).await;
     }
 
     let status = child.wait().await;
@@ -945,19 +1282,33 @@ async fn run_background(
     // line flagged at push time, its FRONT/BACK omission margins — under
     // the table current at completion; the budget's own back-edge cut is
     // elided by `into_string_redacted` below.
-    let redact_now = redact_probe();
+    // Settle registration BEFORE building the result, and build it under the
+    // owner's current table (see `BackgroundCustody::consumer_table`).
+    let settled = custody.settled().await;
+    let probed = redact_probe();
+    let merged = custody.consumer_table(&probed);
+    let settled = settled && custody.ready_for_release();
+    let redact_now: &RedactionTable = merged.as_ref().unwrap_or(&*probed);
     let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
-    write_budget_window(
-        &mut writer,
-        &redact_now,
-        &snap,
-        ASYNC_RESULT_TOKEN_CAP,
-        true,
-    );
-    let body = writer.into_string_redacted(&redact_now);
+    write_budget_window(&mut writer, redact_now, &snap, ASYNC_RESULT_TOKEN_CAP, true);
+    let body = writer.into_string_redacted(redact_now);
+    // See `BackgroundHandle::tail`: re-scrub whole lines under the consumer
+    // table (lines ingested before their registration committed).
+    let body = if merged.is_some() {
+        redact_now.scrub(&body)
+    } else {
+        body
+    };
 
     let (result, failed) = if killed {
         (format!("background `{label}` was cancelled"), false)
+    } else if !settled {
+        (
+            format!(
+                "background `{label}` finished; its output was withheld because registering a secret found in it failed"
+            ),
+            true,
+        )
     } else {
         let header = match exit {
             Some(0) => format!("background `{label}` finished (exit 0)\n"),
@@ -1140,6 +1491,19 @@ fn scrub_overrides(session_env: &HashMap<String, String>) -> Vec<(String, String
 mod tests {
     use super::*;
 
+    #[test]
+    fn background_launch_debug_never_prints_session_env_values() {
+        const SENTINEL: &str = "AKIAdebugSentinelValue77";
+        let launch = BackgroundLaunch::unconfined(HashMap::from([(
+            "AWS_ACCESS_KEY_ID".to_string(),
+            SENTINEL.to_string(),
+        )]));
+        for rendered in [format!("{launch:?}"), format!("{launch:#?}")] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+            assert!(rendered.contains("session_env_key_count"), "{rendered}");
+        }
+    }
+
     fn spawn_test_job(
         label: &str,
         command: &str,
@@ -1171,6 +1535,20 @@ mod tests {
         event_tx: mpsc::Sender<ScheduleEvent>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                cwd.clone(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.persist_redaction_table(&redact).unwrap();
+        let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(redact.clone())),
+            session.clone(),
+        ));
         spawn(BackgroundSpawn {
             job_id: "job-1".to_string(),
             label: label.to_string(),
@@ -1189,6 +1567,11 @@ mod tests {
             turn_tx,
             event_tx,
             cancel,
+            observed_sink: Some(ObservedOutputSink {
+                interrupts,
+                session,
+                cfg: Default::default(),
+            }),
         })
     }
 
@@ -1547,6 +1930,7 @@ mod tests {
             }),
             kill_tx,
             pgid: Arc::new(Mutex::new(None)),
+            custody: Arc::new(BackgroundCustody::default()),
         };
 
         let tail = handle.tail(10, &RedactionTable::empty()).await;
@@ -2024,4 +2408,524 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+}
+
+#[cfg(test)]
+mod codex_r2_background_probe {
+    use super::*;
+    #[tokio::test]
+    async fn codex_r2_cap_cut_pem_fence_keeps_body_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "Novel515Base64BodySecret78529";
+        let text = format!(
+            "{}-----BEGIN PRIVATE KEY-----\nFirst515Base64BodyLine78529\nSecond515Base64BodyLine78529\n{body}\n",
+            "x".repeat(BACKGROUND_LINE_READ_CAP - 10)
+        );
+        std::fs::write(tmp.path().join("key.txt"), text).unwrap();
+        let table = Arc::new(RedactionTable::empty());
+        let (turn_tx, _turn_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let table_for_probe = table.clone();
+        let (handle, task) = spawn(BackgroundSpawn {
+            job_id: "codex-bg".into(),
+            label: "cap-fence".into(),
+            command: "cat key.txt".into(),
+            cwd: tmp.path().to_path_buf(),
+            launch: BackgroundLaunch::unconfined(HashMap::new()),
+            redact_probe: Arc::new(move || table_for_probe.clone()),
+            utility_guard_probe: Arc::new(|| {
+                crate::knowledge::KbUtilityGuard::new(
+                    &crate::config::extended::ExtendedConfig::default(),
+                    crate::config::providers::ProvidersConfig::default(),
+                    Arc::new(RedactionTable::empty()),
+                    std::path::Path::new("."),
+                )
+            }),
+            turn_tx,
+            event_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            observed_sink: None,
+        });
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let event = event_rx.recv().await.unwrap();
+        let ScheduleEvent::Completed { result, .. } = event else {
+            panic!("expected completion: {event:?}");
+        };
+        let tail = handle.tail(3, &table).await;
+        assert!(
+            !result.contains(body) && !tail.contains(body),
+            "cap-split BEGIN lost context: result={result:?}, tail={tail:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod codex_r2_background_failure_probe {
+    use super::*;
+    #[tokio::test]
+    async fn codex_r2_background_persist_failure_withholds_tail_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let table = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&table).unwrap();
+        let live = Arc::new(std::sync::RwLock::new(table.clone()));
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+            live,
+            session.clone(),
+        ));
+        crate::session::lifecycle::fail_next_redaction_vault_write_for_test();
+        let secret = "NovelBgFailure515Secret78529";
+        let command = format!("echo DB_SECRET={secret}; echo {secret} 1>&2");
+        let (turn_tx, _turn_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let probe_table = table.clone();
+        let (handle, task) = spawn(BackgroundSpawn {
+            job_id: "codex-bg-failure".into(),
+            label: "failure-tail".into(),
+            command,
+            cwd: tmp.path().to_path_buf(),
+            launch: BackgroundLaunch::unconfined(HashMap::new()),
+            redact_probe: Arc::new(move || probe_table.clone()),
+            utility_guard_probe: Arc::new(|| {
+                crate::knowledge::KbUtilityGuard::new(
+                    &crate::config::extended::ExtendedConfig::default(),
+                    crate::config::providers::ProvidersConfig::default(),
+                    Arc::new(RedactionTable::empty()),
+                    std::path::Path::new("."),
+                )
+            }),
+            turn_tx,
+            event_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            observed_sink: Some(ObservedOutputSink {
+                interrupts: hub.clone(),
+                session: session.clone(),
+                cfg: crate::config::extended::RedactConfig::default(),
+            }),
+        });
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let event = event_rx.recv().await.unwrap();
+        let ScheduleEvent::Completed { result, failed, .. } = event else {
+            panic!("expected completion: {event:?}");
+        };
+        // r3: the injected failure is consumed by the first registration;
+        // the custody retries before releasing anything, and every released
+        // consumer scrubs under the owner's current table.
+        assert!(
+            !crate::session::lifecycle::redaction_vault_write_failure_armed_for_test(),
+            "precondition: the injected vault failure fired"
+        );
+        assert!(
+            !result.contains(secret),
+            "completion released the unregistered stderr echo: {result} (failed={failed})"
+        );
+        let tail = handle.tail(100, &table).await;
+        let model_bound = crate::tools::output_backstop::scrub_command_output(
+            &hub,
+            &session,
+            &table,
+            &crate::config::extended::RedactConfig::default(),
+            &tail,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !model_bound.contains(secret),
+            "completion withheld but tail leaks unregistered stderr echo: {model_bound}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_review_r4 {
+    use super::*;
+    #[tokio::test]
+    async fn r4_tail_waits_for_inflight_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let table = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&table).unwrap();
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(table.clone())),
+            session.clone(),
+        ));
+        let custody = Arc::new(BackgroundCustody {
+            sink: Mutex::new(Some(ObservedOutputSink {
+                interrupts: hub.clone(),
+                session: session.clone(),
+                cfg: Default::default(),
+            })),
+            ..Default::default()
+        });
+        let secret = "NovelInflight515Secret78529";
+        let found = table
+            .scrub_novel_command_output_secrets_with_mode(
+                &format!("DB_SECRET={secret}"),
+                crate::redact::NovelScrubMode::KeyedNarrow,
+            )
+            .found;
+        custody.defer(found);
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push(format!("earlier stderr echo {secret}"));
+        let handle = BackgroundHandle {
+            label: "r4-inflight".into(),
+            ring: Arc::new(Mutex::new(ring)),
+            attached_knowledge_read: false,
+            utility_guard_probe: Arc::new(|| {
+                crate::knowledge::KbUtilityGuard::new(
+                    &Default::default(),
+                    Default::default(),
+                    Arc::new(RedactionTable::empty()),
+                    std::path::Path::new("."),
+                )
+            }),
+            kill_tx: tokio::sync::watch::channel(false).0,
+            pgid: Arc::new(Mutex::new(None)),
+            custody: custody.clone(),
+        };
+        let guard = hub.redaction_owner().unwrap().lock().await;
+        let mut registration = Box::pin(custody.register(Vec::new()));
+        assert!(
+            futures::poll!(registration.as_mut()).is_pending(),
+            "registration must be waiting for the actual owner lock"
+        );
+        let tail = tokio::time::timeout(Duration::from_millis(100), handle.tail(100, &table)).await;
+        let model_bound = match tail {
+            Ok(tail) => Some(
+                crate::tools::output_backstop::scrub_command_output(
+                    &hub,
+                    &session,
+                    &table,
+                    &Default::default(),
+                    &tail,
+                )
+                .await
+                .unwrap(),
+            ),
+            Err(_) => None,
+        };
+        drop(guard);
+        registration.await;
+        let protected_tail = handle.tail(100, &table).await;
+        assert!(
+            !protected_tail.contains(secret),
+            "control: committed registration must hide echo"
+        );
+        if let Some(model_bound) = model_bound {
+            assert!(
+                !model_bound.contains(secret),
+                "tail returned unregistered echo while custody commit was in flight: {model_bound}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_r4_cancellation {
+    use super::*;
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        Arc<crate::engine::interrupt::InterruptHub>,
+        Arc<BackgroundCustody>,
+        BackgroundHandle,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let table = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&table).unwrap();
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(table)),
+            session.clone(),
+        ));
+        let custody = Arc::new(BackgroundCustody {
+            sink: Mutex::new(Some(ObservedOutputSink {
+                interrupts: hub.clone(),
+                session,
+                cfg: Default::default(),
+            })),
+            ..Default::default()
+        });
+        let mut ring = BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP);
+        ring.push("earlier stderr echo NovelInflight515Secret78529".to_string());
+        let handle = BackgroundHandle {
+            label: "r4-cancel".into(),
+            ring: Arc::new(Mutex::new(ring)),
+            attached_knowledge_read: false,
+            utility_guard_probe: Arc::new(|| {
+                crate::knowledge::KbUtilityGuard::new(
+                    &Default::default(),
+                    Default::default(),
+                    Arc::new(RedactionTable::empty()),
+                    std::path::Path::new("."),
+                )
+            }),
+            kill_tx: tokio::sync::watch::channel(false).0,
+            pgid: Arc::new(Mutex::new(None)),
+            custody: custody.clone(),
+        };
+        (tmp, hub, custody, handle)
+    }
+
+    #[tokio::test]
+    async fn r4_tail_waits_for_semantic_value_closure() {
+        let (_tmp, _hub, custody, handle) = fixture().await;
+        let secret = "ab cd";
+        handle
+            .ring
+            .lock()
+            .unwrap()
+            .push(format!("earlier echo {secret}"));
+        let mut stream = crate::redact::NovelScrubStream::new(
+            "[redacted]",
+            crate::redact::NovelScrubMode::KeyedNarrow,
+        );
+        for line in ["password: >-", "  ab", "  cd"] {
+            ingest_background_line(&mut stream, line, false, true, &custody)
+                .await
+                .expect("scalar line is represented");
+        }
+        let tail = handle.tail(100, &RedactionTable::empty()).await;
+        assert!(tail.contains("withheld"));
+        assert!(!tail.contains(secret));
+        ingest_background_line(&mut stream, "done", false, true, &custody)
+            .await
+            .expect("dedented line is preserved");
+        let tail = handle.tail(100, &RedactionTable::empty()).await;
+        assert!(!tail.contains(secret));
+        assert!(
+            !tail.contains("withheld"),
+            "semantic closure must release ordinary protected output"
+        );
+    }
+
+    #[tokio::test]
+    async fn r4_cancelled_background_registration_keeps_custody() {
+        let (_tmp, hub, custody, handle) = fixture().await;
+        let table = RedactionTable::empty();
+        custody.defer(
+            table
+                .scrub_novel_command_output_secrets_with_mode(
+                    "PASSWORD=NovelInflight515Secret78529",
+                    crate::redact::NovelScrubMode::KeyedNarrow,
+                )
+                .found,
+        );
+        let lock = hub.redaction_owner().unwrap().lock().await;
+        let mut registration = Box::pin(custody.register(Vec::new()));
+        assert!(futures::poll!(registration.as_mut()).is_pending());
+        drop(registration);
+        assert!(
+            custody.has_pending(),
+            "cancellation dropped in-flight observations"
+        );
+        drop(lock);
+        let tail = handle.tail(100, &table).await;
+        assert!(!tail.contains("NovelInflight515Secret78529"));
+        assert!(
+            !tail.contains("withheld"),
+            "successful retry must release ordinary output"
+        );
+        assert!(!custody.has_pending());
+    }
+
+    #[tokio::test]
+    async fn r4_background_observation_overflow_withholds_echo() {
+        let (_tmp, _hub, custody, handle) = fixture().await;
+        let mut stream = crate::redact::NovelScrubStream::new(
+            "[redacted]",
+            crate::redact::NovelScrubMode::KeyedNarrow,
+        );
+        for i in 0..12000 {
+            stream.push_line(&format!("PASSWORD=NovelObservation515Secret{i:08}"));
+            custody.defer(stream.take_found());
+        }
+        custody.defer(
+            RedactionTable::empty()
+                .scrub_novel_command_output_secrets_with_mode(
+                    "PASSWORD=NovelInflight515Secret78529",
+                    crate::redact::NovelScrubMode::KeyedNarrow,
+                )
+                .found,
+        );
+        let tail = handle.tail(100, &RedactionTable::empty()).await;
+        assert!(tail.contains("withheld"));
+        assert!(!tail.contains("NovelInflight515Secret78529"));
+        assert!(
+            custody.has_pending(),
+            "overflow must remain a refusal after retry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod independent_security_review_r5 {
+    use super::*;
+    #[tokio::test]
+    async fn review_r5_tail_rechecks_custody_after_concurrent_intake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let table = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&table).unwrap();
+        let shared = Arc::new(std::sync::RwLock::new(table.clone()));
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+            shared.clone(),
+            session.clone(),
+        ));
+        let custody = Arc::new(BackgroundCustody {
+            sink: Mutex::new(Some(ObservedOutputSink {
+                interrupts: hub.clone(),
+                session: session.clone(),
+                cfg: Default::default(),
+            })),
+            ..Default::default()
+        });
+        let handle = Arc::new(BackgroundHandle {
+            label: "r5-concurrent-intake".into(),
+            ring: Arc::new(Mutex::new(BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP))),
+            attached_knowledge_read: false,
+            utility_guard_probe: Arc::new(|| {
+                crate::knowledge::KbUtilityGuard::new(
+                    &Default::default(),
+                    Default::default(),
+                    Arc::new(RedactionTable::empty()),
+                    std::path::Path::new("."),
+                )
+            }),
+            kill_tx: tokio::sync::watch::channel(false).0,
+            pgid: Arc::new(Mutex::new(None)),
+            custody: custody.clone(),
+        });
+        let secret = "NovelConcurrentIntake515Review5";
+        // Block the real current-table read after tail's settlement check.
+        // consumer_table owns a cloned sink before reading this lock. Its
+        // extra hub Arc proves tail reached this exact point, without a sleep
+        // deciding whether the interleaving happened.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let tail_handle = handle.clone();
+        let tail_table = table.clone();
+        let pause_hub = hub.clone();
+        // The pause owner is synchronous: the async intake actor never holds
+        // a std lock across an await, and channel drop/timeout releases it.
+        let pause_thread = std::thread::spawn(move || {
+            let table_lock = shared.write().unwrap();
+            let baseline_refs = Arc::strong_count(&pause_hub);
+            let tail_thread = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(tail_handle.tail(100, &tail_table))
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while Arc::strong_count(&pause_hub) == baseline_refs
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let reached = Arc::strong_count(&pause_hub) > baseline_refs;
+            let _ = ready_tx.send(reached);
+            let released = reached && release_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+            drop(table_lock);
+            let tail = tail_thread.join().unwrap();
+            assert!(
+                !reached || released,
+                "test intake did not release the consumer-table pause"
+            );
+            tail
+        });
+        let reached_consumer = tokio::time::timeout(Duration::from_secs(4), ready_rx)
+            .await
+            .expect("consumer-table pause must complete")
+            .unwrap();
+        assert!(
+            reached_consumer,
+            "tail did not reach the blocked actual consumer-table read"
+        );
+        *custody.last_registration.lock().unwrap() = Some(std::time::Instant::now());
+        let mut stream = crate::redact::NovelScrubStream::new(
+            "[redacted]",
+            crate::redact::NovelScrubMode::KeyedNarrow,
+        );
+        let keyed = ingest_background_line(
+            &mut stream,
+            &format!("PASSWORD={secret}"),
+            false,
+            true,
+            &custody,
+        )
+        .await
+        .unwrap();
+        assert!(!keyed.contains(secret));
+        assert!(
+            custody.has_pending(),
+            "precondition: real intake has uncommitted custody"
+        );
+        handle
+            .ring
+            .lock()
+            .unwrap()
+            .push(format!("new stderr echo {secret}"));
+        release_tx.send(()).unwrap();
+        let tail = tokio::task::spawn_blocking(move || pause_thread.join().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            custody.has_pending(),
+            "precondition: no registration completed"
+        );
+        let model_bound = crate::tools::output_backstop::scrub_command_output(
+            &hub,
+            &session,
+            &table,
+            &Default::default(),
+            &tail,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !model_bound.contains(secret),
+            "tail released a new echo after its settlement check while actual intake custody was pending: {model_bound}"
+        );
+    }
 }

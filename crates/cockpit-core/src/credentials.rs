@@ -81,8 +81,9 @@ fn command_spec_payload(command: &[String]) -> Result<Vec<u8>> {
 /// CLOSED: a malformed payload or an empty argv is an error, never a silent
 /// fallback to a usable secret value.
 fn parse_command_spec_payload(bytes: &[u8]) -> Result<Vec<String>> {
-    let argv: Vec<String> =
-        serde_json::from_slice(bytes).context("parsing command-backed secret spec")?;
+    let argv: Vec<String> = serde_json::from_slice(bytes)
+        .map_err(|error| crate::config::value_free::json_error(&error))
+        .context("parsing command-backed secret spec")?;
     if argv.is_empty() {
         anyhow::bail!("command-backed secret spec has an empty argv");
     }
@@ -90,7 +91,7 @@ fn parse_command_spec_payload(bytes: &[u8]) -> Result<Vec<String>> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct CredentialFile {
     #[serde(
         default,
@@ -102,13 +103,61 @@ struct CredentialFile {
     records: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone)]
+#[cfg(any(test, feature = "test-support"))]
+impl std::fmt::Debug for CredentialFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialFile")
+            .field("secret_names", &self.secrets.keys().collect::<Vec<_>>())
+            .field("record_names", &self.records.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 enum RecordMutation {
     Set(String, Value),
     Remove(String),
 }
 
-#[derive(Debug, Clone)]
+// Mutations carry credential record values, literals and command argv:
+// Debug shows the operation and the record name only.
+impl std::fmt::Debug for RecordMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Set(name, _) => formatter
+                .debug_tuple("Set")
+                .field(name)
+                .finish_non_exhaustive(),
+            Self::Remove(name) => formatter.debug_tuple("Remove").field(name).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SecretMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Set(name, _) => formatter
+                .debug_tuple("Set")
+                .field(name)
+                .finish_non_exhaustive(),
+            Self::SetCommand(name, argv) => formatter
+                .debug_struct("SetCommand")
+                .field("name", name)
+                .field("argument_count", &argv.len())
+                .finish(),
+            Self::Remove(name) => formatter.debug_tuple("Remove").field(name).finish(),
+            Self::RemoveLiteral(name) => {
+                formatter.debug_tuple("RemoveLiteral").field(name).finish()
+            }
+            Self::RemoveCommand(name) => {
+                formatter.debug_tuple("RemoveCommand").field(name).finish()
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 enum SecretMutation {
     /// Write a literal under [`SecretVaultKind::NamedSecret`].
     Set(String, String),
@@ -1146,7 +1195,9 @@ fn read_credential_file_readonly(path: &Path) -> Result<CredentialFile> {
     if raw.trim().is_empty() {
         return Ok(CredentialFile::default());
     }
-    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    serde_json::from_str(&raw)
+        .map_err(|error| crate::config::value_free::json_error(&error))
+        .with_context(|| format!("parsing {}", path.display()))
 }
 
 #[cfg(any(test, feature = "test-support"))]

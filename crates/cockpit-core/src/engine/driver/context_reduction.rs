@@ -2114,38 +2114,11 @@ impl Driver {
         let predecessor_id = self.session.live_id();
         let predecessor_short_id = self.session.short_id();
         let successor_id = uuid::Uuid::new_v4();
-        self.session
-            .begin_compaction_successor(successor_id)
-            .map_err(|error| PreparedCompactionApplyError::SeedSuccessor(error.to_string()))?;
-        let vault = self.session.secret_vault().clone();
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        let successor_row = match self
+        let successor_row = self
             .session
-            .db
-            .transaction(move |conn| {
-                crate::session::lifecycle::copy_vault_session_secrets_on_conn(
-                    conn,
-                    &vault,
-                    predecessor_id,
-                    successor_id,
-                )?;
-                crate::db::Db::create_compaction_successor_conn(
-                    conn,
-                    predecessor_id,
-                    successor_id,
-                    now_unix_ms,
-                )
-            })
+            .publish_compaction_successor(successor_id)
             .await
-        {
-            Ok(row) => row,
-            Err(error) => {
-                self.session.abort_compaction_successor(successor_id);
-                return Err(PreparedCompactionApplyError::SeedSuccessor(
-                    error.to_string(),
-                ));
-            }
-        };
+            .map_err(|error| PreparedCompactionApplyError::SeedSuccessor(error.to_string()))?;
         let successor_short_id = successor_row.short_id.clone();
 
         self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
@@ -2172,6 +2145,7 @@ impl Driver {
                 write_scope: self.write_scope.clone(),
                 dream_read_scope: self.dream_read_scope.clone(),
                 budget: self.budget.clone(),
+                interrupts: self.interrupts.clone(),
             },
         );
         #[cfg(test)]
@@ -2209,7 +2183,12 @@ impl Driver {
         };
         if let Err(e) = self
             .session
-            .record_session_compacted_with_source(&prepared.agent_name, record, compaction_frame)
+            .record_session_compacted_at_window(
+                predecessor_id,
+                &prepared.agent_name,
+                record,
+                compaction_frame,
+            )
             .await
         {
             tracing::warn!(error = %e, "record predecessor session_compacted event failed");
@@ -2217,9 +2196,6 @@ impl Driver {
             #[cfg(test)]
             self.trace_compaction_apply("timeline_recorded");
         }
-
-        self.session
-            .adopt_compaction_successor(successor_row.session_id, successor_short_id.clone());
 
         let seed_record = crate::session::SessionCompactionRecord {
             predecessor_session_id: predecessor_id,

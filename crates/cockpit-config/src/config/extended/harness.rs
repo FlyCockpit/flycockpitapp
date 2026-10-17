@@ -139,7 +139,7 @@ default_const!(default_time_injection_interval, u32, 5);
 /// and editable in `/settings`. Every field carries a `#[serde(default)]`
 /// so a partially-specified user/preset entry parses (defensive against
 /// hand-edited config); only `command` is required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HarnessConfig {
     /// The executable name (resolved on `PATH`).
     pub command: String,
@@ -222,6 +222,33 @@ pub struct HarnessConfig {
 /// Default per-harness invocation timeout: 30 minutes. Headless coding
 /// runs can be long; the cap exists to bound a wedged child, not to clip
 /// legitimate work.
+// Argv templates are user-authored command lines and can carry a literal
+// `--api-key=…`: diagnostics get argument counts, never the arguments.
+impl std::fmt::Debug for HarnessConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HarnessConfig")
+            .field("command", &self.command)
+            .field("args_count", &self.args.len())
+            .field("prompt_input", &self.prompt_input)
+            .field("argv_overflow", &self.argv_overflow)
+            .field("model_args_count", &self.model_args.len())
+            .field("default_model", &self.default_model)
+            .field("models", &self.models)
+            .field("model_list_args_count", &self.model_list_args.len())
+            .field("supports_json_output", &self.supports_json_output)
+            .field("json_output_args_count", &self.json_output_args.len())
+            .field("supports_agent_file", &self.supports_agent_file)
+            .field("agent_file_args_count", &self.agent_file_args.len())
+            .field("agent_file_env", &self.agent_file_env)
+            .field("trust", &self.trust)
+            .field("auth_probe_args_count", &self.auth_probe_args.len())
+            .field("always_allow", &self.always_allow)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
 pub const DEFAULT_HARNESS_TIMEOUT_SECS: u64 = 30 * 60;
 
 default_const!(
@@ -530,4 +557,24 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
             },
         ),
     ]
+}
+
+#[cfg(test)]
+mod value_free_debug_tests {
+    use super::*;
+
+    /// Secrets r2 C1: harness argv templates print as counts.
+    #[test]
+    fn harness_config_debug_hides_argv() {
+        let secret = ["NovelHarness515", "Secret78529"].concat();
+        let config: HarnessConfig = serde_json::from_value(serde_json::json!({
+            "command": "agent",
+            "args": [format!("--api-key={secret}")],
+            "auth_probe_args": [format!("--token={secret}")]
+        }))
+        .unwrap();
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(rendered.contains("args_count"), "{rendered}");
+    }
 }

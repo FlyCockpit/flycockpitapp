@@ -1665,8 +1665,13 @@ pub(crate) fn build_endpoint_request(
     })
 }
 
+/// Header names of a provider header list; values (credentials) never print.
+fn header_names(headers: &[(String, String)]) -> Vec<&str> {
+    headers.iter().map(|(name, _)| name.as_str()).collect()
+}
+
 /// Read-only request description for `POST /api/v1/images`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SubmitRequestDescription {
     pub url: String,
     pub method: String,
@@ -1675,8 +1680,22 @@ pub struct SubmitRequestDescription {
     pub headers: Vec<(String, String)>,
 }
 
+// Provider header values (the API key) and the request body (the user's
+// prompt) never print: names, URL, method and flags only.
+impl fmt::Debug for SubmitRequestDescription {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubmitRequestDescription")
+            .field("url", &crate::config::value_free::redacted_url(&self.url))
+            .field("method", &self.method)
+            .field("streaming", &self.streaming)
+            .field("header_names", &header_names(&self.headers))
+            .finish_non_exhaustive()
+    }
+}
+
 /// Read-only request description for `GET /api/v1/images/models`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DiscoveryRequestDescription {
     pub url: String,
     pub method: String,
@@ -1684,13 +1703,37 @@ pub struct DiscoveryRequestDescription {
     pub headers: Vec<(String, String)>,
 }
 
+impl fmt::Debug for DiscoveryRequestDescription {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryRequestDescription")
+            .field("url", &crate::config::value_free::redacted_url(&self.url))
+            .field("method", &self.method)
+            .field("streaming", &self.streaming)
+            .field("header_names", &header_names(&self.headers))
+            .finish()
+    }
+}
+
 /// Read-only request description for the selected model's endpoint link.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EndpointRequestDescription {
     pub url: String,
     pub method: String,
     pub streaming: bool,
     pub headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for EndpointRequestDescription {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EndpointRequestDescription")
+            .field("url", &crate::config::value_free::redacted_url(&self.url))
+            .field("method", &self.method)
+            .field("streaming", &self.streaming)
+            .field("header_names", &header_names(&self.headers))
+            .finish()
+    }
 }
 
 /// A local runtime error for the adapter contract.
@@ -2026,7 +2069,7 @@ impl OpenrouterImagesTransport for OpenrouterImagesHttpTransport {
 /// The immutable per-attempt inputs the OpenRouter adapter needs to build one
 /// submission. The daemon-integration layer resolves these from the opaque
 /// dispatch identity; this crate ships the seam plus a scripted resolver.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenrouterImagesAttemptInput {
     /// Configured endpoint origin (used only to build the request description;
     /// the transport owns the actual dial to its own configured origin).
@@ -2040,6 +2083,26 @@ pub struct OpenrouterImagesAttemptInput {
     pub request: OpenrouterImageRequest,
     /// Validated user/provider header overrides.
     pub provider_headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for OpenrouterImagesAttemptInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenrouterImagesAttemptInput")
+            .field(
+                "origin",
+                &crate::config::value_free::redacted_url(&self.origin),
+            )
+            .field(
+                "apply_openrouter_attribution",
+                &self.apply_openrouter_attribution,
+            )
+            .field(
+                "provider_header_names",
+                &header_names(&self.provider_headers),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// Resolves the immutable per-attempt plan from a dispatch handoff request.

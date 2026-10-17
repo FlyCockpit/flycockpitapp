@@ -6,9 +6,11 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::cli::SetupArgs;
+use crate::config::dirs::global_config_dir;
+#[cfg(test)]
+use crate::config::dirs::global_config_file;
 #[cfg(test)]
 use crate::config::dirs::most_specific_config_write_target;
-use crate::config::dirs::{global_config_dir, global_config_file};
 #[cfg(test)]
 use crate::config::providers::ConfigDoc;
 use crate::config::providers::HeaderSpec;
@@ -492,6 +494,15 @@ fn is_provider_revision(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// The installation config file the setup wizard wrote: the `COCKPIT_CONFIG`
+/// override when set, otherwise the canonical global config file. The daemon
+/// selects the same layer through its own write-target selector; the CLI uses
+/// this only to name the file it reports as saved.
+fn installation_config_file() -> Result<PathBuf> {
+    crate::config::dirs::installation_config_read_target()
+        .context("resolving the installation config layer for setup")
+}
+
 #[cfg(not(test))]
 async fn apply_security_wizard_via_daemon(_cwd: &std::path::Path, run: &WizardRun) -> Result<bool> {
     let daemon = ensure_persistent_daemon()
@@ -954,7 +965,7 @@ impl ProviderSetupActions {
                 #[cfg(not(test))]
                 let result = apply_security_wizard_via_daemon(&self.cwd, run).await?;
                 if result {
-                    self.security_saved = Some(global_config_file()?);
+                    self.security_saved = Some(installation_config_file()?);
                     io.write_line("Saved security settings through the daemon.")?;
                 } else {
                     io.write_line("Security settings unchanged.")?;
@@ -974,7 +985,7 @@ impl ProviderSetupActions {
                 let (changed, model_file_written, default_scope) =
                     apply_model_wizard_via_daemon(&self.cwd, run).await?;
                 if model_file_written {
-                    self.model_saved = Some(global_config_file()?);
+                    self.model_saved = Some(installation_config_file()?);
                     io.write_line("Saved model settings through the daemon.")?;
                 }
                 if let Some(scope) = default_scope {
@@ -1116,7 +1127,7 @@ impl ProviderSetupActions {
                     .is_some_and(|view| provider_view_matches_entry(view, &expected_entry)) => {}
             other => bail!("daemon returned an unbound provider configuration receipt: {other:?}"),
         }
-        self.saved = Some((id.clone(), global_config_file()?));
+        self.saved = Some((id.clone(), installation_config_file()?));
         io.write_line(&format!("Saved provider `{id}`."))?;
         if let Some(message) = header_reference_notice {
             io.write_line(&message)?;

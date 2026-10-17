@@ -2697,3 +2697,64 @@ async fn locked_connection_renews_rechecks_each_envelope_and_releases_on_io_erro
         "every exit path releases the connection's credential"
     );
 }
+
+#[tokio::test]
+async fn locked_onboarding_profile_follows_cockpit_config_override() {
+    let (tmp, locked) = fresh_locked_services().await;
+    let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let target = tmp.path().join("operator/custom.json");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    env.set_cockpit_config(&target);
+    let (welcome, _) = locked
+        .onboarding
+        .begin_or_reopen(
+            BeginOrReopenOnboarding {
+                expected_revision: None,
+                client_operation_id: "begin-override-profile".into(),
+                reentry: false,
+            },
+            locked.host_capabilities(),
+        )
+        .await
+        .unwrap();
+    locked
+        .onboarding
+        .apply_transition(
+            ApplyOnboardingTransition {
+                run_id: welcome.run_id,
+                attempt_id: welcome.attempt_id,
+                expected_revision: welcome.revision,
+                client_operation_id: "advance-override-profile".into(),
+                transition: OnboardingTransitionKind::Advance,
+                settlement: None,
+            },
+            locked.host_capabilities(),
+        )
+        .await
+        .unwrap();
+    let result = handle_locked_in_process_request(
+        &locked,
+        Request::ApplyOnboardingProfile(ApplyOnboardingProfile {
+            client_operation_id: "save-override-profile".into(),
+            display_name: "Ada".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        result,
+        Response::SetupWizardApplied { changed: true, .. }
+    ));
+    assert_eq!(
+        crate::config::extended::ExtendedConfigDoc::load(&target)
+            .unwrap()
+            .config()
+            .name
+            .as_deref(),
+        Some("Ada")
+    );
+    assert!(
+        !crate::config::dirs::global_config_dir().unwrap().exists(),
+        "an ephemeral owner may write an override without creating the global layer"
+    );
+}

@@ -1103,7 +1103,7 @@ impl ConfigDoc {
     }
 
     fn load_with_mask(path: &Path, mask: Option<&[u8]>) -> Result<Self> {
-        let path = config_path_for_layer_path(path);
+        let path = config_path_for_layer_path(path)?;
         let raw_str = match mask {
             Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
             // No outer read context: the bounded reader already attaches a

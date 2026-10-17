@@ -2846,6 +2846,21 @@ pub(crate) enum EphemeralReapDecision {
     WaitingForLiveWork,
 }
 
+/// A provider/config write target that could not be selected: a workspace
+/// trust refusal keeps its code, every other cause is a bad request.
+pub(super) fn config_write_target_error(
+    error: cockpit_config::config::dirs::ConfigWriteTargetError,
+) -> ErrorPayload {
+    use cockpit_config::config::dirs::ConfigWriteTargetError as E;
+    ErrorPayload {
+        code: match error {
+            E::Refused(_) | E::NoWorkspacePolicy => ErrorCode::WorkspaceTrust,
+            E::InvalidProviderId(_) | E::Unresolved(_) => ErrorCode::BadRequest,
+        },
+        message: error.to_string(),
+    }
+}
+
 /// Ephemeral/diagnostic owners fail closed when a user-level write would
 /// create the global Cockpit config directory. Persistent daemons create
 /// that directory at boot; `cockpit doctor` and other ephemeral owners
@@ -4885,10 +4900,14 @@ async fn apply_locked_onboarding_profile(
         current.stage == cockpit_proto::OnboardingStage::Profile,
         "bootstrap is locked"
     );
-    let global_config = cockpit_config::config::dirs::global_config_file()
-        .context("resolving the global Cockpit config for the onboarding profile")?;
-    refuse_ephemeral_missing_global_layer(locked.paths.ephemeral, &global_config)?;
-    ensure_authorized_global_layer(&global_config)?;
+    // Route the profile write through the installation-layer write-target
+    // selector so it lands on the `COCKPIT_CONFIG` override when one is set,
+    // matching where `apply_onboarding_profile_display_name` will write.
+    let installation_config = cockpit_config::config::dirs::installation_config_write_target()
+        .map_err(anyhow::Error::from)
+        .context("resolving the installation Cockpit config for the onboarding profile")?;
+    refuse_ephemeral_missing_global_layer(locked.paths.ephemeral, &installation_config)?;
+    ensure_authorized_global_layer(&installation_config)?;
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let changed = crate::wizard::apply_onboarding_profile_display_name(display_name)?;
     let config_generation = if changed {

@@ -17,7 +17,7 @@ pub use apply::{
     apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
     descriptor_for_cwd_with_caps, model_descriptor_for_cwd,
     onboarding_lifetime_client_answers_json, onboarding_model_client_answers_json,
-    onboarding_model_descriptor_for_cwd, security_config_path,
+    onboarding_model_descriptor_for_cwd,
 };
 
 macro_rules! named_setup_wizard_rows {

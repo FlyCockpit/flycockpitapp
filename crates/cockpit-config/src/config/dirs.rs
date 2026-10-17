@@ -60,8 +60,8 @@ pub(crate) fn global_config_file_unchecked() -> anyhow::Result<PathBuf> {
     Ok(global_config_dir_unchecked()?.join(CONFIG_FILE))
 }
 
-/// The canonical global `config.json` path. Onboarding and other
-/// user-level setup must use this rather than selecting a workspace layer.
+/// The canonical global `config.json` path. Installation configuration reads
+/// and writes use the override-aware installation selectors below.
 pub fn global_config_file() -> anyhow::Result<PathBuf> {
     Ok(global_config_dir()?.join(CONFIG_FILE))
 }
@@ -153,7 +153,7 @@ pub fn is_global_config_dir(path: &Path) -> anyhow::Result<bool> {
 }
 
 /// Symlink-safe equality that does not require either path to exist.
-fn same_logical_path(left: &Path, right: &Path) -> bool {
+pub(super) fn same_logical_path(left: &Path, right: &Path) -> bool {
     match (
         cockpit_host::path_containment::effective_path(left),
         cockpit_host::path_containment::effective_path(right),
@@ -277,10 +277,38 @@ pub fn explicit_config_override() -> Result<Option<PathBuf>, ExplicitConfigOverr
 /// otherwise the canonical global layer. No project root takes part and
 /// every returned path is absolute.
 pub fn installation_config_file_paths() -> anyhow::Result<Vec<PathBuf>> {
-    if let Some(path) = explicit_config_override()? {
-        return Ok(vec![path]);
+    Ok(vec![installation_config_read_target()?])
+}
+
+/// The one installation-layer `config.json` a reader must use: the
+/// `COCKPIT_CONFIG` explicit override when set, otherwise the canonical
+/// global layer. This is the read side of
+/// [`installation_config_write_target`], so a global reader and the writer
+/// it must observe can never diverge. It resolves even when the file does
+/// not exist yet, and it is not gated by workspace trust: readability never
+/// implies writability.
+pub fn installation_config_read_target() -> anyhow::Result<PathBuf> {
+    match explicit_config_override()? {
+        Some(path) => Ok(path),
+        None => global_config_file(),
     }
-    Ok(vec![global_config_file()?])
+}
+
+/// `config.json` write target for an installation-global mutation: the
+/// `COCKPIT_CONFIG` explicit override exactly as sessions and the daemon
+/// select it, otherwise the canonical global layer. This is the write side
+/// of [`installation_config_file_paths`], so a global writer and the readers
+/// it must agree with can never diverge.
+///
+/// No project root takes part, and a missing global directory is allowed
+/// (the caller creates it through the authorized funnel). A refused
+/// override is a typed error, never a fallback to the layer the override
+/// masks; the returned target has passed the write gate.
+pub fn installation_config_write_target() -> Result<PathBuf, ConfigWriteTargetError> {
+    let path = installation_config_read_target()
+        .map_err(|error| ConfigWriteTargetError::Unresolved(format!("{error:#}")))?;
+    authorize_config_layer_write(&path)?;
+    Ok(path)
 }
 
 /// The one write gate for a durable configuration file: a `config.json`
@@ -1185,6 +1213,121 @@ mod tests {
             "provider file lives beside the exact override config"
         );
         crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// The installation-layer write target is the `COCKPIT_CONFIG` override
+    /// when set, otherwise the canonical global layer — the write side of
+    /// [`installation_config_file_paths`], so a global writer and the readers
+    /// it must agree with can never diverge.
+    #[test]
+    fn installation_write_target_follows_cockpit_config_override() {
+        let tmp = TempDir::new().unwrap();
+        let env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let global = tmp.path().join("home/.config/cockpit").join(CONFIG_FILE);
+
+        assert_eq!(
+            installation_config_write_target().unwrap(),
+            global,
+            "without an override the target is the canonical global layer"
+        );
+
+        let override_cfg = tmp.path().join("explicit/config.json");
+        std::fs::create_dir_all(override_cfg.parent().unwrap()).unwrap();
+        std::fs::write(&override_cfg, "{}").unwrap();
+        let _ovr = env.override_cockpit_config(&override_cfg);
+
+        assert_eq!(
+            installation_config_file_paths().unwrap(),
+            vec![override_cfg.clone()],
+            "the override is the only layer installation-wide policy reads"
+        );
+        assert_eq!(
+            installation_config_read_target().unwrap(),
+            override_cfg.clone(),
+            "the single-layer read target is the same layer installation-wide policy reads"
+        );
+        assert_eq!(
+            installation_config_write_target().unwrap(),
+            override_cfg,
+            "the write target is the same layer the read side selects"
+        );
+    }
+
+    /// A refused override is a typed refusal, never a fallback to the global
+    /// layer the override masks.
+    #[test]
+    fn installation_write_target_refuses_an_ignored_override() {
+        let tmp = TempDir::new().unwrap();
+        let env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        let override_cfg = repo.join(".cockpit").join(CONFIG_FILE);
+        std::fs::create_dir_all(override_cfg.parent().unwrap()).unwrap();
+        std::fs::write(&override_cfg, "{}").unwrap();
+        let root = crate::config::trust::resolve_trust_root(&repo).unwrap();
+        crate::config::trust::set_runtime_policy(
+            root,
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        );
+        let _ovr = env.override_cockpit_config(&override_cfg);
+
+        assert!(
+            matches!(
+                installation_config_write_target(),
+                Err(ConfigWriteTargetError::Refused(_))
+            ),
+            "an untrusted override must refuse rather than fall back"
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn provider_document_reads_the_cockpit_config_override_filename() {
+        let tmp = TempDir::new().unwrap();
+        let env = test_support::IsolatedCockpitHome::new(tmp.path());
+        let target = tmp.path().join("operator/custom.json");
+        let providers = target.parent().unwrap().join("providers");
+        std::fs::create_dir_all(&providers).unwrap();
+        std::fs::write(&target, r#"{"active_model":{"provider":"p","model":"m"}}"#).unwrap();
+        let _override = env.override_cockpit_config(&target);
+        for id in ["p", "config"] {
+            let provider = providers.join(format!("{id}.json"));
+            std::fs::write(&provider, "{}").unwrap();
+            let doc = crate::config::providers::ConfigDoc::load(&provider).unwrap();
+            assert_eq!(doc.path, target);
+            let active = doc
+                .providers()
+                .active_model
+                .expect("override's active model");
+            assert_eq!(active.provider, "p");
+            assert_eq!(active.model, "m");
+        }
+        assert!(!target.parent().unwrap().join(CONFIG_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_config_document_keeps_a_dangling_override_and_refuses_writing_it() {
+        let tmp = TempDir::new().unwrap();
+        let env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let config_dir = tmp.path().join("operator");
+        let target = config_dir.join("providers/custom.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("missing.json", &target).unwrap();
+        let _override = env.override_cockpit_config(&target);
+        let mut doc = crate::config::providers::ConfigDoc::load(&target).unwrap();
+        assert_eq!(
+            doc.path, target,
+            "a dangling override is never another layer"
+        );
+        let error = doc.write(&doc.providers()).unwrap_err();
+        assert!(
+            error.downcast_ref::<ConfigWriteRefused>().is_some(),
+            "{error:#}"
+        );
+        assert!(!config_dir.join(CONFIG_FILE).exists());
     }
 
     /// When no project layer applies, the fallback is the canonical global

@@ -353,9 +353,14 @@ async fn validate_onboarding_stage_settlement(
                     && (changed || model_file_written)
                     && config_generation == settlement.config_generation =>
                 {
-                    let global =
-                        cockpit_config::config::dirs::global_config_file().map_err(internal)?;
-                    let providers = crate::config::providers::ConfigDoc::load(&global)
+                    // The wizard committed the installation layer, which is the
+                    // `COCKPIT_CONFIG` override when set, else the canonical
+                    // global layer. Validate the default against that same
+                    // layer, not the global one the override masks.
+                    let installation_config =
+                        cockpit_config::config::dirs::installation_config_read_target()
+                            .map_err(internal)?;
+                    let providers = crate::config::providers::ConfigDoc::load(&installation_config)
                         .map_err(internal)?
                         .providers();
                     if providers.active_model.is_some() {
@@ -18594,9 +18599,15 @@ async fn handle_serialized_request_inner(
                 return Ok(response);
             }
             let mutation = async {
-                let global_config =
-                    cockpit_config::config::dirs::global_config_file().map_err(internal)?;
-                prepare_user_level_write_target(ctx, &global_config)?;
+                // The wizard writes the installation layer exactly as it
+                // reads it: the `COCKPIT_CONFIG` override when set, else the
+                // canonical global layer. This is the same write-target
+                // selector the settings writer uses; a refused override is a
+                // typed error, not a fallback.
+                let installation_config =
+                    cockpit_config::config::dirs::installation_config_write_target()
+                        .map_err(config_write_target_error)?;
+                prepare_user_level_write_target(ctx, &installation_config)?;
                 // Every generic wizard apply is a config publication: it
                 // shares the daemon-wide serialization gate with provider
                 // mutations so a wizard write cannot interleave with a
@@ -21640,21 +21651,6 @@ fn sandbox_capability_missing(
     }
 }
 
-/// A provider/config write target that could not be selected: a workspace
-/// trust refusal keeps its code, every other cause is a bad request.
-fn config_write_target_error(
-    error: cockpit_config::config::dirs::ConfigWriteTargetError,
-) -> ErrorPayload {
-    use cockpit_config::config::dirs::ConfigWriteTargetError as E;
-    ErrorPayload {
-        code: match error {
-            E::Refused(_) | E::NoWorkspacePolicy => ErrorCode::WorkspaceTrust,
-            E::InvalidProviderId(_) | E::Unresolved(_) => ErrorCode::BadRequest,
-        },
-        message: error.to_string(),
-    }
-}
-
 /// Expected prospective-write validation is a client error; filesystem and
 /// serialization failures retain Internal, including through anyhow contexts.
 fn provider_write_error(error: anyhow::Error) -> ErrorPayload {
@@ -21938,8 +21934,13 @@ async fn daemon_provider_config_with_warnings(
     let cwd = crate::daemon::fs_api::canonical_project_root(project_root)?;
     let trust_policy = resolve_user_level_trust_policy(ctx, &cwd).await?;
     if global_config_root(&cwd)? {
-        let global_config = cockpit_config::config::dirs::global_config_file().map_err(internal)?;
-        let config = crate::config::providers::ConfigDoc::load(&global_config)
+        // The installation-layer catalog: the `COCKPIT_CONFIG` override when
+        // set, else the canonical global layer. This is the same layer
+        // `config_write_target_for_provider` writes and the wizard reads, so
+        // a snapshot and its mutation can never name different layers.
+        let installation_config =
+            cockpit_config::config::dirs::installation_config_read_target().map_err(internal)?;
+        let config = crate::config::providers::ConfigDoc::load(&installation_config)
             .map_err(daemon_config_error)?
             .providers();
         return Ok((cwd, trust_policy, config, Vec::new()));
@@ -22398,7 +22399,7 @@ fn catalog_config_after_layer_writes(
     >,
 ) -> std::result::Result<crate::config::providers::ProvidersConfig, ErrorPayload> {
     let paths = if global_config_root(cwd)? {
-        vec![cockpit_config::config::dirs::global_config_file().map_err(internal)?]
+        cockpit_config::config::dirs::installation_config_file_paths().map_err(internal)?
     } else {
         crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
             ctx.config_source().watch_paths(cwd).config_files

@@ -426,7 +426,7 @@ fn persist_redaction_table_to_vault(
         .map_err(|error| anyhow::anyhow!("persisting session redaction table: {error}"))
 }
 
-fn persist_redaction_table_to_vault_on_conn(
+pub(super) fn persist_redaction_table_to_vault_on_conn(
     vault: &crate::secure_key::SecretVault,
     conn: &rusqlite::Connection,
     session_id: uuid::Uuid,
@@ -1619,6 +1619,83 @@ impl Session {
         Ok(())
     }
 
+    /// Copy custody, publish the durable edge and adopt its identity as one
+    /// cancellation-safe operation. Lock order: redaction cache, then DB
+    /// writer. No DB job takes the cache lock. Pending journal permits refuse
+    /// the transition before any publication; synchronous registrations either
+    /// precede the final copy or target the adopted identity afterwards.
+    pub(crate) async fn publish_compaction_successor(
+        self: &Arc<Self>,
+        successor_id: Uuid,
+    ) -> Result<crate::db::sessions::SessionRow> {
+        self.begin_compaction_successor(successor_id)?;
+        let session = self.clone();
+        // Once submitted, this owner completes even if the driver is cancelled.
+        // There is no await between committing the edge and adopting identity.
+        tokio::task::spawn_blocking(move || {
+            let result = (|| {
+                let mut cache = session
+                    .redaction_table_json
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                anyhow::ensure!(
+                    session
+                        .pending_redaction_commits
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        == 0,
+                    "cannot publish compaction successor while redaction custody is committing"
+                );
+                let predecessor = session.live_id();
+                let vault = session.secret_vault().clone();
+                let (row, json) = session
+                    .db
+                    .blocking_write_for_sync_maintenance(move |conn| {
+                        let tx = conn.unchecked_transaction()?;
+                        copy_vault_session_secrets_on_conn(&tx, &vault, predecessor, successor_id)?;
+                        let json = require_redaction_table_json_from_vault_on_conn(
+                            &vault,
+                            &tx,
+                            successor_id,
+                            "publishing compaction custody",
+                        )?;
+                        let row = crate::db::Db::create_compaction_successor_conn(
+                            &tx,
+                            predecessor,
+                            successor_id,
+                            chrono::Utc::now().timestamp_millis(),
+                        )?;
+                        tx.commit()?;
+                        Ok((row, json))
+                    })?;
+                *cache = Some(json);
+                *session
+                    .live_id
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = row.session_id;
+                *session
+                    .short_id
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = row.short_id.clone();
+                drop(cache);
+                if let Some(hook) = session
+                    .on_compaction_successor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                {
+                    hook(predecessor, successor_id);
+                }
+                Ok(row)
+            })();
+            if result.is_err() {
+                session.abort_compaction_successor(successor_id);
+            }
+            result
+        })
+        .await
+        .context("joining compaction publication owner")?
+    }
+
     /// Persist the accumulated egress redaction table with the session so raw
     /// history remains covered after resume even if env/dotenv sources change.
     ///
@@ -1628,7 +1705,7 @@ impl Session {
     /// committed table (persist-before-swap).
     ///
     /// The cache lock is held across the vault write, and
-    /// [`Self::adopt_compaction_successor`] takes it to retarget: a persist
+    /// `publish_compaction_successor` takes it through copy and adoption: a persist
     /// either lands before the retarget (and is copied onto the successor)
     /// or after it (and targets the successor directly).
     pub fn persist_redaction_table(&self, table: &crate::redact::RedactionTable) -> Result<()> {
@@ -1675,6 +1752,7 @@ impl Session {
     /// operands are read under the identity-transition lock, after every
     /// queued commit's permit has been released. A failed transfer leaves
     /// the predecessor identity and cache untouched.
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn retarget_redaction_custody(
         &self,
         predecessor: Uuid,
@@ -2351,5 +2429,73 @@ pub(super) struct PendingRedactionCommit(Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for PendingRedactionCommit {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod independent_security_review_r5_publication {
+    use super::*;
+    use crate::redact::RedactionTable;
+    #[tokio::test]
+    async fn review_r5_cancelled_publication_keeps_identity_and_durable_custody_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("publish-cancel.db")).unwrap();
+        let parent = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let secret = "PublicationCancellation515Review5";
+        let table = RedactionTable::empty()
+            .with_forced_literal(secret.into(), "$test:publication".into())
+            .unwrap();
+        parent.persist_redaction_table(&table).unwrap();
+        let predecessor = parent.live_id();
+        let successor = uuid::Uuid::new_v4();
+        let stall = db.stall_writer_for_test().unwrap();
+        let task_session = parent.clone();
+        let task =
+            tokio::spawn(async move { task_session.publish_compaction_successor(successor).await });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if parent.redaction_table_json.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publication owner must enter its cache fence");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(stall);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while parent.live_id() != successor {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached publication owner must finish");
+        let resumed = Session::resume_with_test_workspace_root(
+            db,
+            predecessor,
+            parent.redaction_key_resolver().clone(),
+            parent.secret_vault().clone(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.live_id(), successor);
+        assert!(
+            !resumed
+                .persisted_redaction_table()
+                .unwrap()
+                .unwrap()
+                .scrub(secret)
+                .contains(secret)
+        );
     }
 }

@@ -197,6 +197,13 @@ impl BackgroundCustody {
         if self.failed.load(std::sync::atomic::Ordering::SeqCst) || self.has_pending() {
             self.register(Vec::new()).await;
         }
+        self.ready_for_release()
+    }
+
+    /// A snapshot may be released only if intake still has no unsettled
+    /// custody. Unlike `settled`, this never starts a new registration against
+    /// a table the consumer has already sampled.
+    fn ready_for_release(&self) -> bool {
         !self.failed.load(std::sync::atomic::Ordering::SeqCst)
             && !self.has_pending()
             && self
@@ -341,6 +348,16 @@ impl BackgroundHandle {
             let ring = self.ring.lock().unwrap();
             ring.snapshot_tail(lines)
         };
+        // Intake can advance while consumer_table reads the shared owner or
+        // while we wait for the ring. Check AFTER capturing all released bytes.
+        // Later intake cannot change this snapshot, and the merged table keeps
+        // its live owner link for registrations that have already committed.
+        if !self.custody.ready_for_release() {
+            return format!(
+                "`{}` output is withheld: secret registration is pending",
+                self.label
+            );
+        }
         let mut writer = BudgetedWriter::new(TAIL_TOKEN_CAP);
         // Tail: keep the most recent lines. The window is a SUFFIX of the
         // stream — requested-tail slicing, ring eviction, and the token cap
@@ -1270,6 +1287,7 @@ async fn run_background(
     let settled = custody.settled().await;
     let probed = redact_probe();
     let merged = custody.consumer_table(&probed);
+    let settled = settled && custody.ready_for_release();
     let redact_now: &RedactionTable = merged.as_ref().unwrap_or(&*probed);
     let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
     write_budget_window(&mut writer, redact_now, &snap, ASYNC_RESULT_TOKEN_CAP, true);
@@ -2767,6 +2785,147 @@ mod security_r4_cancellation {
         assert!(
             custody.has_pending(),
             "overflow must remain a refusal after retry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod independent_security_review_r5 {
+    use super::*;
+    #[tokio::test]
+    async fn review_r5_tail_rechecks_custody_after_concurrent_intake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                crate::db::Db::open_in_memory().unwrap(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let table = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&table).unwrap();
+        let shared = Arc::new(std::sync::RwLock::new(table.clone()));
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached_owning(
+            shared.clone(),
+            session.clone(),
+        ));
+        let custody = Arc::new(BackgroundCustody {
+            sink: Mutex::new(Some(ObservedOutputSink {
+                interrupts: hub.clone(),
+                session: session.clone(),
+                cfg: Default::default(),
+            })),
+            ..Default::default()
+        });
+        let handle = Arc::new(BackgroundHandle {
+            label: "r5-concurrent-intake".into(),
+            ring: Arc::new(Mutex::new(BoundedOutputRing::new(BACKGROUND_RING_BYTE_CAP))),
+            attached_knowledge_read: false,
+            utility_guard_probe: Arc::new(|| {
+                crate::knowledge::KbUtilityGuard::new(
+                    &Default::default(),
+                    Default::default(),
+                    Arc::new(RedactionTable::empty()),
+                    std::path::Path::new("."),
+                )
+            }),
+            kill_tx: tokio::sync::watch::channel(false).0,
+            pgid: Arc::new(Mutex::new(None)),
+            custody: custody.clone(),
+        });
+        let secret = "NovelConcurrentIntake515Review5";
+        // Block the real current-table read after tail's settlement check.
+        // consumer_table owns a cloned sink before reading this lock. Its
+        // extra hub Arc proves tail reached this exact point, without a sleep
+        // deciding whether the interleaving happened.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let tail_handle = handle.clone();
+        let tail_table = table.clone();
+        let pause_hub = hub.clone();
+        // The pause owner is synchronous: the async intake actor never holds
+        // a std lock across an await, and channel drop/timeout releases it.
+        let pause_thread = std::thread::spawn(move || {
+            let table_lock = shared.write().unwrap();
+            let baseline_refs = Arc::strong_count(&pause_hub);
+            let tail_thread = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(tail_handle.tail(100, &tail_table))
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while Arc::strong_count(&pause_hub) == baseline_refs
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let reached = Arc::strong_count(&pause_hub) > baseline_refs;
+            let _ = ready_tx.send(reached);
+            let released = reached && release_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+            drop(table_lock);
+            let tail = tail_thread.join().unwrap();
+            assert!(
+                !reached || released,
+                "test intake did not release the consumer-table pause"
+            );
+            tail
+        });
+        let reached_consumer = tokio::time::timeout(Duration::from_secs(4), ready_rx)
+            .await
+            .expect("consumer-table pause must complete")
+            .unwrap();
+        assert!(
+            reached_consumer,
+            "tail did not reach the blocked actual consumer-table read"
+        );
+        *custody.last_registration.lock().unwrap() = Some(std::time::Instant::now());
+        let mut stream = crate::redact::NovelScrubStream::new(
+            "[redacted]",
+            crate::redact::NovelScrubMode::KeyedNarrow,
+        );
+        let keyed = ingest_background_line(
+            &mut stream,
+            &format!("PASSWORD={secret}"),
+            false,
+            true,
+            &custody,
+        )
+        .await
+        .unwrap();
+        assert!(!keyed.contains(secret));
+        assert!(
+            custody.has_pending(),
+            "precondition: real intake has uncommitted custody"
+        );
+        handle
+            .ring
+            .lock()
+            .unwrap()
+            .push(format!("new stderr echo {secret}"));
+        release_tx.send(()).unwrap();
+        let tail = tokio::task::spawn_blocking(move || pause_thread.join().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            custody.has_pending(),
+            "precondition: no registration completed"
+        );
+        let model_bound = crate::tools::output_backstop::scrub_command_output(
+            &hub,
+            &session,
+            &table,
+            &Default::default(),
+            &tail,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !model_bound.contains(secret),
+            "tail released a new echo after its settlement check while actual intake custody was pending: {model_bound}"
         );
     }
 }

@@ -235,15 +235,25 @@ pub struct TrustedChildCaptureRegistry {
 /// The capture base for a session no live owner writes: its latest durable
 /// table (so a capture never rewrites the vault item from an older turn
 /// snapshot), unioned with the caller's snapshot.
-fn own_durable_base(
+async fn own_durable_base(
     session: &Session,
     snapshot: &RedactionTable,
 ) -> anyhow::Result<std::sync::Arc<RedactionTable>> {
-    let base = match session.persisted_redaction_table()? {
-        Some(durable) => durable.union(snapshot)?,
-        None => snapshot.clone(),
-    };
-    Ok(std::sync::Arc::new(base))
+    let vault = session.secret_vault().clone();
+    let session_id = session.live_id();
+    let json = session
+        .db
+        .read(move |conn| {
+            super::lifecycle::require_redaction_table_json_from_vault_on_conn(
+                &vault,
+                conn,
+                session_id,
+                "loading trusted-child capture custody",
+            )
+        })
+        .await?;
+    let durable = RedactionTable::from_persisted_json(&json)?;
+    Ok(std::sync::Arc::new(durable.union(snapshot)?))
 }
 
 impl TrustedChildCaptureRegistry {
@@ -466,7 +476,7 @@ impl TrustedChildCaptureRegistry {
         // enqueue (the DB writer may still commit it) can never leave the
         // durable table ahead of the live one. A failed write restores the
         // previous table; an extra live literal is the fail-closed direction.
-        let create = |table: std::sync::Arc<RedactionTable>| {
+        let create = |table: std::sync::Arc<RedactionTable>, mirror| {
             let proceed = &proceed;
             let value = &value;
             async move {
@@ -480,6 +490,7 @@ impl TrustedChildCaptureRegistry {
                         value.as_str(),
                         &proceed.source_tool_call_id,
                         now_ms,
+                        mirror,
                     )
                     .await
             }
@@ -495,16 +506,17 @@ impl TrustedChildCaptureRegistry {
         let result: anyhow::Result<()> = match owner {
             Some(owner) => {
                 let guard = owner.lock().await;
-                let owns_session = guard
-                    .durable(session)
-                    .is_ok_and(|durable| durable.live_id() == session.live_id());
-                if owns_session {
+                let durable = match guard.durable(session) {
+                    Ok(durable) => durable,
+                    Err(_) => return TrustedChildCaptureOutcome::Denied,
+                };
+                if durable.live_id() == session.live_id() {
                     let previous = guard.current();
                     match sealed_table(&previous) {
                         Ok(table) => {
                             let table = guard.link(table);
                             guard.publish_persisted(table.clone());
-                            let created = create(table).await;
+                            let created = create(table, None).await;
                             if created.is_err() {
                                 guard.publish_persisted(previous);
                             }
@@ -520,8 +532,9 @@ impl TrustedChildCaptureRegistry {
                     // adopts the owner's table) still redacts it. The mirror
                     // is a forced credential literal persisted to the owner's
                     // durable session; failing it fails the capture closed.
-                    // The mirror is published first for the same
-                    // cancellation reason as above.
+                    // Publish live before awaiting, and commit both vaults
+                    // in the SAME child transaction. Cancellation cannot leave
+                    // a committed child without its parent's durable mirror.
                     let mirrored = guard.current().with_forced_credential_literal(
                         value.as_str().to_owned(),
                         format!("$secret:fork-capture:{}", proceed.record_id),
@@ -531,17 +544,19 @@ impl TrustedChildCaptureRegistry {
                             let previous = guard.current();
                             let mirrored = guard.link(mirrored);
                             guard.publish_persisted(mirrored.clone());
-                            let captured = match own_durable_base(session, redaction)
+                            let persisted = match own_durable_base(session, redaction)
+                                .await
                                 .and_then(|base| sealed_table(&base))
                             {
-                                Ok(table) => create(std::sync::Arc::new(table)).await,
+                                Ok(table) => {
+                                    create(
+                                        std::sync::Arc::new(table),
+                                        Some((durable, mirrored.as_ref())),
+                                    )
+                                    .await
+                                }
                                 Err(error) => Err(error),
                             };
-                            let persisted = captured.and_then(|()| {
-                                guard
-                                    .durable(session)
-                                    .and_then(|durable| durable.persist_redaction_table(&mirrored))
-                            });
                             if persisted.is_err() {
                                 guard.publish_persisted(previous);
                             }
@@ -551,9 +566,11 @@ impl TrustedChildCaptureRegistry {
                     }
                 }
             }
-            None => match own_durable_base(session, redaction).and_then(|base| sealed_table(&base))
+            None => match own_durable_base(session, redaction)
+                .await
+                .and_then(|base| sealed_table(&base))
             {
-                Ok(table) => create(std::sync::Arc::new(table)).await,
+                Ok(table) => create(std::sync::Arc::new(table), None).await,
                 Err(error) => Err(error),
             },
         };

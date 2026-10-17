@@ -1093,7 +1093,8 @@ mod security_r4_diagnostics {
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0u8; 4096];
-                stream.read(&mut request).await.unwrap();
+                let received = stream.read(&mut request).await.unwrap();
+                assert!(received > 0, "mock token server must receive a request");
                 stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             }
         });

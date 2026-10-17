@@ -233,7 +233,14 @@ impl Session {
         value: &str,
         source_tool_call_id: &str,
         now_ms: i64,
+        mirror: Option<(&Session, &crate::redact::RedactionTable)>,
     ) -> Result<()> {
+        if let Some((owner, _)) = mirror {
+            anyhow::ensure!(
+                std::sync::Arc::ptr_eq(self.secret_vault(), owner.secret_vault()),
+                "fork capture mirror must share its session vault authority"
+            );
+        }
         validate_agent_acquired_sealed_value(name, value).map_err(anyhow::Error::from)?;
         let protected = crate::redact::protected_redaction_history::ProtectedLiteral::new(
             value.to_owned(),
@@ -261,12 +268,19 @@ impl Session {
         let cache_json = write_json.clone();
         let vault = self.secret_vault.clone();
         let (session_id, pending_commit) = self.begin_redaction_commit();
+        let mirror_write = mirror
+            .map(|(owner, table)| -> Result<_> {
+                let json = table.to_persisted_json()?;
+                let (id, permit) = owner.begin_redaction_commit();
+                Ok((owner.secret_vault().clone(), id, json, permit))
+            })
+            .transpose()?;
         let item_id = crate::secure_key::session_sealed_item_id(&session_id.to_string(), name, 1);
         let literal = value.to_owned();
         let reason = description.to_owned();
         let acquisition_id = acquisition_id.to_owned();
         let source_tool_call_id = source_tool_call_id.to_owned();
-        let pending_commit = self
+        let (pending_commit, mirror_commit) = self
             .db
             .transaction(move |conn| {
                 let exists: i64 = conn.query_row(
@@ -287,6 +301,18 @@ impl Session {
                         write_json.as_bytes(),
                     )
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let mirror_commit = match mirror_write {
+                    Some((mirror_vault, id, json, permit)) => {
+                        super::lifecycle::persist_redaction_table_to_vault_on_conn(
+                            &mirror_vault,
+                            conn,
+                            id,
+                            json.as_bytes(),
+                        )?;
+                        Some((id, json, permit))
+                    }
+                    None => None,
+                };
                 let row = crate::db::sealed_scope::create_agent_acquired_session_sealed_value_conn(
                     conn,
                     &record,
@@ -316,12 +342,19 @@ impl Session {
                     row.active_version == 1,
                     "agent-acquired create did not publish version one"
                 );
-                Ok(pending_commit)
+                Ok((pending_commit, mirror_commit))
             })
             .await?;
         // Persist-before-swap: advertise the union as persisted only after the
         // vault write commits, matching [`Session::persist_redaction_table`].
         self.commit_redaction_cache(session_id, cache_json)?;
+        if let Some((id, json, permit)) = mirror_commit {
+            mirror
+                .expect("mirror commit has an owner")
+                .0
+                .commit_redaction_cache(id, json)?;
+            drop(permit);
+        }
         drop(pending_commit);
         Ok(())
     }

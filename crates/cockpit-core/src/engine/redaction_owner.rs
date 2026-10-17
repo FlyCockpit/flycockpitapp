@@ -627,3 +627,109 @@ mod security_review_r4 {
         assert!(!actual_table(&session, id).scrub(secret).contains(secret));
     }
 }
+
+#[cfg(test)]
+mod independent_security_review_r5_successor {
+    use super::*;
+
+    #[tokio::test]
+    async fn review_r5_failed_retarget_cannot_resume_published_successor_without_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("retarget-resume.db")).unwrap();
+        let parent = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let initial = Arc::new(RedactionTable::empty());
+        parent.persist_redaction_table(&initial).unwrap();
+        let hub = crate::engine::interrupt::InterruptHub::detached_owning(
+            Arc::new(std::sync::RwLock::new(initial.clone())),
+            parent.clone(),
+        );
+        let predecessor = parent.live_id();
+        let successor = uuid::Uuid::new_v4();
+        let secret = "NovelAfterCopyRegistration515Review5";
+        crate::tools::output_backstop::scrub_command_output(
+            &hub,
+            &parent,
+            &initial,
+            &Default::default(),
+            &format!("PASSWORD={secret}"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !parent
+                .persisted_redaction_table()
+                .unwrap()
+                .unwrap()
+                .scrub(secret)
+                .contains(secret)
+        );
+        crate::session::lifecycle::fail_next_redaction_vault_write_for_test();
+        // Exercise the sole production publication boundary, which replaced
+        // the old copy -> published edge -> fallible adoption sequence.
+        let error = parent
+            .publish_compaction_successor(successor)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected redaction vault write failure"));
+        assert_eq!(parent.live_id(), predecessor);
+        assert!(db.get_session(successor).await.unwrap().is_none());
+        assert!(
+            db.get_session(predecessor)
+                .await
+                .unwrap()
+                .unwrap()
+                .ended_at_unix_ms
+                .is_none()
+        );
+        let resumed = Session::resume_with_test_workspace_root(
+            db.clone(),
+            predecessor,
+            parent.redaction_key_resolver().clone(),
+            parent.secret_vault().clone(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.live_id(), predecessor);
+        assert!(
+            !resumed
+                .persisted_redaction_table()
+                .unwrap()
+                .unwrap()
+                .scrub(secret)
+                .contains(secret),
+            "failed transition lost successfully registered custody on resume"
+        );
+        // Inverse: a later successful transition must still work and include
+        // every registration in the actual successor vault and canonical resume.
+        parent
+            .publish_compaction_successor(successor)
+            .await
+            .unwrap();
+        let resumed = Session::resume_with_test_workspace_root(
+            db,
+            predecessor,
+            parent.redaction_key_resolver().clone(),
+            parent.secret_vault().clone(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.live_id(), successor);
+        assert!(
+            !resumed
+                .persisted_redaction_table()
+                .unwrap()
+                .unwrap()
+                .scrub(secret)
+                .contains(secret),
+            "published successor is missing a successful registration"
+        );
+    }
+}

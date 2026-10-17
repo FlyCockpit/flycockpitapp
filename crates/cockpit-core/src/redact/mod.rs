@@ -1127,7 +1127,7 @@ pub struct RedactionTable {
     /// replaced with [`COVERAGE_WITHHELD_PLACEHOLDER`]. Used where a
     /// response must still be delivered but no current coverage exists.
     withhold_all: bool,
-    scrub_refusals: Vec<coverage_authority::CoverageTableBinding>,
+    scrub_refusals: Vec<ScrubRefusal>,
     /// Test-only fault injection: when set, [`Self::enforced_checked`] returns
     /// an error, so a caller's fail-closed-before-side-effect path (e.g. the
     /// external-harness runner constructing its scrub view before spawning a
@@ -1171,10 +1171,46 @@ pub(crate) trait LiveRedactionSource: Send + Sync {
 type DerivedResolution =
     std::sync::Arc<std::sync::Mutex<Option<(u64, std::sync::Arc<RedactionTable>)>>>;
 
+/// A scrub-only operand's refusal, with the owner (if any) that can replace
+/// it. Independent operands never inherit another operand's live authority.
+#[derive(Clone)]
+struct ScrubRefusal {
+    binding: coverage_authority::CoverageTableBinding,
+    owner: Option<std::sync::Weak<dyn LiveRedactionSource>>,
+}
+
+impl ScrubRefusal {
+    fn from_operand(table: &RedactionTable) -> Option<Self> {
+        let binding = table.coverage_binding.as_ref()?;
+        let owner = table
+            .live
+            .as_ref()
+            .filter(|link| {
+                link.owner_binding
+                    .as_ref()
+                    .is_some_and(|owned| owned.same_generation(binding))
+            })
+            .map(|link| link.source.clone());
+        Some(Self {
+            binding: binding.clone(),
+            owner,
+        })
+    }
+
+    fn replaced_by(&self, source: &std::sync::Weak<dyn LiveRedactionSource>) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|owner| owner.ptr_eq(source))
+    }
+}
+
 #[derive(Clone)]
 struct LiveLink {
     source: std::sync::Weak<dyn LiveRedactionSource>,
     generation: u64,
+    /// The binding this owner publication can supersede. A composed table's
+    /// separate binding need not belong to this owner.
+    owner_binding: Option<coverage_authority::CoverageTableBinding>,
     /// `Some` for a table derived from a published one (see the `live`
     /// field): its resolution unions the owner's newest table with its own
     /// entries.
@@ -1815,10 +1851,10 @@ impl RedactionTable {
         // a cached derived view can outlive an authority invalidation.
         merged
             .scrub_refusals
-            .extend(self.coverage_binding.iter().cloned());
+            .extend(ScrubRefusal::from_operand(self));
         merged
             .scrub_refusals
-            .extend(other.coverage_binding.iter().cloned());
+            .extend(ScrubRefusal::from_operand(other));
         Ok(merged)
     }
 
@@ -2465,6 +2501,7 @@ impl RedactionTable {
         self.live = Some(LiveLink {
             source,
             generation,
+            owner_binding: self.coverage_binding.clone(),
             derived: None,
         });
         self
@@ -2496,8 +2533,17 @@ impl RedactionTable {
         // The derived table's own entries plus the owner's newest. The merge
         // is unlinked, so resolution never recurses.
         let mut local = self.clone();
+        if let Some(refusal) = ScrubRefusal::from_operand(&local)
+            && !refusal.replaced_by(&link.source)
+        {
+            local.scrub_refusals.push(refusal);
+        }
         local.coverage_binding = None;
-        local.scrub_refusals.clear();
+        // Supersede only this owner's refusal. Global coverage and other
+        // independent operands must continue to validate on every render.
+        local
+            .scrub_refusals
+            .retain(|refusal| !refusal.replaced_by(&link.source));
         local.live = None;
         match newest.scrub_only_union(&local) {
             Ok(mut merged) => {
@@ -2520,6 +2566,7 @@ impl RedactionTable {
         self.live.as_ref().map(|link| LiveLink {
             source: link.source.clone(),
             generation: link.generation,
+            owner_binding: link.owner_binding.clone(),
             derived: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
         })
     }
@@ -2544,8 +2591,8 @@ impl RedactionTable {
         if let Some(binding) = &self.coverage_binding {
             binding.validate()?;
         }
-        for binding in &self.scrub_refusals {
-            binding.validate()?;
+        for refusal in &self.scrub_refusals {
+            refusal.binding.validate()?;
         }
         Ok(())
     }
@@ -4040,6 +4087,215 @@ mod security_r4_composition_failure {
         assert_eq!(
             outbound.scrub("other uncaptured content"),
             COVERAGE_WITHHELD_PLACEHOLDER
+        );
+    }
+}
+
+#[cfg(test)]
+mod independent_security_review_r5_refusal {
+    use super::*;
+    use coverage_authority::{
+        CoverageBinding, CoverageBuild, CoverageScope, RedactionCoverageAuthority,
+        RedactionCoverageKey,
+    };
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn review_r5_live_event_merge_retains_independent_global_refusal() {
+        let binding = || CoverageBinding::from_daemon_bytes([83u8; 16]);
+        let key = RedactionCoverageKey::session(
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+        );
+        let boundary = coverage_bindings::OwnedSourceRevisions {
+            environment: binding(),
+            credential_vault: binding(),
+            policy: binding(),
+            sealed: binding(),
+            override_revision: binding(),
+            machine_sources: binding(),
+        };
+        let global_authority = RedactionCoverageAuthority::default();
+        let global = global_authority
+            .acquire(key, CoverageScope::SessionStart, move || {
+                Ok(CoverageBuild::from_complete_table(
+                    RedactionTable::empty(),
+                    boundary,
+                ))
+            })
+            .await
+            .unwrap()
+            .install_table()
+            .unwrap();
+        let owner = crate::engine::redaction_owner::SessionRedactionOwner::new(
+            Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty()))),
+            uuid::Uuid::new_v4(),
+        );
+        // This is the exact production EventScrub::with_origin composition.
+        let event = crate::daemon::EventScrub::with_origin(&global, &owner.current()).unwrap();
+        {
+            let guard = owner.lock().await;
+            guard.publish_persisted(
+                guard.link(
+                    guard
+                        .current()
+                        .with_forced_literal(
+                            "RegisteredOwner515Review5".into(),
+                            "$leak:contained".into(),
+                        )
+                        .unwrap(),
+                ),
+            );
+        }
+        global_authority.invalidate();
+        let secret = "NewGlobalUncaptured515Review5";
+        assert!(global.ensure_binding_current().is_err());
+        assert!(
+            !global.scrub(secret).contains(secret),
+            "precondition: global authority now refuses this text"
+        );
+        let original = crate::daemon::proto::Event::Notice {
+            session_id: uuid::Uuid::new_v4(),
+            text: secret.into(),
+        };
+        let projected = event
+            .project_for_non_owner(original, |event, table| {
+                if let crate::daemon::proto::Event::Notice { text, .. } = event {
+                    *text = table.scrub(text);
+                }
+            })
+            .unwrap();
+        let crate::daemon::proto::Event::Notice { text, .. } = projected else {
+            panic!("notice variant changed")
+        };
+        assert!(
+            !text.contains(secret),
+            "live owner advance dropped independent global refusal at real EventScrub projection: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod security_r5_refusal_inverse {
+    use super::*;
+    use coverage_authority::{
+        CoverageBinding, CoverageBuild, CoverageScope, RedactionCoverageAuthority,
+        RedactionCoverageKey,
+    };
+    use std::sync::Arc;
+
+    async fn bound(authority: &RedactionCoverageAuthority) -> RedactionTable {
+        let binding = || CoverageBinding::from_daemon_bytes([84u8; 16]);
+        let key = RedactionCoverageKey::session(
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+            binding(),
+        );
+        let boundary = coverage_bindings::OwnedSourceRevisions {
+            environment: binding(),
+            credential_vault: binding(),
+            policy: binding(),
+            sealed: binding(),
+            override_revision: binding(),
+            machine_sources: binding(),
+        };
+        authority
+            .acquire(key, CoverageScope::SessionStart, move || {
+                Ok(CoverageBuild::from_complete_table(
+                    RedactionTable::empty(),
+                    boundary,
+                ))
+            })
+            .await
+            .unwrap()
+            .install_table()
+            .unwrap()
+    }
+
+    fn project(event: &crate::daemon::EventScrub, text: &str) -> String {
+        let event = event
+            .project_for_non_owner(
+                crate::daemon::proto::Event::Notice {
+                    session_id: uuid::Uuid::new_v4(),
+                    text: text.into(),
+                },
+                |event, table| {
+                    if let crate::daemon::proto::Event::Notice { text, .. } = event {
+                        *text = table.scrub(text);
+                    }
+                },
+            )
+            .unwrap();
+        let crate::daemon::proto::Event::Notice { text, .. } = event else {
+            panic!("notice variant changed")
+        };
+        text
+    }
+
+    #[tokio::test]
+    async fn review_r5_event_owner_refresh_replaces_only_its_own_refusal() {
+        let authority = RedactionCoverageAuthority::default();
+        let owner = crate::engine::redaction_owner::SessionRedactionOwner::new(
+            Arc::new(std::sync::RwLock::new(Arc::new(bound(&authority).await))),
+            uuid::Uuid::new_v4(),
+        );
+        let event =
+            crate::daemon::EventScrub::with_origin(&RedactionTable::empty(), &owner.current())
+                .unwrap();
+        let ordinary = "ordinary event content";
+        assert_eq!(project(&event, ordinary), ordinary);
+        authority.invalidate();
+        assert!(!project(&event, ordinary).contains(ordinary));
+        {
+            let guard = owner.lock().await;
+            let next = RedactionTable::empty()
+                .with_forced_literal("OwnerRefreshCredential515".into(), "$test:refreshed".into())
+                .unwrap();
+            guard.publish_persisted(guard.link(next));
+        }
+        assert_eq!(
+            project(&event, ordinary),
+            ordinary,
+            "a fresh owner must replace its own stale event refusal"
+        );
+        assert!(
+            !project(&event, "OwnerRefreshCredential515").contains("OwnerRefreshCredential515")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_r5_live_union_retains_independent_coverage_binding() {
+        let authority = RedactionCoverageAuthority::default();
+        let global = bound(&authority).await;
+        let owner = crate::engine::redaction_owner::SessionRedactionOwner::new(
+            Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty()))),
+            uuid::Uuid::new_v4(),
+        );
+        let derived = global.union(&owner.current()).unwrap();
+        {
+            let guard = owner.lock().await;
+            guard.publish_persisted(guard.link(RedactionTable::empty()));
+        }
+        let ordinary = "IndependentBinding515";
+        assert_eq!(derived.scrub(ordinary), ordinary);
+        authority.invalidate();
+        assert!(
+            !derived.scrub(ordinary).contains(ordinary),
+            "owner advance dropped independent union coverage"
         );
     }
 }

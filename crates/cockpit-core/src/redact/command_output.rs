@@ -643,7 +643,17 @@ fn source_type_annotation(code: &str, value: &str) -> bool {
         .trim()
         .trim_end_matches([',', ';'])
         .trim_end();
-    source_field_type(code).is_some_and(|ty| ty == observed && is_code_type_expression(ty))
+    source_field_type(code).is_some_and(|ty| {
+        // Flow mapping scans stop at the first comma, including a comma inside
+        // a generic type. Suppress that exact scanner fragment only after the
+        // COMPLETE field type has validated; assignments and quoted data never
+        // qualify for this source-only exception.
+        is_code_type_expression(ty)
+            && (ty == observed
+                || ty
+                    .split_once(',')
+                    .is_some_and(|(head, _)| head.trim_end() == observed))
+    })
 }
 
 fn source_field_type(code: &str) -> Option<&str> {
@@ -5087,6 +5097,89 @@ mod security_r4_comment_data {
                 !addition.scrub("String").contains("String"),
                 "a real comment credential was mistaken for an annotation"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod independent_security_review_r5 {
+    use super::*;
+    #[test]
+    fn review_r5_inline_generic_field_does_not_register_source_fragments() {
+        let table = RedactionTable::empty();
+        for input in [
+            "pub struct Creds<T> { password: HashMap<String, SecretString> }\n",
+            "pub struct Creds<T> { api_key: Result<String, SecretString> }\n",
+            "interface Creds<T> { token: Record<string, string>; }\n",
+        ] {
+            let out = table
+                .scrub_novel_command_output_secrets_with_mode(input, NovelScrubMode::KeyedNarrow);
+            assert!(
+                out.found.is_empty(),
+                "source generic fragments entered custody for {input}: {:?}",
+                out.found
+            );
+            let addition = table
+                .observed_output_addition(&Default::default(), &out.found)
+                .unwrap();
+            assert_eq!(addition.scrub("HashMap<String, SecretString> Result<String, SecretString> Record<string, string>"), "HashMap<String, SecretString> Result<String, SecretString> Record<string, string>");
+            assert!(
+                !out.text.contains("password: HashMap")
+                    && !out.text.contains("api_key: Result")
+                    && !out.text.contains("token: Record")
+            );
+        }
+    }
+    #[test]
+    fn review_r5_multiline_generic_fields_do_not_register_source_fragments() {
+        let input = "pub struct Creds<T> {\n password: HashMap<String, SecretString>,\n api_key: Result<String, SecretString>,\n}\n";
+        let out = RedactionTable::empty()
+            .scrub_novel_command_output_secrets_with_mode(input, NovelScrubMode::KeyedNarrow);
+        assert!(
+            out.found.is_empty(),
+            "generic type annotation entered custody: {:?}",
+            out.found
+        );
+        assert!(!out.text.contains("password: HashMap"));
+    }
+    #[test]
+    fn review_r5_actual_type_default_and_marker_passwords_register() {
+        let table = RedactionTable::empty();
+        for value in [
+            "HashMap<String, SecretString>",
+            "Option<SecretString>",
+            "test",
+            "COCKPIT",
+            "SecretString",
+        ] {
+            for input in [
+                format!("PASSWORD='{value}'\n"),
+                format!("password: '{value}'\n"),
+                format!("pub struct Creds<T> {{\nPASSWORD='{value}'\n}}\n"),
+            ] {
+                let out = table.scrub_novel_command_output_secrets_with_mode(
+                    &input,
+                    NovelScrubMode::KeyedNarrow,
+                );
+                // The configured scanner marker can itself contain COCKPIT;
+                // assert removal of the complete quoted input credential, then
+                // assert raw registration and collision-free final rendering.
+                assert!(
+                    !out.text.contains(&format!("'{value}'")),
+                    "actual password not replaced"
+                );
+                assert!(
+                    out.found.iter().any(|secret| secret.value == value),
+                    "actual password was not observed"
+                );
+                let addition = table
+                    .observed_output_addition(&Default::default(), &out.found)
+                    .unwrap();
+                assert!(
+                    !addition.scrub(value).contains(value),
+                    "actual password not registered: {input}"
+                );
+            }
         }
     }
 }

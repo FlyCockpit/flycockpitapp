@@ -1339,6 +1339,9 @@ impl Session {
     /// committed table is re-persisted onto the successor's vault item, so a
     /// registration committed between the predecessor→successor custody copy
     /// and this adoption is never missing from the resumed successor.
+    // Test fixtures may construct a successor independently. Production must
+    // use publish_compaction_successor, which cannot expose a partial transfer.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn adopt_compaction_successor(
         &self,
         successor_id: Uuid,

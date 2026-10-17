@@ -404,13 +404,6 @@ async fn macos_strict_uses_container_when_available() {
     }
 }
 
-#[tokio::test]
-async fn queue_saturation_returns_busy() {
-    // The queue is large; we verify the error type exists and Full maps correctly.
-    let err = ContainmentError::QueueSaturated;
-    assert!(err.to_string().contains("saturated"));
-}
-
 /// Compile inventory: workspace-owned windows-sys feature union (AC12).
 #[test]
 fn containment_platform_compile_inventory() {

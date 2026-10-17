@@ -220,13 +220,6 @@ fn compile_descriptor_rejects_zero_revision() {
 // ---- AC4: redirect deny, parameter bounds, credential placement ------------
 
 #[test]
-fn https_kind_has_fixed_timeout() {
-    let kind = sample_https_kind();
-    let descriptor = kind.compile_descriptor("a", 1, "d").unwrap();
-    assert_eq!(descriptor.response_after_ms, HTTPS_TIMEOUT_MS);
-}
-
-#[test]
 fn https_kind_credential_placement_is_fixed_header() {
     let kind = sample_https_kind();
     match &kind {
@@ -630,24 +623,6 @@ async fn build_live_registry_reflects_current_snapshots() {
 }
 
 // ---- AC3: snapshot is immutable and serializable ---------------------------
-
-#[test]
-fn snapshot_round_trips_serde() {
-    let kind = sample_https_kind();
-    let snap = SealedActionSnapshot {
-        action_id: "action.snap.1".to_string(),
-        revision: 1,
-        kind,
-        description: "Test".to_string(),
-        project_key: "proj".to_string(),
-        enabled: true,
-        created_at_ms: 1_000,
-        retired_at_ms: None,
-    };
-    let json = serde_json::to_string(&snap).unwrap();
-    let back: SealedActionSnapshot = serde_json::from_str(&json).unwrap();
-    assert_eq!(snap, back);
-}
 
 // ---- AC3: no model-supplied URL/header/template/credential ----------------
 

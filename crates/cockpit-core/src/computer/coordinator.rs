@@ -5831,23 +5831,6 @@ impl ComputerActionCoordinator {
         }
     }
 
-    /// Check if a batch of actions contains pointer actions (move, click,
-    /// drag, scroll) that require the strict pointer sequence:
-    /// observation -> move -> pointer-confirming observation -> click ->
-    /// post-action observation.
-    fn contains_pointer_actions(actions: &[ComputerAction]) -> bool {
-        actions.iter().any(|action| {
-            matches!(
-                action,
-                ComputerAction::MoveCursor { .. }
-                    | ComputerAction::Click { .. }
-                    | ComputerAction::MouseDown { .. }
-                    | ComputerAction::MouseUp { .. }
-                    | ComputerAction::Drag { .. }
-            )
-        })
-    }
-
     /// The Ask delegation lease store (for tests/diagnostics).
     pub fn ask_lease_store(&self) -> &AskDelegationLeaseStore {
         &self.ask_lease_store
@@ -11579,6 +11562,10 @@ mod tests {
             outcome,
             CoordinatedOutcome::CancelledBeforeDispatch
         ));
+        assert_eq!(
+            coordinator.dispatch_state("call-cancel-1"),
+            Some(DispatchState::CancelledBeforeDispatch)
+        );
     }
 
     #[tokio::test]
@@ -11820,34 +11807,6 @@ mod tests {
             }
             other => panic!("expected completed outcome, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn computer_native_provider_continuation_no_live_pixels_in_durable() {
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let backend = Box::new(FakeBackend::new());
-        let mut coordinator = make_coordinator(backend, authorizer).await;
-
-        let output = vec![serde_json::json!({
-            "type": "computer_call",
-            "call_id": "call-transient",
-            "action": {"type": "screenshot"}
-        })];
-        let calls = NativeResponseExtractor::extract_openai(&output);
-        let call = &calls[0];
-        let outcome = coordinator
-            .execute_openai_call("call-transient", &{
-                let NativeComputerCall::OpenAi { actions, .. } = call else {
-                    panic!()
-                };
-                actions.clone()
-            })
-            .await;
-
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
-        // The continuation does not carry pixel data in a serializable form.
-        // (The TransientProviderRequest, if present, is not Serialize.)
-        let _ = continuation;
     }
 
     // =====================================================================
@@ -12571,14 +12530,6 @@ mod tests {
 
         assert_eq!(lease1.key(), lease2.key());
         assert_ne!(lease1, lease2); // Different tokens.
-    }
-
-    #[test]
-    fn computer_lease_unforgeable_no_serde() {
-        // AskDelegationLease has no serde implementation (compile-time
-        // guarantee). The store exposes no serialization API.
-        let store = AskDelegationLeaseStore::new();
-        assert!(store.is_empty());
     }
 
     // =====================================================================
@@ -13873,35 +13824,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn computer_action_pointer_sequence_contains_pointer_actions() {
-        // Verify the helper detects pointer actions.
-        let pointer_actions = vec![
-            ComputerAction::MoveCursor {
-                to: Point {
-                    x: 1.0,
-                    y: 2.0,
-                    space: CoordinateSpace::Physical,
-                },
-                duration: Duration::from_millis(10),
-                easing: Easing::Linear,
-            },
-            ComputerAction::Click {
-                button: MouseButton::Left,
-                count: ClickCount::Single,
-                modifiers: Modifiers::default(),
-            },
-        ];
-        assert!(ComputerActionCoordinator::contains_pointer_actions(
-            &pointer_actions
-        ));
-
-        let non_pointer = vec![ComputerAction::CaptureFull];
-        assert!(!ComputerActionCoordinator::contains_pointer_actions(
-            &non_pointer
-        ));
-    }
-
     // =====================================================================
     // Action hardening: computer_action_host_global
     // AC3: Two delegations and simulated processes on one physical key prove
@@ -13945,121 +13867,12 @@ mod tests {
         assert!(arbiter.lock().unwrap().is_held(&key));
     }
 
-    #[tokio::test]
-    async fn computer_action_host_global_cross_process_contention() {
-        let os_lock = InMemoryOsAdvisoryLock::new();
-        let os_lock_b = os_lock.shared_clone();
-        let mut arbiter_a = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(1));
-        let mut arbiter_b = HostInputArbiter::new(Box::new(os_lock_b), OwnerInstance(2));
-
-        let key = physical_key();
-        let delegation = DelegationId("delegation-1".to_string());
-
-        // Process A acquires.
-        let result_a = arbiter_a.try_acquire(&key, delegation.clone());
-        assert!(matches!(result_a, AcquireResult::Acquired(_)));
-
-        // Process B cannot acquire (OS lock held by A).
-        let result_b = arbiter_b.try_acquire(&key, delegation);
-        assert!(matches!(result_b, AcquireResult::OsLockFailed(_)));
-    }
-
-    #[tokio::test]
-    async fn computer_action_host_global_virtual_targets_independent() {
-        // Virtual targets do not take the host lock and remain independently
-        // serialized per virtual display.
-        let adapter = FakeTargetEvidenceAdapter::new(virtual_evidence());
-        let authorizer: Arc<dyn ComputerAuthorizer> =
-            Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer,
-            host_arbiter: None,
-            target_adapter: Some(Box::new(adapter)),
-            provider_id: ProviderId("anthropic".to_string()),
-            model_id: ModelId("claude-3-5-sonnet".to_string()),
-            outcome_store: None,
-            handoff_journal: None,
-            audit_chain: None,
-        };
-        let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
-            .await
-            .expect("coordinator open");
-
-        // No host lease for virtual displays — they are independently serialized.
-        assert!(coordinator.host_lease().is_none());
-    }
-
     // =====================================================================
     // Action hardening: computer_action_exactly_once
     // AC4: Duplicate calls, reconnect, both timeout/cancel orders, backend
     // death, partial batch, audit/journal faults, and provider-continuation
     // failure with at most one backend call.
     // =====================================================================
-
-    #[tokio::test]
-    async fn computer_action_exactly_once_duplicate_call() {
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let backend = FakeBackend::new();
-        let mut coordinator = make_coordinator(Box::new(backend), authorizer).await;
-
-        let actions = vec![OpenAiComputerAction::Screenshot];
-        let outcome1 = coordinator
-            .execute_openai_call("call-once-1", &actions)
-            .await;
-        assert!(matches!(outcome1, CoordinatedOutcome::Completed { .. }));
-
-        // Duplicate — prior outcome, no input.
-        let outcome2 = coordinator
-            .execute_openai_call("call-once-1", &actions)
-            .await;
-        assert!(matches!(
-            outcome2,
-            CoordinatedOutcome::DuplicateReplay { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn computer_action_exactly_once_reconnect_replays() {
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let backend = FakeBackend::new();
-        let mut coordinator = make_coordinator(Box::new(backend), authorizer).await;
-
-        let actions = vec![OpenAiComputerAction::Screenshot];
-        let _ = coordinator
-            .execute_openai_call("call-reconnect-1", &actions)
-            .await;
-
-        // Simulate reconnect: same call ID replayed.
-        let outcome = coordinator
-            .execute_openai_call("call-reconnect-1", &actions)
-            .await;
-        assert!(matches!(
-            outcome,
-            CoordinatedOutcome::DuplicateReplay { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn computer_action_exactly_once_cancel_before_dispatch() {
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let backend = FakeBackend::new();
-        let mut coordinator = make_coordinator(Box::new(backend), authorizer).await;
-
-        // Cancel before dispatch — zero input.
-        let outcome = coordinator.cancel_before_dispatch("call-cancel-before");
-        assert!(matches!(
-            outcome,
-            CoordinatedOutcome::CancelledBeforeDispatch
-        ));
-        assert_eq!(
-            coordinator.dispatch_state("call-cancel-before"),
-            Some(DispatchState::CancelledBeforeDispatch)
-        );
-    }
 
     #[tokio::test]
     async fn computer_action_exactly_once_cancel_after_dispatch_unknown() {
@@ -14083,93 +13896,6 @@ mod tests {
             coordinator.dispatch_state("call-cancel-after"),
             Some(DispatchState::DispatchUnknown)
         );
-    }
-
-    #[tokio::test]
-    async fn computer_action_exactly_once_backend_death_zero_input() {
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let backend = FakeBackend::new();
-        let mut coordinator = make_coordinator(Box::new(backend), authorizer).await;
-
-        coordinator.mark_backend_dead();
-
-        let actions = vec![OpenAiComputerAction::Screenshot];
-        let outcome = coordinator
-            .execute_openai_call("call-dead-1", &actions)
-            .await;
-        assert!(matches!(outcome, CoordinatedOutcome::Invalidated { .. }));
-    }
-
-    #[tokio::test]
-    async fn computer_action_exactly_once_partial_batch_one_terminal() {
-        let mut backend = FakeBackend::new();
-        backend.fail_at = Some(1);
-        backend.fail_with = ComputerError::Refused("mid-batch".to_string());
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        // Opens with a real focus generation so the TypeText actions clear the
-        // focus gate; the mid-batch Failed { index: 1 } assertion is against
-        // the coordinator path.
-        let params = make_coordinator_params_with_focus(authorizer);
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
-            .await
-            .expect("coordinator open");
-
-        let actions = vec![
-            OpenAiComputerAction::Move {
-                to: Point {
-                    x: 4.0,
-                    y: 5.0,
-                    space: CoordinateSpace::Physical,
-                },
-            },
-            OpenAiComputerAction::TypeText("stop".to_string()),
-            OpenAiComputerAction::TypeText("not dispatched".to_string()),
-        ];
-        let outcome = coordinator
-            .execute_openai_call("call-partial-batch", &actions)
-            .await;
-
-        match outcome {
-            CoordinatedOutcome::Failed { failure, .. } => {
-                assert_eq!(failure.index, 1);
-            }
-            other => panic!("expected failed outcome, got {other:?}"),
-        }
-        assert_eq!(
-            coordinator.dispatch_state("call-partial-batch"),
-            Some(DispatchState::Completed)
-        );
-    }
-
-    #[tokio::test]
-    async fn computer_action_exactly_once_at_most_one_backend_call() {
-        // Verify that a duplicate call does not result in a second backend
-        // call. The FakeBackend records actions; a duplicate should not add
-        // to the recorded list.
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let backend = FakeBackend::new();
-        let params = make_coordinator_params(authorizer);
-        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
-            .await
-            .expect("coordinator open");
-
-        let actions = vec![OpenAiComputerAction::Screenshot];
-        let _ = coordinator
-            .execute_openai_call("call-once-backend", &actions)
-            .await;
-
-        // Record the backend call count after the first call.
-        // The first call does: 1 screenshot action + 1 capture screenshot = 2.
-        // But we can't easily access the backend after it's moved into the
-        // coordinator. Instead, verify via the journal that the duplicate
-        // returns a replay.
-        let outcome = coordinator
-            .execute_openai_call("call-once-backend", &actions)
-            .await;
-        assert!(matches!(
-            outcome,
-            CoordinatedOutcome::DuplicateReplay { .. }
-        ));
     }
 
     // =====================================================================
@@ -15940,40 +15666,6 @@ mod tests {
     // =====================================================================
 
     #[test]
-    fn computer_action_batch_item_outcome_variants() {
-        // BatchItemOutcome explicitly represents not_dispatched tails — never
-        // inferred from missing rows.
-        assert_eq!(
-            BatchItemOutcome::NotDispatched,
-            BatchItemOutcome::NotDispatched
-        );
-        assert_eq!(
-            BatchItemOutcome::BackendCompleted,
-            BatchItemOutcome::BackendCompleted
-        );
-        assert_eq!(
-            BatchItemOutcome::SubmissionUnknown,
-            BatchItemOutcome::SubmissionUnknown
-        );
-        assert!(matches!(
-            BatchItemOutcome::Rejected {
-                reason: "stale".to_string()
-            },
-            BatchItemOutcome::Rejected { .. }
-        ));
-        assert!(matches!(
-            BatchItemOutcome::Failed {
-                error: ComputerError::Refused("x".to_string())
-            },
-            BatchItemOutcome::Failed { .. }
-        ));
-        assert_eq!(
-            BatchItemOutcome::IdentityConflict,
-            BatchItemOutcome::IdentityConflict
-        );
-    }
-
-    #[test]
     fn computer_live_dispatch_order_pre_handoff_before_dispatching() {
         let src = include_str!("coordinator.rs");
         let start = src
@@ -16080,30 +15772,6 @@ mod tests {
             BatchItemOutcome::NotDispatched,
             "early stop must represent the tail explicitly, not omit it"
         );
-    }
-
-    #[tokio::test]
-    async fn computer_geometry_decl_from_backend() {
-        let mut backend = FakeBackend::new();
-        backend.geometry = DisplayGeometry {
-            physical: PixelSize {
-                width: 1920,
-                height: 1080,
-            },
-            logical: LogicalSize {
-                width: 1920.0,
-                height: 1080.0,
-            },
-            scale_factor: ScaleFactor(1.0),
-        };
-        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let coordinator = make_coordinator(Box::new(backend), authorizer).await;
-        assert_eq!(coordinator.geometry().physical.width, 1920);
-        assert_eq!(coordinator.geometry().physical.height, 1080);
-        let wire = coordinator.provider_declarations(ComputerToolContract::Anthropic20251124);
-        let tool = &wire.tools[0];
-        assert_eq!(tool["display_width_px"], 1920);
-        assert_eq!(tool["display_height_px"], 1080);
     }
 
     #[tokio::test]

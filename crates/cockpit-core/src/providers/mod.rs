@@ -810,77 +810,78 @@ mod tests {
     }
 
     #[test]
-    fn provider_template_catalog_contains_baseten() {
-        let t = template_by_id("baseten").expect("baseten template");
-        assert_eq!(t.id, "baseten");
-        assert_eq!(t.display, "Baseten Model APIs");
-        assert_eq!(t.url, "https://inference.baseten.co/v1");
-        assert!(!t.url.contains("model-"));
-        assert_eq!(t.auth, AuthKind::ApiKey);
-        assert_eq!(t.default_env_var, Some("BASETEN_API_KEY"));
-        assert_eq!(t.env_var_candidates, &["BASETEN_API_KEY"]);
-        assert_eq!(
-            t.default_headers,
-            &[("Authorization", "Bearer $BASETEN_API_KEY")]
-        );
-        assert_eq!(t.default_wire_api, WireApi::Completions);
-        assert!(t.supports_models_endpoint);
-        assert!(t.use_id_as_default);
-        assert_eq!(
-            t.hint,
-            Some(
-                "Generate an API key at https://app.baseten.co/settings/api_keys. Model APIs: https://docs.baseten.co/inference/model-apis/overview"
-            )
-        );
-        let api_key = t.api_key.expect("api key metadata");
-        assert_eq!(api_key.header_name, "Authorization");
-        assert_eq!(api_key.value_template, "Bearer {key}");
-        assert_eq!(
-            api_key.console_url,
-            "https://app.baseten.co/settings/api_keys"
-        );
-        assert!(matches!(t.auth_check, AuthCheckKind::ModelsEndpoint));
-        assert!(builtin_thinking_params("baseten", ThinkingMode::High).is_none());
-    }
-
-    #[test]
-    fn provider_template_catalog_contains_nous_research() {
-        let t = template_by_id("nous-research").expect("nous-research template");
-        assert_eq!(t.id, "nous-research");
-        assert_eq!(t.display, "Nous Research");
-        assert_eq!(t.url, "https://inference-api.nousresearch.com/v1");
-        assert_eq!(t.auth, AuthKind::ApiKey);
-        assert_eq!(t.default_env_var, Some("NOUS_API_KEY"));
-        assert_eq!(t.env_var_candidates, &["NOUS_API_KEY"]);
-        assert_eq!(
-            t.default_headers,
-            &[("Authorization", "Bearer $NOUS_API_KEY")]
-        );
-        assert_eq!(t.default_wire_api, WireApi::Completions);
-        assert!(!t.supports_models_endpoint);
-        assert!(t.use_id_as_default);
-        let api_key = t.api_key.expect("api key metadata");
-        assert_eq!(api_key.header_name, "Authorization");
-        assert_eq!(api_key.value_template, "Bearer {key}");
-        assert_eq!(
-            api_key.console_url,
-            "https://portal.nousresearch.com/api-docs"
-        );
-        assert!(
-            t.hint
-                .is_some_and(|h| h.contains("portal.nousresearch.com"))
-        );
-        match t.auth_check {
-            AuthCheckKind::ChatCompletions {
-                path,
-                model,
-                docs_url,
-            } => {
-                assert_eq!(path, "/chat/completions");
-                assert_eq!(model, "Hermes-4.3-36B");
-                assert_eq!(docs_url, "https://portal.nousresearch.com/api-docs");
+    fn provider_template_catalog_auth_contract() {
+        for (id, display, url, env_var, console_url, supports_models) in [
+            (
+                "baseten",
+                "Baseten Model APIs",
+                "https://inference.baseten.co/v1",
+                "BASETEN_API_KEY",
+                "https://app.baseten.co/settings/api_keys",
+                true,
+            ),
+            (
+                "nous-research",
+                "Nous Research",
+                "https://inference-api.nousresearch.com/v1",
+                "NOUS_API_KEY",
+                "https://portal.nousresearch.com/api-docs",
+                false,
+            ),
+        ] {
+            let t = template_by_id(id).expect("provider template");
+            assert_eq!(t.id, id);
+            assert_eq!(t.display, display);
+            assert_eq!(t.url, url);
+            assert_eq!(t.auth, AuthKind::ApiKey);
+            assert_eq!(t.default_env_var, Some(env_var));
+            assert_eq!(t.env_var_candidates, &[env_var]);
+            assert_eq!(
+                t.default_headers,
+                &[(
+                    "Authorization",
+                    if id == "baseten" {
+                        "Bearer $BASETEN_API_KEY"
+                    } else {
+                        "Bearer $NOUS_API_KEY"
+                    }
+                )]
+            );
+            assert_eq!(t.default_wire_api, WireApi::Completions);
+            assert_eq!(t.supports_models_endpoint, supports_models);
+            assert!(t.use_id_as_default);
+            let api_key = t.api_key.expect("api key metadata");
+            assert_eq!(api_key.header_name, "Authorization");
+            assert_eq!(api_key.value_template, "Bearer {key}");
+            assert_eq!(api_key.console_url, console_url);
+            if id == "baseten" {
+                assert!(!t.url.contains("model-"));
+                assert_eq!(
+                    t.hint,
+                    Some(
+                        "Generate an API key at https://app.baseten.co/settings/api_keys. Model APIs: https://docs.baseten.co/inference/model-apis/overview"
+                    )
+                );
+                assert!(matches!(t.auth_check, AuthCheckKind::ModelsEndpoint));
+                assert!(builtin_thinking_params("baseten", ThinkingMode::High).is_none());
+            } else {
+                assert!(
+                    t.hint
+                        .is_some_and(|h| h.contains("portal.nousresearch.com"))
+                );
+                match t.auth_check {
+                    AuthCheckKind::ChatCompletions {
+                        path,
+                        model,
+                        docs_url,
+                    } => {
+                        assert_eq!(path, "/chat/completions");
+                        assert_eq!(model, "Hermes-4.3-36B");
+                        assert_eq!(docs_url, "https://portal.nousresearch.com/api-docs");
+                    }
+                    other => panic!("expected ChatCompletions auth_check, got {other:?}"),
+                }
             }
-            other => panic!("expected ChatCompletions auth_check, got {other:?}"),
         }
     }
 

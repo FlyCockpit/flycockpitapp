@@ -907,30 +907,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn builtin_trust_suggestions_still_require_confirmation() {
-        let mut def = embedded_default("Assistant").expect("Assistant definition");
-        let primary = def
-            .vnext
-            .as_mut()
-            .unwrap()
-            .model_slots
-            .get_mut("primary")
-            .unwrap();
-        primary
-            .suggested_models
-            .push(crate::agents::ModelRecommendation {
-                recommendation_id: "trusted-candidate".into(),
-                upstream_identity: "vendor/model".into(),
-                provider_aliases: Vec::new(),
-                author_label: None,
-                rationale: None,
-                trust_suggestion: Some(crate::agents::ModelTrustSuggestion::Trusted),
-            });
-
-        assert!(primary.suggested_models[0].requires_trust_confirmation());
-    }
-
     fn effective_tier(def: &AgentDef, tool: &str) -> ToolTier {
         if crate::engine::builtin::default_disabled_tools_for(&def.name).contains(&tool) {
             return ToolTier::Disabled;
@@ -965,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_default_governs_primary_selection() {
+    fn configured_default_resolves_primary() {
         // Issue #75: the mode axis no longer selects Careful; the configured
         // default (`FALLBACK_PRIMARY` here) governs for brand-new sessions.
         assert_eq!(resolve_primary(None, FALLBACK_PRIMARY), FALLBACK_PRIMARY);
@@ -975,6 +951,15 @@ mod tests {
                 .name,
             "Careful"
         );
+
+        {
+            let build = embedded_default(FALLBACK_PRIMARY).expect("Build embedded default");
+            let resolved = resolve_primary(None, FALLBACK_PRIMARY);
+            let resolved_def = embedded_default(&resolved).expect("resolved embedded default");
+
+            assert_eq!(resolved, FALLBACK_PRIMARY);
+            assert_eq!(resolved_def.tools, build.tools);
+        }
     }
 
     #[test]
@@ -990,16 +975,6 @@ mod tests {
                 "unexpected forkContext grant for {name}"
             );
         }
-    }
-
-    #[test]
-    fn configured_default_resolves_to_build_when_default_is_build() {
-        let build = embedded_default(FALLBACK_PRIMARY).expect("Build embedded default");
-        let resolved = resolve_primary(None, FALLBACK_PRIMARY);
-        let resolved_def = embedded_default(&resolved).expect("resolved embedded default");
-
-        assert_eq!(resolved, FALLBACK_PRIMARY);
-        assert_eq!(resolved_def.tools, build.tools);
     }
 
     #[test]

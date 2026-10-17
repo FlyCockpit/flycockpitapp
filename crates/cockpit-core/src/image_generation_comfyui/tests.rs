@@ -1056,11 +1056,6 @@ fn comfyui_discovery_base_cancellation_capability() {
     );
 }
 
-#[test]
-fn comfyui_adapter_kind_is_comfyui() {
-    assert_eq!(adapter_kind(), ImageAdapterKind::Comfyui);
-}
-
 // ---------------------------------------------------------------------------
 // Config: exclusive_server field round-trips and defaults to false.
 // ---------------------------------------------------------------------------

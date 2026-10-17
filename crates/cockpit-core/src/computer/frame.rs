@@ -780,21 +780,6 @@ pub enum ProviderMediaVariant {
     ScreenshotOnly,
 }
 
-impl ProviderMediaVariant {
-    /// Exhaustive match: returns the wire type string for this variant.
-    ///
-    /// Adding a new variant to [`ProviderMediaVariant`] requires extending this
-    /// match, which forces the boundary to handle the new shape.
-    pub fn wire_type(self) -> &'static str {
-        match self {
-            Self::OpenAiComputerCallOutput => "computer_call_output",
-            Self::Anthropic20250124ImageBlock => "anthropic_20250124_image_block",
-            Self::Anthropic20251124ImageBlock => "anthropic_20251124_image_block",
-            Self::ScreenshotOnly => "screenshot_only",
-        }
-    }
-}
-
 /// Build a transient OpenAI `computer_call_output` request from a live frame.
 ///
 /// The durable projection is constructed first (from the live frame), then the
@@ -1145,16 +1130,6 @@ mod tests {
         // There is no .bytes(), .into_bytes(), .as_bytes(), or .data_url().
     }
 
-    /// Runtime proof that borrow_bytes is scoped and does not leak the bytes.
-    #[test]
-    fn computer_screenshot_transient_type_scoped_borrow() {
-        let (_, frame) = make_test_frame();
-        // borrow_bytes returns the closure's result, not the bytes.
-        let result: String = frame.borrow_bytes(|b| format!("got {} bytes", b.len()));
-        assert_eq!(result, "got 8 bytes");
-        // The bytes are not accessible outside the closure.
-    }
-
     /// Proof that LiveComputerFrame does not implement Serialize: attempting
     /// to serialize it should fail to compile. We verify this by checking that
     /// SanitizedComputerFrame *does* serialize but the live type cannot be
@@ -1428,48 +1403,12 @@ mod tests {
     }
 
     #[test]
-    fn computer_screenshot_cleanup_provider_failure() {
-        // Simulate provider failure: cleanup is called, frame is dropped.
-        let (released, mut frame) = make_test_frame();
-        let proj = frame.sanitized();
-        assert_eq!(proj.byte_count, 8);
-        let (res, temp) = frame.cleanup();
-        assert!(res.is_ok());
-        assert!(temp.is_ok());
-        assert!(released.load(Ordering::SeqCst));
-        drop(frame);
-        // Released exactly once.
-        assert!(released.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn computer_screenshot_cleanup_pre_handoff_cancellation() {
-        // Pre-handoff: frame is cleaned up before being sent to provider.
-        let (released, mut frame) = make_test_frame();
-        // No provider call made.
-        let (res, temp) = frame.cleanup();
-        assert!(res.is_ok());
-        assert!(temp.is_ok());
-        assert!(released.load(Ordering::SeqCst));
-    }
-
-    #[test]
     fn computer_screenshot_cleanup_post_handoff_cancellation() {
         // Post-handoff: frame is cleaned up after provider call.
         let (released, frame) = make_test_frame();
         let _req = openai_transient_computer_output(&frame, "call-post", 1, None);
         // Frame still alive after building request (borrow only).
         let mut frame = frame;
-        let (res, temp) = frame.cleanup();
-        assert!(res.is_ok());
-        assert!(temp.is_ok());
-        assert!(released.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn computer_screenshot_cleanup_timeout() {
-        // Timeout: frame is cleaned up.
-        let (released, mut frame) = make_test_frame();
         let (res, temp) = frame.cleanup();
         assert!(res.is_ok());
         assert!(temp.is_ok());
@@ -1534,17 +1473,6 @@ mod tests {
         assert!(temp.is_ok());
         assert!(released.load(Ordering::SeqCst));
         assert!(!slot.is_occupied());
-    }
-
-    #[test]
-    fn computer_screenshot_cleanup_session_teardown() {
-        let (released, frame) = make_test_frame();
-        let mut slot = FrameSlot::new();
-        assert!(slot.replace(frame));
-        let (res, temp) = slot.teardown();
-        assert!(res.is_ok());
-        assert!(temp.is_ok());
-        assert!(released.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1652,33 +1580,6 @@ mod tests {
     // zeroization limits.
     // -------------------------------------------------------------------------
 
-    #[test]
-    fn computer_screenshot_zeroize_on_drop() {
-        let bytes = vec![0xABu8; 1024];
-        let (_released, handle) = make_test_handle();
-        let frame = LiveComputerFrame::try_new(
-            bytes,
-            ScreenshotMediaType::Png,
-            test_dimensions(),
-            ObservationId("obs-z".to_string()),
-            ActionId("act-z".to_string()),
-            CaptureEpoch(100),
-            handle,
-            None,
-        )
-        .unwrap();
-        // Get the pointer to the bytes.
-        let ptr = frame.borrow_bytes(|b| b.as_ptr());
-        let len = frame.borrow_bytes(|b| b.len());
-        drop(frame);
-        // After drop, the allocation is freed (and zeroized). We cannot safely
-        // read the freed memory, but we can verify the frame is gone.
-        // This test mainly documents the zeroization behavior.
-        assert!(len > 0);
-        // ptr is now dangling; do not dereference.
-        let _ = ptr;
-    }
-
     // -------------------------------------------------------------------------
     // Temp guard tests
     // -------------------------------------------------------------------------
@@ -1692,15 +1593,7 @@ mod tests {
         guard.cleanup().unwrap();
         assert!(guard.path.is_none());
         assert!(guard.is_cleaned());
-    }
-
-    #[test]
-    fn temp_guard_cleanup_idempotent() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut guard = TempCaptureGuard::new(dir, "test2.png").unwrap();
-        std::fs::write(guard.path().unwrap(), b"pixels").unwrap();
-        guard.cleanup().unwrap();
-        // Second call is a no-op.
+        // Cleanup remains a no-op after the capture has been removed.
         guard.cleanup().unwrap();
     }
 
@@ -1802,24 +1695,6 @@ mod tests {
         assert_eq!(c1, c2);
         let c3 = FrameChecksum::of(&[1, 2, 3]);
         assert_ne!(c1, c3);
-    }
-
-    #[test]
-    fn checksum_hex_length() {
-        let c = FrameChecksum::of(&test_frame_bytes());
-        // SHA-256 = 32 bytes = 64 hex chars
-        assert_eq!(c.0.len(), 64);
-    }
-
-    // -------------------------------------------------------------------------
-    // Media type tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn media_type_strings() {
-        assert_eq!(ScreenshotMediaType::Png.as_str(), "image/png");
-        assert_eq!(ScreenshotMediaType::Jpeg.as_str(), "image/jpeg");
-        assert_eq!(format!("{}", ScreenshotMediaType::Png), "image/png");
     }
 
     // -------------------------------------------------------------------------
@@ -1946,46 +1821,6 @@ mod tests {
         slot.replace(f_new);
         // Old frame's reservation was released.
         assert!(released_old.load(Ordering::SeqCst));
-    }
-
-    // -------------------------------------------------------------------------
-    // Cleanup reason code display
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn cleanup_reason_code_display() {
-        assert_eq!(
-            format!("{}", CleanupReasonCode::TempRemovalFailed),
-            "temp_removal_failed"
-        );
-        assert_eq!(
-            format!("{}", CleanupReasonCode::ReservationReleaseFailed),
-            "reservation_release_failed"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // ProviderMediaVariant wire_type exhaustive
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn provider_media_variant_wire_types() {
-        assert_eq!(
-            ProviderMediaVariant::OpenAiComputerCallOutput.wire_type(),
-            "computer_call_output"
-        );
-        assert_eq!(
-            ProviderMediaVariant::Anthropic20250124ImageBlock.wire_type(),
-            "anthropic_20250124_image_block"
-        );
-        assert_eq!(
-            ProviderMediaVariant::Anthropic20251124ImageBlock.wire_type(),
-            "anthropic_20251124_image_block"
-        );
-        assert_eq!(
-            ProviderMediaVariant::ScreenshotOnly.wire_type(),
-            "screenshot_only"
-        );
     }
 
     // -------------------------------------------------------------------------

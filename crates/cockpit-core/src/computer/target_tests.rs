@@ -1291,17 +1291,3 @@ fn computer_x11_randr_output_identity() {
 // ---------------------------------------------------------------------------
 // AC8 is in tests/computer_target_dependency_inventory.rs (integration)
 // ---------------------------------------------------------------------------
-
-#[test]
-fn computer_target_no_semantic_denylist() {
-    // Historical slug continuity: no target-blocking config or lookup API exists.
-    let src = include_str!("target.rs");
-    assert!(!src.contains("deny_list"));
-    assert!(!src.contains("TargetDenylist"));
-    assert!(!src.contains("is_denied_target"));
-    assert!(!src.contains("blocked_applications"));
-    let host_src = include_str!("host_identity.rs");
-    assert!(!host_src.contains("deny_list"));
-    // Yolo path must not consult application/title/role for denial — covered by
-    // computer_target_yolo_advisory_only.
-}

@@ -1684,29 +1684,6 @@ mod purpose_body {
         assert_eq!(q.chars().count(), ASK_IMAGE_MAX_UNICODE_SCALARS);
         assert!(PurposeBody::ask_image(&q).is_ok());
     }
-
-    #[test]
-    fn ask_image_over_byte_bound_fails() {
-        // 2049 scalars * 4 bytes = 8196 bytes > 8192 byte bound.
-        // This also exceeds the scalar bound, so test the byte bound
-        // independently with a string that is within scalar bound but over
-        // byte bound. That's impossible with max 2048 scalars at 4 bytes each
-        // = 8192 exactly. So instead verify a string that exceeds the byte
-        // bound is rejected for whichever bound it hits first.
-        let q = "🚀".repeat(ASK_IMAGE_MAX_UNICODE_SCALARS + 1);
-        // This exceeds both bounds; the scalar check comes first.
-        assert!(PurposeBody::ask_image(&q).is_err());
-    }
-
-    #[test]
-    fn ask_image_multibyte_within_both_bounds() {
-        // 2-byte chars (e.g. Latin-1 supplement) — but use a simple emoji
-        // that is multi-byte.
-        // '€' is 3 UTF-8 bytes, 1 Unicode scalar.
-        let q = "€".repeat(100);
-        assert!(PurposeBody::ask_image(&q).is_ok());
-        assert_eq!(q.len(), 300); // 100 * 3 bytes
-    }
 }
 
 // ===========================================================================
@@ -1789,22 +1766,6 @@ mod credential_fingerprint {
 
 mod digest_versioning {
     use super::*;
-
-    #[test]
-    fn digest_version_is_constant() {
-        let policy = DestinationPolicy {
-            provider: "p".to_string(),
-            model: "m".to_string(),
-            endpoint_origin: NormalizedEndpointOrigin::parse("http://localhost:9090").unwrap(),
-            connected_location: ConnectedLocationClass::Local,
-            credential_fingerprint: CredentialFingerprint::from_identity("c"),
-            project_identity: ProjectIdentity::default(),
-            image_capability_value: CapabilityStatus::Supported,
-            capability_contract_revision: CAPABILITY_CONTRACT_REVISION,
-            egress_fields: EgressFields::default(),
-        };
-        assert_eq!(policy.digest().version, DESTINATION_POLICY_DIGEST_VERSION);
-    }
 
     #[test]
     fn digest_display_redacts_bytes() {

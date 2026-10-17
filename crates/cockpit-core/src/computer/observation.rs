@@ -2203,133 +2203,45 @@ mod tests {
     }
 
     #[test]
-    fn computer_observation_qualification_type_never_qualifies() {
-        let p = policy();
+    fn computer_observation_qualification_non_qualifying_actions() {
         let gens = gen_snapshot(1);
         let result = ComparisonResult {
             total_pixels: 10000,
             outside_mask_changed: 0,
             inside_mask_changed: 0,
         };
-        let decision = evaluate_qualification(
-            p,
-            &type_action(),
-            None,
-            None,
-            None,
-            false,
-            gens,
-            gens,
-            1100,
-            1000,
-            false,
-            false,
-            Some(&Ok(result)),
-        );
-        assert!(matches!(
-            decision,
-            QualificationDecision::DoesNotQualify(NonQualificationReason::NeverQualifyingAction)
-        ));
-    }
-
-    #[test]
-    fn computer_observation_qualification_scroll_never_qualifies() {
-        let p = policy();
-        let gens = gen_snapshot(1);
-        let decision = evaluate_qualification(
-            p,
-            &scroll_action(),
-            None,
-            None,
-            None,
-            false,
-            gens,
-            gens,
-            1100,
-            1000,
-            false,
-            false,
-            None,
-        );
-        assert!(matches!(
-            decision,
-            QualificationDecision::DoesNotQualify(NonQualificationReason::NeverQualifyingAction)
-        ));
-    }
-
-    #[test]
-    fn computer_observation_qualification_drag_never_qualifies() {
-        let p = policy();
-        let gens = gen_snapshot(1);
-        let decision = evaluate_qualification(
-            p,
-            &drag_action(),
-            None,
-            None,
-            None,
-            false,
-            gens,
-            gens,
-            1100,
-            1000,
-            false,
-            false,
-            None,
-        );
-        assert!(matches!(
-            decision,
-            QualificationDecision::DoesNotQualify(NonQualificationReason::NeverQualifyingAction)
-        ));
-    }
-
-    #[test]
-    fn computer_observation_qualification_wait_never_qualifies() {
-        let p = policy();
-        let gens = gen_snapshot(1);
-        let decision = evaluate_qualification(
-            p,
-            &wait_action(),
-            None,
-            None,
-            None,
-            false,
-            gens,
-            gens,
-            1100,
-            1000,
-            false,
-            false,
-            None,
-        );
-        assert!(matches!(
-            decision,
-            QualificationDecision::DoesNotQualify(NonQualificationReason::NeverQualifyingAction)
-        ));
-    }
-
-    #[test]
-    fn computer_observation_qualification_key_never_qualifies() {
-        let p = policy();
-        let gens = gen_snapshot(1);
-        let decision = evaluate_qualification(
-            p,
-            &key_action(),
-            None,
-            None,
-            None,
-            false,
-            gens,
-            gens,
-            1100,
-            1000,
-            false,
-            false,
-            None,
-        );
-        assert!(matches!(
-            decision,
-            QualificationDecision::DoesNotQualify(NonQualificationReason::NeverQualifyingAction)
-        ));
+        for (action, comparison) in [
+            (type_action(), Some(Ok(result))),
+            (scroll_action(), None),
+            (drag_action(), None),
+            (wait_action(), None),
+            (key_action(), None),
+        ] {
+            let decision = evaluate_qualification(
+                policy(),
+                &action,
+                None,
+                None,
+                None,
+                false,
+                gens,
+                gens,
+                1100,
+                1000,
+                false,
+                false,
+                comparison.as_ref(),
+            );
+            assert!(
+                matches!(
+                    decision,
+                    QualificationDecision::DoesNotQualify(
+                        NonQualificationReason::NeverQualifyingAction
+                    )
+                ),
+                "{action:?}"
+            );
+        }
     }
 
     #[test]

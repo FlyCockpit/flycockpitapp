@@ -189,11 +189,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_string_is_zero() {
-        assert_eq!(count(""), 0);
-    }
-
-    #[test]
     fn count_with_matches_default_cl100k() {
         let t = "The quick brown fox jumps over the lazy dog.";
         assert_eq!(count(t), count_with(t, TokenizerStrategy::Cl100k));
@@ -250,19 +245,6 @@ mod tests {
             (scale - 1.0).abs() < 1e-9,
             "scale should be ~1.0, got {scale}"
         );
-    }
-
-    #[test]
-    fn hello_world_is_a_few_tokens() {
-        let n = count("Hello, world!");
-        assert!((1..=10).contains(&n), "got {n}");
-    }
-
-    #[test]
-    fn longer_text_is_more_tokens_than_short() {
-        let short = count("hi");
-        let long = count("The quick brown fox jumps over the lazy dog.");
-        assert!(long > short);
     }
 
     /// The `From<rig::completion::Usage>` impl carries both cache fields

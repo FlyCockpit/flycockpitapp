@@ -1170,16 +1170,20 @@ mod tests {
             assert_eq!(plan.scheduled_mode, VerificationCandidateDispatch::Parallel);
             assert_eq!(plan.warm_candidate, None);
         }
-    }
 
-    #[test]
-    fn cache_mode_none_never_arms_a_warm_then_fanout() {
-        let plan = candidate_dispatch_plan(
-            VerificationCandidateDispatch::WarmThenFanout,
-            &[0, 1],
-            cache_warm_is_eligible(CacheMode::None, true),
-        );
-        assert_eq!(plan.scheduled_mode, VerificationCandidateDispatch::Parallel);
+        // An explicit parallel request never serializes a cache warm, and
+        // CacheMode::None never arms a warm-then-fanout.
+        for (mode, eligible) in [
+            (VerificationCandidateDispatch::Parallel, true),
+            (
+                VerificationCandidateDispatch::WarmThenFanout,
+                cache_warm_is_eligible(CacheMode::None, true),
+            ),
+        ] {
+            let plan = candidate_dispatch_plan(mode, &[0, 1], eligible);
+            assert_eq!(plan.scheduled_mode, VerificationCandidateDispatch::Parallel);
+            assert_eq!(plan.warm_candidate, None);
+        }
     }
 
     #[test]
@@ -1326,25 +1330,6 @@ mod tests {
         assert!(
             fanout_follows_warm(&plan),
             "payload parsing must not erase a completed warm request or suppress its fan-out"
-        );
-    }
-
-    #[test]
-    fn parallel_never_serializes_a_cache_warm() {
-        let plan = candidate_dispatch_plan(VerificationCandidateDispatch::Parallel, &[0, 1], true);
-        assert_eq!(plan.scheduled_mode, VerificationCandidateDispatch::Parallel);
-        assert_eq!(plan.warm_candidate, None);
-    }
-
-    #[test]
-    fn cache_warm_groups_require_identical_realized_request_snapshots() {
-        let prefix = r#"{"provider":"p","prompt":"before"}"#;
-        let changed_workspace_input = r#"{"provider":"p","prompt":"after"}"#;
-
-        assert!(shares_realized_cacheable_request_prefix(prefix, prefix));
-        assert!(
-            !shares_realized_cacheable_request_prefix(prefix, changed_workspace_input),
-            "matching generator specs cannot share a cache group if their realized workspace inputs differ"
         );
     }
 

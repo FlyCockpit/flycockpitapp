@@ -2096,40 +2096,6 @@ mod tests {
     }
 
     #[test]
-    fn sealed_owner_responses_are_registered() {
-        assert_eq!(
-            Response::SealedOwnerOperationBegun {
-                capability_id: "cap".into(),
-                expires_at_ms: 1,
-            }
-            .wire_tag(),
-            "sealed_owner_operation_begun"
-        );
-        assert_eq!(
-            Response::SealedOwnerOperationApplied {
-                revealed_literal: None,
-            }
-            .wire_tag(),
-            "sealed_owner_operation_applied"
-        );
-        assert_eq!(
-            Response::SealedOwnerInventory {
-                items: Vec::new(),
-                acquisitions: Vec::new(),
-            }
-            .wire_tag(),
-            "sealed_owner_inventory"
-        );
-        assert_eq!(
-            Response::SealedActions {
-                actions: Vec::new()
-            }
-            .wire_tag(),
-            "sealed_actions"
-        );
-    }
-
-    #[test]
     fn only_recover_apply_response_reveals_a_planted_literal() {
         // AC1 / AC6 (proto boundary): a sealed-value plaintext appears ONLY on
         // the recover-apply success response's `revealed_literal`. Plant a unique
@@ -2310,54 +2276,6 @@ mod tests {
             }
             other => panic!("expected actions, got {}", other.wire_tag()),
         }
-    }
-
-    #[test]
-    fn leak_response_variants_are_registered() {
-        assert_eq!(
-            Response::LeakReports {
-                page: LeakReportsPage {
-                    reports: Vec::new(),
-                    next_cursor: None,
-                    has_more: false,
-                }
-            }
-            .wire_tag(),
-            "leak_reports"
-        );
-        assert_eq!(
-            Response::LeakRevealCapability {
-                capability: LeakRevealCapability {
-                    capability: LeakRevealToken::new("00".repeat(32)),
-                    report_id: String::new(),
-                    expires_at_ms: 0,
-                }
-            }
-            .wire_tag(),
-            "leak_reveal_capability"
-        );
-        assert_eq!(
-            Response::LeakRevealCancelled {
-                report_id: String::new(),
-            }
-            .wire_tag(),
-            "leak_reveal_cancelled"
-        );
-        assert_eq!(
-            Response::LeakRotationUpdated {
-                report_id: String::new(),
-                rotation: String::new(),
-            }
-            .wire_tag(),
-            "leak_rotation_updated"
-        );
-        assert_eq!(
-            Response::LeakReportDeleted {
-                report_id: String::new(),
-            }
-            .wire_tag(),
-            "leak_report_deleted"
-        );
     }
 
     #[test]

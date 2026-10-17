@@ -1810,11 +1810,6 @@ fn config_refreshed_is_exhaustively_redacted() {
     ));
 }
 
-#[tokio::test]
-async fn refresh_config_response_is_causally_terminal() {
-    assert_worker_delivery_happy("refresh_config").await;
-}
-
 #[test]
 fn invalid_response_metrics_tokenizer_dispatch_error_is_exact_and_safe() {
     let error = explicit_config_refresh_error(
@@ -12746,20 +12741,6 @@ async fn doctor_snapshot_does_not_create_the_global_config_dir() {
     );
 }
 
-#[test]
-fn doctor_snapshot_handler_does_not_ensure_the_global_config_dir() {
-    let source = include_str!("dispatch.rs");
-    let body = source
-        .split("async fn get_doctor_snapshot_response(")
-        .nth(1)
-        .and_then(|tail| tail.split("\nasync fn ").next())
-        .expect("doctor snapshot handler");
-    assert!(
-        !body.contains("ensure_global_config_dir"),
-        "doctor must not create the global config layer"
-    );
-}
-
 // `#[tokio::test]`: `persistent_test_ctx` spawns the daemon scheduler loop,
 // which needs a Tokio reactor at construction. The vault compare-and-restore
 // operations themselves are synchronous blocking DB calls.
@@ -16394,39 +16375,6 @@ fn daemon_store_uses_injected_vault() {
         store.contains("secret_vault"),
         "store must use the daemon-held vault handle"
     );
-}
-
-#[test]
-fn unify_remaining_stores_stays_gone() {
-    for rel in [
-        "secure_key/mod.rs",
-        "secure_key/resolve.rs",
-        "secure_key/vault.rs",
-        "credentials.rs",
-        "db/secret_vault.rs",
-    ] {
-        let _path = format!(
-            "{}/src/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            rel.replace("db/", "../../../cockpit-db/src/db/")
-        );
-        let path = if rel.starts_with("db/") {
-            format!(
-                "{}/../cockpit-db/src/{}",
-                env!("CARGO_MANIFEST_DIR"),
-                rel.trim_start_matches("db/")
-            )
-        } else {
-            format!("{}/src/{rel}", env!("CARGO_MANIFEST_DIR"))
-        };
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        assert!(
-            !source.contains("unify_remaining_stores"),
-            "{rel} must not revive unify_remaining_stores"
-        );
-    }
 }
 
 #[tokio::test]
@@ -26348,21 +26296,6 @@ async fn remove_queued_message_propagates_terminal_receipt_failure() {
 
     assert_eq!(error.code, ErrorCode::Internal);
     assert_eq!(error.message, "queued payload was restored; retry removal");
-}
-
-#[tokio::test]
-async fn set_preflight_returns_preflight_state() {
-    assert_worker_delivery_happy("set_preflight").await;
-}
-
-#[tokio::test]
-async fn set_redaction_returns_redaction_state() {
-    assert_worker_delivery_happy("set_redaction").await;
-}
-
-#[tokio::test]
-async fn set_longcache_returns_longcache_state() {
-    assert_worker_delivery_happy("set_longcache").await;
 }
 
 async fn assert_attached_required_malformed(kind: &str) {

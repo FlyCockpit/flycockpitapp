@@ -916,82 +916,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_languages_by_extension() {
-        assert_eq!(Language::from_path(Path::new("a.rs")), Language::Rust);
-        assert_eq!(Language::from_path(Path::new("a.ts")), Language::TypeScript);
-        assert_eq!(Language::from_path(Path::new("a.tsx")), Language::Tsx);
-        assert_eq!(Language::from_path(Path::new("a.py")), Language::Python);
-        assert_eq!(Language::from_path(Path::new("a.go")), Language::Go);
-        assert_eq!(Language::from_path(Path::new("a.cpp")), Language::Cpp);
-        assert_eq!(Language::from_path(Path::new("a.txt")), Language::Text);
-        assert_eq!(
-            Language::from_path(Path::new("README.md")),
-            Language::Markdown
-        );
-        assert_eq!(
-            Language::from_path(Path::new("config.toml")),
-            Language::Toml
-        );
-        assert_eq!(
-            Language::from_path(Path::new("compose.yaml")),
-            Language::Yaml
-        );
-        assert_eq!(
-            Language::from_path(Path::new("package.json")),
-            Language::Json
-        );
-        assert_eq!(Language::from_path(Path::new("index.html")), Language::Html);
-        assert_eq!(Language::from_path(Path::new("style.scss")), Language::Css);
-        assert_eq!(Language::from_path(Path::new("schema.sql")), Language::Sql);
-        assert_eq!(Language::from_path(Path::new("doc.xml")), Language::Xml);
-        assert_eq!(Language::from_path(Path::new("script.sh")), Language::Shell);
-        assert_eq!(
-            Language::from_path(Path::new("build.mk")),
-            Language::Makefile
-        );
-        assert_eq!(
-            Language::from_path(Path::new("scratch.unknownext")),
-            Language::Unknown
-        );
-    }
-
-    #[test]
     fn detects_languages_by_filename_before_extension() {
-        assert_eq!(
-            Language::from_path(Path::new("Dockerfile")),
-            Language::Dockerfile
-        );
-        assert_eq!(
-            Language::from_path(Path::new("Dockerfile.dev")),
-            Language::Dockerfile
-        );
-        assert_eq!(
-            Language::from_path(Path::new("Dockerfile.relay")),
-            Language::Dockerfile
-        );
-        assert_eq!(
-            Language::from_path(Path::new("Dockerfile.worker")),
-            Language::Dockerfile
-        );
-        assert_eq!(Language::from_path(Path::new(".env")), Language::Dotenv);
-        assert_eq!(
-            Language::from_path(Path::new(".env.example")),
-            Language::Dotenv
-        );
-        assert_eq!(
-            Language::from_path(Path::new(".env.docker.defaults")),
-            Language::Dotenv
-        );
-        assert_eq!(Language::from_path(Path::new("Cargo.lock")), Language::Toml);
-        assert_eq!(Language::from_path(Path::new("LICENSE")), Language::Text);
-        assert_eq!(
-            Language::from_path(Path::new("Makefile")),
-            Language::Makefile
-        );
-        assert_eq!(
-            Language::from_path(Path::new("GNUmakefile")),
-            Language::Makefile
-        );
+        for (path, expected) in [
+            ("a.rs", Language::Rust),
+            ("a.ts", Language::TypeScript),
+            ("a.tsx", Language::Tsx),
+            ("a.py", Language::Python),
+            ("a.go", Language::Go),
+            ("a.cpp", Language::Cpp),
+            ("a.txt", Language::Text),
+            ("README.md", Language::Markdown),
+            ("config.toml", Language::Toml),
+            ("compose.yaml", Language::Yaml),
+            ("package.json", Language::Json),
+            ("index.html", Language::Html),
+            ("style.scss", Language::Css),
+            ("schema.sql", Language::Sql),
+            ("doc.xml", Language::Xml),
+            ("script.sh", Language::Shell),
+            ("build.mk", Language::Makefile),
+            ("scratch.unknownext", Language::Unknown),
+            ("Dockerfile", Language::Dockerfile),
+            ("Dockerfile.dev", Language::Dockerfile),
+            ("Dockerfile.relay", Language::Dockerfile),
+            ("Dockerfile.worker", Language::Dockerfile),
+            (".env", Language::Dotenv),
+            (".env.example", Language::Dotenv),
+            (".env.docker.defaults", Language::Dotenv),
+            ("Cargo.lock", Language::Toml),
+            ("LICENSE", Language::Text),
+            ("Makefile", Language::Makefile),
+            ("GNUmakefile", Language::Makefile),
+        ] {
+            assert_eq!(Language::from_path(Path::new(path)), expected, "{path}");
+        }
     }
 
     #[test]

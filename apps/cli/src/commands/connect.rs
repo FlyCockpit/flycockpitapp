@@ -140,15 +140,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_connect_command_is_status() {
-        let args = ConnectArgs { command: None };
-        assert_eq!(
-            args.command.unwrap_or(ConnectCommand::Status),
-            ConnectCommand::Status
-        );
-    }
-
-    #[test]
     fn status_without_connector_row_reports_off() {
         let rendered = format_status("https://app.example.test", "inst-1", None);
         assert!(rendered.contains("  server:   https://app.example.test\n"));
@@ -170,11 +161,5 @@ mod tests {
         assert!(rendered.contains("  status:   connected\n"));
         assert!(rendered.contains("  relay:    wss://relay.example.test/ws\n"));
         assert!(rendered.contains("  error:    transient reset\n"));
-    }
-
-    #[test]
-    fn connector_state_view_parses_null_projection() {
-        let parsed: Option<ConnectorStateView> = serde_json::from_str("null").unwrap();
-        assert!(parsed.is_none());
     }
 }

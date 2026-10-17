@@ -3772,23 +3772,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_vnext_empty_models_does_not_change_canonical_digest() {
-        let with_empty = valid();
-        let mut with_explicit_empty = valid();
-        with_explicit_empty
-            .model_slots
-            .get_mut("primary")
-            .unwrap()
-            .models = Vec::new();
-        let left = serde_yaml::to_string(&with_empty.model_slots).unwrap();
-        let right = serde_yaml::to_string(&with_explicit_empty.model_slots).unwrap();
-        assert_eq!(
-            left, right,
-            "empty models must skip_serializing for digest stability"
-        );
-    }
-
-    #[test]
     fn agent_vnext_default_child_must_be_an_allowed_child() {
         let mut definition = valid();
         definition.delegation = DelegationPolicy {

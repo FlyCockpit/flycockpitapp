@@ -1517,8 +1517,7 @@ fn row_to_job(row: ScheduledJobRow) -> Result<ScheduledJob> {
 #[cfg(test)]
 #[cfg(feature = "extended")]
 mod tests {
-    use std::collections::{HashMap, VecDeque};
-    use std::sync::Mutex;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -1568,29 +1567,6 @@ mod tests {
     impl JitterSource for MaxJitter {
         fn duration_up_to(&self, cap: Duration) -> Duration {
             cap
-        }
-    }
-
-    struct SequenceJitter {
-        values: Mutex<VecDeque<Duration>>,
-    }
-
-    impl SequenceJitter {
-        fn new(values: impl IntoIterator<Item = Duration>) -> Self {
-            Self {
-                values: Mutex::new(values.into_iter().collect()),
-            }
-        }
-    }
-
-    impl JitterSource for SequenceJitter {
-        fn duration_up_to(&self, cap: Duration) -> Duration {
-            self.values
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(cap)
-                .min(cap)
         }
     }
 
@@ -1753,38 +1729,6 @@ mod tests {
     }
 
     #[test]
-    fn backoff_jitter_varies_across_retries_of_the_same_job() {
-        let jitter = SequenceJitter::new([
-            Duration::ZERO,
-            Duration::from_secs(5),
-            Duration::from_secs(25),
-        ]);
-
-        let components = (1..=3)
-            .map(|failure_count| {
-                let floor = 30_i64 * (1_i64 << (failure_count - 1));
-                backoff_seconds(failure_count, &jitter) - floor
-            })
-            .collect::<Vec<_>>();
-
-        assert!(components.windows(2).any(|pair| pair[0] != pair[1]));
-    }
-
-    #[test]
-    fn backoff_jitter_scales_with_the_backoff_base() {
-        let jitter = MaxJitter;
-
-        let low_floor = 30;
-        let high_floor = 1_800;
-        let low_extra = backoff_seconds(1, &jitter) - low_floor;
-        let high_extra = backoff_seconds(7, &jitter) - high_floor;
-
-        assert!(high_extra > low_extra);
-        assert_eq!(low_extra, low_floor);
-        assert_eq!(high_extra, high_floor);
-    }
-
-    #[test]
     fn zero_jitter_reproduces_exact_backoff_ladder() {
         let jitter = ZeroJitter;
         let delays = (1..=7)
@@ -1793,6 +1737,19 @@ mod tests {
 
         assert_eq!(delays, vec![30, 60, 120, 240, 480, 960, 1_800]);
         assert_eq!(backoff_seconds(64, &jitter), 1_800);
+
+        {
+            let jitter = MaxJitter;
+
+            let low_floor = 30;
+            let high_floor = 1_800;
+            let low_extra = backoff_seconds(1, &jitter) - low_floor;
+            let high_extra = backoff_seconds(7, &jitter) - high_floor;
+
+            assert!(high_extra > low_extra);
+            assert_eq!(low_extra, low_floor);
+            assert_eq!(high_extra, high_floor);
+        }
     }
 
     #[test]

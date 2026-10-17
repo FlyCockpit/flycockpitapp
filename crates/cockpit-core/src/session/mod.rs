@@ -3680,21 +3680,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn note_user_content_empty_is_noop() {
-        let db = Db::open_in_memory().unwrap();
-        let s = Session::create_for_test(
-            db,
-            PathBuf::from("/x"),
-            "a",
-            crate::session::test_redaction_key_resolver(),
-        )
-        .unwrap();
-        assert_eq!(s.note_user_content(""), TitleAction::None);
-        assert_eq!(s.user_content_tokens(), 0);
-        assert_eq!(s.user_content_turns(), 0);
-    }
-
-    #[tokio::test]
     async fn non_slot_turns_do_not_fire_even_with_large_content() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create_for_test(

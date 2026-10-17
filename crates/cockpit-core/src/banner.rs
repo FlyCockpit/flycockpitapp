@@ -500,13 +500,4 @@ mod tests {
             });
         }
     }
-
-    /// Visual smoke test. Run with `--nocapture` to see the banner.
-    #[test]
-    fn dump_for_visual_inspection() {
-        eprintln!();
-        for line in render_unconditional() {
-            eprintln!("{line}");
-        }
-    }
 }

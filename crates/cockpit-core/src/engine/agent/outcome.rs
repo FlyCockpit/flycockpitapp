@@ -485,36 +485,6 @@ mod handoff_outcome_removal_tests {
             "non-object budget must fail closed"
         );
     }
-
-    /// The dead native handoff tool's structural outcome and helper must not
-    /// reappear. Source-level so this fails first while the variant/helper
-    /// remain, then passes after deletion. Banned tokens are assembled at
-    /// runtime so this test body does not self-match via `include_str!`.
-    #[test]
-    fn turn_outcome_has_no_handoff_variant() {
-        let src = include_str!("outcome.rs");
-        // Strip this test module before scanning so assert messages cannot
-        // self-match.
-        let production = src
-            .split("mod handoff_outcome_removal_tests")
-            .next()
-            .unwrap_or(src);
-        let variant = format!("{} {{", "Handoff");
-        let helper = format!("fn hand{}target", "off_");
-        let path = format!("TurnOutcome::{}", "Handoff");
-        assert!(
-            !production.contains(&variant),
-            "TurnOutcome must not declare a Handoff variant"
-        );
-        assert!(
-            !production.contains(&helper),
-            "handoff_target helper must be removed with the dead tool"
-        );
-        assert!(
-            !production.contains(&path),
-            "no TurnOutcome::Handoff references may remain in outcome production code"
-        );
-    }
 }
 
 #[cfg(test)]

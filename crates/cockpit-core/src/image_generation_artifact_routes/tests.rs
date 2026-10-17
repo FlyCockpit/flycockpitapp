@@ -573,15 +573,6 @@ fn image_artifact_route_svg_is_sanitized_svg_detection() {
 }
 
 #[test]
-fn image_artifact_route_svg_content_type_constant() {
-    assert_eq!(
-        content_type_for_media_kind("image/svg+xml"),
-        Some(CONTENT_TYPE_SVG)
-    );
-    assert_eq!(content_type_for_media_kind("svg"), Some(CONTENT_TYPE_SVG));
-}
-
-#[test]
 fn image_artifact_route_svg_disposition_attachment_only() {
     let d = svg_content_disposition();
     assert!(d.starts_with("attachment; filename=\""));
@@ -798,6 +789,7 @@ fn image_artifact_route_byte_headers_content_type_map() {
         Some(CONTENT_TYPE_SVG)
     );
     assert_eq!(content_type_for_media_kind("unknown"), None);
+    assert_eq!(content_type_for_media_kind("svg"), Some(CONTENT_TYPE_SVG));
 }
 
 #[test]
@@ -1154,33 +1146,28 @@ fn image_artifact_route_authz_image_admin_not_artifact_authority() {
 // ===========================================================================
 
 #[test]
-fn image_artifact_route_lease_transfer_chunk_boundary() {
+fn image_artifact_route_lease_transfer_protocol_constants() {
     assert_eq!(IMAGE_ARTIFACT_MAX_CHUNK_BYTES, 524_255);
-}
 
-#[test]
-fn image_artifact_route_lease_transfer_receiver_window() {
-    assert_eq!(IMAGE_ARTIFACT_RECEIVER_WINDOW_BYTES, 4 * 1024 * 1024);
-}
+    {
+        assert_eq!(IMAGE_ARTIFACT_RECEIVER_WINDOW_BYTES, 4 * 1024 * 1024);
+    }
 
-#[test]
-fn image_artifact_route_lease_transfer_queue_and_aggregate_caps() {
-    assert_eq!(IMAGE_ARTIFACT_BULK_QUEUE_BYTES, 8 * 1024 * 1024);
-    assert_eq!(IMAGE_ARTIFACT_AGGREGATE_CAP_BYTES, 16 * 1024 * 1024);
-}
+    {
+        assert_eq!(IMAGE_ARTIFACT_BULK_QUEUE_BYTES, 8 * 1024 * 1024);
+        assert_eq!(IMAGE_ARTIFACT_AGGREGATE_CAP_BYTES, 16 * 1024 * 1024);
+    }
 
-#[test]
-fn image_artifact_route_lease_transfer_mime_class_constant() {
-    assert_eq!(IMAGE_ARTIFACT_BYTES_MIME_CLASS, "image_artifact_bytes_v1");
-}
+    {
+        assert_eq!(IMAGE_ARTIFACT_BYTES_MIME_CLASS, "image_artifact_bytes_v1");
+    }
 
-#[test]
-fn image_artifact_route_lease_transfer_begin_option_bits() {
-    assert_eq!(IMAGE_ARTIFACT_BEGIN_OPTION_BITS, 0x03);
-}
+    {
+        assert_eq!(IMAGE_ARTIFACT_BEGIN_OPTION_BITS, 0x03);
+    }
 
-#[test]
-fn image_artifact_route_lease_transfer_lease_deadline_bounds() {
-    assert_eq!(LEASE_DEADLINE_MIN_MS, 1);
-    assert_eq!(LEASE_DEADLINE_MAX_MS, 60_000);
+    {
+        assert_eq!(LEASE_DEADLINE_MIN_MS, 1);
+        assert_eq!(LEASE_DEADLINE_MAX_MS, 60_000);
+    }
 }

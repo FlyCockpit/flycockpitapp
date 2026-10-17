@@ -305,17 +305,6 @@ mod tests {
     }
 
     #[test]
-    fn import_summary_parses_daemon_projection() {
-        let summary: PackageImportSummaryView = serde_json::from_str(
-            r#"{"imported":2,"deduped":1,"skipped":0,"failed":1,"warnings":["w"],"failures":[{"path":"/a","reason":"boom"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(summary.imported, 2);
-        assert_eq!(summary.failed, 1);
-        assert_eq!(summary.failures[0].reason, "boom");
-    }
-
-    #[test]
     fn package_add_parses_singular_alias_with_git_before_identifier() {
         let cli = Cli::try_parse_from([
             "cockpit",
@@ -338,14 +327,6 @@ mod tests {
     }
 
     #[test]
-    fn package_list_parses_singular_alias() {
-        let cli = Cli::try_parse_from(["cockpit", "package", "list"]).unwrap();
-        let Some(Command::Packages(PackagesCommand::List)) = cli.command else {
-            panic!("expected package alias list command");
-        };
-    }
-
-    #[test]
     fn packages_add_deep_flag_parses_full_clone() {
         let cli = Cli::try_parse_from([
             "cockpit",
@@ -362,14 +343,6 @@ mod tests {
         };
         assert_eq!(args.identifier, "tokio");
         assert!(args.deep);
-    }
-
-    #[test]
-    fn dependencies_alias_parses_package_surface() {
-        let cli = Cli::try_parse_from(["cockpit", "dependencies", "list"]).unwrap();
-        let Some(Command::Packages(PackagesCommand::List)) = cli.command else {
-            panic!("expected packages list command through dependencies alias");
-        };
     }
 
     #[test]

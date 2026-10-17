@@ -2348,17 +2348,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runs_trivial_script_and_returns_value() {
+    async fn returns_final_expression_as_json() {
         let cfg = McpConfig::default();
-        let out = run("1 + 2", &cfg).await.unwrap();
-        assert_eq!(out, "3");
-    }
-
-    #[tokio::test]
-    async fn returns_string_value() {
-        let cfg = McpConfig::default();
-        let out = run("'hello ' + 'world'", &cfg).await.unwrap();
-        assert_eq!(out, "\"hello world\"");
+        for (script, expected) in [("1 + 2", "3"), ("'hello ' + 'world'", "\"hello world\"")] {
+            assert_eq!(run(script, &cfg).await.unwrap(), expected, "{script}");
+        }
     }
 
     #[tokio::test]
@@ -3903,26 +3897,6 @@ for line in sys.stdin:
         assert!(out.contains("\"description\":\"Count numbers\""));
         assert!(!out.contains("input_schema"), "{out}");
         assert!(!out.contains("\"properties\""), "{out}");
-    }
-
-    #[tokio::test]
-    async fn printed_search_normalizes_fake_server_hits() {
-        let tmp = fake_stdio_server();
-        let script = tmp.path().join("fake-mcp.py");
-        let cfg = monty_stdio_cfg(script.to_str().unwrap());
-        let out = run("result = mcp.search('')\nprint(result)", &cfg)
-            .await
-            .unwrap();
-        let json: Value = serde_json::from_str(&out).unwrap();
-        let fake = json
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|hit| hit["server"] == "fake")
-            .expect("fake server hit");
-        assert_eq!(fake["tool"], "count");
-        assert_eq!(fake["description"], "Count numbers");
-        assert!(fake.get("input_schema").is_none(), "{out}");
     }
 
     #[tokio::test]

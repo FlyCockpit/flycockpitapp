@@ -6687,16 +6687,6 @@ async fn provider_view_requires_no_client_side_secret_resolution() {
 }
 
 #[tokio::test]
-async fn replace_config_snapshot_unchanged_values_do_not_bump_generation() {
-    let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
-    let replacement = snapshot.read().unwrap().clone();
-    let result = replace_config_snapshot(&snapshot, replacement);
-    assert!(!result.changed);
-    assert_eq!(result.generation, 0);
-    assert_eq!(snapshot.read().unwrap().generation, 0);
-}
-
-#[tokio::test]
 async fn replace_config_snapshot_changed_values_bump_generation() {
     let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
     let result = replace_config_snapshot(
@@ -6750,14 +6740,6 @@ async fn trust_transition_tag_rejects_an_older_generation_matched_refresh() {
     assert!(stale.stale);
     assert!(!stale.changed);
     assert_eq!(snapshot.read().unwrap().trust_revision, 7);
-}
-
-#[tokio::test]
-async fn config_snapshot_generation_stable_without_reresolve() {
-    let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
-    let before = snapshot.read().unwrap().generation;
-    let _current = snapshot.read().unwrap().clone();
-    assert_eq!(snapshot.read().unwrap().generation, before);
 }
 
 #[tokio::test]
@@ -7003,6 +6985,9 @@ async fn replace_config_snapshot_no_change_emits_no_config_snapshot_event() {
     let replacement = snapshot.read().unwrap().clone();
 
     let result = replace_config_snapshot(&snapshot, replacement);
+    assert!(!result.changed);
+    assert_eq!(result.generation, 0);
+    assert_eq!(snapshot.read().unwrap().generation, 0);
     let generation =
         send_config_snapshot_event_if_changed(&event_tx, &redaction, &snapshot, session_id, result);
 

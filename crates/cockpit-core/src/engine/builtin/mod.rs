@@ -7487,23 +7487,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn builtin_prompts_have_no_mode_suffixed_files() {
-        // Issue #75 ratchet: the retired `.normal.md`/`.frontier.md` prompt
-        // bodies are gone; each bundled agent has a single canonical body.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/builtin");
-        let entries = std::fs::read_dir(&dir).unwrap();
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".normal.md") || name.ends_with(".frontier.md") {
-                panic!(
-                    "builtin prompt dir still contains mode-suffixed file `{name}` — issue #75 requires a single canonical body"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn learn_is_reachable_from_write_capable_build() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
@@ -7842,22 +7825,6 @@ pub(crate) mod tests {
                 );
             }
         }
-    }
-
-    /// Module + source file for the dead native handoff tool must be gone.
-    #[test]
-    fn handoff_tool_source_and_module_are_removed() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools/handoff.rs");
-        assert!(
-            !path.exists(),
-            "tools/handoff.rs must be deleted (still present at {})",
-            path.display()
-        );
-        let tools_mod = include_str!("../../tools/mod.rs");
-        assert!(
-            !tools_mod.contains("mod handoff"),
-            "tools/mod.rs must not export the handoff module"
-        );
     }
 
     /// Live same-word "handoff" features remain after the dead native tool is

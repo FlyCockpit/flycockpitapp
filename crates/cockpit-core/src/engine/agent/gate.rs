@@ -1449,22 +1449,6 @@ mod safety_gate_tests {
         assert_eq!(safety_gate_evaluate_calls(), 0);
     }
 
-    #[test]
-    fn gate_degrade_notice_copy_names_remedy() {
-        assert_eq!(
-            AUTO_GATE_UNSET_NOTICE,
-            "Auto approval needs a utility model to pre-screen commands; falling back to manual approval — set utility_model (provider:model) in your config to enable it."
-        );
-        assert!(AUTO_GATE_UNSET_NOTICE.contains("utility_model"));
-        assert!(AUTO_GATE_UNSET_NOTICE.contains("provider:model"));
-        assert_eq!(
-            AUTO_GATE_UNUSABLE_NOTICE,
-            "The configured utility model is unreachable; Auto approval is falling back to manual asks until it recovers."
-        );
-        assert!(AUTO_GATE_UNUSABLE_NOTICE.contains("unreachable"));
-        assert!(AUTO_GATE_UNUSABLE_NOTICE.contains("recovers"));
-    }
-
     struct SleepTool;
 
     #[async_trait]

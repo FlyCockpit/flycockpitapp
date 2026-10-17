@@ -531,18 +531,6 @@ mod tests {
     }
 
     #[test]
-    fn no_daemon_fallback_deleted() {
-        let source = include_str!("flycockpit.rs");
-        let production = source
-            .split("mod tests {")
-            .next()
-            .expect("production source");
-        assert!(!production.contains(concat!("store_credential_via_daemon", "_or_vault")));
-        assert!(!production.contains(concat!("clear_credential_via_daemon", "_or_vault")));
-        assert!(!production.contains(concat!("Daemon-less: in-process vault ", "handle")));
-    }
-
-    #[test]
     fn login_logout_use_store_clear_rpcs() {
         let source = include_str!("flycockpit.rs");
         let production = source

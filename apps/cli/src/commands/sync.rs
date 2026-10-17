@@ -202,12 +202,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_command_status_is_routable() {
-        let command = SyncCommand::Status;
-        assert!(matches!(command, SyncCommand::Status));
-    }
-
-    #[test]
     fn connector_state_null_is_none_but_malformed_surfaces() {
         // `null` is the only legitimate `None` (no connector row yet).
         assert!(parse_connector_state("null").unwrap().is_none());

@@ -214,18 +214,18 @@ mod tests {
     }
 
     #[test]
-    fn exact_length_input_is_not_truncated() {
-        assert_eq!(cap_chars("abcd", 4), ("abcd".to_string(), false));
-    }
-
-    #[test]
-    fn one_char_over_cap_appends_marker() {
-        assert_eq!(cap_chars("abcde", 4), ("abcd...".to_string(), true));
-    }
-
-    #[test]
-    fn multibyte_input_truncates_at_char_cap() {
-        assert_eq!(cap_chars("é😀中x", 3), ("é😀中...".to_string(), true));
+    fn cap_chars_table() {
+        for (text, cap, expected, truncated) in [
+            ("abcd", 4, "abcd", false),
+            ("abcde", 4, "abcd...", true),
+            ("é😀中x", 3, "é😀中...", true),
+        ] {
+            assert_eq!(
+                cap_chars(text, cap),
+                (expected.to_string(), truncated),
+                "{text}"
+            );
+        }
     }
 
     #[test]

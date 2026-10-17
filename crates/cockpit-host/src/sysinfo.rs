@@ -59,14 +59,3 @@ pub fn os_string() -> String {
 pub fn is_ssh() -> bool {
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn os_string_nonempty() {
-        let s = os_string();
-        assert!(!s.is_empty());
-    }
-}

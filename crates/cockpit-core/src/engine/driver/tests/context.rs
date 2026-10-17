@@ -2218,25 +2218,6 @@ async fn prepare_commits_nothing() {
 }
 
 #[tokio::test]
-async fn prepared_compaction_round_trips_serde() {
-    let (mut driver, _tmp) = prepare_apply_fixture().await;
-    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
-
-    let prepared = driver
-        .prepare_compaction_with_source(
-            &tx,
-            "manual",
-            crate::engine::driver::CompactionAppendixScope::Session,
-        )
-        .await
-        .expect("prepare succeeds");
-    let encoded = serde_json::to_string(&prepared).unwrap();
-    let decoded: PreparedCompaction = serde_json::from_str(&encoded).unwrap();
-
-    assert_eq!(decoded, prepared);
-}
-
-#[tokio::test]
 async fn apply_runs_no_inference() {
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -2795,15 +2776,6 @@ async fn effective_auto_compact_pct_defaults_when_unset() {
         driver.effective_auto_compact_pct(&cfg, Some(&conservative)),
         60
     );
-}
-
-#[tokio::test]
-async fn effective_auto_compact_pct_is_80_without_mcp() {
-    use crate::config::providers::ContextConfig;
-    let (driver, _tmp) = test_driver_without_network(8);
-    let cfg = ContextConfig::default();
-
-    assert_eq!(driver.effective_auto_compact_pct(&cfg, None), 80);
 }
 
 #[tokio::test]

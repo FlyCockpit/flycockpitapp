@@ -2,62 +2,55 @@ use super::*;
 use crate::engine::tool::Tool;
 
 #[test]
-fn bash_terse_description_is_within_the_raised_budget() {
+fn bash_descriptions_carry_required_steering() {
     let tool = BashTool::new();
-    let len = tool.description().len();
+    let terse = tool.description();
+    let len = terse.len();
     assert!(
         (300..=400).contains(&len),
-        "bash terse description is {len} bytes: {}",
-        tool.description()
+        "bash terse description is {len} bytes: {terse}"
     );
-}
-
-#[test]
-fn bash_terse_description_routes_to_native_tools() {
-    let description = BashTool::new().description().to_string();
-    for term in ["read", "search", "code", "cat", "grep", "ls", "find"] {
-        assert!(description.contains(term), "missing {term}: {description}");
+    let verbose = tool.verbose_description().unwrap();
+    for (description, required) in [
+        (
+            terse,
+            &[
+                "read",
+                "search",
+                "code",
+                "cat",
+                "grep",
+                "ls",
+                "find",
+                "Fresh shell",
+                "cd/env do NOT persist",
+                "Non-interactive",
+                "pagers",
+                "120s default",
+            ][..],
+        ),
+        (
+            verbose.as_str(),
+            &[
+                "non-interactive",
+                "stdin is /dev/null",
+                "pagers",
+                "editors",
+                "tail -f",
+                "servers",
+            ][..],
+        ),
+    ] {
+        for term in required {
+            assert!(description.contains(term), "missing {term}: {description}");
+        }
     }
-}
-
-#[test]
-fn bash_terse_description_states_fresh_shell_semantics() {
-    let description = BashTool::new().description().to_string();
-    assert!(description.contains("Fresh shell"), "{description}");
-    assert!(
-        description.contains("cd/env do NOT persist"),
-        "{description}"
-    );
-}
-
-#[test]
-fn bash_terse_description_warns_about_interactive_and_long_running_commands() {
-    let description = BashTool::new().description().to_string();
-    assert!(description.contains("Non-interactive"), "{description}");
-    assert!(description.contains("pagers"), "{description}");
     assert!(
         ["-i", "watch", "tail -f", "servers"]
             .iter()
-            .any(|needle| description.contains(needle)),
-        "{description}"
+            .any(|term| terse.contains(term)),
+        "{terse}"
     );
-}
-
-#[test]
-fn bash_terse_description_states_the_default_timeout() {
-    let description = BashTool::new().description().to_string();
-    assert!(description.contains("120s default"), "{description}");
-}
-
-#[test]
-fn bash_verbose_description_warns_about_interactive_and_long_running_commands() {
-    let description = BashTool::new().verbose_description().unwrap();
-    assert!(description.contains("non-interactive"), "{description}");
-    assert!(description.contains("stdin is /dev/null"), "{description}");
-    assert!(description.contains("pagers"), "{description}");
-    assert!(description.contains("editors"), "{description}");
-    assert!(description.contains("tail -f"), "{description}");
-    assert!(description.contains("servers"), "{description}");
 }
 
 #[test]

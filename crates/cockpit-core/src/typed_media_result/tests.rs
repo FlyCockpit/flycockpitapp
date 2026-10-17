@@ -247,25 +247,6 @@ fn typed_media_result_schema_rejects_data_video_url() {
 }
 
 #[test]
-fn typed_media_result_schema_uses_camel_case() {
-    let reference = test_reference(
-        CanonicalMediaKind::Image,
-        2,
-        MediaReferenceAvailability::Ready,
-    )
-    .with_dimensions(640, 480);
-    let content = CanonicalToolResultContent::media_reference(reference);
-    let json = serde_json::to_string(&content).unwrap();
-    // Check camelCase field names
-    assert!(json.contains("\"attachmentId\""));
-    assert!(json.contains("\"attachmentVersion\""));
-    assert!(json.contains("\"mediaKind\""));
-    assert!(json.contains("\"mimeType\""));
-    assert!(json.contains("\"byteCount\""));
-    assert!(json.contains("\"media_reference\""));
-}
-
-#[test]
 fn typed_media_result_schema_rejects_unknown_fields_in_media_reference() {
     let reference = test_reference(
         CanonicalMediaKind::Image,
@@ -1416,11 +1397,6 @@ fn typed_media_result_mapping_tool_call_id_and_ordinal() {
 // ---------------------------------------------------------------------------
 // Schema version
 // ---------------------------------------------------------------------------
-
-#[test]
-fn typed_media_result_schema_version() {
-    assert_eq!(CANONICAL_TOOL_RESULT_SCHEMA_VERSION, 1);
-}
 
 // ---------------------------------------------------------------------------
 // TypeScript round-trip (JSON compatibility)

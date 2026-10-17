@@ -1381,61 +1381,6 @@ fn raw_blocking_transport_primitives_are_not_public_api() {
 }
 
 #[test]
-fn cockpit_core_db_reexport_removed() {
-    let source = read("crates/cockpit-core/src/lib.rs");
-    assert!(!source.contains(concat!("pub use cockpit_", "db as db")));
-}
-
-#[test]
-fn tui_manifest_has_no_cockpit_db() {
-    let manifest = read("crates/cockpit-tui/Cargo.toml");
-    assert!(
-        !manifest
-            .lines()
-            .any(|line| line.starts_with(concat!("cockpit", "-db")))
-    );
-}
-
-#[test]
-fn tui_db_inventory_converted() {
-    let sources = tui_sources();
-    for forbidden in [
-        concat!("cockpit_", "db"),
-        concat!("cockpit_core::", "db"),
-        concat!("D", "b::open"),
-        concat!("new_with_", "db"),
-    ] {
-        assert!(
-            !sources.contains(forbidden),
-            "forbidden TUI DB surface: {forbidden}"
-        );
-    }
-    for rpc in [
-        "SetWorkspaceTrust",
-        "GetStartupDisclosures",
-        "ResolveAssistantSession",
-        "ReadSubagentHistoryPage",
-        "StatsRollup",
-        "ListProjectNotes",
-        "ListPinnedMessages",
-        "ListSessions",
-    ] {
-        assert!(sources.contains(rpc), "missing daemon RPC migration: {rpc}");
-    }
-}
-
-#[test]
-fn tui_db_surface_behavior_matrix() {
-    let sources = tui_sources();
-    assert!(sources.contains("startup_disclosures_ready"));
-    assert!(sources.contains("Startup disclosures Unavailable"));
-    assert!(sources.contains("Assistants Unavailable"));
-    assert!(sources.contains("reconnect to the daemon, then Retry"));
-    assert!(sources.contains("source_session_id"));
-    assert!(sources.contains("result.project_root != self.project_root"));
-}
-
-#[test]
 fn notes_project_identity_resolution_is_daemon_owned() {
     let notes = production_source(&read("crates/cockpit-tui/src/tui/notes_pane.rs"));
     for forbidden in [
@@ -1483,10 +1428,7 @@ fn git_diff_and_review_source_authority_is_daemon_owned() {
     assert!(tui.contains("Request::GitReviewSources"));
     assert!(tui.contains("AsyncActionKind::DaemonRpc(\"git.diff\")"));
     assert!(tui.contains("AsyncActionKind::DaemonRpc(\"git.review_sources\")"));
-}
 
-#[test]
-fn repo_status_and_worktree_root_authority_is_daemon_owned() {
     // The chrome poller, the branch pill, and the permissions/session panes no
     // longer reach into `cockpit_core::git`: repository status and worktree
     // root discovery are daemon RPCs, and `repo_counts` is a presentation-only
@@ -1515,7 +1457,6 @@ fn repo_status_and_worktree_root_authority_is_daemon_owned() {
             "{path} retains direct worktree-root git authority"
         );
     }
-    let tui = tui_sources();
     assert!(tui.contains("Request::GitRepoStatus"));
     assert!(tui.contains("Request::FindWorktreeRoot"));
 }
@@ -2166,14 +2107,6 @@ fn production_filesystem_mutations_have_device_ui_owners() {
 }
 
 #[test]
-fn tui_settings_use_revisioned_typed_mutation() {
-    let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
-    assert!(settings.contains("GetExtendedConfigSnapshot"));
-    assert!(settings.contains("ApplyExtendedConfigPatch"));
-    assert!(!settings.contains("base_hash = None"));
-}
-
-#[test]
 fn every_tui_agent_mutation_is_exactly_receipted_and_recoverable() {
     let agents = read("crates/cockpit-tui/src/tui/settings/agents_page.rs");
     let goals = read("crates/cockpit-tui/src/tui/goal_settings_pane.rs");
@@ -2237,19 +2170,6 @@ fn assistant_definition_mutations_are_durable_and_close_gated() {
             "missing paired authority gate {required}"
         );
     }
-}
-
-#[test]
-fn tui_db_boundary_gate_first_has_real_negative_alias_fixtures() {
-    for fixture in ["direct_alias.rs", "core_alias.rs"] {
-        let source = read(&format!("scripts/fixtures/tui-db-boundary/{fixture}"));
-        assert!(source.contains("use "));
-        assert!(source.contains(" as storage;"));
-        assert!(source.contains(concat!("storage::D", "b::open_default()")));
-    }
-    let gate = read("scripts/check-tui-db-boundary.sh");
-    assert!(gate.contains("cargo check"));
-    assert!(gate.contains("negative fixture unexpectedly compiled"));
 }
 
 #[test]

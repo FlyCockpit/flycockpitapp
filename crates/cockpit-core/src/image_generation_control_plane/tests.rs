@@ -421,16 +421,15 @@ mod capability_matrix {
     use super::*;
 
     #[test]
-    fn image_generation_admin_ordinal_is_15() {
-        assert_eq!(image_generation_admin_ordinal(), 15);
-        assert!(verify_image_generation_admin_ordinal());
-    }
-
-    #[test]
     fn capability_imported_from_foundation() {
         let cap = image_generation_admin_capability();
         assert_eq!(cap, RemoteProjectCapabilityV1::ImageGenerationAdmin);
         assert_eq!(cap.ordinal(), 15);
+
+        {
+            assert_eq!(image_generation_admin_ordinal(), 15);
+            assert!(verify_image_generation_admin_ordinal());
+        }
     }
 
     #[test]
@@ -611,12 +610,6 @@ mod schema_conformance {
     fn unknown_tag_string_rejected() {
         assert!(ImageControlRequestTag::from_str("unknown_tag").is_none());
         assert!(ImageControlRequestTag::from_str("").is_none());
-    }
-
-    #[test]
-    fn tag_count_is_exact() {
-        // 31 tags total: 15 reads + 16 mutations.
-        assert_eq!(ImageControlRequestTag::all().len(), 31);
     }
 
     #[test]

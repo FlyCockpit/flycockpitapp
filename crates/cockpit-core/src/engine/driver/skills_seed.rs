@@ -607,13 +607,7 @@ fn skill_slash_call_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::skill_slash_call_id;
     use serde_json::json;
-
-    #[test]
-    fn responses_fc_prefix_mints_are_wire_legal() {
-        assert!(skill_slash_call_id().starts_with("fc-skillslash-"));
-    }
 
     #[test]
     fn seed_label_output_unchanged_except_escaping() {

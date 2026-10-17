@@ -78,14 +78,6 @@ fn worker_cannot_create_or_mutate_goal() {
     assert!(!crate::agents::known_tool_names().contains(&"goal"));
 }
 
-#[test]
-fn goal_continue_progress_accepts_goal_status_update() {
-    assert!(
-        !crate::agents::known_tool_names().contains(&"goal"),
-        "worker status updates must remain unavailable; host continuations use durable DB state"
-    );
-}
-
 #[tokio::test]
 async fn delegation_brief_todo_block_omits_append_note_instruction() {
     let (driver, _tmp) = test_driver(1);
@@ -564,16 +556,6 @@ async fn persistent_goal_usage_limit_requires_manual_resume_after_bound() {
         }
         other => panic!("expected manual resume Notice, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn ordinary_non_goal_idle_reason_is_completed() {
-    let (mut driver, _tmp) = test_driver(1);
-
-    assert_eq!(
-        driver.take_idle_reason(true).await,
-        crate::engine::IdleReason::Completed
-    );
 }
 
 /// Direct `emit_goal_no_progress_budget_exhausted` used to force

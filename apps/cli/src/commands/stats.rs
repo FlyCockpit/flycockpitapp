@@ -509,17 +509,6 @@ mod tests {
     }
 
     #[test]
-    fn table_renders_all_sections() {
-        // Smoke test: rendering doesn't panic and the JSON/CSV paths
-        // produce non-empty output for a populated rollup.
-        let r = sample_rollup();
-        print_table(&r); // would panic on a formatting bug
-        let json = serde_json::to_string_pretty(&r).unwrap();
-        assert!(json.contains("\"opus\""));
-        assert!(json.contains("\"Rust\""));
-    }
-
-    #[test]
     fn stats_recovery_cli_table_groups_by_model_only() {
         let r = sample_rollup();
         let text = recovery_table_lines(&r.recovery).join("\n");

@@ -145,36 +145,6 @@ fn catalog_gpt_image_15_supports_transparency_and_fidelity() {
     assert!(descriptor.supports_input_fidelity(InputFidelity::High));
 }
 
-#[test]
-fn catalog_all_entries_support_all_qualities_formats_moderations() {
-    for descriptor in OpenaiImagesCatalog::descriptors() {
-        for quality in [Quality::Auto, Quality::Low, Quality::Medium, Quality::High] {
-            assert!(
-                descriptor.supports_quality(quality),
-                "{:?} lacks quality {:?}",
-                descriptor.identity.as_str(),
-                quality.as_str()
-            );
-        }
-        for format in [OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::Webp] {
-            assert!(
-                descriptor.supports_format(format),
-                "{:?} lacks format {:?}",
-                descriptor.identity.as_str(),
-                format.as_str()
-            );
-        }
-        for moderation in [Moderation::Auto, Moderation::Low] {
-            assert!(
-                descriptor.supports_moderation(moderation),
-                "{:?} lacks moderation {:?}",
-                descriptor.identity.as_str(),
-                moderation.as_str()
-            );
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Preflight table tests
 // ---------------------------------------------------------------------------

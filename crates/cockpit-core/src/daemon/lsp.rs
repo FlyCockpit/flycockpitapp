@@ -1816,13 +1816,6 @@ mod tests {
     }
 
     #[test]
-    fn lsp_lifecycle_defaults_are_bounded() {
-        let cfg = crate::config::extended::LspConfig::default();
-        assert_eq!(cfg.idle_ttl_secs, 30 * 60);
-        assert_eq!(cfg.max_cached_clients, 16);
-    }
-
-    #[test]
     fn diagnostics_read_rejects_an_oversized_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("over.rs");

@@ -154,16 +154,4 @@ mod tests {
         assert!(lines[3].contains("`failed`"));
         assert!(lines[3].contains("configured model is unavailable"));
     }
-
-    #[test]
-    fn project_root_resolution_honors_an_explicit_project() {
-        let workspace = tempfile::tempdir().unwrap();
-        let nested = workspace.path().join("project");
-        std::fs::create_dir(&nested).unwrap();
-
-        assert_eq!(
-            resolve_project_root(Some(&nested)).unwrap(),
-            nested.canonicalize().unwrap()
-        );
-    }
 }

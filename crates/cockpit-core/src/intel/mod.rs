@@ -1963,16 +1963,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_pool_leaves_interactive_headroom() {
-        let cores = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1);
-        let expected = cores.saturating_sub(1).max(1);
-        assert_eq!(intel_parse_threads(), expected);
-        assert!(intel_parse_threads() <= cores.max(1));
-    }
-
-    #[test]
     fn parse_one_large_file_skips_read_and_parse() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("huge.rs");

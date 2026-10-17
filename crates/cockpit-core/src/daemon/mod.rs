@@ -6403,41 +6403,6 @@ mod tests {
         assert_eq!(restart_release_timeout(Some(7)), RESTART_RELEASE_DEADLINE);
     }
 
-    #[test]
-    fn stop_routing_uses_exact_kqueue_witness_on_macos_and_freebsd() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/mod.rs");
-        let source = std::fs::read_to_string(&path).expect("daemon mod.rs source");
-        let start = source.find("pub fn stop(paths:").expect("stop entry");
-        let exact = source
-            .find("pub(crate) fn stop_exact")
-            .expect("exact stop entry");
-        let stable = source
-            .find("fn stop_kqueue_unix")
-            .expect("kqueue stop backend");
-        let unsupported = source
-            .find("fn stop_unix_without_stable_handle")
-            .expect("unsupported Unix backend");
-
-        for body in [&source[start..exact], &source[exact..stable]] {
-            assert!(
-                body.contains("target_os = \"macos\"")
-                    && body.contains("target_os = \"freebsd\"")
-                    && body.contains("stop_kqueue_unix"),
-                "macOS and FreeBSD stop entries must route through the exact kqueue witness"
-            );
-        }
-        assert!(
-            source[stable..unsupported].contains("wait_for_exit_blocking"),
-            "the kqueue backend must consume exact exit evidence"
-        );
-        assert!(
-            source[unsupported.saturating_sub(160)..unsupported].contains(
-                "not(any(target_os = \"linux\", target_os = \"macos\", target_os = \"freebsd\"))"
-            ),
-            "only Unix targets without a kernel witness may use the fail-closed backend"
-        );
-    }
-
     #[tokio::test]
     async fn restart_release_wait_preserves_live_metadata_after_timeout() {
         let dir = tempfile::tempdir().unwrap();

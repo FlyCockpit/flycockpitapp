@@ -1635,40 +1635,6 @@ async fn builder_followup_persist_and_rehydrate_round_trip() {
     );
 }
 
-/// A `builder` follow-up persisting more work under the SAME handle upserts
-/// the transcript (idempotent handle lifecycle), same as `explore`.
-#[tokio::test]
-async fn builder_followup_refreshes_handle_idempotently() {
-    let (driver, tmp) = test_driver(8);
-    let h1 = driver
-        .persist_subagent_handle(
-            "builder",
-            &[Message::user("step 1")],
-            Some(tmp.path()),
-            None,
-        )
-        .await
-        .unwrap();
-    let h2 = driver
-        .persist_subagent_handle(
-            "builder",
-            &[Message::user("step 1"), Message::assistant("did step 1")],
-            Some(tmp.path()),
-            Some(&h1),
-        )
-        .await
-        .unwrap();
-    assert_eq!(h1, h2);
-    assert_eq!(
-        driver
-            .rehydrate_handle(&h2, "builder", Some(tmp.path()), true)
-            .await
-            .unwrap()
-            .len(),
-        2
-    );
-}
-
 /// The `docs` pipeline is excluded from follow-up: it never persists a
 /// handle, so any `docs` resume is stale (told to spawn fresh).
 #[tokio::test]

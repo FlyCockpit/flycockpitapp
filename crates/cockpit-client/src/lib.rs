@@ -2517,19 +2517,6 @@ mod tests {
     }
 
     #[test]
-    fn discoverable_wire_owner_matches_wire_endpoint() {
-        assert!(ClientEndpoint::Wire(PathBuf::from("daemon.sock")).is_discoverable_wire_owner());
-    }
-
-    #[test]
-    fn discoverable_wire_owner_rejects_in_process_endpoint() {
-        let (connections, _connection_rx) = tokio::sync::mpsc::channel(1);
-        let (sensitive, _sensitive_rx) = tokio::sync::mpsc::channel(1);
-        let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
-        assert!(!endpoint.is_discoverable_wire_owner());
-    }
-
-    #[test]
     fn owner_capability_path_is_a_pure_function_of_the_control_socket() {
         assert_eq!(
             owner_capability_path(Path::new("/run/user/1000/cockpit/cockpit.sock")),

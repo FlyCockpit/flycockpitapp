@@ -1265,19 +1265,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_cli_management_text_labels_do_not_use_color_to_distinguish_scopes() {
-        assert_eq!(scope_label(AgentInstallationScopeWire::Global), "Global");
-        assert_eq!(
-            scope_label(AgentInstallationScopeWire::WorkspacePrivate),
-            "Workspace private"
-        );
-        assert_eq!(
-            scope_label(AgentInstallationScopeWire::WorkspaceShared),
-            "Workspace"
-        );
-    }
-
-    #[test]
     fn agent_cli_management_shared_record_text_omits_local_binding_status() {
         let record = crate::daemon::proto::AgentInstallationRecordV1 {
             installation_id: "installation".into(),

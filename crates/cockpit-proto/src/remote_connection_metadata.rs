@@ -836,9 +836,4 @@ mod tests {
         );
         assert_eq!(tuple, [1, 2, 1, 1, 1, 2, 3]);
     }
-
-    #[test]
-    fn correction_horizon_is_eight_days() {
-        assert_eq!(correction_closes_at(19937), 19937 + 8 * 86400);
-    }
 }

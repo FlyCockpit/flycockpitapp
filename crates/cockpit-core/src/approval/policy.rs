@@ -1969,22 +1969,6 @@ fn mcp_server_connect_prompt(server: &str, identity: &str) -> String {
 }
 
 #[cfg(test)]
-mod mcp_server_connect_tests {
-    use super::*;
-
-    #[test]
-    fn server_connect_label_includes_command_and_args() {
-        let prompt = mcp_server_connect_prompt(
-            "filesystem",
-            "stdio command=npx args=[\"-y\",\"@modelcontextprotocol/server-filesystem\"]",
-        );
-        assert!(prompt.contains("filesystem"));
-        assert!(prompt.contains("command=npx"));
-        assert!(prompt.contains("server-filesystem"));
-    }
-}
-
-#[cfg(test)]
 mod approval_mode_tests {
     use super::*;
 

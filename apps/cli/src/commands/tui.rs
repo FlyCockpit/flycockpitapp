@@ -307,17 +307,4 @@ mod tests {
 
         crate::config::trust::clear_runtime_policy_for_tests();
     }
-
-    #[test]
-    fn modes_session_setup_mode_is_the_canonical_proto_type() {
-        assert_eq!(SessionMode::Code, cockpit_tui::tui::app::SessionMode::Code);
-        assert_eq!(
-            SessionMode::Assistant,
-            cockpit_tui::tui::app::SessionMode::Assistant
-        );
-        assert_eq!(
-            SessionMode::Computer,
-            cockpit_tui::tui::app::SessionMode::Computer
-        );
-    }
 }

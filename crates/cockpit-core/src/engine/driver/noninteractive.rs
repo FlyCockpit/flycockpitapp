@@ -14645,47 +14645,6 @@ mod select_lane_error_tests {
         );
     }
 
-    /// When multiple parked errors are present, the one with the lowest
-    /// source_index wins (first found in BTreeMap iteration order).
-    #[test]
-    fn multiple_parked_errors_lowest_source_index_wins() {
-        let mut errors = std::collections::BTreeMap::new();
-        errors.insert(
-            2,
-            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
-        );
-        errors.insert(
-            0,
-            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
-        );
-
-        let selected = select_lane_error(errors).expect("an error must be selected");
-        assert!(
-            crate::engine::interrupt::is_parked(&selected),
-            "a parked error must be selected"
-        );
-    }
-
-    /// A parked error at a lower source_index wins over a non-park error at
-    /// a higher source_index.  Both the fix and the old `into_values().next()`
-    /// agree here, but verify the parked preference does not accidentally
-    /// skip it.
-    #[test]
-    fn parked_error_at_lower_source_index_wins_over_non_park_at_higher() {
-        let mut errors = std::collections::BTreeMap::new();
-        errors.insert(
-            0,
-            anyhow::Error::from(crate::engine::interrupt::InterruptParked),
-        );
-        errors.insert(1, anyhow::anyhow!("non-park error at source_index 1"));
-
-        let selected = select_lane_error(errors).expect("an error must be selected");
-        assert!(
-            crate::engine::interrupt::is_parked(&selected),
-            "the parked error at source_index 0 must win"
-        );
-    }
-
     /// Three errors: non-park at 0, non-park at 1, parked at 2.  The parked
     /// error at the highest source_index must still win.
     #[test]

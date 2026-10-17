@@ -187,40 +187,28 @@ mod tests {
     }
 
     #[test]
-    fn line_prefix_carries_timestamp_role_and_pid() {
-        assert_eq!(
-            line_prefix(DaemonLogRole::Worker, 7, fixed_now()),
-            "2026-09-23T12:34:56.000Z [worker 7]"
-        );
-    }
-
-    #[test]
     fn current_run_lines_start_at_the_last_marker() {
-        let text = format!(
-            "old-error\n{DAEMON_LOG_RUN_MARKER_PREFIX} a ===\nold-run-line\n{DAEMON_LOG_RUN_MARKER_PREFIX} b ===\nnew-line-1\nnew-line-2\n"
-        );
-
-        assert_eq!(
-            current_run_lines(&text),
-            vec![
-                format!("{DAEMON_LOG_RUN_MARKER_PREFIX} b ==="),
-                "new-line-1".to_string(),
-                "new-line-2".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn current_run_lines_fall_back_to_every_line_without_a_marker() {
-        assert_eq!(
-            current_run_lines("line-a\nline-b\n"),
-            vec!["line-a", "line-b"]
-        );
-    }
-
-    #[test]
-    fn current_run_lines_are_empty_when_the_run_wrote_only_its_marker() {
-        let text = format!("stale-error\n{DAEMON_LOG_RUN_MARKER_PREFIX} x ===\n");
-        assert!(current_run_lines(&text).is_empty());
+        for (text, expected) in [
+            (
+                format!(
+                    "old-error\n{DAEMON_LOG_RUN_MARKER_PREFIX} a ===\nold-run-line\n{DAEMON_LOG_RUN_MARKER_PREFIX} b ===\nnew-line-1\nnew-line-2\n"
+                ),
+                vec![
+                    format!("{DAEMON_LOG_RUN_MARKER_PREFIX} b ==="),
+                    "new-line-1".to_string(),
+                    "new-line-2".to_string(),
+                ],
+            ),
+            (
+                "line-a\nline-b\n".to_string(),
+                vec!["line-a".to_string(), "line-b".to_string()],
+            ),
+            (
+                format!("stale-error\n{DAEMON_LOG_RUN_MARKER_PREFIX} x ===\n"),
+                vec![],
+            ),
+        ] {
+            assert_eq!(current_run_lines(&text), expected);
+        }
     }
 }

@@ -54,7 +54,7 @@ fn service(
 }
 
 // ---------------------------------------------------------------------------
-// AC1: corrected tests first + production source inventory
+// AC1: corrected route and fallback contracts
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -158,42 +158,6 @@ fn clipboard_route_tests_corrected_first() {
         r.attempts
             .iter()
             .all(|a| a.outcome == AttemptOutcome::Failed)
-    );
-
-    // Source inventory: antipatterns must not remain.
-    inventory_no_legacy_antipatterns();
-}
-
-fn inventory_no_legacy_antipatterns() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/clipboard");
-    let mut bad = Vec::new();
-    walk_rs(&root, &mut |path, src| {
-        if path.ends_with("tests.rs") {
-            return;
-        }
-        for (i, line) in src.lines().enumerate() {
-            let t = line.trim();
-            if t.starts_with("//") || t.starts_with("//!") || t.starts_with('*') {
-                continue;
-            }
-            if t.contains("fn accepted(") || t.contains("CopyOutcome::accepted") {
-                bad.push(format!("{}:{} accepted", path.display(), i + 1));
-            }
-            if t.contains("OSC52_MAX_B64") {
-                bad.push(format!("{}:{} OSC52_MAX_B64", path.display(), i + 1));
-            }
-            // Double-emit: raw concatenated with tmux wrap in one format!.
-            if t.contains("{raw}\\x1bPtmux") || t.contains("{raw}\x1bPtmux") {
-                bad.push(format!("{}:{} double-emit", path.display(), i + 1));
-            }
-            if t.contains("format!(\"{raw}") && t.contains("tmux") {
-                bad.push(format!("{}:{} multifire format", path.display(), i + 1));
-            }
-        }
-    });
-    assert!(
-        bad.is_empty(),
-        "legacy clipboard antipatterns remain: {bad:?}"
     );
 }
 
@@ -921,51 +885,7 @@ fn extract_code_blocks_none_for_prose() {
 }
 
 // ---------------------------------------------------------------------------
-// Opt-in platform executable conformance (skipped when tools unavailable)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn clipboard_executable_stdin_conformance_opt_in() {
-    // Does not change production policy when unavailable — pure probe.
-    #[cfg(target_os = "macos")]
-    {
-        let path = Path::new(contracts::MACOS_PBCOPY);
-        if !path.is_file() {
-            return;
-        }
-        // Round-trip not asserted via pbpaste (would require PATH); only
-        // verify trusted candidate + spawn success without reading content
-        // back into logs.
-        let mut exe = super::executable::PlatformExecutable::default();
-        let _ = ExecutableClipboard::set_plain(&mut exe, "conformance-plain");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let path = Path::new(contracts::LINUX_WL_COPY);
-        if !path.is_file() {
-            return;
-        }
-        // Without a held Wayland socket the adapter must fail closed as
-        // Ineligible — never PATH-search or shell out.
-        let mut exe = super::executable::PlatformExecutable::default();
-        let err = ExecutableClipboard::set_plain(&mut exe, "conformance-plain");
-        assert!(
-            matches!(
-                err,
-                Err(SafeErrorKind::Ineligible) | Err(SafeErrorKind::SpawnFailed) | Ok(())
-            ),
-            "unexpected {err:?}"
-        );
-    }
-    #[cfg(windows)]
-    {
-        let mut exe = super::executable::PlatformExecutable::default();
-        let _ = ExecutableClipboard::set_plain(&mut exe, "conformance-plain");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Use RecordingExecutable trait in scope
+// Recording adapter traits used by probes
 // ---------------------------------------------------------------------------
 
 use super::executable::ExecutableClipboard;

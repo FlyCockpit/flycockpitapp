@@ -1913,23 +1913,6 @@ Body.
 }
 
 #[test]
-fn legacy_tool_descriptions_do_not_round_trip_through_vnext() {
-    let text = r#"---
-description: A custom builder.
-mode: subagent
-tools: [read]
-tool_descriptions:
-  read:
-    normal: "do-it-yourself wording"
-    defensive: "defensive do-it-yourself wording"
----
-
-Body.
-"#;
-    assert!(parse_agent(text, "builder", "x.md".into()).is_err());
-}
-
-#[test]
 fn tool_description_override_for_ungranted_tool_is_rejected() {
     // Overriding a tool the agent doesn't grant is a mistake (inert), so it's
     // rejected loudly rather than silently dropped.

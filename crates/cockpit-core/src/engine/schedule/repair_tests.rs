@@ -156,40 +156,44 @@ fn background_tail_clean_lines_untouched() {
 // ---- actions with no numeric fields: repair runs trivially ---------------
 
 #[test]
-fn loop_cancel_string_job_id_is_clean() {
-    let (args, recovery) =
-        repair_subargs(ScheduleAction::LoopCancel, json!({ "job_id": "job-abc" }));
-    assert_eq!(recovery, Recovery::Clean);
-    assert_eq!(parse_loop_cancel(&args).unwrap().job_id, "job-abc");
-}
+fn string_only_actions_repair_clean() {
+    // Every action with no numeric fields is already clean, and the
+    // validate+repair pass leaves the args object untouched.
+    for (action, args) in [
+        (ScheduleAction::LoopCancel, json!({ "job_id": "job-abc" })),
+        (
+            ScheduleAction::BackgroundStart,
+            json!({ "command": "cargo test", "cwd": "/tmp" }),
+        ),
+        (
+            ScheduleAction::BackgroundCancel,
+            json!({ "job_id": "job-z" }),
+        ),
+        (ScheduleAction::List, json!({})),
+    ] {
+        let (repaired, recovery) = repair_subargs(action, args.clone());
+        assert_eq!(recovery, Recovery::Clean, "{action:?}");
+        assert_eq!(repaired, args, "{action:?}");
+    }
 
-#[test]
-fn background_start_string_fields_are_clean() {
-    let (args, recovery) = repair_subargs(
+    let (loop_cancel, _) =
+        repair_subargs(ScheduleAction::LoopCancel, json!({ "job_id": "job-abc" }));
+    assert_eq!(parse_loop_cancel(&loop_cancel).unwrap().job_id, "job-abc");
+
+    let (background_start, _) = repair_subargs(
         ScheduleAction::BackgroundStart,
         json!({ "command": "cargo test", "cwd": "/tmp" }),
     );
-    assert_eq!(recovery, Recovery::Clean);
-    let parsed = parse_background_start(&args).unwrap();
+    let parsed = parse_background_start(&background_start).unwrap();
     assert_eq!(parsed.command, "cargo test");
     assert_eq!(parsed.cwd.as_deref(), Some("/tmp"));
-}
 
-#[test]
-fn background_cancel_string_job_id_is_clean() {
-    let (args, recovery) = repair_subargs(
+    let (background_cancel, _) = repair_subargs(
         ScheduleAction::BackgroundCancel,
         json!({ "job_id": "job-z" }),
     );
-    assert_eq!(recovery, Recovery::Clean);
-    assert_eq!(parse_background_cancel(&args).unwrap().job_id, "job-z");
-}
-
-#[test]
-fn list_empty_object_validates_trivially() {
-    // The `list` schema is an empty closed object: an empty args object is
-    // clean, and the validate+repair pass runs without complaint.
-    let (args, recovery) = repair_subargs(ScheduleAction::List, json!({}));
-    assert_eq!(recovery, Recovery::Clean);
-    assert!(args.as_object().unwrap().is_empty());
+    assert_eq!(
+        parse_background_cancel(&background_cancel).unwrap().job_id,
+        "job-z"
+    );
 }

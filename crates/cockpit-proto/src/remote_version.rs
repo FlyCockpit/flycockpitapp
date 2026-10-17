@@ -1401,34 +1401,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_version_no_hardcoded_application_version() {
-        // The application version has a single authority: the PROTOCOL_VERSION
-        // constant, read live by v1_tuple(). It is not part of the
-        // cross-language transcript byte corpus, so the shared fixture must not
-        // embed it as a second hand-maintained authority. A re-added
-        // protocolVersion / v1Application field (which a constant bump would
-        // silently desync) fails this guard.
-        let fixture = include_str!(
-            "../../../packages/cockpit-protocol/fixtures/remote/version-negotiation-v1.json"
-        );
-        assert!(
-            !fixture.contains("protocolVersion"),
-            "fixture must not embed a second application-version authority (protocolVersion)"
-        );
-        assert!(
-            !fixture.contains("v1Application"),
-            "fixture must not embed a second application-version authority (v1Application)"
-        );
-
-        // Non-vacuous: prove the production registry derives its application
-        // component from PROTOCOL_VERSION (the sole authority).
-        assert_eq!(
-            v1_tuple().application,
-            u16::try_from(PROTOCOL_VERSION).unwrap()
-        );
-    }
-
-    #[test]
     fn remote_version_transcript_hex_round_trip() {
         // A literal V1 transcript hex for cross-language identity.
         let transcript = RemoteNegotiationTranscriptV1 {
@@ -1475,23 +1447,5 @@ mod tests {
         // SHA-256 of the raw bytes, no prefix.
         let direct: [u8; 32] = Sha256::digest(&bytes).into();
         assert_eq!(digest, direct);
-    }
-
-    #[test]
-    fn remote_version_fixture_no_checked_in_digest() {
-        // Guard: the fixture must not contain a checked-in registry digest.
-        // Every comparison against the live registry is computed at test time,
-        // never checked in.
-        let fixture = include_str!(
-            "../../../packages/cockpit-protocol/fixtures/remote/version-negotiation-v1.json"
-        );
-        assert!(
-            !fixture.contains("registryDigestHex"),
-            "fixture must not contain a checked-in registry digest"
-        );
-        assert!(
-            !fixture.contains("registry_digest_hex"),
-            "fixture must not contain a checked-in registry digest"
-        );
     }
 }

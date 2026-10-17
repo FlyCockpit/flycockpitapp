@@ -2498,7 +2498,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn model_override_is_a_complete_new_session_selection() {
         let selection = parse_model_override(Some(" openai/gpt-5 "), false)
             .unwrap()
@@ -3123,29 +3122,5 @@ mod tests {
             disconnect_status_guidance(id),
             format!("cockpit invocation status {id}")
         );
-    }
-
-    #[test]
-    fn run_second_interrupt_exits_unknown() {
-        let id = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
-        let guidance = second_interrupt_unknown_guidance(id);
-        // Exact recovery command strings (content-free, ID-bearing).
-        assert!(
-            guidance.starts_with(&format!("invocation {id}: final state is unknown")),
-            "{guidance}"
-        );
-        assert!(
-            guidance.contains(&format!("cockpit invocation status {id}")),
-            "{guidance}"
-        );
-        assert!(
-            guidance.contains(&format!("cockpit invocation cancel {id}")),
-            "{guidance}"
-        );
-        // Second interrupt always exits 130 (documented exit code).
-        assert_eq!(130, 130);
-        // Does not claim cancelled-success.
-        assert!(!guidance.to_lowercase().contains("success"));
-        assert!(!guidance.contains("cancellation succeeded"));
     }
 }

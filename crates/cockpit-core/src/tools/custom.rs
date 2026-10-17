@@ -939,56 +939,47 @@ mod tests {
 
     #[test]
     fn web_tool_schema_is_backend_neutral_for_configured_template() {
-        let tpl = ToolCommandTemplate {
-            enabled: true,
-            command: "firecrawl search --json --limit 8 {query}".into(),
-            description: Some("Search using Firecrawl and DuckDuckGo fallback.".into()),
-        };
-        let tool = CustomBashTool::from_template_with_provenance(
-            "websearch",
-            &tpl,
-            ToolTemplateProvenance::Configured {
-                source: "test".to_string(),
-            },
-        );
-        let desc = tool.description().to_lowercase();
-        assert!(!desc.contains("firecrawl"));
-        assert!(!desc.contains("duckduckgo"));
-        assert!(!desc.contains("curl"));
-
-        let schema = tool.parameters();
-        let param_desc = schema["properties"]["query"]["description"]
-            .as_str()
-            .unwrap()
-            .to_lowercase();
-        assert_eq!(param_desc, "search query.");
-        assert!(!param_desc.contains("bash"));
-        assert!(!param_desc.contains("template"));
-    }
-
-    #[test]
-    fn web_tool_schema_is_backend_neutral_for_registered_web_template() {
-        let tpl = ToolCommandTemplate {
-            enabled: true,
-            command: "custom-search {query}".into(),
-            description: None,
-        };
-        let tool = CustomBashTool::from_template_with_provenance(
-            "websearch",
-            &tpl,
-            ToolTemplateProvenance::Configured {
-                source: "web.custom.search_command".to_string(),
-            },
-        );
-        let desc = tool.description().to_lowercase();
-        assert_eq!(
-            desc,
-            neutral_web_description("websearch").unwrap().to_lowercase()
-        );
-        assert_eq!(
-            tool.parameters()["properties"]["query"]["description"],
-            serde_json::json!("Search query.")
-        );
+        for (command, description, source) in [
+            (
+                "firecrawl search --json --limit 8 {query}",
+                Some("Search using Firecrawl and DuckDuckGo fallback.".to_string()),
+                "test",
+            ),
+            ("custom-search {query}", None, "web.custom.search_command"),
+        ] {
+            let tpl = ToolCommandTemplate {
+                enabled: true,
+                command: command.into(),
+                description,
+            };
+            let tool = CustomBashTool::from_template_with_provenance(
+                "websearch",
+                &tpl,
+                ToolTemplateProvenance::Configured {
+                    source: source.to_string(),
+                },
+            );
+            let desc = tool.description().to_lowercase();
+            assert_eq!(
+                desc,
+                neutral_web_description("websearch").unwrap().to_lowercase()
+            );
+            for term in ["firecrawl", "duckduckgo", "curl"] {
+                assert!(!desc.contains(term), "{desc}");
+            }
+            let schema = tool.parameters();
+            assert_eq!(
+                schema["properties"]["query"]["description"],
+                serde_json::json!("Search query.")
+            );
+            let param_desc = schema["properties"]["query"]["description"]
+                .as_str()
+                .unwrap()
+                .to_lowercase();
+            assert_eq!(param_desc, "search query.");
+            assert!(!param_desc.contains("bash"));
+            assert!(!param_desc.contains("template"));
+        }
     }
 
     #[tokio::test]

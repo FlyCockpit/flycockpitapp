@@ -535,15 +535,6 @@ mod tests {
     }
 
     #[test]
-    fn question_terse_description_carries_one_ask_rule() {
-        let description = QuestionTool.description();
-        assert!(description.contains("batch every question"));
-        assert!(description.contains("costly to reverse"));
-        assert!(description.contains("changes what gets built"));
-        assert_eq!(description.matches("costly to reverse").count(), 1);
-    }
-
-    #[test]
     fn question_verbose_description_states_ask_and_proceed() {
         let description = QuestionTool.verbose_description().unwrap();
         assert!(description.contains("costly to reverse"));
@@ -552,6 +543,14 @@ mod tests {
         assert!(description.contains("make the call"));
         assert!(description.contains("Put EVERY question"));
         assert!(description.contains("reading code or running a command"));
+
+        {
+            let description = QuestionTool.description();
+            assert!(description.contains("batch every question"));
+            assert!(description.contains("costly to reverse"));
+            assert!(description.contains("changes what gets built"));
+            assert_eq!(description.matches("costly to reverse").count(), 1);
+        }
     }
 
     #[test]

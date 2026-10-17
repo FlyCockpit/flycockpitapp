@@ -2593,23 +2593,44 @@ pub struct SettingsConfigFile {
 }
 
 impl SettingsConfigFile {
+    fn installation() -> anyhow::Result<Self> {
+        Ok(Self {
+            kind: ConfigDirKind::HomeXdg,
+            path: installation_config_read_target()?,
+            // The selected file is not a workspace authority root. In
+            // particular, its parent must never become project_root.
+            request_root: global_config_dir()?,
+        })
+    }
+
     fn open(&self, picker_cwd: PathBuf) -> SettingsDialog {
         let mut settings =
             SettingsDialog::open_from_picker(self.path.clone(), self.request_root.clone());
         settings.picker_cwd = Some(picker_cwd);
         settings
     }
+
+    fn open_for_provider(
+        &self,
+        cwd: &std::path::Path,
+        provider_id: &str,
+    ) -> anyhow::Result<SettingsDialog> {
+        let provider_path = config_write_target_for_provider(cwd, provider_id)?;
+        let installation_provider_path =
+            cockpit_config::providers::provider_file_path_for_config(&self.path, provider_id)?;
+        let mut settings = self.open(cwd.to_path_buf());
+        if provider_path != installation_provider_path {
+            // Scoped providers retain their catalog/mutation context. Their
+            // entry file is never a typed settings document or authority root.
+            settings.provider_project_root = Some(cwd.to_path_buf());
+        }
+        Ok(settings)
+    }
 }
 
 fn settings_config_files(cwd: &std::path::Path) -> anyhow::Result<Vec<SettingsConfigFile>> {
     if explicit_config_override()?.is_some() {
-        return Ok(vec![SettingsConfigFile {
-            kind: ConfigDirKind::HomeXdg,
-            path: installation_config_read_target()?,
-            // The selected file is not a workspace authority root. In
-            // particular, its parent must never become project_root.
-            request_root: global_config_dir()?,
-        }]);
+        return Ok(vec![SettingsConfigFile::installation()?]);
     }
     discover_config_dirs(cwd)
         .into_iter()
@@ -3347,6 +3368,9 @@ pub struct SettingsCx {
     /// Active launch/session project root for side effects that must operate on
     /// a project while this dialog may be editing a home/global config file.
     pub(super) active_project_root: Option<PathBuf>,
+    /// A direct recovery entry may edit a scoped provider while typed settings
+    /// stay bound to the installation file and canonical global request root.
+    provider_project_root: Option<PathBuf>,
     /// Per-session launch policy (`false` for `--no-sandbox`) used by
     /// dependency applicability. This is runtime state, never persisted.
     pub(super) sandbox_enabled: bool,
@@ -3437,6 +3461,13 @@ struct ProviderEditAuthority {
 }
 
 impl SettingsCx {
+    fn provider_project_context(&self) -> Option<&std::path::Path> {
+        self.provider_project_root
+            .as_deref()
+            .or(self.active_project_root.as_deref())
+            .or(self.picker_cwd.as_deref())
+    }
+
     fn queue_guidance_trace(&mut self) {
         let target = SettingsEffectTarget {
             surface: "settings.guidance-trace",
@@ -4151,9 +4182,8 @@ impl SettingsCx {
         self.provider_edit_authority = None;
         self.provider_catalog_reload_required = true;
         let project_root = self
-            .active_project_root
-            .clone()
-            .or_else(|| self.picker_cwd.clone())
+            .provider_project_context()
+            .map(std::path::Path::to_path_buf)
             .or_else(|| config_cwd(&self.config_path))
             .unwrap_or_else(|| PathBuf::from("."))
             .display()
@@ -6662,10 +6692,11 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        let Ok(path) = config_write_target_for_provider(cwd, provider_id) else {
+        let Ok(mut settings) = SettingsConfigFile::installation()
+            .and_then(|file| file.open_for_provider(cwd, provider_id))
+        else {
             return Self::open(cwd);
         };
-        let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
         settings.page = providers_page(ProvidersPage::List {
             cursor: 0,
             status: Some(format!("loading `{provider_id}` from the daemon…")),
@@ -6684,10 +6715,11 @@ impl Dialog {
     /// Open the existing provider-model editor directly for one configured provider.
     /// This is the canonical add-model surface used by scoped model recovery.
     pub fn open_provider_models(cwd: &std::path::Path, provider_id: &str) -> Self {
-        let Ok(path) = config_write_target_for_provider(cwd, provider_id) else {
+        let Ok(mut settings) = SettingsConfigFile::installation()
+            .and_then(|file| file.open_for_provider(cwd, provider_id))
+        else {
             return Self::open(cwd);
         };
-        let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
         settings.page = providers_page(ProvidersPage::List {
             cursor: 0,
             status: Some(format!("loading models for `{provider_id}`…")),
@@ -8197,6 +8229,7 @@ impl SettingsDialog {
                 mcp_revision: None,
                 picker_cwd: None,
                 active_project_root: None,
+                provider_project_root: None,
                 sandbox_enabled: true,
                 back_to_picker: false,
                 command_installed: |cmd| {
@@ -9711,14 +9744,8 @@ impl SettingsCx {
     }
 
     pub(super) fn effective_default_scope_label(&self) -> String {
-        let cwd = self
-            .active_project_root
-            .clone()
-            .or_else(|| self.picker_cwd.clone());
-        match cwd
-            .as_deref()
-            .map(cockpit_config::providers::resolve_effective_default_write_target)
-        {
+        let cwd = self.provider_project_context();
+        match cwd.map(cockpit_config::providers::resolve_effective_default_write_target) {
             Some(Ok(target)) => target.scope_label(),
             _ => "current configuration context".to_string(),
         }

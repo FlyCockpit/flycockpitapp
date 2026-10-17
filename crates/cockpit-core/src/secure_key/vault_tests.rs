@@ -1595,7 +1595,7 @@ fn walk_skipping_comments(root: &std::path::Path, needles: &[String], hits: &mut
             continue;
         }
         // Guard tests legitimately name the forbidden symbols inside their
-        // assertions (e.g. the sibling `unify_remaining_stores_stays_gone`).
+        // assertions.
         // Only production/SQL source may revive the dual-store importer, so
         // exclude test sources to keep the two guards mutually satisfiable.
         let is_test_source = path

@@ -3069,6 +3069,7 @@ mod oauth_store_tests {
         assert!(docs.contains("CoverageScope::DocsAsk"));
         assert!(docs.contains("coverage_authority"));
         assert!(docs.contains(".acquire("));
+        assert!(docs.contains("consume_at_async_sink"));
         assert!(!docs.contains("RedactionTable::build"));
 
         let title = source
@@ -3083,22 +3084,6 @@ mod oauth_store_tests {
         assert!(title.contains("key,"));
         assert!(!title.contains("RedactionTable::build"));
         assert!(!title.contains("RedactionTable::empty"));
-    }
-
-    #[test]
-    fn docsask_requires_bound_coverage() {
-        let source = include_str!("dispatch.rs");
-        let docs = source
-            .rsplit("async fn run_docs_ask_pipeline(")
-            .next()
-            .and_then(|body| body.split("async fn ").next())
-            .expect("DocsAsk implementation");
-        assert!(docs.contains("CoverageScope::DocsAsk"));
-        // #390 requires the lease to span the awaited model sink. The async
-        // consuming API is the stronger boundary; a synchronous `use_at_sink`
-        // check before the await would leave a stale-generation window.
-        assert!(docs.contains("consume_at_async_sink"));
-        assert!(!docs.contains("RedactionTable::build"));
     }
 
     #[test]

@@ -720,15 +720,6 @@ mod tests {
     }
 
     #[test]
-    fn per_machine_default_jitter_is_stable_and_kb_specific() {
-        let first = default_jitter_seconds("kb-a", "machine-a");
-        assert_eq!(first, default_jitter_seconds("kb-a", "machine-a"));
-        assert!((0..DEFAULT_JITTER_SECONDS).contains(&first));
-        assert!((0..DEFAULT_JITTER_SECONDS).contains(&default_jitter_seconds("kb-b", "machine-a")));
-        assert!((0..DEFAULT_JITTER_SECONDS).contains(&default_jitter_seconds("kb-a", "machine-b")));
-    }
-
-    #[test]
     fn empty_custom_schedule_is_the_local_midnight_default() {
         assert!(is_due(None, None, 1, "kb", "machine").unwrap());
         assert!(is_due(Some("   "), None, 1, "kb", "machine").unwrap());

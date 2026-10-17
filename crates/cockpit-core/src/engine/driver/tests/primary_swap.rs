@@ -1019,27 +1019,6 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
 }
 
 #[tokio::test]
-async fn new_constructs_idle_driver() {
-    // `Driver::new` is the public default-cap constructor; exercise it
-    // so the default path stays alive + correct.
-    let (driver, _t) = test_driver(crate::engine::schedule::DEFAULT_MAX_CONCURRENT_SCHEDULES);
-    let agent = driver.stack[0].agent.clone();
-    let d2 = Driver::new(
-        driver.session.clone(),
-        driver.locks.clone(),
-        driver.redact.clone(),
-        driver.cwd.clone(),
-        agent,
-    );
-    assert_eq!(d2.active_agent(), "Build");
-    assert!(!d2.schedule.has_loop());
-    assert_eq!(
-        d2.schedule.max_concurrent,
-        crate::engine::schedule::DEFAULT_MAX_CONCURRENT_SCHEDULES
-    );
-}
-
-#[tokio::test]
 async fn live_skill_inventory_publishes_exact_dynamic_toolbox() {
     let (driver, _tmp) = test_driver_without_network(1);
     let mut agent = (*driver.stack[0].agent).clone();

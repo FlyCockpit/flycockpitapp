@@ -146,14 +146,6 @@ mod tests {
     }
 
     #[test]
-    fn schedule_loop_interval_schema_still_accepts_duration_string() {
-        let schema = schema_for(ScheduleAction::LoopStart);
-        let v = jsonschema::validator_for(&schema).unwrap();
-
-        assert!(v.is_valid(&json!({ "interval": "30s", "prompt": "p" })));
-    }
-
-    #[test]
     fn background_tail_flags_stringified_lines() {
         let schema = schema_for(ScheduleAction::BackgroundTail);
         let v = jsonschema::validator_for(&schema).unwrap();

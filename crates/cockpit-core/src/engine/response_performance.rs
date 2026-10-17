@@ -951,72 +951,12 @@ mod tests {
     }
 
     #[test]
-    fn response_performance_round_trips_through_serde() {
-        let perf = ResponsePerformance {
-            ttft_ms: 120,
-            generation_ms: 340,
-            displayed_tokens: 42,
-            encoding: TiktokenEncoding::O200k.as_str().to_string(),
-        };
-        let json = serde_json::to_string(&perf).unwrap();
-        let back: ResponsePerformance = serde_json::from_str(&json).unwrap();
-        assert_eq!(perf, back);
-        // The JSON keys match the spec: ttft_ms, generation_ms,
-        // displayed_tokens, encoding.
-        assert!(json.contains("\"ttft_ms\""));
-        assert!(json.contains("\"generation_ms\""));
-        assert!(json.contains("\"displayed_tokens\""));
-        assert!(json.contains("\"encoding\""));
-    }
-
-    #[test]
-    fn response_performance_absent_legacy_field_round_trips() {
-        // A legacy AssistantTextPayload without response_performance /
-        // presentation_text must still deserialize.
-        let legacy = serde_json::json!({
-            "text": "hello",
-            "reasoning": "",
-            "seq": 7
-        });
-        let payload: AssistantTextPayload = serde_json::from_value(legacy).unwrap();
-        assert_eq!(payload.text, "hello");
-        assert_eq!(payload.seq, Some(7));
-        assert!(payload.presentation_text.is_none());
-        assert!(payload.response_performance.is_none());
-        // display_text falls back to text.
-        assert_eq!(payload.display_text(), "hello");
-    }
-
-    #[test]
     fn assistant_attempt_id_is_opaque_and_monotonic() {
         let a = AssistantAttemptId::new(1);
         let b = AssistantAttemptId::new(2);
         assert_ne!(a, b);
         assert_eq!(a.as_u64(), 1);
         assert_eq!(format!("{a}"), "attempt-1");
-    }
-
-    #[test]
-    fn assistant_text_payload_display_text_uses_presentation_when_present() {
-        let payload = AssistantTextPayload {
-            text: "Bonjour".to_string(),
-            presentation_text: Some("Hello".to_string()),
-            reasoning: String::new(),
-            seq: None,
-            response_performance: None,
-        };
-        assert_eq!(payload.display_text(), "Hello");
-    }
-
-    #[test]
-    fn display_attempt_reset_carries_failed_and_replacement_ids() {
-        let reset = DisplayAttemptReset {
-            failed_attempt_id: AssistantAttemptId::new(1),
-            replacement_attempt_id: AssistantAttemptId::new(2),
-            reason: "timeout".to_string(),
-        };
-        assert_eq!(reset.failed_attempt_id.as_u64(), 1);
-        assert_eq!(reset.replacement_attempt_id.as_u64(), 2);
     }
 
     #[test]
@@ -1118,6 +1058,20 @@ mod tests {
 
     #[test]
     fn response_performance_round_trips_through_assistant_wire_history() {
+        // A legacy AssistantTextPayload without response_performance /
+        // presentation_text must still deserialize.
+        let legacy = serde_json::json!({
+            "text": "hello",
+            "reasoning": "",
+            "seq": 7
+        });
+        let legacy_payload: AssistantTextPayload = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy_payload.text, "hello");
+        assert_eq!(legacy_payload.seq, Some(7));
+        assert!(legacy_payload.presentation_text.is_none());
+        assert!(legacy_payload.response_performance.is_none());
+        assert_eq!(legacy_payload.display_text(), "hello");
+
         let perf = ResponsePerformance {
             ttft_ms: 120,
             generation_ms: 340,

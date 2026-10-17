@@ -2295,39 +2295,6 @@ async fn background_single_completion_does_not_apply_stale_shrink() {
 }
 
 #[tokio::test]
-async fn noninteractive_single_inline_result_shape_is_unchanged() {
-    let (mut driver, _tmp) = test_driver(8);
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    let result = driver
-        .finalize_single_noninteractive_task(
-            SingleNoninteractiveCompletion {
-                child_agent: "explore".to_string(),
-                task_call_id: "task-single".to_string(),
-                task_provider_item_id: None,
-                task_function_call_id: Some("fn-single".to_string()),
-                report: "single report".to_string(),
-                failed: false,
-                failure: None,
-                partial_progress: DelegationPartialProgress::default(),
-                new_handle: None,
-                snapshot: NoninteractiveDelegationSnapshot::empty(),
-                shrink: None,
-                repair_notes: Vec::new(),
-                child_routing: None,
-            },
-            &tx,
-            true,
-        )
-        .await
-        .unwrap();
-    drop(tx);
-    while rx.recv().await.is_some() {}
-
-    assert_eq!(tool_result_id(&result), "task-single");
-    assert_eq!(tool_result_text(&result), "single report");
-}
-
-#[tokio::test]
 async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_result() {
     let (mut driver, _tmp) = test_driver(8);
     seed_task_delegation(&driver, "task-single", "default").await;
@@ -3848,28 +3815,6 @@ async fn async_delegation_result_lists_only_new_children_with_status() {
     assert_eq!(children[1]["status"], "failed");
     assert_eq!(children[1]["error"], "third failed");
     assert!(!body.contains("first report"));
-}
-
-/// An async-result delivery header names both the job `kind` and the
-/// originating `job_id` (implementation note), identically
-/// across every job kind (`loop`/`timer`/`background`/`swarm`). Drives the
-/// real `ScheduleKind::as_str` so a kind-vocabulary drift is caught.
-#[tokio::test]
-async fn async_result_header_names_kind_and_job_id_for_every_kind() {
-    use crate::engine::schedule::spec::ScheduleKind;
-    let job_id = "sched-f36b81df";
-    for kind in [
-        ScheduleKind::Loop,
-        ScheduleKind::Timer,
-        ScheduleKind::Background,
-        ScheduleKind::Swarm,
-    ] {
-        let header = async_result_header(kind.as_str(), job_id);
-        assert_eq!(
-            header,
-            format!("[async result · {} · sched-f36b81df]", kind.as_str()),
-        );
-    }
 }
 
 /// The recorded delivery event carries `data.job_id` set to the

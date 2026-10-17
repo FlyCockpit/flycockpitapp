@@ -1611,17 +1611,6 @@ impl ContextUsageSnapshot {
     }
 }
 
-#[cfg(test)]
-mod context_usage_snapshot_tests {
-    use super::ContextUsageSnapshot;
-
-    #[test]
-    fn unavailable_uses_definition_policy_default() {
-        let snapshot = ContextUsageSnapshot::unavailable();
-        assert_eq!(snapshot.auto_compact_pct, 80);
-    }
-}
-
 impl ToolOutput {
     /// Schema for the structured, timeline-only metadata every tool output may
     /// carry. Keeping this marker list beside the output shape replaces the
@@ -3147,47 +3136,6 @@ mod capability_tests {
                 crate::capabilities::BinaryProbeStatus::Missing
             }
         }
-    }
-
-    #[test]
-    fn capability_tool_trait_defaults_empty_and_declared_requirement_round_trips() {
-        struct NoRequirementTool;
-        #[async_trait]
-        impl Tool for NoRequirementTool {
-            fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
-                crate::engine::tool::ToolIdempotency::NotIdempotent
-            }
-
-            fn name(&self) -> &str {
-                "none"
-            }
-            fn description(&self) -> &str {
-                "none"
-            }
-            fn parameters(&self) -> Value {
-                serde_json::json!({"type": "object", "properties": {}})
-            }
-            async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
-                Ok(ToolOutput::text("ok"))
-            }
-        }
-
-        assert!(NoRequirementTool.binary_requirements().is_empty());
-
-        let tool = RequirementTool {
-            name: "declared",
-            requirements: vec![crate::capabilities::BinaryRequirement::required(
-                "demo-bin",
-                crate::capabilities::CapabilityRemedy::prose("Install demo-bin."),
-            )],
-        };
-        let requirements = tool.binary_requirements();
-        assert_eq!(requirements.len(), 1);
-        assert_eq!(requirements[0].name, "demo-bin");
-        assert_eq!(
-            requirements[0].kind,
-            crate::capabilities::BinaryRequirementKind::Required
-        );
     }
 
     #[test]

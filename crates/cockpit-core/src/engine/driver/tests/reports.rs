@@ -121,31 +121,6 @@ fn explore_deferred_items_appear_in_subagent_report() {
     assert!(deferred.is_empty(), "report assembly drains deferred items");
 }
 
-#[test]
-fn empty_deferred_log_leaves_subagent_report_unchanged() {
-    let (driver, _tmp) = test_driver(1);
-    let explore = crate::engine::builtin::load("explore", &driver.spawn_args(false)).unwrap();
-    let history = vec![Message::assistant("the bug is in foo.rs line 10")];
-    let baseline = assemble_subagent_report(
-        &explore,
-        &history,
-        &crate::engine::deferred::DeferredLog::new(),
-        None,
-        &crate::redact::RedactionTable::empty(),
-    );
-
-    let report = assemble_subagent_report(
-        &explore,
-        &history,
-        &crate::engine::deferred::DeferredLog::new(),
-        None,
-        &crate::redact::RedactionTable::empty(),
-    );
-
-    assert_eq!(report, baseline);
-    assert!(!report.contains("[deferred to orchestrator"));
-}
-
 /// The `docs` pipeline is exempt: a `docs`-style agent holds no `return`
 /// tool, so `assemble_subagent_report` returns its plain answer unchanged
 /// (no envelope headers).

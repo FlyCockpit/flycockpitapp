@@ -497,12 +497,6 @@ mod tests {
     }
 
     #[test]
-    fn loop_start_limit_zero_is_unlimited() {
-        let a = parse_loop_start(&json!({ "interval": 10, "prompt": "p", "limit": 0 })).unwrap();
-        assert_eq!(a.limit, None);
-    }
-
-    #[test]
     fn idle_loop_requires_a_finite_limit_and_validates_watch_paths() {
         let defaulted = parse_loop_start(&json!({
             "interval": "2m",

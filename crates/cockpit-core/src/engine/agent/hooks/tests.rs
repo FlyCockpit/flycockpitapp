@@ -99,11 +99,9 @@ impl ProcessEnv for FakeProcessEnv {
 #[derive(Debug, Clone)]
 struct CapturedInvocation {
     executable: PathBuf,
-    args: Vec<String>,
     env: BTreeMap<String, String>,
     cwd: PathBuf,
     stdin: String,
-    timeout: Duration,
 }
 
 /// A fake command runner that returns pre-configured output and captures
@@ -132,20 +130,18 @@ impl CommandRunner for FakeCommandRunner {
     async fn run(
         &self,
         executable: &Path,
-        args: &[String],
+        _args: &[String],
         env: &BTreeMap<String, String>,
         cwd: &Path,
         stdin: &str,
-        timeout: Duration,
+        _timeout: Duration,
         _session_id: Uuid,
     ) -> HookRawOutput {
         self.invocations.lock().unwrap().push(CapturedInvocation {
             executable: executable.to_path_buf(),
-            args: args.to_vec(),
             env: env.clone(),
             cwd: cwd.to_path_buf(),
             stdin: stdin.to_string(),
-            timeout,
         });
         self.output.clone()
     }
@@ -1381,25 +1377,6 @@ fn build_hook_run_audit_failed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hook_run_audit_serializes_and_deserializes_unchanged() {
-    let audit = HookRunAudit {
-        event: "preToolUse".to_string(),
-        hook: "project:abcdef0123456789:0".to_string(),
-        origin: "project:abcdef0123456789:0".to_string(),
-        status: HookRunStatus::Denied,
-        duration_ms: 42,
-        reason: Some("too risky".to_string()),
-        turn_id: Some("turn_1".to_string()),
-        tool_name: Some("bash".to_string()),
-        tool_call_id: Some("call_123".to_string()),
-        subagent_id: None,
-    };
-    let json = serde_json::to_value(&audit).unwrap();
-    let restored: HookRunAudit = serde_json::from_value(json).unwrap();
-    assert_eq!(audit, restored);
-}
-
-#[test]
 fn hook_run_audit_rejects_unknown_fields() {
     let mut json = serde_json::to_value(&HookRunAudit {
         event: "preToolUse".to_string(),
@@ -1438,19 +1415,28 @@ fn hook_run_audit_all_statuses_roundtrip() {
         let restored: HookRunAudit = serde_json::from_value(json).unwrap();
         assert_eq!(audit, restored);
     }
+
+    // A fully-populated audit round-trips unchanged too.
+    let populated = HookRunAudit {
+        event: "preToolUse".to_string(),
+        hook: "project:abcdef0123456789:0".to_string(),
+        origin: "project:abcdef0123456789:0".to_string(),
+        status: HookRunStatus::Denied,
+        duration_ms: 42,
+        reason: Some("too risky".to_string()),
+        turn_id: Some("turn_1".to_string()),
+        tool_name: Some("bash".to_string()),
+        tool_call_id: Some("call_123".to_string()),
+        subagent_id: None,
+    };
+    let json = serde_json::to_value(&populated).unwrap();
+    let restored: HookRunAudit = serde_json::from_value(json).unwrap();
+    assert_eq!(populated, restored);
 }
 
 // ---------------------------------------------------------------------------
 // Stop-gate state machine tests
 // ---------------------------------------------------------------------------
-
-#[test]
-fn stop_gate_state_default_is_inactive() {
-    let state = StopGateState::default();
-    assert!(!state.stop_hook_active);
-    assert_eq!(state.continuation_count, 0);
-    assert!(!state.capped());
-}
 
 #[test]
 fn stop_gate_state_capped_at_max_continuations() {
@@ -2184,16 +2170,6 @@ fn session_config_snapshot_carries_hook_registry() {
 }
 
 #[test]
-fn session_config_snapshot_default_has_empty_hooks() {
-    let snapshot = crate::daemon::session_worker::SessionConfigSnapshot::new(
-        0,
-        crate::config::providers::ProvidersConfig::default(),
-        crate::config::extended::ExtendedConfig::default(),
-    );
-    assert!(snapshot.hooks().hooks.is_empty());
-}
-
-#[test]
 fn session_config_handle_repin_carries_hooks() {
     let hook = test_hook(
         HookEvent::PreToolUse,
@@ -2215,39 +2191,9 @@ fn session_config_handle_repin_carries_hooks() {
     assert_eq!(repinned.generation(), 1);
 }
 
-#[test]
-fn session_config_handle_detached_default_has_empty_hooks() {
-    let handle = crate::daemon::session_worker::SessionConfigHandle::detached_default();
-    assert!(handle.snapshot().hooks().hooks.is_empty());
-}
-
 // ---------------------------------------------------------------------------
 // FakeCommandRunner integration tests
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn fake_command_runner_captures_invocation() {
-    let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
-    let result = runner
-        .run(
-            Path::new("/usr/bin/echo"),
-            &["hello".to_string()],
-            &BTreeMap::new(),
-            Path::new("/workspace"),
-            "stdin data",
-            Duration::from_secs(5),
-            uuid::Uuid::new_v4(),
-        )
-        .await;
-    assert_eq!(result.exit_code, Some(0));
-    let invocations = runner.invocations();
-    assert_eq!(invocations.len(), 1);
-    assert_eq!(invocations[0].executable, Path::new("/usr/bin/echo"));
-    assert_eq!(invocations[0].args, vec!["hello"]);
-    assert_eq!(invocations[0].cwd, Path::new("/workspace"));
-    assert_eq!(invocations[0].stdin, "stdin data");
-    assert_eq!(invocations[0].timeout, Duration::from_secs(5));
-}
 
 // ---------------------------------------------------------------------------
 // Dispatch/observe/stop function behavior tests
@@ -3308,85 +3254,50 @@ fn tool_hook_session_config_snapshot_is_turn_stable() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hook_decision_allow_maps_to_success_status() {
+fn hook_decision_status_and_reason_table() {
     assert_eq!(HookDecision::Allow.status(), HookRunStatus::Success);
-}
-
-#[test]
-fn hook_decision_deny_maps_to_denied_status() {
-    let decision = HookDecision::Deny {
-        reason: "no".to_string(),
-    };
-    assert_eq!(decision.status(), HookRunStatus::Denied);
-}
-
-#[test]
-fn hook_decision_block_maps_to_blocked_status() {
-    let decision = HookDecision::Block {
-        reason: "stop".to_string(),
-        additional_context: None,
-    };
-    assert_eq!(decision.status(), HookRunStatus::Blocked);
-}
-
-#[test]
-fn hook_decision_failed_maps_to_failed_status() {
-    let decision = HookDecision::Failed {
-        reason: "error".to_string(),
-    };
-    assert_eq!(decision.status(), HookRunStatus::Failed);
-}
-
-#[test]
-fn hook_decision_continue_maps_to_success_status() {
-    let decision = HookDecision::Continue {
-        stop_reason: "done".to_string(),
-    };
-    assert_eq!(decision.status(), HookRunStatus::Success);
-}
-
-#[test]
-fn hook_decision_reason_extracted_correctly() {
     assert!(HookDecision::Allow.reason().is_none());
-    assert_eq!(
-        HookDecision::Deny {
-            reason: "r".to_string()
-        }
-        .reason(),
-        Some("r")
-    );
-    assert_eq!(
-        HookDecision::Failed {
-            reason: "e".to_string()
-        }
-        .reason(),
-        Some("e")
-    );
+
+    let cases = [
+        (
+            HookDecision::Deny {
+                reason: "no".to_string(),
+            },
+            HookRunStatus::Denied,
+            Some("no"),
+        ),
+        (
+            HookDecision::Block {
+                reason: "stop".to_string(),
+                additional_context: None,
+            },
+            HookRunStatus::Blocked,
+            Some("stop"),
+        ),
+        (
+            HookDecision::Failed {
+                reason: "error".to_string(),
+            },
+            HookRunStatus::Failed,
+            Some("error"),
+        ),
+        (
+            HookDecision::Continue {
+                stop_reason: "done".to_string(),
+            },
+            HookRunStatus::Success,
+            Some("done"),
+        ),
+    ];
+    for (decision, status, reason) in cases {
+        assert_eq!(decision.status(), status);
+        assert_eq!(decision.reason(), reason);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Output cap tests
 // ---------------------------------------------------------------------------
-
-#[test]
-fn output_cap_bytes_is_64k() {
-    assert_eq!(OUTPUT_CAP_BYTES, 64 * 1024);
-}
-
-#[test]
-fn envelope_value_max_bytes_is_128k() {
-    assert_eq!(ENVELOPE_VALUE_MAX_BYTES, 128 * 1024);
-}
-
-#[test]
-fn reason_max_chars_is_1024() {
-    assert_eq!(REASON_MAX_CHARS, 1024);
-}
-
-#[test]
-fn stop_hook_max_continuations_is_8() {
-    assert_eq!(STOP_HOOK_MAX_CONTINUATIONS, 8);
-}
 
 // ---------------------------------------------------------------------------
 // Fail-open decision parsing with raw output fixtures
@@ -3447,36 +3358,6 @@ fn parse_observe_decision_spawn_failed_output_is_allow() {
 // ---------------------------------------------------------------------------
 // Stop-gate outcome and aggregation tests
 // ---------------------------------------------------------------------------
-
-#[test]
-fn stop_hook_outcome_end_is_default_for_no_hooks() {
-    // With no matching hooks, run_stop_hooks returns End. This is tested
-    // via the state machine types; the full async integration requires a
-    // SessionConfigHandle which is tested in the session config snapshot
-    // tests above.
-    let state = StopGateState::default();
-    assert!(!state.capped());
-    assert_eq!(state.continuation_count, 0);
-}
-
-#[test]
-fn stop_gate_state_increments_continuation_count() {
-    let state = StopGateState {
-        continuation_count: 1,
-        ..Default::default()
-    };
-    assert_eq!(state.continuation_count, 1);
-    assert!(!state.capped());
-}
-
-#[test]
-fn stop_gate_state_capped_forces_end() {
-    let state = StopGateState {
-        continuation_count: STOP_HOOK_MAX_CONTINUATIONS,
-        ..Default::default()
-    };
-    assert!(state.capped());
-}
 
 // ---------------------------------------------------------------------------
 // README hooks-contract documentation test

@@ -24,24 +24,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifier_maps_write_and_edit_to_artifact_write() {
-        for name in ["write", "edit"] {
-            assert_eq!(
-                classify_tool(name),
-                Some(ToolClass::ArtifactWrite),
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
     fn classifier_maps_command_and_monty_surfaces() {
-        assert_eq!(classify_tool("bash"), Some(ToolClass::Command));
-        assert_eq!(classify_tool("mcp"), Some(ToolClass::Monty));
-    }
+        // Authoring self-verification surfaces, including `delete`.
+        for (name, class) in [
+            ("write", ToolClass::ArtifactWrite),
+            ("edit", ToolClass::ArtifactWrite),
+            ("delete", ToolClass::ArtifactWrite),
+            ("bash", ToolClass::Command),
+            ("mcp", ToolClass::Monty),
+        ] {
+            assert_eq!(classify_tool(name), Some(class), "{name}");
+        }
 
-    #[test]
-    fn classifier_leaves_other_tools_unclassified() {
         for name in [
             "read", "search", "grep", "glob", "shell", "task", "question",
         ] {

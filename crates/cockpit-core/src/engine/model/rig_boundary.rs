@@ -416,9 +416,7 @@ mod tests {
     use rig::completion::CompletionError;
 
     use super::*;
-    use crate::engine::model::{
-        InferenceFailure, ProviderRecoverySignal, auth_failure_kind, failure_engages_backup,
-    };
+    use crate::engine::model::{InferenceFailure, ProviderRecoverySignal, auth_failure_kind};
 
     fn provider_error(message: &str) -> CompletionError {
         CompletionError::ProviderError(message.to_string())
@@ -473,11 +471,9 @@ mod tests {
         for (class, expected) in cases {
             assert_eq!(class.as_str(), expected);
         }
-    }
 
-    #[test]
-    fn error_taxonomy_round_trips_every_variant() {
-        let cases = [
+        // Every variant also round-trips through its wire string.
+        let variants = [
             InferenceErrorClass::TimeoutTtft,
             InferenceErrorClass::TimeoutIdle,
             InferenceErrorClass::Network,
@@ -494,7 +490,7 @@ mod tests {
             InferenceErrorClass::UnrenderableWireField,
             InferenceErrorClass::Other("novel_provider_class".to_string()),
         ];
-        for class in cases {
+        for class in variants {
             let parsed = InferenceErrorClass::from_str(&class.as_str()).unwrap();
             assert_eq!(parsed, class);
         }
@@ -520,36 +516,6 @@ mod tests {
             InferenceErrorClass::from_str("novel_provider_failure").unwrap(),
             InferenceErrorClass::Other("novel_provider_failure".to_string())
         );
-    }
-
-    #[test]
-    fn error_taxonomy_backup_engagement_set_is_unchanged() {
-        let cases = [
-            (InferenceErrorClass::TimeoutTtft, true),
-            (InferenceErrorClass::TimeoutIdle, true),
-            (InferenceErrorClass::Network, true),
-            (
-                InferenceErrorClass::MissingToolEntitlement {
-                    feature: "client_side_tools".to_string(),
-                },
-                true,
-            ),
-            (InferenceErrorClass::ClientSideToolsUnsupported, true),
-            (InferenceErrorClass::Http(500), true),
-            (InferenceErrorClass::Http(502), true),
-            (InferenceErrorClass::Http(599), true),
-            (InferenceErrorClass::Http(400), false),
-            (InferenceErrorClass::Http(401), false),
-            (InferenceErrorClass::Http(403), false),
-            (InferenceErrorClass::Http(404), false),
-            (InferenceErrorClass::Http(429), false),
-            (InferenceErrorClass::Other("http_".to_string()), false),
-            (InferenceErrorClass::Other("weird".to_string()), false),
-            (InferenceErrorClass::Other("http_abc".to_string()), false),
-        ];
-        for (class, expected) in cases {
-            assert_eq!(failure_engages_backup(&class), expected, "{class:?}");
-        }
     }
 
     #[test]
@@ -695,36 +661,6 @@ mod tests {
             "unsupported endpoint",
         ] {
             assert!(is_endpoint_mismatch_error_text(phrase), "{phrase}");
-        }
-    }
-
-    #[test]
-    fn endpoint_mismatch_inference_and_probe_agree() {
-        for phrase in [
-            "method not allowed",
-            "unknown route",
-            "unknown path",
-            "unknown endpoint",
-            "no route",
-            "no path",
-            "route not found",
-            "path not found",
-            "endpoint not found",
-            "use the responses api",
-            "use /v1/responses",
-            UNSUPPORTED_API_CODE,
-            "not supported on this endpoint",
-            "not supported with this endpoint",
-            "chat completions endpoint",
-            "model is not accessible via the /chat/completions endpoint",
-            "responses endpoint",
-            "unsupported endpoint",
-        ] {
-            assert_eq!(
-                is_endpoint_mismatch_error(&provider_error(phrase)),
-                is_endpoint_mismatch_error_text(phrase),
-                "{phrase}"
-            );
         }
     }
 

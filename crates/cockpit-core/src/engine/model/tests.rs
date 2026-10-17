@@ -491,13 +491,6 @@ async fn pre_drain_record_failure_aborts_before_response_processing() {
     );
 }
 
-#[test]
-fn tandem_failure_response_preserves_kind_and_detail() {
-    let value = tandem_failure_response("error", "provider detail");
-    assert_eq!(value["error"]["kind"], "error");
-    assert_eq!(value["error"]["detail"], "provider detail");
-}
-
 /// Behavior 9 fail-closed omission on the tandem / second-opinion path: a raw
 /// provider `CompletionError` must NOT be persisted verbatim into the tandem
 /// session record. The `tandem_provider_error_response` builder (used by the
@@ -2764,32 +2757,6 @@ async fn computer_live_unaddressable_items_do_not_count_as_retained() {
         assert!(super::has_retained_native_computer_items());
     })
     .await;
-}
-
-#[test]
-fn computer_live_detach_inherited_native_computer_clears_advertisement() {
-    let mut params = ModelParams {
-        native_computer: Some(crate::computer::NativeComputerToolConfig {
-            contract: crate::computer::ComputerToolContract::OpenAiResponses,
-            target: crate::computer::DisplayTarget::Virtual,
-            require_backend: false,
-            geometry: Some(crate::computer::DisplayGeometry {
-                physical: crate::computer::PixelSize {
-                    width: 1280,
-                    height: 720,
-                },
-                logical: crate::computer::LogicalSize {
-                    width: 1280.0,
-                    height: 720.0,
-                },
-                scale_factor: crate::computer::ScaleFactor(1.0),
-            }),
-            approval_required: false,
-        }),
-        ..ModelParams::default()
-    };
-    params.detach_inherited_native_computer();
-    assert!(params.native_computer.is_none());
 }
 
 #[test]

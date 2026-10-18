@@ -2774,6 +2774,9 @@ impl App {
                 super::ToastKind::Info,
             );
             self.retry_startup_background();
+            if self.startup_background.workspace_ready && self.startup_session_resolved {
+                self.ensure_agent_runner();
+            }
             return false;
         }
         // A selection in flight is deliberately *not* a missing-model state.

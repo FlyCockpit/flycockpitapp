@@ -1,11 +1,83 @@
 use super::*;
 
 impl App {
-    /// Attach the session eagerly once the daemon is reachable so the
-    /// startup graphic can show its id (session-id-display-and-lazy-persist).
-    /// The attach creates a deferred (un-persisted) session in the daemon;
-    /// the first user message is what writes the `sessions` row. Runs each
-    /// event-loop tick.
+    pub(super) fn maybe_submit_startup_retained_message(&mut self) -> bool {
+        if self
+            .startup_retained_submission_id
+            .is_some_and(|(generation, _)| generation == self.startup_background.generation)
+            && matches!(self.agent_runner, Some(Ok(_)))
+            && !self.provisional_new_session
+            && !self.session_switch_in_progress()
+            && !self.config_snapshot.providers.providers.is_empty()
+            && self.launch.active_model.is_some()
+        {
+            let _ = self.submit_input();
+            return true;
+        }
+        false
+    }
+
+    pub fn set_startup_session_selector(&mut self, selector: Option<String>) {
+        self.startup_session_selector = selector;
+    }
+
+    pub(super) fn start_startup_session_resolution(&mut self) {
+        let Some(selected) = self.startup_lifecycle.as_ref() else {
+            return;
+        };
+        let endpoint = selected.endpoint.clone();
+        let generation = self.startup_background.generation;
+        let cwd = self.launch.cwd.clone();
+        let selector = self.startup_session_selector.clone();
+        self.async_actions.start(
+            AsyncActionKind::Internal("startup.session"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.session")),
+            async move {
+                let result = agent_runner::resolve_startup_code_session(
+                    &endpoint,
+                    &cwd,
+                    selector.as_deref(),
+                )
+                .await
+                .map_err(|error| error.to_string());
+                Ok(AsyncActionPayload::StartupSessionResolved { generation, result })
+            },
+        );
+    }
+
+    pub(super) fn apply_startup_session_resolution(
+        &mut self,
+        generation: u64,
+        result: Result<Option<uuid::Uuid>, String>,
+    ) {
+        if generation != self.startup_background.generation || self.exit_requested {
+            return;
+        }
+        match result {
+            Ok(session_id) => {
+                self.startup_background.retry = None;
+                self.startup_session_resolved = true;
+                self.launch.session_id = session_id;
+                if session_id.is_none() {
+                    self.local_session_draft = true;
+                    self.launch.provider_line.clear();
+                    self.session_setup_inline = None;
+                }
+            }
+            Err(error) => {
+                self.startup_background.retry = Some(StartupRetry::Session);
+                self.apply_runner_attach_neutral_pane_error(&error);
+                self.show_toast(
+                    format!("Session could not be resolved: {error}; send to retry"),
+                    ToastKind::Error,
+                );
+            }
+        }
+    }
+
+    /// Resolve the last durable Code session before attaching for display.
+    /// Empty projects and /new stay local drafts until a user message.
+    /// Runs each event-loop tick, fenced by accepted workspace trust.
     ///
     /// Gates (all must hold):
     /// - No live runner yet. A successful attach (`Some(Ok)`) stops the
@@ -43,6 +115,18 @@ impl App {
                 return;
             }
             self.start_named_assistant_resolution(name);
+            return;
+        }
+        if self.local_session_draft {
+            return;
+        }
+        if self.session_mode.unwrap_or(SessionMode::Code) == SessionMode::Code
+            && self.launch.session_id.is_none()
+            && !self.startup_session_resolved
+        {
+            if !matches!(self.startup_background.retry, Some(StartupRetry::Session)) {
+                self.start_startup_session_resolution();
+            }
             return;
         }
         // Evaluate the cheap struct-only gates first; the daemon probe is the
@@ -165,6 +249,25 @@ impl App {
                 return;
             }
         }
+        if self.local_session_draft {
+            if self.startup_retained_submission_id.is_none() {
+                self.show_toast("Send a message to save this draft first", ToastKind::Info);
+                return;
+            }
+            self.local_session_draft = false;
+            if let Some(runner) = self
+                .draft_return_view
+                .as_mut()
+                .and_then(|saved| saved.runner.take())
+            {
+                self.agent_runner = Some(Ok(runner));
+                self.pending_new_session = true;
+                if let Err(error) = self.maybe_service_new_session_with_clear(|| Ok(())) {
+                    self.restore_durable_view_after_draft_failure(&error.to_string());
+                }
+                return;
+            }
+        }
         if matches!(self.agent_runner, Some(Ok(_))) {
             return;
         }
@@ -181,6 +284,10 @@ impl App {
         continuation: RunnerAttachContinuation,
     ) {
         if !self.guard_startup_workspace_effects() {
+            return;
+        }
+        if self.local_session_draft && self.startup_retained_submission_id.is_none() {
+            self.show_toast("Send a message to save this draft first", ToastKind::Info);
             return;
         }
         if matches!(self.agent_runner, Some(Ok(_))) {
@@ -307,6 +414,7 @@ impl App {
         }
         match payload {
             Ok(AsyncActionPayload::AgentRunnerAttached(runner)) => {
+                self.draft_return_view = None;
                 self.adopt_runner(Ok(*runner));
                 for continuation in pending.continuations {
                     self.apply_runner_attach_continuation(continuation);
@@ -361,6 +469,15 @@ impl App {
         continuations: &[RunnerAttachContinuation],
         error: &str,
     ) {
+        if self.startup_session_resolved && self.launch.session_id.is_none() {
+            self.local_session_draft = true;
+            self.startup_retained_submission_id = None;
+            self.session_setup_inline = None;
+            self.history.push(HistoryEntry::CommandError {
+                line: format!("Could not create session: {error}; send to retry"),
+            });
+            self.agent_runner = None;
+        }
         for continuation in continuations {
             match continuation {
                 RunnerAttachContinuation::SelectModel {
@@ -416,8 +533,16 @@ impl App {
                 tracing::info!(target: cockpit_core::startup::TARGET, event = "session-ready", "startup");
             }
             // The daemon, not the CLI parser, is authoritative after Attach.
+            self.local_session_draft = false;
+            self.visible_attachment_epoch = r.attachment_epoch();
             self.session_mode = Some(r.session_entry_mode);
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
+            if !r.history.is_empty() {
+                self.history
+                    .extend(wire_history_to_entries(std::mem::take(&mut r.history)));
+                self.current_session_persisted = true;
+                self.prepare_session_setup_for_resume(true);
+            }
             let live_btw_fork = r.btw_fork.clone();
             let resume_compaction_offer = r.resume_compaction_offer.clone();
             self.reset_display_attach_backoff();
@@ -499,19 +624,7 @@ impl App {
             (session_id, connection_epoch)
         });
         self.agent_runner = Some(runner);
-        if self
-            .startup_retained_submission_id
-            .is_some_and(|(generation, _)| generation == self.startup_background.generation)
-            && self
-                .agent_runner
-                .as_ref()
-                .is_some_and(|runner| runner.is_ok())
-        {
-            let _ = self.submit_input();
-            if self.startup_retained_submission_id.is_none() {
-                self.clear_model_and_config_chrome_for_empty_session();
-            }
-        }
+        self.maybe_submit_startup_retained_message();
         if let Some((session_id, connection_epoch)) = attach_ids {
             self.bootstrap_inventory_after_attach(
                 uuid::Uuid::nil(), // single TUI instance

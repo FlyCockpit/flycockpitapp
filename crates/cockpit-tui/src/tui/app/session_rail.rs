@@ -33,12 +33,17 @@ impl App {
         if !self.first_paint_completed {
             return;
         }
+        self.session_rail.set_local_draft(self.local_session_draft);
         let connected =
             self.sessions_daemon_endpoint().is_some() || self.sessions_daemon_socket().is_some();
         if self.session_rail.set_daemon_connected(connected) {
             self.abort_session_rail_runner_actions(false);
         }
-        if connected && self.session_rail.needs_initial_list() {
+        if connected
+            && (self.session_rail.needs_initial_list()
+                || self.session_rail_refresh_needed
+                || Instant::now() >= self.session_rail_next_refresh)
+        {
             self.start_sessions_list_action();
         }
     }
@@ -215,6 +220,37 @@ mod tests {
             compaction_lineage_root_id: None,
             lineage_window_count: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn day2_rail_marks_draft_and_requests_fresh_saved_title_and_activity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _env) = configured_app(&tmp);
+        let id = Uuid::new_v4();
+        let mut row = summary(id, 1);
+        row.title = None;
+        seed_rail_sessions(&mut app, vec![row.clone()]);
+        app.local_session_draft = true;
+        app.session_rail.set_local_draft(true);
+        assert!(render_width(&mut app, 140, 40).contains("Draft (unsaved)"));
+        app.session_rail_refresh_needed = false;
+        app.apply_event(TurnEvent::ThinkingStarted {
+            agent: "Build".into(),
+            turn_id: None,
+        });
+        assert!(app.session_rail_refresh_needed);
+        row.title = Some("Fix word count".into());
+        row.turns = 1;
+        row.last_active_at_unix_ms = 2;
+        row.activity_state = Some(cockpit_proto::SessionActivityState::InferenceInProgress);
+        seed_rail_sessions(&mut app, vec![row]);
+        let text = render_width(&mut app, 140, 40);
+        assert!(text.contains("Fix word count"), "{text}");
+        assert_eq!(app.session_rail.session_summary(id).unwrap().turns, 1);
+        assert_eq!(
+            app.session_rail.session_summary(id).unwrap().activity_state,
+            Some(cockpit_proto::SessionActivityState::InferenceInProgress)
+        );
     }
 
     fn seed_rail_sessions(app: &mut App, sessions: Vec<SessionSummary>) {

@@ -71,6 +71,7 @@ pub async fn run(
         false,
         None,
         None,
+        None,
     )
     .await
 }
@@ -89,6 +90,7 @@ pub async fn run_mode(
     debug_last_message: bool,
     setup_wizard: Option<String>,
     provider_add_template: Option<String>,
+    session_selector: Option<String>,
 ) -> Result<()> {
     if !stdin().is_terminal() || !stdout().is_terminal() {
         welcome::print(project, !no_sandbox);
@@ -104,6 +106,7 @@ pub async fn run_mode(
         launch_start,
         lifecycle,
     );
+    app.set_startup_session_selector(session_selector);
     app.set_startup_debug_last_message(debug_last_message);
     app.configure_onboarding_launch_with_setup_wizard(
         skip_setup,

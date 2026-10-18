@@ -290,6 +290,7 @@ pub struct SessionRail {
     pointer_position: Option<(u16, u16)>,
     toggle_area: Option<Rect>,
     new_session_area: Option<Rect>,
+    local_draft: bool,
     counts: RailRequestCounts,
 }
 
@@ -350,6 +351,7 @@ impl SessionRail {
             pointer_position: None,
             toggle_area: None,
             new_session_area: None,
+            local_draft: false,
             counts: RailRequestCounts::default(),
         }
     }
@@ -741,6 +743,10 @@ impl SessionRail {
         self.error = None;
         self.counts.list_started = self.counts.list_started.saturating_add(1);
         true
+    }
+
+    pub(crate) fn set_local_draft(&mut self, draft: bool) {
+        self.local_draft = draft;
     }
 
     pub fn needs_initial_list(&self) -> bool {

@@ -260,7 +260,7 @@ impl App {
         &mut self,
         terminal: &mut DefaultTerminal,
     ) -> Result<bool> {
-        self.maybe_service_new_session_with_clear(|| terminal.clear().map_err(Into::into))
+        self.maybe_open_local_session_draft_with_clear(|| terminal.clear().map_err(Into::into))
     }
 
     /// Force a full alt-screen clear after the `/leaks` reveal buffer was
@@ -285,6 +285,88 @@ impl App {
         true
     }
 
+    /// User entry (/new, Ctrl+N, rail): a draft owns no daemon worker or DB row.
+    /// Keep the durable runner alive until the first-message replacement succeeds.
+    pub(super) fn maybe_open_local_session_draft_with_clear(
+        &mut self,
+        mut clear_terminal: impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        if !self.pending_new_session {
+            return Ok(self.clear_terminal_after_committed_new_session(&mut clear_terminal));
+        }
+        self.pending_new_session = false;
+        if !self.guard_startup_workspace_effects() {
+            return Ok(true);
+        }
+        if self.has_pending_session_switch_action()
+            || self.pending_runner_attach.is_some()
+            || self.submission_order.front().is_some()
+        {
+            self.report_session_switch_busy("/new");
+            return Ok(true);
+        }
+        if !self.local_session_draft {
+            self.draft_return_view = match self.agent_runner.take() {
+                Some(Ok(runner)) => Some(DraftReturnView {
+                    runner: Some(runner),
+                    history: std::mem::take(&mut self.history),
+                    queue: std::mem::take(&mut self.queue),
+                    pending: self.pending.take(),
+                    busy: self.busy,
+                    persisted: self.current_session_persisted,
+                }),
+                _ => None,
+            };
+        }
+        self.async_actions.advance_view_generation();
+        self.commit_new_session_without_swappable_runner();
+        self.local_session_draft = true;
+        self.startup_session_resolved = true;
+        self.startup_retained_submission_id = None;
+        self.session_setup_inline = None;
+        self.launch.provider_line.clear();
+        self.clear_composer_buffer();
+        self.busy = false;
+        self.queue.clear();
+        self.pending = None;
+        self.clear_terminal_after_committed_new_session(&mut clear_terminal);
+        Ok(true)
+    }
+
+    pub(super) fn restore_durable_view_after_draft_failure(&mut self, error: &str) {
+        let Some(mut saved) = self.draft_return_view.take() else {
+            return;
+        };
+        self.startup_retained_submission_id = None;
+        self.provisional_new_session = false;
+        self.provisional_new_epoch_event_buffer.clear();
+        self.same_session_resync_event_buffer.clear();
+        self.local_session_draft = false;
+        self.history = saved.history;
+        self.queue = saved.queue;
+        self.pending = saved.pending;
+        self.busy = saved.busy;
+        self.current_session_persisted = saved.persisted;
+        if let Some(runner) = saved
+            .runner
+            .take()
+            .or_else(|| self.agent_runner.take().and_then(Result::ok))
+        {
+            self.visible_attachment_epoch = runner.attachment_epoch();
+            self.adopt_runner(Ok(runner));
+        }
+        self.prepare_session_setup_for_resume(!self.history.is_empty());
+        if !error.is_empty() {
+            self.history.push(HistoryEntry::CommandError {
+                line: error.to_string(),
+            });
+        }
+        self.mark_chat_geometry_dirty_from(0);
+        self.new_session_terminal_clear_pending = true;
+    }
+
+    /// First-message materialization of an existing local draft. The attach is
+    /// transactional; no message dispatch can cross its session-switch fence.
     pub(super) fn maybe_service_new_session_with_clear(
         &mut self,
         mut clear_terminal: impl FnMut() -> Result<()>,
@@ -719,6 +801,8 @@ impl App {
         &mut self,
         outcome: agent_runner::SessionSwitchOutcome,
     ) {
+        self.local_session_draft = false;
+        self.draft_return_view = None;
         self.apply_session_switch_outcome_inner(outcome, true);
     }
 

@@ -2829,3 +2829,169 @@ async fn resume_header_adopts_identity_and_rehomes_outgoing_activity() {
         );
     }
 }
+
+#[tokio::test]
+async fn day2_new_is_a_local_draft_until_first_message_and_failed_create_restores_saved_view() {
+    let mut app = App::new(None, false);
+    let (_input, _control, outcome_tx) = install_live_swappable_runner(&mut app, 8);
+    let old_id = app
+        .agent_runner
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .session_id();
+    app.launch.session_id = Some(old_id);
+    app.current_session_persisted = true;
+    app.history.push(HistoryEntry::Plain {
+        text: "saved conversation".into(),
+    });
+    app.composer.insert_str("discard this composer text");
+    cockpit_client::reset_connect_call_count();
+    app.execute_slash(*super::slash::slash_command_by_name("new").unwrap());
+    assert!(
+        app.maybe_open_local_session_draft_with_clear(|| Ok(()))
+            .unwrap()
+    );
+    assert!(app.local_session_draft);
+    assert!(app.history.is_empty());
+    assert!(app.composer.display_text().is_empty());
+    assert!(app.launch.session_id.is_none());
+    assert!(app.agent_runner.is_none());
+    assert!(!app.session_switch_in_progress());
+    assert!(app.session_setup_inline.is_none());
+    assert_eq!(cockpit_client::connect_call_count(), 0);
+    assert!(app.draft_return_view.as_ref().unwrap().runner.is_some());
+
+    app.composer.insert_str("first message");
+    app.startup_retained_submission_id =
+        Some((app.startup_background.generation, uuid::Uuid::now_v7()));
+    app.ensure_agent_runner();
+    assert!(
+        app.session_switch_in_progress(),
+        "only the first message may attach"
+    );
+    outcome_tx
+        .send(Err("opening held workspace definition: missing".into()))
+        .unwrap();
+    drain_session_switch_until_complete(&mut app).await;
+    assert_eq!(app.launch.session_id, Some(old_id));
+    assert!(app.current_session_persisted);
+    assert!(app.history.iter().any(
+        |entry| matches!(entry, HistoryEntry::Plain { text } if text == "saved conversation")
+    ));
+    assert_eq!(app.composer.display_text(), "first message");
+    assert!(!app.provisional_new_session);
+    assert!(!app.local_session_draft);
+}
+
+#[tokio::test]
+async fn day2_relaunch_adopts_durable_history_and_first_attachment_event_epoch() {
+    let mut app = App::new(None, false);
+    let (mut runner, _input, _control) = runner_with_input(8);
+    runner.attachment_epoch.store(7, Ordering::Release);
+    runner.history = vec![cockpit_proto::HistoryEntry::User {
+        text: "durable first message".into(),
+        seq: 1,
+        ts_ms: 1,
+        origin_principal: None,
+        display_text: None,
+        client_submission_ids: Vec::new(),
+        tag_expansions: Vec::new(),
+    }];
+    let id = runner.session_id();
+    app.adopt_runner(Ok(runner));
+    assert_eq!(app.visible_attachment_epoch, 7);
+    assert_eq!(app.launch.session_id, Some(id));
+    assert!(app.current_session_persisted);
+    assert!(app.history.iter().any(
+        |entry| matches!(entry, HistoryEntry::User { text, .. } if text == "durable first message")
+    ));
+    assert!(app.session_setup_collapsed);
+}
+
+#[tokio::test]
+async fn day2_empty_relaunch_is_a_draft_and_does_not_eagerly_attach() {
+    let mut app = App::new(None, false);
+    app.first_paint_completed = true;
+    app.startup_background.workspace_ready = true;
+    let generation = app.startup_background.generation;
+    app.apply_startup_session_resolution(generation, Ok(None));
+    app.ensure_session_for_display();
+    assert!(app.local_session_draft);
+    assert!(app.launch.session_id.is_none());
+    assert!(app.session_setup_inline.is_none());
+    assert!(app.pending_runner_attach.is_none());
+    assert!(app.agent_runner.is_none());
+    app.ensure_agent_runner(); // /compact or /model must not persist a blank draft either.
+    assert!(app.pending_runner_attach.is_none());
+}
+
+#[tokio::test]
+async fn day2_ctrl_n_opens_local_draft_and_rail_can_return_to_saved_conversation() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = App::new(None, false);
+    let (_input, _control, _outcome) = install_live_swappable_runner(&mut app, 8);
+    let old_id = app
+        .agent_runner
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .session_id();
+    app.launch.session_id = Some(old_id);
+    app.history.push(HistoryEntry::Plain {
+        text: "keep saved view".into(),
+    });
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    assert!(app.pending_new_session);
+    app.maybe_open_local_session_draft_with_clear(|| Ok(()))
+        .unwrap();
+    assert!(app.local_session_draft);
+    assert!(app.history.is_empty());
+    app.resume_session(old_id);
+    assert!(!app.local_session_draft);
+    assert_eq!(app.launch.session_id, Some(old_id));
+    assert!(
+        app.history.iter().any(
+            |entry| matches!(entry, HistoryEntry::Plain { text } if text == "keep saved view")
+        )
+    );
+}
+
+#[tokio::test]
+async fn day2_first_message_waits_for_attach_and_config_then_dispatches_once() {
+    let mut app = App::new(None, false);
+    let (mut input, _control, outcome_tx) = install_live_swappable_runner(&mut app, 8);
+    app.pending_new_session = true;
+    app.maybe_open_local_session_draft_with_clear(|| Ok(()))
+        .unwrap();
+    assert!(input.try_recv().is_err());
+    app.composer.insert_str("save only this first message");
+    let submission_id = uuid::Uuid::now_v7();
+    app.startup_retained_submission_id = Some((app.startup_background.generation, submission_id));
+    app.ensure_agent_runner();
+    let next_id = uuid::Uuid::new_v4();
+    let AsyncActionPayload::SessionSwitched(outcome) = switch_outcome(next_id, "new123") else {
+        unreachable!()
+    };
+    outcome_tx.send(Ok(*outcome)).unwrap();
+    drain_session_switch_until_complete(&mut app).await;
+    assert_eq!(app.launch.session_id, Some(next_id));
+    assert!(input.try_recv().is_err(), "no send before config is ready");
+    assert_eq!(app.composer.display_text(), "save only this first message");
+    super::seed_ready_model_for_tests(&mut app);
+    assert!(app.maybe_submit_startup_retained_message());
+    let sent = input
+        .try_recv()
+        .expect("first message after successful attach");
+    let RunnerInput::Submission(sent) = sent else {
+        panic!("expected one first message")
+    };
+    assert_eq!(sent.intended_session_id, next_id);
+    assert_eq!(sent.optimistic_submission_id, submission_id);
+    assert_eq!(sent.submission.text, "save only this first message");
+    assert!(!app.maybe_submit_startup_retained_message());
+    assert!(input.try_recv().is_err());
+    assert!(app.composer.display_text().is_empty());
+}

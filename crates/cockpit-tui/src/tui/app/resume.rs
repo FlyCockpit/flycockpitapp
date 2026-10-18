@@ -178,6 +178,18 @@ impl App {
             self.report_session_switch_busy("/resume");
             return;
         }
+        if self.local_session_draft {
+            self.restore_durable_view_after_draft_failure("");
+            if self.launch.session_id == Some(session_id) {
+                return;
+            }
+            if self.agent_runner.is_none() {
+                self.local_session_draft = false;
+                self.launch.session_id = Some(session_id);
+                self.start_runner_attach(true, RunnerAttachContinuation::RetryRetainedSubmissions);
+                return;
+            }
+        }
         self.cancel_outgoing_turn_if_busy();
 
         // Resuming another session from inside a side conversation: discard the

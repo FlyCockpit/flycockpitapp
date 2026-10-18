@@ -255,6 +255,7 @@ cockpit packages prune --dry-run
 | `cockpit daemon status` | Show daemon status. |
 | `cockpit daemon stop` | Stop the daemon. |
 | `cockpit doctor [path]` | Print a read-only diagnostics snapshot. |
+| `cockpit --session <id-or-name>` | Open a saved Code session by full UUID, the short id from `session list`, or its exact title. Ambiguous names require a UUID. |
 | `cockpit session list` | List recorded sessions. |
 | `cockpit session delete <session> [--yes]` | Permanently delete one session and its local data; prompts unless `--yes` is supplied. |
 | `cockpit session purge --before <YYYY-MM-DD|30d> [--dry-run] [--yes]` | Permanently delete ended sessions before a cutoff; `--dry-run` reports the count only. |
@@ -917,3 +918,10 @@ explicit approval unless a matching session, project, or global grant exists.
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+Launching `cockpit` again in the same project restores its most recently active
+saved Code session. If none exists, the composer starts as an unsaved draft.
+`/new`, Ctrl+N, and the rail's New session button open a blank draft; it becomes
+a saved session when you send the first message. The rail marks drafts as
+unsaved and refreshes saved titles, message previews, and activity.
+`cockpit run --session <uuid>` continues to run a noninteractive turn.

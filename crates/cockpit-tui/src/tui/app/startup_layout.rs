@@ -1897,6 +1897,7 @@ impl App {
                 self.launch.cwd.join(".lastmessage"),
             );
         }
+        self.session_rail.set_project_scope(None, &self.launch.cwd);
         self.startup_background.workspace_ready = true;
         if self.mark_startup_trace_milestone("trust-ready") {
             tracing::info!(target: cockpit_core::startup::TARGET, event = "trust-ready", "startup");
@@ -3596,6 +3597,7 @@ impl App {
             StartupRetry::Lifecycle => self.start_startup_lifecycle_resolution(),
             StartupRetry::Onboarding => self.start_onboarding_bootstrap_fetch(),
             StartupRetry::Workspace(snapshot) => self.start_workspace_resolution(snapshot),
+            StartupRetry::Session => self.start_startup_session_resolution(),
             StartupRetry::NamedAssistant => {
                 if let Some(name) = self.startup_assistant_name.clone() {
                     self.start_named_assistant_resolution(name);

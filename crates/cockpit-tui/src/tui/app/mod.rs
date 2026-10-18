@@ -2084,6 +2084,7 @@ enum StartupRetry {
     Onboarding,
     Workspace(Option<cockpit_proto::OnboardingBootstrapSnapshot>),
     NamedAssistant,
+    Session,
 }
 
 /// Daemon-resolved config the TUI renders from (`tui-config-single-source`).
@@ -2157,8 +2158,23 @@ fn providers_from_view(
 /// requests until it adopts the daemon-returned authoritative value.
 pub type SessionMode = cockpit_proto::SessionEntryMode;
 
+struct DraftReturnView {
+    runner: Option<AgentRunner>,
+    history: history_window::HistoryWindow,
+    queue: Vec<QueuedUserMessage>,
+    pending: Option<PendingMsg>,
+    busy: bool,
+    persisted: bool,
+}
+
 #[allow(private_interfaces)]
 pub struct App {
+    local_session_draft: bool,
+    draft_return_view: Option<DraftReturnView>,
+    startup_session_selector: Option<String>,
+    startup_session_resolved: bool,
+    session_rail_refresh_needed: bool,
+    session_rail_next_refresh: Instant,
     /// Requested before attach, then replaced by the daemon-owned session
     /// value from `Attached`. It never grants or changes execution authority.
     pub(super) session_mode: Option<SessionMode>,
@@ -4426,6 +4442,12 @@ impl App {
             slash_dismissed: false,
             slash_scroll: 0,
             slash_menu_cache: std::cell::RefCell::new(None),
+            local_session_draft: false,
+            draft_return_view: None,
+            startup_session_selector: None,
+            startup_session_resolved: false,
+            session_rail_refresh_needed: false,
+            session_rail_next_refresh: Instant::now(),
             pending_new_session: false,
             provisional_new_session: false,
             visible_attachment_epoch: 0,
@@ -5038,6 +5060,7 @@ impl App {
         changed |= self.drain_fetch_progress();
         changed |= self.drain_agent_events();
         changed |= self.drain_async_actions();
+        changed |= self.maybe_submit_startup_retained_message();
         self.maybe_start_session_rail_list();
         changed |= self.drain_leak_reveal();
         changed |= self.retry_pending_session_switch_submissions();

@@ -1018,6 +1018,10 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
     );
 
     if let Some(mode) = tui_mode_for_command(cli.command.as_ref()) {
+        anyhow::ensure!(
+            cli.session.is_none() || mode == commands::tui::SessionMode::Code,
+            "--session selects a saved Code session; launch it with `cockpit --session <id-or-name>`"
+        );
         return commands::tui::run_mode(
             cli.project.as_deref(),
             cli.no_sandbox,
@@ -1028,9 +1032,15 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
             cli.debug_last_message,
             None,
             None,
+            cli.session.clone(),
         )
         .await;
     }
+
+    anyhow::ensure!(
+        cli.session.is_none(),
+        "--session opens the TUI; use `cockpit run --session <uuid>` for noninteractive runs"
+    );
 
     if let Some(Command::Setup(args)) = cli.command.as_ref() {
         if interactive_shell {
@@ -1043,6 +1053,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
                 args.wizard.is_none(),
                 cli.debug_last_message,
                 args.wizard.clone(),
+                None,
                 None,
             )
             .await;
@@ -1068,6 +1079,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
                 cli.debug_last_message,
                 Some(cockpit_core::wizard::PROVIDER_WIZARD_ID.to_string()),
                 args.template.clone(),
+                None,
             )
             .await;
         }

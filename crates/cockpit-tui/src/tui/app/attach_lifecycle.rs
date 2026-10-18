@@ -118,6 +118,11 @@ impl App {
             return;
         }
         if self.local_session_draft {
+            // The first submit may precede durable discovery completing. Its
+            // retained intent is sufficient to materialize the now-resolved draft.
+            if self.startup_retained_submission_id.is_some() {
+                self.ensure_agent_runner();
+            }
             return;
         }
         if self.session_mode.unwrap_or(SessionMode::Code) == SessionMode::Code
@@ -284,6 +289,20 @@ impl App {
         continuation: RunnerAttachContinuation,
     ) {
         if !self.guard_startup_workspace_effects() {
+            return;
+        }
+        if self.session_mode.unwrap_or(SessionMode::Code) == SessionMode::Code
+            && self.launch.session_id.is_none()
+            && !self.startup_session_resolved
+            && (self.first_paint_completed || self.startup_background.started)
+        {
+            // Controls and sibling commands share this boundary with startup:
+            // none may accidentally create a session while discovery is pending.
+            self.start_startup_session_resolution();
+            self.show_toast(
+                "Session is still opening; retry when ready",
+                ToastKind::Info,
+            );
             return;
         }
         if self.local_session_draft && self.startup_retained_submission_id.is_none() {

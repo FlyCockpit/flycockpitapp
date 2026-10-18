@@ -2749,7 +2749,7 @@ pub(crate) async fn resolve_startup_code_session(
                     workspace_selector: workspace_selector.clone(),
                     logical_client_id: logical_client_id.clone(),
                     cursor,
-                    limit: proto::CODE_ROOT_DISCOVERY_PAGE_MAX,
+                    limit: proto::acp::CODE_ROOT_DISCOVERY_PAGE_MAX,
                 },
             ))
             .await
@@ -5797,6 +5797,9 @@ mod tests {
                     .send(Some(InProcessConnection { requests, events }))
                     .is_ok()
             );
+            let readiness = requests_rx.recv().await.unwrap();
+            assert!(matches!(readiness.request, Request::DaemonStatus));
+            assert!(readiness.reply.send(Ok(Response::Ack)).is_ok());
             let cursor = proto::CodeRootDiscoveryCursorV1::from_daemon_random(Uuid::new_v4());
             let mut client_id = None;
             for page in 0..2 {

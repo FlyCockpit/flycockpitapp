@@ -222,8 +222,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn day2_rail_marks_draft_and_requests_fresh_saved_title_and_activity() {
+    #[test]
+    fn day2_rail_marks_draft_and_requests_fresh_saved_title_and_activity() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut app, _env) = configured_app(&tmp);
         let id = Uuid::new_v4();

@@ -2844,7 +2844,7 @@ async fn day2_new_is_a_local_draft_until_first_message_and_failed_create_restore
     app.launch.session_id = Some(old_id);
     app.current_session_persisted = true;
     app.history.push(HistoryEntry::Plain {
-        text: "saved conversation".into(),
+        line: "saved conversation".into(),
     });
     app.composer.insert_str("discard this composer text");
     cockpit_client::reset_connect_call_count();
@@ -2878,7 +2878,7 @@ async fn day2_new_is_a_local_draft_until_first_message_and_failed_create_restore
     assert_eq!(app.launch.session_id, Some(old_id));
     assert!(app.current_session_persisted);
     assert!(app.history.iter().any(
-        |entry| matches!(entry, HistoryEntry::Plain { text } if text == "saved conversation")
+        |entry| matches!(entry, HistoryEntry::Plain { line } if line == "saved conversation")
     ));
     assert_eq!(app.composer.display_text(), "first message");
     assert!(!app.provisional_new_session);
@@ -2941,7 +2941,7 @@ async fn day2_ctrl_n_opens_local_draft_and_rail_can_return_to_saved_conversation
         .session_id();
     app.launch.session_id = Some(old_id);
     app.history.push(HistoryEntry::Plain {
-        text: "keep saved view".into(),
+        line: "keep saved view".into(),
     });
     app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
     assert!(app.pending_new_session);
@@ -2954,7 +2954,7 @@ async fn day2_ctrl_n_opens_local_draft_and_rail_can_return_to_saved_conversation
     assert_eq!(app.launch.session_id, Some(old_id));
     assert!(
         app.history.iter().any(
-            |entry| matches!(entry, HistoryEntry::Plain { text } if text == "keep saved view")
+            |entry| matches!(entry, HistoryEntry::Plain { line } if line == "keep saved view")
         )
     );
 }
@@ -2994,4 +2994,55 @@ async fn day2_first_message_waits_for_attach_and_config_then_dispatches_once() {
     assert!(!app.maybe_submit_startup_retained_message());
     assert!(input.try_recv().is_err());
     assert!(app.composer.display_text().is_empty());
+}
+
+#[tokio::test]
+async fn day2_controls_cannot_create_before_durable_session_resolution() {
+    let mut app = App::new(None, false);
+    app.first_paint_completed = true;
+    app.startup_background.workspace_ready = true;
+    app.startup_lifecycle = Some(App::stub_startup_lifecycle_for_tests());
+    app.start_runner_attach(
+        false,
+        super::RunnerAttachContinuation::RetryRetainedSubmissions,
+    );
+    assert!(
+        app.pending_runner_attach.is_none(),
+        "controls must not bypass durable discovery"
+    );
+    assert!(
+        app.async_actions
+            .has_pending_kind(&AsyncActionKind::Internal("startup.session"))
+    );
+    assert!(
+        !app.async_actions
+            .has_pending_kind(&AsyncActionKind::Internal("runner.attach"))
+    );
+}
+
+#[tokio::test]
+async fn day2_first_message_during_empty_discovery_materializes_after_resolution() {
+    let mut app = App::new(None, false);
+    app.first_paint_completed = true;
+    app.startup_background.workspace_ready = true;
+    app.startup_lifecycle = Some(App::stub_startup_lifecycle_for_tests());
+    app.composer
+        .insert_str("first message while discovery is pending");
+    app.startup_retained_submission_id =
+        Some((app.startup_background.generation, uuid::Uuid::now_v7()));
+    app.apply_startup_session_resolution(app.startup_background.generation, Ok(None));
+    assert!(app.pending_runner_attach.is_none());
+    app.ensure_session_for_display();
+    assert!(
+        app.pending_runner_attach.is_some(),
+        "a retained first message must not strand on a draft"
+    );
+    assert!(
+        app.async_actions
+            .has_pending_kind(&AsyncActionKind::Internal("runner.attach"))
+    );
+    assert_eq!(
+        app.composer.display_text(),
+        "first message while discovery is pending"
+    );
 }

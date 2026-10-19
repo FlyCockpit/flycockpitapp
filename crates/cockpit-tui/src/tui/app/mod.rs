@@ -2159,7 +2159,13 @@ fn providers_from_view(
 pub type SessionMode = cockpit_proto::SessionEntryMode;
 
 struct DraftReturnView {
+    // The runner may still be the discarded side's transport for a New
+    // switch. Only this snapshot is authoritative for a return to main.
+    side_return: Option<SideConversation>,
     runner: Option<AgentRunner>,
+    session_id: Option<uuid::Uuid>,
+    session_short_id: Option<String>,
+    project_id: Option<String>,
     history: history_window::HistoryWindow,
     queue: Vec<QueuedUserMessage>,
     pending: Option<PendingMsg>,
@@ -2171,6 +2177,9 @@ struct DraftReturnView {
 pub struct App {
     local_session_draft: bool,
     draft_return_view: Option<DraftReturnView>,
+    // A detached main snapshot is provisional until its authoritative
+    // reattach history replaces it. Keep this through transient failures.
+    restored_draft_session: Option<uuid::Uuid>,
     startup_session_selector: Option<String>,
     startup_session_resolved: bool,
     session_rail_refresh_needed: bool,
@@ -4445,6 +4454,7 @@ impl App {
             slash_menu_cache: std::cell::RefCell::new(None),
             local_session_draft: false,
             draft_return_view: None,
+            restored_draft_session: None,
             startup_session_selector: None,
             startup_session_resolved: false,
             session_rail_refresh_needed: false,

@@ -490,7 +490,11 @@ impl App {
         continuations: &[RunnerAttachContinuation],
         error: &str,
     ) {
-        if self.startup_session_resolved && self.launch.session_id.is_none() {
+        if self.draft_return_view.is_some() {
+            self.restore_durable_view_after_draft_failure(&format!(
+                "Could not create session: {error}; saved conversation restored. Send again or /new to retry."
+            ));
+        } else if self.startup_session_resolved && self.launch.session_id.is_none() {
             self.local_session_draft = true;
             self.startup_retained_submission_id = None;
             self.session_setup_inline = None;
@@ -550,6 +554,16 @@ impl App {
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         let mut runner = runner;
         if let Ok(r) = &mut runner {
+            if self.restored_draft_session.take() == Some(r.session_id()) {
+                // The saved main was shown while detached. Attach returns
+                // its complete current history, including any work completed
+                // during /side; appending would duplicate the saved view.
+                self.history.clear();
+                self.history_render_versions.clear();
+                self.history_render_fingerprints.clear();
+                self.history_render_cache_clear();
+                self.mark_chat_geometry_dirty_from(0);
+            }
             if self.mark_startup_trace_milestone("session-ready") {
                 tracing::info!(target: cockpit_core::startup::TARGET, event = "session-ready", "startup");
             }

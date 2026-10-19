@@ -3602,3 +3602,357 @@ async fn day2_draft_materialization_queue_edit_cannot_target_outgoing_session() 
 async fn day2_draft_materialization_stale_fork_cannot_target_outgoing_session() {
     day2_draft_control_waits_for_adoption("fork.stale").await;
 }
+
+// Seed the established production side state: switching to a side reuses the
+// live runner, so saved_runner is None and only the snapshot names main.
+async fn day2_open_side_draft(
+    control: usize,
+    connected: bool,
+) -> (
+    App,
+    uuid::Uuid,
+    uuid::Uuid,
+    mpsc::Receiver<RunnerInput>,
+    oneshot::Sender<Result<SessionSwitchOutcome, String>>,
+) {
+    use cockpit_client::{
+        ClientEndpoint, InProcessConnection, InProcessEndpoint, InProcessRequest,
+    };
+    use cockpit_proto::{Request, Response};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    let (inputs, _controls, outcome_tx) = install_live_swappable_runner(&mut app, 8);
+    let side_id = app
+        .agent_runner
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .session_id();
+    let (connections, mut incoming) = mpsc::channel(2);
+    let (sensitive, _sensitive_rx) = mpsc::channel(1);
+    let mut side = side_conversation(tmp.path());
+    side.side_session_id = side_id;
+    let main_id = side.saved_session_id.unwrap();
+    side.saved_history.push(HistoryEntry::Plain {
+        line: "durable main view".into(),
+    });
+    side.saved_queue.push(super::input::optimistic_queue_item(
+        "main queued message".into(),
+    ));
+    side.endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
+    app.side_conversation = Some(side);
+    app.launch.session_id = Some(side_id);
+    app.launch.session_short_id = Some("side01".into());
+    app.startup_session_resolved = true;
+    app.first_paint_completed = true;
+    app.startup_background.workspace_ready = true;
+    app.current_session_persisted = false;
+    app.history.push(HistoryEntry::Plain {
+        line: "throwaway side view".into(),
+    });
+    super::seed_ready_model_for_tests(&mut app);
+    if !connected {
+        app.agent_runner = None;
+    }
+    match control {
+        0 => {
+            app.execute_slash(*super::slash::slash_command_by_name("new").unwrap());
+        }
+        1 => {
+            app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        }
+        _ => {
+            app.apply_session_rail_outcome(Some(crate::tui::session_rail::RailOutcome::NewSession));
+        }
+    }
+    app.maybe_open_local_session_draft_with_clear(|| Ok(()))
+        .unwrap();
+    assert!(app.local_session_draft);
+    assert!(app.side_conversation.is_none());
+    assert!(app.launch.session_id.is_none());
+    assert!(app.agent_runner.is_none());
+    assert!(app.history.is_empty());
+    assert!(app.pending_runner_attach.is_none());
+    assert!(!app.session_switch_in_progress());
+
+    // Acknowledge the real discard helper before any first-message action.
+    // This makes restoring the side ID observably invalid, independent of
+    // scheduling of the discard relative to a failed replacement attach.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let reply = incoming.recv().await.unwrap();
+        let (requests, mut requests_rx) = mpsc::channel::<InProcessRequest>(2);
+        let (_events_tx, events) = mpsc::channel(1);
+        assert!(reply.send(Some(InProcessConnection { requests, events })).is_ok());
+        let readiness = requests_rx.recv().await.unwrap();
+        assert!(matches!(readiness.request, Request::DaemonStatus));
+        assert!(readiness.reply.send(Ok(Response::Ack)).is_ok());
+        let discard = requests_rx.recv().await.unwrap();
+        assert!(matches!(discard.request, Request::DiscardSession { session_id } if session_id == side_id));
+        assert!(discard.reply.send(Ok(Response::Ack)).is_ok());
+        while app.async_actions.pending_count() > 0 {
+            app.drain_async_actions();
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(incoming.try_recv().is_err(), "discard exactly once");
+    (app, main_id, side_id, inputs, outcome_tx)
+}
+
+fn day2_assert_side_draft_restored_main(app: &App, main_id: uuid::Uuid, side_id: uuid::Uuid) {
+    assert_ne!(
+        app.launch.session_id,
+        Some(side_id),
+        "never restore a discarded ephemeral identity"
+    );
+    assert_eq!(app.launch.session_id, Some(main_id));
+    assert_eq!(app.current_session_id(), Some(main_id));
+    assert_eq!(app.launch.session_short_id.as_deref(), Some("main01"));
+    assert_eq!(app.project_id.as_deref(), Some("main-project"));
+    assert!(app.current_session_persisted);
+    assert!(
+        app.history.iter().any(
+            |entry| matches!(entry, HistoryEntry::Plain { line } if line == "durable main view")
+        )
+    );
+    assert!(!app.history.iter().any(
+        |entry| matches!(entry, HistoryEntry::Plain { line } if line == "throwaway side view")
+    ));
+    assert_eq!(app.queue.len(), 1);
+    assert!(
+        app.agent_runner.is_none(),
+        "discarded side transport cannot admit main effects"
+    );
+    assert!(app.foreground_input_target.is_none());
+    assert!(!app.local_session_draft);
+    assert!(!app.provisional_new_session);
+    assert!(app.draft_return_view.is_none());
+    assert!(app.startup_retained_submission_id.is_none());
+}
+
+fn day2_assert_main_reattach_target(app: &mut App, main_id: uuid::Uuid) {
+    let unsent = app.composer.display_text();
+    app.startup_lifecycle = Some(App::stub_startup_lifecycle_for_tests());
+    app.daemon_connected = true;
+    super::seed_ready_model_for_tests(app);
+    app.ensure_session_for_display();
+    let pending = app
+        .pending_runner_attach
+        .as_ref()
+        .expect("restored main can reattach");
+    assert_eq!(pending.requested_session_id, Some(main_id));
+    let action_id = pending.action_id;
+    app.async_actions
+        .abort_kind(&AsyncActionKind::Internal("runner.attach"));
+    app.apply_runner_attach_result(action_id, Err("main temporarily unavailable".into()));
+    assert_eq!(app.launch.session_id, Some(main_id));
+    assert!(
+        app.history.iter().any(
+            |entry| matches!(entry, HistoryEntry::Plain { line } if line == "durable main view")
+        )
+    );
+
+    app.reset_display_attach_backoff();
+    app.ensure_session_for_display();
+    let pending = app
+        .pending_runner_attach
+        .as_ref()
+        .expect("retry main attach");
+    assert_eq!(pending.requested_session_id, Some(main_id));
+    let action_id = pending.action_id;
+    app.async_actions
+        .abort_kind(&AsyncActionKind::Internal("runner.attach"));
+    let (mut runner, mut inputs, _controls) = runner_with_input(8);
+    runner.adopt_live_session_id(main_id);
+    runner.history = ["durable main view", "main work completed during side"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| cockpit_proto::HistoryEntry::User {
+            text: text.into(),
+            seq: index as i64 + 1,
+            ts_ms: 1,
+            origin_principal: None,
+            display_text: None,
+            client_submission_ids: Vec::new(),
+            tag_expansions: Vec::new(),
+        })
+        .collect();
+    app.apply_runner_attach_result(
+        action_id,
+        Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner))),
+    );
+    assert_eq!(
+        app.agent_runner
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .session_id(),
+        main_id
+    );
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|entry| match entry {
+                HistoryEntry::Plain { line } => line == "durable main view",
+                HistoryEntry::User { text, .. } => text == "durable main view",
+                _ => false,
+            })
+            .count(),
+        1,
+        "authoritative reattach replaces the saved main transcript"
+    );
+    assert!(app.history.iter().any(|entry| matches!(entry, HistoryEntry::User { text, .. } if text == "main work completed during side")));
+    assert_eq!(app.composer.display_text(), unsent);
+    assert!(
+        inputs.try_recv().is_err(),
+        "restoring main must not send the rejected first message"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_failed_side_draft_create_restores_main_after_real_discard() {
+    for control in 0..3 {
+        let (mut app, main_id, side_id, mut inputs, outcome_tx) =
+            day2_open_side_draft(control, true).await;
+        app.composer
+            .insert_str("first message for new durable session");
+        app.submit_input();
+        assert!(app.session_switch_in_progress());
+        assert!(inputs.try_recv().is_err());
+        outcome_tx
+            .send(Err("replacement attach rejected".into()))
+            .unwrap();
+        drain_session_switch_until_complete(&mut app).await;
+        assert_eq!(
+            app.composer.display_text(),
+            "first message for new durable session"
+        );
+        day2_assert_side_draft_restored_main(&app, main_id, side_id);
+        assert!(inputs.try_recv().is_err(), "failure preserves unsent text");
+        day2_assert_main_reattach_target(&mut app, main_id);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_blank_side_draft_returns_to_main_after_real_discard_and_reentry() {
+    for control in 0..3 {
+        let (mut app, main_id, side_id, _inputs, _outcome_tx) =
+            day2_open_side_draft(control, true).await;
+        // Reopening the blank draft must not overwrite the retained main.
+        app.pending_new_session = true;
+        app.maybe_open_local_session_draft_with_clear(|| Ok(()))
+            .unwrap();
+        app.resume_session(main_id);
+        day2_assert_side_draft_restored_main(&app, main_id, side_id);
+        day2_assert_main_reattach_target(&mut app, main_id);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_successful_side_draft_create_keeps_replacement_and_dispatches_once() {
+    for control in 0..3 {
+        let (mut app, main_id, side_id, mut inputs, outcome_tx) =
+            day2_open_side_draft(control, true).await;
+        app.composer
+            .insert_str("first message for replacement only");
+        app.submit_input();
+        assert!(app.session_switch_in_progress());
+        assert!(inputs.try_recv().is_err());
+        let replacement_id = uuid::Uuid::new_v4();
+        let AsyncActionPayload::SessionSwitched(outcome) = switch_outcome(replacement_id, "new456")
+        else {
+            unreachable!()
+        };
+        outcome_tx.send(Ok(*outcome)).unwrap();
+        drain_session_switch_until_complete(&mut app).await;
+        assert_eq!(app.launch.session_id, Some(replacement_id));
+        assert_ne!(replacement_id, main_id);
+        assert_ne!(replacement_id, side_id);
+        assert!(app.side_conversation.is_none());
+        assert!(app.draft_return_view.is_none());
+        assert!(
+            app.queue.is_empty(),
+            "do not inherit main's queue on success"
+        );
+        assert!(!app.history.iter().any(
+            |entry| matches!(entry, HistoryEntry::Plain { line } if line == "durable main view")
+        ));
+        super::seed_ready_model_for_tests(&mut app);
+        day2_materialization_tick(&mut app);
+        let RunnerInput::Submission(sent) = inputs.try_recv().expect("replacement first message")
+        else {
+            panic!("submission")
+        };
+        assert_eq!(sent.intended_session_id, replacement_id);
+        assert_eq!(sent.submission.text, "first message for replacement only");
+        day2_materialization_tick(&mut app);
+        assert!(inputs.try_recv().is_err(), "dispatch exactly once");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_disconnected_side_draft_attach_failure_restores_main() {
+    for control in 0..3 {
+        let (mut app, main_id, side_id, _inputs, _outcome_tx) =
+            day2_open_side_draft(control, false).await;
+        app.startup_lifecycle = Some(App::stub_startup_lifecycle_for_tests());
+        app.composer.insert_str("unsent after disconnected side");
+        app.submit_input();
+        let pending = app
+            .pending_runner_attach
+            .as_ref()
+            .expect("fresh replacement attach");
+        assert_eq!(pending.requested_session_id, None);
+        let action_id = pending.action_id;
+        app.async_actions
+            .abort_kind(&AsyncActionKind::Internal("runner.attach"));
+        app.apply_runner_attach_result(action_id, Err("replacement attach rejected".into()));
+        assert_eq!(
+            app.composer.display_text(),
+            "unsent after disconnected side"
+        );
+        day2_assert_side_draft_restored_main(&app, main_id, side_id);
+        day2_assert_main_reattach_target(&mut app, main_id);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_restored_side_draft_main_survives_another_draft_before_reattach() {
+    for control in 0..3 {
+        let (mut app, main_id, side_id, _inputs, outcome_tx) =
+            day2_open_side_draft(control, true).await;
+        app.composer.insert_str("rejected first message");
+        app.submit_input();
+        outcome_tx
+            .send(Err("replacement attach rejected".into()))
+            .unwrap();
+        drain_session_switch_until_complete(&mut app).await;
+        day2_assert_side_draft_restored_main(&app, main_id, side_id);
+
+        // The normal display attach has not yet run. A second draft must
+        // preserve the restored durable view without a side or live runner.
+        app.pending_new_session = true;
+        app.maybe_open_local_session_draft_with_clear(|| Ok(()))
+            .unwrap();
+        assert!(app.local_session_draft);
+        assert!(app.launch.session_id.is_none());
+        app.startup_lifecycle = Some(App::stub_startup_lifecycle_for_tests());
+        app.composer.insert_str("second rejected first message");
+        app.submit_input();
+        let pending = app
+            .pending_runner_attach
+            .as_ref()
+            .expect("second replacement attach");
+        assert_eq!(pending.requested_session_id, None);
+        let action_id = pending.action_id;
+        app.async_actions
+            .abort_kind(&AsyncActionKind::Internal("runner.attach"));
+        app.apply_runner_attach_result(action_id, Err("second replacement rejected".into()));
+        assert_eq!(app.composer.display_text(), "second rejected first message");
+        day2_assert_side_draft_restored_main(&app, main_id, side_id);
+        day2_assert_main_reattach_target(&mut app, main_id);
+    }
+}

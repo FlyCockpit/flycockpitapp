@@ -321,17 +321,30 @@ impl App {
             return Ok(true);
         }
         if !self.local_session_draft {
-            self.draft_return_view = match self.agent_runner.take() {
-                Some(Ok(runner)) => Some(DraftReturnView {
-                    runner: Some(runner),
-                    history: std::mem::take(&mut self.history),
-                    queue: std::mem::take(&mut self.queue),
-                    pending: self.pending.take(),
-                    busy: self.busy,
-                    persisted: self.current_session_persisted,
-                }),
-                _ => None,
-            };
+            self.restored_draft_session = None;
+            // Supersede the ephemeral side immediately, but retain its main
+            // snapshot until the replacement is adopted. The side runner is
+            // useful for switching on the same daemon, never for rollback.
+            let side_return = self.side_conversation.take();
+            if let Some(side) = &side_return {
+                self.schedule_created_session_discard(side.endpoint.clone(), side.side_session_id);
+            }
+            let runner = self.agent_runner.take().and_then(Result::ok);
+            self.draft_return_view = (runner.is_some()
+                || side_return.is_some()
+                || (self.current_session_persisted && self.launch.session_id.is_some()))
+            .then(|| DraftReturnView {
+                side_return,
+                runner,
+                session_id: self.launch.session_id,
+                session_short_id: self.launch.session_short_id.clone(),
+                project_id: self.project_id.clone(),
+                history: std::mem::take(&mut self.history),
+                queue: std::mem::take(&mut self.queue),
+                pending: self.pending.take(),
+                busy: self.busy,
+                persisted: self.current_session_persisted,
+            });
         }
         self.async_actions.advance_view_generation();
         self.commit_new_session_without_swappable_runner();
@@ -362,18 +375,43 @@ impl App {
         self.provisional_new_epoch_event_buffer.clear();
         self.same_session_resync_event_buffer.clear();
         self.local_session_draft = false;
+        self.restored_draft_session = None;
         self.history = saved.history;
         self.queue = saved.queue;
         self.pending = saved.pending;
         self.busy = saved.busy;
         self.current_session_persisted = saved.persisted;
-        if let Some(runner) = saved
+        if let Some(side) = saved.side_return {
+            // Production side switches reuse the runner: it still names the
+            // now-discarded side after a rejected replacement. Drop it and
+            // let the ordinary display/submit attach resume the saved main.
+            // A separately saved main runner, if present, is restored by the
+            // snapshot instead.
+            self.agent_runner = None;
+            self.foreground_input_target = None;
+            self.busy = false;
+            self.restore_side_snapshot(side);
+            if self.agent_runner.is_none() {
+                self.restored_draft_session = self.launch.session_id;
+            }
+            self.reset_display_attach_backoff();
+        } else if let Some(runner) = saved
             .runner
             .take()
             .or_else(|| self.agent_runner.take().and_then(Result::ok))
         {
             self.visible_attachment_epoch = runner.attachment_epoch();
             self.adopt_runner(Ok(runner));
+        } else {
+            // Re-entering /new before a restored main has reattached still
+            // needs a durable rollback target, even without a live runner.
+            self.agent_runner = None;
+            self.launch.session_id = saved.session_id;
+            self.launch.session_short_id = saved.session_short_id;
+            self.project_id = saved.project_id;
+            self.foreground_input_target = None;
+            self.restored_draft_session = saved.session_id;
+            self.reset_display_attach_backoff();
         }
         self.prepare_session_setup_for_resume(!self.history.is_empty());
         if !error.is_empty() {

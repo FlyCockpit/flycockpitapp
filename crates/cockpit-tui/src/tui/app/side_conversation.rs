@@ -105,7 +105,7 @@ impl App {
         });
     }
 
-    fn schedule_created_session_discard(
+    pub(super) fn schedule_created_session_discard(
         &mut self,
         endpoint: cockpit_client::ClientEndpoint,
         session_id: uuid::Uuid,
@@ -325,7 +325,8 @@ impl App {
     /// conversation. Discard its ephemeral row without first launching the
     /// normal side-return attach (which would compete for the shared switch
     /// key). Resume restores the main snapshot as a coherent fallback while
-    /// its claimed switch is pending; `/new` is about to clear it anyway.
+    /// its claimed switch is pending. Local drafts retain their main fallback
+    /// separately in DraftReturnView before scheduling the discard.
     pub(super) fn discard_side_conversation_for_replacement(&mut self, restore_main: bool) {
         let Some(side) = self.side_conversation.take() else {
             return;

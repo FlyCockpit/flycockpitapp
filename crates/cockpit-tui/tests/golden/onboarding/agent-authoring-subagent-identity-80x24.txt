@@ -1,24 +1,24 @@
  ‹ Back                                                                         
-  Subagent · step 6/8                                                           
+  Subagent · step 5/5                                                           
   Name it, then choose its models, trust, tools, and helpers.                   
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Subagent ────────────────────────────────────────────────────────────────╮  
   │ ╭ Name ────────────────────────────────────────────────────────────────╮ │  
   │ │ runner                                                               │ │  
-  │ │                                                                      │ │  
-  │ │                                                                      │ │  
-  │ │                                                                      │ │  
-  │ │                                                                      │ │  
-  │ │                                                                      │ │  
-  │ │                                                                      │ │  
-  │ │                                                                      │ │  
-  │ │                                                                      │ │  
-  │ │                                                                      │ │  
-  │ │                                                                      │ │  
-  │ │                                                                      │ │  
   │ ╰──────────────────────────────────────────────────────────────────────╯ │  
+  │ Slug: runner. Display name is preserved. Spaces become hyphens.          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
   type text   enter continue   esc back                           [ Continue ]  
                                                                                 

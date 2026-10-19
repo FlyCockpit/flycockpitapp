@@ -1372,6 +1372,23 @@ impl App {
             },
             AsyncActionKind::DaemonRpc("onboarding.provider.verify") => match result.payload {
                 Ok(AsyncActionPayload::StartupProviderVerification(completion)) => {
+                    let model_refresh = self.onboarding_shell.as_ref().is_some_and(|shell| {
+                        shell.screen_kind() == crate::tui::onboarding::OnboardingScreenKind::Model
+                    });
+                    if model_refresh {
+                        let outcome = self
+                            .refresh_onboarding_model_config_snapshot()
+                            .and(completion.outcome)
+                            .unwrap_or_else(crate::tui::onboarding::VerifyOutcome::Failed);
+                        if let Some(shell) = self.onboarding_shell.as_mut() {
+                            shell.apply_model_catalog_refresh(
+                                &completion.provider_id,
+                                outcome,
+                                &self.config_snapshot.providers,
+                            );
+                        }
+                        return;
+                    }
                     if let Some(shell) = self.onboarding_shell.as_mut() {
                         match completion.outcome {
                             Ok(outcome) => shell.apply_provider_verification(
@@ -1389,6 +1406,15 @@ impl App {
                 }
                 Err(error) => {
                     if let Some(shell) = self.onboarding_shell.as_mut() {
+                        if let Some((provider, _)) = shell.model_selection_for_refresh() {
+                            let provider = provider.to_string();
+                            shell.apply_model_catalog_refresh(
+                                &provider,
+                                crate::tui::onboarding::VerifyOutcome::Failed(error),
+                                &self.config_snapshot.providers,
+                            );
+                            return;
+                        }
                         let provider_id = shell
                             .verifying_provider_id()
                             .unwrap_or_default()
@@ -1587,10 +1613,23 @@ impl App {
                         client_operation_id,
                         request_id,
                         projection,
-                    }) if pending_request_id.as_deref() == Some(&request_id) => {
-                        self.onboarding_agent_operation_id = Some(client_operation_id.clone());
+                    }) if pending_request_id.as_deref() == Some(&request_id)
+                        && self.onboarding_agent_operation_id.as_deref()
+                            == Some(client_operation_id.as_str()) =>
+                    {
+                        let optional = self.onboarding_snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot.stage == cockpit_proto::OnboardingStage::Complete
+                        });
                         if let Some(shell) = self.onboarding_shell.as_mut() {
-                            shell.present_agent_authoring(projection, client_operation_id.clone());
+                            if optional {
+                                shell.present_agent_authoring(
+                                    projection,
+                                    client_operation_id.clone(),
+                                );
+                            } else {
+                                shell
+                                    .present_default_agent(projection, client_operation_id.clone());
+                            }
                             if let Some((pending_operation_id, receipt)) =
                                 self.pending_startup_agent_authoring_receipt.take()
                                 && pending_operation_id == client_operation_id

@@ -1,24 +1,24 @@
  ‹ Back                                                                         
-  Choose your default model · step 5/8                                          
-  Star the model Cockpit should use for new sessions.                           
-  ✓  ✓  ✓  ✓  ◆ Model  ·  ·  ·                                                  
+  Choose your default model · step 4/5                                          
+  Choose one model. Advanced options are available later in /settings or /setu  
+  ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
+  ╭ Provider · Tab then ←/→ to switch · Ctrl+R refresh ──────────────────────╮  
+  │ openai                                                                   │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  ╭ Search models ───────────────────────────────────────────────────────────╮  
+  │ Type a model name                                                        │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  ★ Selected: openai / gpt-5.2-codex                                            
   ╭ Models ──────────────────────────────────────────────────────────────────╮  
   │ ◉ ★ gpt-5.2-codex  openai                                                │  
   │ ○   gpt-5.2  openai                                                      │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
   openai / gpt-5.2-codex                                                        
                                                                                 
                                                                                 
-  ↑↓ move   space set default   enter continue   esc options      [ Continue ]  
+  tab focus   ↑↓ / home/end/page move   ctrl+r refresh   enter ch [ Continue ]  
                                                                                 

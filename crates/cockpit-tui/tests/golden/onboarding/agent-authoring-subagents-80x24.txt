@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Define subagents · step 6/8                                                   
+  Define subagents · step 5/5                                                   
   Helpers this agent can delegate to. The runner is ready to keep or edit.      
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Subagents  ·  1 ─────────────────────────────────────────────────────────╮  

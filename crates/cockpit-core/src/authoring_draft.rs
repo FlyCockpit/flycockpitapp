@@ -527,6 +527,8 @@ fn resolve_source(
             } else {
                 name.to_string()
             };
+            let name = crate::onboarding_agent::authored_agent_slug(&name)
+                .map_err(|error| anyhow::anyhow!(error.message))?;
             let body = format!("You are the `{name}` Cockpit agent.\n");
             Ok((
                 AuthoredAgentSource {
@@ -546,6 +548,8 @@ fn resolve_source(
             } else {
                 name.to_string()
             };
+            let name = crate::onboarding_agent::authored_agent_slug(&name)
+                .map_err(|error| anyhow::anyhow!(error.message))?;
             let body = format!("You are the `{name}` Cockpit agent.\n");
             Ok((
                 AuthoredAgentSource {
@@ -675,7 +679,7 @@ fn build_frontmatter(
         tool_tier_preferences,
         requested_network_hosts: Default::default(),
         requests_requested: false,
-        description: name.to_string(),
+        description: draft.name.trim().to_string(),
         capabilities: if draft.auto_prune {
             [AgentCapability::AutoPrune].into_iter().collect()
         } else {
@@ -737,17 +741,8 @@ fn verification_rule(
 }
 
 fn validate_authored_agent_name(name: &str) -> Result<()> {
-    ensure!(
-        !name.is_empty()
-            && !name.contains('/')
-            && !name.contains('\\')
-            && !name.contains('.')
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
-        "authored agent name must be ASCII alphanumeric with '-' or '_' only"
-    );
-    Ok(())
+    crate::onboarding_agent::validate_authored_agent_name(name)
+        .map_err(|error| anyhow::anyhow!(error.message))
 }
 
 const AUTHORED_MAX_DESCENDANT_DEPTH: u16 = 2;
@@ -977,7 +972,7 @@ fn build_child_markdown(
         tool_tier_preferences,
         requested_network_hosts: Default::default(),
         requests_requested: false,
-        description: name.clone(),
+        description: child.name.trim().to_string(),
         capabilities: if child.auto_prune {
             [AgentCapability::AutoPrune].into_iter().collect()
         } else {
@@ -1000,7 +995,11 @@ fn child_slug(child: &ChildAuthoringDraft) -> String {
     if trimmed.is_empty() {
         "unnamed".to_string()
     } else {
-        trimmed.to_string()
+        trimmed
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-")
+            .to_ascii_lowercase()
     }
 }
 
@@ -1096,6 +1095,42 @@ mod tests {
             default_route: Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 0 }),
             review_trust_disclosure: "shared trust".into(),
         }
+    }
+
+    #[test]
+    fn display_names_derive_valid_package_ids_for_root_and_children() {
+        let projection = sample_projection();
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
+        draft.source_selection = SourceSelection::Authored;
+        draft.name = "Pilot Noteworthy".into();
+        draft.trust_confirmations[0] = true;
+        let mut child = default_child_draft(&projection);
+        child.name = "Quick Helper".into();
+        child.trust_confirmations[0] = true;
+        draft.children.push(child);
+        let package = build_package_draft(&projection, &draft).unwrap();
+        assert_eq!(package.name, "pilot-noteworthy");
+        assert!(package.markdown.contains("description: Pilot Noteworthy"));
+        assert_eq!(
+            package.children[0].relative_path,
+            "subagents/quick-helper.md"
+        );
+        assert!(
+            package.children[0]
+                .markdown
+                .contains("description: Quick Helper")
+        );
+        let files = BTreeMap::from([
+            (
+                crate::agents::PACKAGE_ROOT_FILE.to_string(),
+                package.markdown.into_bytes(),
+            ),
+            (
+                package.children[0].relative_path.clone(),
+                package.children[0].markdown.clone().into_bytes(),
+            ),
+        ]);
+        crate::agents::load_workspace_package_from_files("pilot-noteworthy", files).unwrap();
     }
 
     #[test]

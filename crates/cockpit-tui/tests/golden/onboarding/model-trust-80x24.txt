@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Provider trust · step 5/8                                                     
+  Provider trust · step 4/5                                                     
   Choose the model's data-custody policy.                                       
-  ✓  ✓  ✓  ✓  ◆ Model  ·  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Trust ───────────────────────────────────────────────────────────────────╮  

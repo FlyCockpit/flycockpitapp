@@ -91,7 +91,7 @@ pub use secure_store::SecureStoreSubmission;
 /// Frame at which the complete fly-in has landed and its prompt is visible.
 pub(crate) const WELCOME_ANIMATION_FRAMES: usize = welcome::PROMPT_FRAME;
 
-/// Ordered progress chrome. Maps the daemon stage enum onto the eight
+/// Ordered progress chrome. Maps daemon bookkeeping stages onto the five
 /// user-visible checkpoints; `Profile` owns its own slot so a failed
 /// profile-engine mount can never strand the user on the Welcome "press
 /// any key" screen at a later stage (#425).
@@ -99,14 +99,11 @@ use progress::STEPS as PROGRESS_STEPS;
 
 fn progress_index(stage: OnboardingStage) -> usize {
     match stage {
-        OnboardingStage::Welcome => 0,
-        OnboardingStage::Profile => 1,
-        OnboardingStage::SecureStore => 2,
-        OnboardingStage::Provider => 3,
-        OnboardingStage::Model => 4,
-        OnboardingStage::Agent => 5,
-        OnboardingStage::Lifetime => 6,
-        OnboardingStage::Complete => 7,
+        OnboardingStage::Welcome | OnboardingStage::Profile => 0,
+        OnboardingStage::SecureStore => 1,
+        OnboardingStage::Provider => 2,
+        OnboardingStage::Model => 3,
+        OnboardingStage::Agent | OnboardingStage::Lifetime | OnboardingStage::Complete => 4,
     }
 }
 
@@ -353,6 +350,8 @@ pub(crate) enum OnboardingShellAction {
     /// completion summary again. Purely shell-local: the daemon stage is
     /// already `Complete`.
     ReturnToCompletion,
+    /// Open optional agent authoring from the setup summary.
+    OpenAgentSetup,
     /// Close the shell preserving committed daemon progress; discard only
     /// local unsaved text. The chat becomes the surface.
     Close,
@@ -406,6 +405,7 @@ impl std::fmt::Debug for OnboardingShellAction {
                 .field("add_another", add_another)
                 .finish(),
             Self::ReturnToCompletion => formatter.write_str("ReturnToCompletion"),
+            Self::OpenAgentSetup => formatter.write_str("OpenAgentSetup"),
             Self::Close => formatter.write_str("Close"),
             Self::Quit => formatter.write_str("Quit"),
             Self::AgentAuthoring(action) => formatter
@@ -687,7 +687,7 @@ impl OnboardingShell {
                 OnboardingScreen::ProviderSearch(Box::new(ProviderSearchScreen::new()))
             }
             OnboardingStage::Lifetime => OnboardingScreen::Lifetime(LifetimeScreen::new()),
-            OnboardingStage::Model => OnboardingScreen::Model(Box::new(ModelScreen::new(
+            OnboardingStage::Model => OnboardingScreen::Model(Box::new(ModelScreen::short(
                 &cockpit_config::config::providers::ProvidersConfig::default(),
                 None,
             ))),
@@ -911,13 +911,66 @@ impl OnboardingShell {
         projection: cockpit_proto::AgentAuthoringProjection,
         client_operation_id: String,
     ) {
-        self.screen = OnboardingScreen::AgentAuthoring(Box::new(agent::AgentAuthoringScreen::new(
-            projection,
-            client_operation_id,
-        )));
+        let mut screen = agent::AgentAuthoringScreen::new(projection, client_operation_id);
+        if self.stage == OnboardingStage::Complete {
+            screen.clear_name_for_new_agent();
+        }
+        self.screen = OnboardingScreen::AgentAuthoring(Box::new(screen));
         self.escape = None;
     }
 
+    pub(crate) fn begin_agent_setup(&mut self) {
+        self.completion_detour = true;
+        self.present_embedded_settings();
+    }
+
+    pub(crate) fn present_default_agent(
+        &mut self,
+        projection: cockpit_proto::AgentAuthoringProjection,
+        client_operation_id: String,
+    ) {
+        self.screen = OnboardingScreen::AgentAuthoring(Box::new(
+            agent::AgentAuthoringScreen::first_run(projection, client_operation_id),
+        ));
+        self.escape = None;
+    }
+
+    pub(crate) fn present_default_model(
+        &mut self,
+        config: &cockpit_config::config::providers::ProvidersConfig,
+        preselect: Option<(&str, &str)>,
+    ) {
+        self.screen = OnboardingScreen::Model(Box::new(ModelScreen::short(config, preselect)));
+        self.escape = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_refresh_pending(&self) -> bool {
+        matches!(&self.screen, OnboardingScreen::Model(screen) if screen.refreshing())
+    }
+
+    pub(crate) fn model_selection_for_refresh(&self) -> Option<(&str, &str)> {
+        match &self.screen {
+            OnboardingScreen::Model(screen) => Some(screen.selection()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_model_catalog_refresh(
+        &mut self,
+        provider_id: &str,
+        outcome: VerifyOutcome,
+        config: &cockpit_config::config::providers::ProvidersConfig,
+    ) -> bool {
+        if let OnboardingScreen::Model(screen) = &mut self.screen {
+            screen.apply_refresh(provider_id, outcome, config);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn present_model(
         &mut self,
         config: &cockpit_config::config::providers::ProvidersConfig,
@@ -1415,6 +1468,11 @@ impl OnboardingShell {
                 }
                 verify::VerifyPhase::Fetching => None,
             },
+            OnboardingScreen::AgentAuthoring(screen)
+                if self.stage == OnboardingStage::Complete && screen.ready_for_stage_advance() =>
+            {
+                Some(OnboardingShellAction::Close)
+            }
             OnboardingScreen::AgentAuthoring(screen) => screen
                 .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .map(OnboardingShellAction::AgentAuthoring),
@@ -1645,6 +1703,12 @@ impl OnboardingShell {
                 }
             }
             OnboardingScreen::AgentAuthoring(screen) => {
+                if self.stage == OnboardingStage::Complete
+                    && key.code == KeyCode::Enter
+                    && screen.ready_for_stage_advance()
+                {
+                    return Some(OnboardingShellAction::Close);
+                }
                 if matches!(key.code, KeyCode::Esc) {
                     if !screen.back() {
                         self.open_escape_menu(engine);
@@ -1677,10 +1741,13 @@ impl OnboardingShell {
                     return screen.advance().map(OnboardingShellAction::ApplyModel);
                 }
                 screen.handle_key(key);
-                None
+                screen.take_refresh().map(|provider_id| {
+                    OnboardingShellAction::RetryProviderVerification { provider_id }
+                })
             }
             OnboardingScreen::Complete { cursor, .. } => {
                 match key.code {
+                    KeyCode::Char('g') => return Some(OnboardingShellAction::OpenAgentSetup),
                     KeyCode::Esc => {
                         // Completion has nothing discardable; Escape keeps
                         // the choice visible instead of silently closing.
@@ -1903,10 +1970,16 @@ impl OnboardingShell {
             (OnboardingScreen::Complete { .. }, Some(1)) => {
                 PointerOutcome::acted(OnboardingShellAction::Close)
             }
+            (OnboardingScreen::Complete { .. }, Some(2)) => {
+                PointerOutcome::acted(OnboardingShellAction::OpenAgentSetup)
+            }
             (OnboardingScreen::AgentAuthoring(_), Some(index)) => {
                 let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen else {
                     unreachable!()
                 };
+                if self.stage == OnboardingStage::Complete && screen.ready_for_stage_advance() {
+                    return PointerOutcome::acted(OnboardingShellAction::Close);
+                }
                 match screen.action_bar_click(index) {
                     Some(action) => {
                         PointerOutcome::acted(OnboardingShellAction::AgentAuthoring(action))
@@ -2393,7 +2466,7 @@ impl OnboardingShell {
             }
             OnboardingScreen::Model(screen) => screen.help_text(),
             OnboardingScreen::EmbeddedSettings => "wizard  esc: options",
-            OnboardingScreen::Complete { .. } => "↑/↓  enter: choose",
+            OnboardingScreen::Complete { .. } => "g agent setup   ↑/↓ enter choose",
         }
     }
 
@@ -2424,10 +2497,12 @@ impl OnboardingShell {
             OnboardingScreen::Complete { cursor, .. } if *cursor == 0 => vec![
                 chrome::Button::primary("Add another provider"),
                 chrome::Button::secondary("Start coding"),
+                chrome::Button::secondary("Agent setup"),
             ],
             OnboardingScreen::Complete { .. } => vec![
                 chrome::Button::secondary("Add another provider"),
                 chrome::Button::primary("Start coding"),
+                chrome::Button::secondary("Agent setup"),
             ],
         }
     }
@@ -2669,6 +2744,7 @@ impl OnboardingShell {
             Line::from(summary.to_string()),
             Line::default(),
             Line::from("Next: run /setup security to choose project trust and approval defaults."),
+            Line::from("Optional: Agent setup (g) opens tuning, tools and subagents."),
             Line::from("Use /help any time to see available commands."),
         ];
         let block = Block::bordered()

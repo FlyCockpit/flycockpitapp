@@ -1,7 +1,7 @@
  ‹ Back                                                                                                                 
-                 Let's add a provider · step 4/8                                                                        
+                 Let's add a provider · step 3/5                                                                        
                  Pick who you'll fly with.                                                                              
-                 ✓ Welcome  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Agent  · Background  · Ready                      
+                 ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Start coding                                                 
                  ──────────────────────────────────────────────────────────────────────────────────────                 
                                                                                                                         
                  ╭ Filter ────────────────────────────────────────────────────────────────────────────╮                 

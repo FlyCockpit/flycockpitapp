@@ -1,12 +1,17 @@
  ‹ Back                                                                         
-  Create your first agent · step 6/8                                            
+  Create an agent · step 5/5                                                    
   An agent is a saved configuration you can fly again and again.                
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
-  ╭ Name ────────────────────────────────────────────────────────────────────╮  
+  ╭ Display name ────────────────────────────────────────────────────────────╮  
   │ navigator                                                                │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
+  Slug: navigator. Display name is preserved. Spaces become hyphens.            
+                                                                                
+                                                                                
+                                                                                
+                                                                                
   ╭ Agent ───────────────────────────────────────────────────────────────────╮  
   │                                                                          │  
   │ ◉ Navigator                                                              │  
@@ -14,11 +19,6 @@
   │ ○ Third-party pinned source                                              │  
   │                                                                          │  
   │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
-  type name   enter continue   esc back   ^c quit                 [ Continue ]  
+  type name   tab sources   enter continue   esc back             [ Continue ]  
                                                                                 

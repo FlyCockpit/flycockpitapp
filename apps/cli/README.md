@@ -695,6 +695,21 @@ Every open verifies the SQLite migration ledger checksum and the exact schema DD
 
 ## Providers
 
+First run asks for your name, secret store, provider credentials, and one default
+model. The model picker starts in Search: typing filters the catalog; Tab moves
+focus to the list or provider selector. List focus supports Home, End, Page Up,
+and Page Down. Ctrl+R refreshes the selected provider. Quitting at Model keeps
+the saved provider and catalog for the next launch. Cockpit then creates the
+default coding agent and offers Start coding. Model policy, agent tuning, tool
+grants, subagents, and lifetime preferences remain optional in `/settings` or
+`/setup model`. Open `/setup` and choose **Agent setup** (or press `g`) for the visual agent editor.
+
+Agent authoring accepts a display name such as `Pilot Noteworthy`, preserves it
+in the definition description, and derives the package slug `pilot-noteworthy`.
+The name field shows the derived slug or the complete validation reason before
+you advance. Slugs start with a lowercase ASCII letter or digit and otherwise
+use `a-z`, `0-9`, `-`, or `_`.
+
 Provider setup is available through `/settings -> Providers` in the TUI or `cockpit provider add` in the terminal. The CLI can list templates, inspect configured models, refresh provider catalogs, and show provider usage where supported.
 
 API-key providers store secret references such as `$OPENAI_API_KEY` in provider config instead of copying raw keys into project files. OAuth-backed providers store refreshable token bundles in the private credentials store.

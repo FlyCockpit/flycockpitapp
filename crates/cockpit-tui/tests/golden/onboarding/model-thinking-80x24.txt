@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Default thinking · step 5/8                                                   
+  Default thinking · step 4/5                                                   
   Choose the model-level thinking default.                                      
-  ✓  ✓  ✓  ✓  ◆ Model  ·  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Thinking ────────────────────────────────────────────────────────────────╮  

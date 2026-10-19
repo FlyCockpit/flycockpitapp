@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Sign in to your subscription · step 4/8                                       
+  Sign in to your subscription · step 3/5                                       
   A device code links this client to your account.                              
-  ✓  ✓  ✓  ◆ Provider  ·  ·  ·  ·                                               
+  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   Open this URL in a browser and enter the code:                                

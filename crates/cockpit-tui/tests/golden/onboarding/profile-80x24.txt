@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  What should Cockpit call you? · step 2/8                                      
+  What should Cockpit call you? · step 1/5                                      
   Set an optional display name.                                                 
-  ✓  ◆ Name  ·  ·  ·  ·  ·  ·                                                   
+  ◆ Name  · Secrets  · Provider  · Model  · Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Name ────────────────────────────────────────────────────────────────────╮  

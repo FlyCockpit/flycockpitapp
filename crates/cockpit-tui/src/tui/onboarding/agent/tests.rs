@@ -1866,3 +1866,100 @@ fn trust_list_entered_from_the_action_bar_starts_on_its_first_row() {
         "the first Space confirms the only row"
     );
 }
+
+#[test]
+fn mixed_case_display_name_builds_lowercase_slug_and_invalid_name_stays_at_field() {
+    let projection = sample_projection("name-policy");
+    let mut screen = AgentAuthoringScreen::new(projection.clone(), "name".into());
+    screen.name_field.set("");
+    for ch in "Pilot Noteworthy".chars() {
+        screen.handle_key(key(KeyCode::Char(ch)));
+    }
+    assert_eq!(
+        screen.name_field.text(),
+        "Pilot Noteworthy",
+        "spaces are name text while the field is focused"
+    );
+    screen.handle_key(key(KeyCode::Enter));
+    assert_eq!(screen.phase, Phase::ModelGrants);
+    screen.draft.trust_confirmations[0] = true;
+    screen.draft.children.clear();
+    let package = build_package_draft(&projection, &screen.draft).unwrap();
+    assert_eq!(package.name, "pilot-noteworthy");
+    assert!(package.markdown.contains("description: Pilot Noteworthy"));
+    assert!(
+        package
+            .markdown
+            .contains("agentId: authored/pilot-noteworthy")
+    );
+
+    screen.phase = Phase::SourceIdentity;
+    screen.handle_key(key(KeyCode::Tab));
+    screen.handle_key(key(KeyCode::Down));
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert_eq!(
+        screen.draft.source_selection,
+        SourceSelection::Authored,
+        "source choices remain keyboard-accessible with their own focus"
+    );
+    screen.handle_key(key(KeyCode::Tab));
+    assert!(screen.name_focused);
+
+    for invalid in ["", "-bad", "../escape", "bad/name", "bad.name", "💥"] {
+        screen.phase = Phase::SourceIdentity;
+        screen.name_field.set(invalid);
+        assert!(screen.handle_key(key(KeyCode::Enter)).is_none());
+        assert_eq!(
+            screen.phase,
+            Phase::SourceIdentity,
+            "{invalid} must be rejected at entry"
+        );
+        let rendered = render_string(&mut screen, 80, 24);
+        let visible = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(visible.contains("Agent slug must start with a lowercase letter or digit and contain only a-z, 0-9, '-' or '_'. Spaces become hyphens; use a name that produces a valid slug."), "complete reason must wrap next to the name: {rendered}");
+    }
+    screen.begin_add_subagent();
+    screen.name_field.set("");
+    for ch in "Quick Helper".chars() {
+        screen.handle_key(key(KeyCode::Char(ch)));
+    }
+    assert_eq!(screen.name_field.text(), "Quick Helper");
+    screen.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::ModelGrants)
+    );
+    screen.back();
+    screen.name_field.set("bad/name");
+    screen.handle_key(key(KeyCode::Enter));
+    assert_eq!(screen.phase, Phase::SubagentEdit(SubagentPhase::Identity));
+}
+
+#[test]
+fn short_first_run_creates_safe_default_without_tuning_or_trust_grants() {
+    let mut projection = sample_projection("safe-policy");
+    projection.policy.routes[0].trust = AgentPolicyTrustClassification::Untrusted;
+    projection.policy.routes[0].confirmation_required = false;
+    let mut screen = AgentAuthoringScreen::first_run(projection.clone(), "short-create".into());
+    assert_eq!(screen.phase, Phase::Pending);
+    let Some(AgentAuthoringAction::ApplyPackage {
+        client_operation_id,
+        package,
+    }) = screen.take_pending_action()
+    else {
+        panic!("short first run must create directly")
+    };
+    assert_eq!(client_operation_id, "short-create");
+    assert_eq!(package.name, "pilot");
+    assert!(package.make_default);
+    assert!(package.model_trust_confirmations.is_empty());
+    assert!(package.children.is_empty());
+    assert!(package.sidecars.is_empty());
+    assert!(!package.markdown.contains("verification:"));
+    let optional = AgentAuthoringScreen::new(projection, "optional".into());
+    assert_eq!(
+        optional.phase,
+        Phase::SourceIdentity,
+        "optional authoring keeps the full editor"
+    );
+}

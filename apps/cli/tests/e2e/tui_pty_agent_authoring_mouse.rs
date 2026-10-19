@@ -1,9 +1,8 @@
 //! Mouse-only agent authoring through Subagents → Review → Create (#432).
 //!
-//! The isolated home is seeded to the agent onboarding stage with a loopback
-//! provider and machine-bound vault; the PTY child still cold-boots its daemon
-//! but should mount agent authoring immediately. Keyboard is not used inside
-//! the nested editor walk.
+//! The isolated home has completed onboarding with a loopback provider and
+//! machine-bound vault. The /setup summary opens optional authoring; keyboard is
+//! not used inside the nested editor walk.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -213,9 +212,9 @@ fn mouse_through_agent_authoring(session: &mut HermeticCockpit) {
     click_text(session, "[ Create agent ]");
     session
         .wait_until_screen("agent package committed", AGENT_ASYNC_TIMEOUT, |screen| {
-            screen.contains("Background agents") && screen.contains("step 7/8")
+            screen.contains("Your agent is ready")
         })
-        .expect("committed agent package advances onboarding to the Lifetime stage");
+        .expect("optional authored package commits without reopening onboarding");
 }
 
 fn find_runner_subagent_package(agents_root: &Path) -> Option<PathBuf> {
@@ -248,7 +247,7 @@ fn tui_pty_mouse_agent_authoring_keeps_runner_subagent() {
     let (provider_url, provider_shutdown) = spawn_loopback_models_provider();
 
     let mut session = HermeticCockpit::prepare_fresh(HermeticProfile::Default);
-    session.home().seed_onboarding_open_at_agent(&provider_url);
+    session.home().seed_agent_setup_ready(&provider_url);
     session.enable_isolated_secret_service();
     session.start_detached_daemon();
     session.home().set_workspace_trust_via_daemon();
@@ -258,13 +257,35 @@ fn tui_pty_mouse_agent_authoring_keeps_runner_subagent() {
         .expect("spawn agent-authoring PTY child against pre-started daemon");
 
     session
+        .wait_until_screen(
+            "ready before optional agent setup",
+            COLD_BOOT_TIMEOUT,
+            |screen| screen.contains(crate::support::COMPOSER_PLACEHOLDER),
+        )
+        .expect("completed fixture reaches the composer");
+    session.settle_visible_state(TRANSITION_TIMEOUT);
+    session.write_str("/setup");
+    session.checkpoint_input_with_redraw();
+    session.send_enter();
+    session.checkpoint_input_with_redraw();
+    session
+        .wait_until_screen("setup summary", TRANSITION_TIMEOUT, |screen| {
+            screen.contains("You're ready to fly")
+        })
+        .expect("bare /setup opens the optional setup summary");
+    click_text(&mut session, "[ Agent setup ]");
+    session
         .wait_until_screen("agent authoring stage", COLD_BOOT_TIMEOUT, |screen| {
-            screen.contains("step 6/8") && screen.contains("Create your first agent")
+            screen.contains("step 5/5") && screen.contains("Create an agent")
         })
         .expect("seeded onboarding opens agent authoring in the PTY child");
 
     session.home().set_workspace_trust_via_daemon();
 
+    // The only text entry is a native paste into the name field; every
+    // authoring selection and confirmation below is still mouse-only.
+    session.write_bytes(b"\x1b[200~Optional Pilot\x1b[201~");
+    session.checkpoint_input_with_redraw();
     mouse_through_agent_authoring(&mut session);
     let agents_root = session.home().daemon_agents_dir();
     let runner_deadline = Instant::now() + RUNNER_ARTIFACT_TIMEOUT;
@@ -287,9 +308,9 @@ fn tui_pty_mouse_agent_authoring_keeps_runner_subagent() {
         "runner subagent markdown must survive mouse-only authoring: {markdown}"
     );
 
+    session.reap();
     provider_shutdown.store(true, Ordering::Relaxed);
     session.stop_child_spawned_daemon();
     session.forget_fixture_daemon_ownership();
-    session.reap();
     session.assert_reaped();
 }

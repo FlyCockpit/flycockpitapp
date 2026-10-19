@@ -287,18 +287,31 @@ pub fn authoring_projection(
     })
 }
 
+/// Derive the package identity without changing the display name. Whitespace
+/// separates slug words; punctuation is validated rather than silently lost.
+pub fn authored_agent_slug(display_name: &str) -> Result<String, AuthoredPackageRejection> {
+    let slug = display_name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_ascii_lowercase();
+    validate_authored_agent_name(&slug)?;
+    Ok(slug)
+}
+
+/// Package paths and launch-v1 agent IDs share this enforced spelling.
 pub fn validate_authored_agent_name(name: &str) -> Result<(), AuthoredPackageRejection> {
-    if name.is_empty()
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains('.')
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    if !name
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || !name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        })
     {
         return Err(AuthoredPackageRejection::new(
             AuthoredAgentRejectReason::InvalidNestedGraph,
-            "authored agent name must be ASCII alphanumeric with '-' or '_' only",
+            "Agent slug must start with a lowercase letter or digit and contain only a-z, 0-9, '-' or '_'. Spaces become hyphens; use a name that produces a valid slug.",
         ));
     }
     Ok(())

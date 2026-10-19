@@ -222,22 +222,13 @@ fn mouse_only_walkthrough_reaches_the_provider_catalog() {
 fn profile_stage_presents_its_native_screen_and_step() {
     assert_eq!(
         PROGRESS_STEPS,
-        [
-            "Welcome",
-            "Name",
-            "Secrets",
-            "Provider",
-            "Model",
-            "Agent",
-            "Background",
-            "Ready",
-        ]
+        ["Name", "Secrets", "Provider", "Model", "Start coding"]
     );
     let mut shell = shell_at(OnboardingStage::Profile);
     let mut engine = Dialog::None;
     assert_eq!(shell.screen_kind(), OnboardingScreenKind::Profile);
     let rendered = render_string(&mut shell, 110, 32, &engine);
-    assert!(rendered.contains("step 2/8"), "{rendered}");
+    assert!(rendered.contains("step 1/5"), "{rendered}");
     assert!(
         rendered.contains("What should Cockpit call you?"),
         "{rendered}"
@@ -1869,12 +1860,12 @@ fn progress_row_sits_between_header_and_rule_in_width_tiers() {
     let cases = [
         (
             120u16,
-            "✓ Welcome  ✓ Name  ◆ Secrets  · Provider  · Model  · Agent  · Background  · Ready",
+            "✓ Name  ◆ Secrets  · Provider  · Model  · Start coding",
         ),
-        (80, "✓  ✓  ◆ Secrets  ·  ·  ·  ·  ·"),
-        (60, "✓  ✓  ◆ Secrets  ·  ·  ·  ·  ·"),
-        (40, "✓  ✓  ◆ Secrets  ·  ·  ·  ·  ·"),
-        (30, "Step 3 of 8 · Secrets"),
+        (80, "✓ Name  ◆ Secrets  · Provider  · Model  · Start coding"),
+        (60, "✓ Name  ◆ Secrets  · Provider  · Model  · Start coding"),
+        (40, "✓  ◆ Secrets  ·  ·  ·"),
+        (30, "✓  ◆ Secrets  ·  ·  ·"),
     ];
     for (width, progress) in cases {
         let mut shell = shell_at(OnboardingStage::SecureStore);
@@ -1882,12 +1873,12 @@ fn progress_row_sits_between_header_and_rule_in_width_tiers() {
         let column = rows[1].find("Secure your secrets").expect("title row");
         let at = |row: usize| rows[row].get(column..).unwrap_or_default().to_string();
         assert!(
-            at(1).starts_with("Secure your secrets · step 3/8") || width < 40,
+            at(1).starts_with("Secure your secrets · step 2/5") || width < 40,
             "{rows:#?}"
         );
         assert_eq!(at(3), progress, "{width} cols: {rows:#?}");
         assert!(
-            !at(3).contains("step 3/8") || width < 40,
+            !at(3).contains("step 2/5") || width < 40,
             "count lives in the title"
         );
         let rule = at(4);
@@ -2024,39 +2015,57 @@ fn short_terminals_still_show_the_footer_fields_and_all_secure_choices() {
 }
 
 #[test]
-fn every_step_label_names_the_step_its_screen_title_names() {
-    // One name per step: the progress label is the shortened wording of
-    // the step's entry-screen header (title, or subtitle for the profile
-    // question), so the row never disagrees with the header.
-    for (index, stage) in [
-        OnboardingStage::Profile,
-        OnboardingStage::SecureStore,
-        OnboardingStage::Provider,
-        OnboardingStage::Model,
-        OnboardingStage::Agent,
-        OnboardingStage::Lifetime,
-        OnboardingStage::Complete,
-    ]
-    .into_iter()
-    .enumerate()
-    {
+fn every_stage_names_its_visible_checkpoint_and_operation() {
+    // The five user decisions also cover automatic agent/lifetime work.
+    // Pin every daemon stage: none may advertise a sixth required decision.
+    for (stage, label, operation) in [
+        (OnboardingStage::Welcome, "Name", "welcome"),
+        (
+            OnboardingStage::Profile,
+            "Name",
+            "what should cockpit call you",
+        ),
+        (
+            OnboardingStage::SecureStore,
+            "Secrets",
+            "secure your secrets",
+        ),
+        (
+            OnboardingStage::Provider,
+            "Provider",
+            "let's add a provider",
+        ),
+        (OnboardingStage::Model, "Model", "choose your default model"),
+        (OnboardingStage::Agent, "Start coding", "create an agent"),
+        (
+            OnboardingStage::Lifetime,
+            "Start coding",
+            "background agents",
+        ),
+        (
+            OnboardingStage::Complete,
+            "Start coding",
+            "you're ready to fly",
+        ),
+    ] {
         let mut shell = shell_at(stage);
         if stage == OnboardingStage::Agent {
-            // The app mounts the authoring entry screen asynchronously.
             shell.present_agent_authoring(agent::golden_sample_projection(), "label".into());
         }
-        let label = PROGRESS_STEPS[index + 1];
-        let rows = render_rows(&mut shell, 120, 40);
-        let header = format!("{} {}", rows[1], rows[2]).to_lowercase();
-        assert!(
-            header.contains(&label.to_lowercase()),
-            "{stage:?}: label {label:?} absent from header {header:?}"
-        );
-        assert!(
-            rows[3].contains(&format!("◆ {label}")),
-            "{stage:?}: {:?}",
-            rows[3]
-        );
+        if stage == OnboardingStage::Welcome {
+            // Welcome intentionally owns the whole frame and has no progress row.
+            assert_eq!(PROGRESS_STEPS[progress_index(stage)], label);
+            assert_eq!(shell.screen_title().to_lowercase(), operation);
+        } else {
+            let rows = render_rows(&mut shell, 120, 40);
+            let header = format!("{} {}", rows[1], rows[2]).to_lowercase();
+            assert!(header.contains(operation), "{stage:?}: {header:?}");
+            assert!(
+                rows[3].contains(&format!("◆ {label}")),
+                "{stage:?}: {:?}",
+                rows[3]
+            );
+        }
     }
 }
 
@@ -2645,4 +2654,189 @@ fn click_after_prompt_advances_welcome() {
             None
         ))
     ));
+}
+
+#[test]
+fn short_onboarding_model_selection_skips_every_advanced_page() {
+    let config = model_catalog_with_distinct_policies();
+    let mut shell = shell_at(OnboardingStage::Model);
+    shell.present_default_model(&config, Some(("provider", "model-b")));
+    let mut engine = Dialog::None;
+    let Some(OnboardingShellAction::ApplyModel(submission)) =
+        shell.handle_key(key(KeyCode::Enter), &mut engine)
+    else {
+        panic!(
+            "one model choice must submit, without a trust/capabilities/limits/thinking/delegation page"
+        );
+    };
+    assert_eq!(submission.model_id, "model-b");
+    assert_eq!(
+        submission.trust, "trusted",
+        "existing trust policy must be preserved"
+    );
+    assert_eq!(submission.thinking, "off");
+    assert_eq!(submission.subagent_flags, vec!["subagent_invokable"]);
+}
+
+#[test]
+fn default_model_search_keeps_jk_in_field_and_list_navigation_visible() {
+    use cockpit_config::providers::ModelEntry;
+    let mut config = model_catalog_with_distinct_policies();
+    config.providers.get_mut("provider").unwrap().models = (0..80)
+        .map(|index| ModelEntry {
+            id: format!("jk-model-{index:02}"),
+            ..Default::default()
+        })
+        .collect();
+    let mut shell = shell_at(OnboardingStage::Model);
+    shell.present_default_model(&config, Some(("provider", "jk-model-60")));
+    let mut engine = Dialog::None;
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    let draw = |terminal: &mut Terminal<TestBackend>, shell: &mut OnboardingShell| {
+        terminal
+            .draw(|frame| {
+                shell.render(
+                    frame,
+                    frame.area(),
+                    &Dialog::None,
+                    &mut crate::tui::links::LinkRegistry::default(),
+                )
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let initial = draw(&mut terminal, &mut shell);
+    assert!(
+        initial.contains("★ Selected: provider / jk-model-60"),
+        "{initial}"
+    );
+    assert!(
+        initial.contains("★ jk-model-60"),
+        "the selected list row must be revealed: {initial}"
+    );
+    for ch in "jk-model-07".chars() {
+        shell.handle_key(key(KeyCode::Char(ch)), &mut engine);
+    }
+    let filtered = draw(&mut terminal, &mut shell);
+    assert!(filtered.contains("jk-model-07"), "{filtered}");
+    assert!(
+        !filtered.contains("jk-model-06"),
+        "typing must filter; j/k belong to search: {filtered}"
+    );
+    // Search keeps Home/End for its caret; Tab explicitly focuses the list.
+    shell.handle_key(key(KeyCode::Tab), &mut engine);
+    let Some(OnboardingShellAction::ApplyModel(submission)) =
+        shell.handle_key(key(KeyCode::Enter), &mut engine)
+    else {
+        panic!("filtered choice must submit")
+    };
+    assert_eq!(submission.model_id, "jk-model-07");
+    shell.present_default_model(&config, Some(("provider", "jk-model-60")));
+    draw(&mut terminal, &mut shell);
+    shell.handle_key(key(KeyCode::Tab), &mut engine);
+    shell.handle_key(key(KeyCode::Home), &mut engine);
+    let first = draw(&mut terminal, &mut shell);
+    assert!(first.contains("jk-model-00"), "{first}");
+    shell.handle_key(key(KeyCode::PageDown), &mut engine);
+    let paged = draw(&mut terminal, &mut shell);
+    assert!(
+        !paged.contains("◉   jk-model-00"),
+        "PageDown must move list focus: {paged}"
+    );
+    shell.handle_key(key(KeyCode::End), &mut engine);
+    let last = draw(&mut terminal, &mut shell);
+    assert!(last.contains("jk-model-79"), "{last}");
+    shell.handle_key(key(KeyCode::Char('k')), &mut engine);
+    let Some(OnboardingShellAction::ApplyModel(submission)) =
+        shell.handle_key(key(KeyCode::Enter), &mut engine)
+    else {
+        panic!("list choice must submit")
+    };
+    assert_eq!(submission.model_id, "jk-model-78");
+}
+
+#[test]
+fn default_model_provider_selector_refresh_recovers_and_401_blocks_continue() {
+    let mut config = model_catalog_with_distinct_policies();
+    config
+        .providers
+        .insert("second".into(), config.providers["provider"].clone());
+    let mut shell = shell_at(OnboardingStage::Model);
+    shell.present_default_model(&config, Some(("provider", "model-a")));
+    let mut engine = Dialog::None;
+    shell.handle_key(key(KeyCode::Tab), &mut engine);
+    shell.handle_key(key(KeyCode::Tab), &mut engine);
+    shell.handle_key(key(KeyCode::Char('j')), &mut engine);
+    shell.handle_key(key(KeyCode::Char('k')), &mut engine);
+    shell.handle_key(key(KeyCode::Right), &mut engine);
+    assert_eq!(shell.model_selection(), Some(("second", "model-a")));
+    let refresh = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    assert!(
+        matches!(shell.handle_key(refresh, &mut engine), Some(OnboardingShellAction::RetryProviderVerification { provider_id }) if provider_id == "second")
+    );
+    assert!(
+        shell.handle_key(key(KeyCode::Enter), &mut engine).is_none(),
+        "do not race an in-flight credential check"
+    );
+    assert!(shell.apply_model_catalog_refresh("second", VerifyOutcome::Unauthorized(401), &config));
+    assert!(
+        shell.handle_key(key(KeyCode::Enter), &mut engine).is_none(),
+        "rejected credentials must fail closed"
+    );
+    shell.apply_model_catalog_refresh("second", VerifyOutcome::Network("offline".into()), &config);
+    assert!(
+        shell.handle_key(key(KeyCode::Enter), &mut engine).is_none(),
+        "a later network error must not forgive a rejected credential"
+    );
+    shell.handle_key(key(KeyCode::Left), &mut engine);
+    shell.handle_key(key(KeyCode::Right), &mut engine);
+    assert!(
+        shell.handle_key(key(KeyCode::Enter), &mut engine).is_none(),
+        "switching away and back must not forgive a rejected credential"
+    );
+    // A retry uses the saved provider; the user need not restart setup.
+    assert!(matches!(
+        shell.handle_key(refresh, &mut engine),
+        Some(OnboardingShellAction::RetryProviderVerification { .. })
+    ));
+    shell.apply_model_catalog_refresh(
+        "second",
+        VerifyOutcome::Models(vec!["model-a".into()].into()),
+        &config,
+    );
+    assert!(matches!(
+        shell.handle_key(key(KeyCode::Enter), &mut engine),
+        Some(OnboardingShellAction::ApplyModel(_))
+    ));
+}
+
+#[test]
+fn setup_summary_exposes_optional_agent_editor_without_changing_start_coding_default() {
+    let mut shell = shell_at(OnboardingStage::Complete);
+    shell.present_completion("ready".into());
+    let rendered = render_string(&mut shell, 90, 24, &Dialog::None);
+    assert!(
+        rendered.contains("Agent setup"),
+        "optional tuning must be visible: {rendered}"
+    );
+    let mut engine = Dialog::None;
+    assert!(matches!(
+        shell.handle_key(key(KeyCode::Char('g')), &mut engine),
+        Some(OnboardingShellAction::OpenAgentSetup)
+    ));
+    shell.present_completion("ready".into());
+    assert!(
+        matches!(
+            shell.handle_key(key(KeyCode::Enter), &mut engine),
+            Some(OnboardingShellAction::Close)
+        ),
+        "Start coding remains the default first-run action"
+    );
 }

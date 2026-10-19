@@ -966,8 +966,12 @@ pub fn assert_onboarding_native_screens() {
         assert_golden_sizes("onboarding", name, |width, height| {
             let mut shell = onboarding_shell_at(OnboardingStage::Model);
             let config = golden_model_config();
-            shell.present_model(&config, Some(("openai", "gpt-5.2-codex")));
-            shell.set_model_phase_for_golden(phase);
+            if phase == crate::tui::onboarding::ModelPhase::DefaultModel {
+                shell.present_default_model(&config, Some(("openai", "gpt-5.2-codex")));
+            } else {
+                shell.present_model(&config, Some(("openai", "gpt-5.2-codex")));
+                shell.set_model_phase_for_golden(phase);
+            }
             let engine = Dialog::None;
             let mut links = crate::tui::links::LinkRegistry::default();
             render_frame(width, height, |frame| {

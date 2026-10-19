@@ -1,7 +1,7 @@
  ‹ Back                                                                                                                 
-                 Delegation · step 5/8                                                                                  
+                 Delegation · step 4/5                                                                                  
                  Choose how this model participates in delegation.                                                      
-                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Agent  · Background  · Ready                      
+                 ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Start coding                                                 
                  ──────────────────────────────────────────────────────────────────────────────────────                 
                                                                                                                         
                  ╭ Delegation ────────────────────────────────────────────────────────────────────────╮                 

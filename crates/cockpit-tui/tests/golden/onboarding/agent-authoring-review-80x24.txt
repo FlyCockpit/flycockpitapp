@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Ready to create · step 6/8                                                    
+  Ready to create · step 5/5                                                    
   Read the package back once before Cockpit creates it.                         
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Summary ─────────────────────────────────────────────────────────────────╮  

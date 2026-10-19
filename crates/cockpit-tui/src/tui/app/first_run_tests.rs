@@ -260,15 +260,13 @@ fn complete_native_model(app: &mut App) {
         shell_screen_kind(app),
         Some(crate::tui::onboarding::OnboardingScreenKind::Model)
     );
-    for phase in ModelPhase::ALL {
-        assert_eq!(
-            app.onboarding_shell
-                .as_ref()
-                .and_then(|shell| shell.model_phase()),
-            Some(phase)
-        );
-        shell_key(app, KeyCode::Enter);
-    }
+    assert_eq!(
+        app.onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.model_phase()),
+        Some(ModelPhase::DefaultModel)
+    );
+    shell_key(app, KeyCode::Enter);
     assert!(
         app.onboarding_shell
             .as_ref()
@@ -521,7 +519,11 @@ fn first_run_provider_without_catalog_offers_manual_model_entry() {
     );
     let rendered = render_app(&mut app, 100, 30);
     assert!(rendered.contains("Model ID"), "{rendered}");
-    assert!(rendered.contains("type model id"), "{rendered}");
+    assert!(rendered.contains("Ctrl+R"), "{rendered}");
+    // Search, list, provider, then the explicit manual-entry fallback.
+    for _ in 0..3 {
+        shell_key(&mut app, KeyCode::Tab);
+    }
     for ch in "manual-model".chars() {
         shell_key(&mut app, KeyCode::Char(ch));
     }
@@ -532,11 +534,11 @@ fn first_run_provider_without_catalog_offers_manual_model_entry() {
         Some(("p", "manual-model"))
     );
     shell_key(&mut app, KeyCode::Enter);
-    assert_eq!(
+    assert!(
         app.onboarding_shell
             .as_ref()
-            .and_then(|shell| shell.model_phase()),
-        Some(crate::tui::onboarding::ModelPhase::Trust)
+            .is_some_and(|shell| shell.transition_pending()),
+        "one model selection must settle directly without advanced tuning"
     );
     assert!(!app.dialog.is_active());
 }
@@ -1500,5 +1502,43 @@ fn onboarding_workspace_trust_pointer_uses_painted_wrapped_choices() {
                 "clipped choices are inert"
             );
         }
+    }
+}
+
+#[test]
+fn model_resume_uses_global_catalog_even_with_ignored_or_untrusted_project_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(
+        tmp.path(),
+        &config_with_provider("project-injection", "must-not-select"),
+    );
+    write_global_provider_config_on_disk(&config_with_provider("verified-global", "saved-model"));
+    for mode in [
+        cockpit_config::WorkspaceTrustMode::Trust,
+        cockpit_config::WorkspaceTrustMode::IgnoreConfig,
+        cockpit_config::WorkspaceTrustMode::Untrusted,
+    ] {
+        let policy = cockpit_config::trust::WorkspaceTrustPolicy {
+            root: cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode,
+        };
+        cockpit_config::trust::with_workspace_trust_policy(policy, || {
+            let mut app = App::new(Some(tmp.path()), false);
+            inject_onboarding_stage(&mut app, OnboardingStage::Model);
+            let rendered = render_app(&mut app, 100, 30);
+            assert!(rendered.contains("verified-global"), "{mode:?}: {rendered}");
+            assert!(rendered.contains("saved-model"), "{mode:?}: {rendered}");
+            assert!(
+                !rendered.contains("project-injection"),
+                "global model setup must not consume project overlays: {mode:?}: {rendered}"
+            );
+            assert_eq!(
+                app.onboarding_shell
+                    .as_ref()
+                    .and_then(|shell| shell.model_selection()),
+                Some(("verified-global", "saved-model"))
+            );
+        });
     }
 }

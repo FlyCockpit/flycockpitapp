@@ -220,9 +220,9 @@ impl IsolatedHome {
         });
     }
 
-    /// Leave first-run onboarding open at the agent authoring stage with a
-    /// machine-bound vault and a loopback provider already configured.
-    pub fn seed_onboarding_open_at_agent(&self, provider_url: &str) {
+    /// Complete first run with a machine-bound vault and loopback provider,
+    /// ready for the optional /setup agent editor.
+    pub fn seed_agent_setup_ready(&self, provider_url: &str) {
         self.write_agent_authoring_loopback_provider(provider_url);
         let cockpit_data_dir = self.data_home.join("cockpit");
         std::fs::create_dir_all(&cockpit_data_dir).expect("create isolated cockpit data dir");
@@ -259,12 +259,12 @@ impl IsolatedHome {
                 let (snapshot, _) = db
                     .onboarding_begin_or_reopen(None, "fixture-agent-begin".into(), false)
                     .await
-                    .expect("begin agent-stage onboarding fixture");
+                    .expect("begin optional-agent onboarding fixture");
                 db.onboarding_transition(
                     snapshot,
                     "fixture-agent-stage".into(),
                     cockpit_db::db::onboarding::OnboardingTransitionOutcome {
-                        next_stage: cockpit_db::db::onboarding::OnboardingStage::Agent,
+                        next_stage: cockpit_db::db::onboarding::OnboardingStage::Complete,
                         bootstrap_state:
                             cockpit_db::db::onboarding::OnboardingBootstrapState::Ready,
                         limited_mode: false,
@@ -275,11 +275,11 @@ impl IsolatedHome {
                     0,
                 )
                 .await
-                .expect("open onboarding at the agent authoring stage");
+                .expect("complete onboarding for optional agent authoring");
             });
         })
         .join()
-        .expect("agent-stage onboarding fixture thread panicked");
+        .expect("optional-agent onboarding fixture thread panicked");
     }
 
     /// Seed the explicit authority owned by legacy E2E profiles that model an

@@ -76,6 +76,20 @@ fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+fn render_app(app: &mut App, width: u16, height: u16) -> String {
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .chunks(usize::from(width))
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn shell_key(app: &mut App, code: KeyCode) -> bool {
     app.handle_onboarding_shell_key(press(code))
 }
@@ -277,182 +291,7 @@ fn with_trusted_fixture_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -
     )
 }
 
-fn seed_computer_use_catalog_capabilities() {
-    use cockpit_config::providers::{
-        CapabilityStatus, ComputerUseCapability, ComputerUseContract, ModelCapabilities,
-        ModelLocation,
-    };
-    let global = cockpit_config::dirs::global_config_file().expect("isolated global config path");
-    let model_target =
-        cockpit_config::providers::provider_file_path_for_config(&global, "localtest")
-            .expect("committed provider file path");
-    let mut doc = ConfigDoc::load(&model_target).expect("committed provider config file");
-    let mut providers = doc.providers();
-    let entry = providers
-        .providers
-        .get_mut("localtest")
-        .expect("the committed provider owns its model file");
-    let model = entry
-        .models
-        .iter_mut()
-        .find(|model| model.id == "manual-model")
-        .expect("the verification probe persisted its fetched model");
-    model.manual = true;
-    model.location = Some(ModelLocation::Remote);
-    model.capabilities = ModelCapabilities {
-        context_tokens: Some(200_000),
-        tool_calling: CapabilityStatus::Supported,
-        computer_use: ComputerUseCapability {
-            contract: Some(ComputerUseContract::OpenAiResponses),
-            ..ComputerUseCapability::default()
-        },
-        ..ModelCapabilities::default()
-    };
-    doc.write(&providers)
-        .expect("seeding catalog capability metadata onto the provider file");
-}
-
-fn agent_authoring_phase(app: &App) -> Option<crate::tui::onboarding::agent::Phase> {
-    app.onboarding_shell
-        .as_ref()
-        .and_then(|shell| shell.test_agent_authoring_phase())
-}
-
-fn sync_config_generation_after_agent_apply(app: &mut App, generation: u64) {
-    app.sync_config_generation_after_authored_agent_apply(generation);
-}
-
-fn settle_agent_via_real_daemon_rpc(app: &mut App) {
-    use cockpit_core::authoring_draft::{AgentAuthoringDraft, build_package_draft};
-    use cockpit_proto::{ApplyAuthoredAgentPackageRequest, AuthoredAgentOnboardingCorrelation};
-
-    pump_onboarding(
-        app,
-        |app| {
-            stage(app) == Some(OnboardingStage::Agent)
-                && shell_kind(app)
-                    == Some(crate::tui::onboarding::OnboardingScreenKind::AgentAuthoring)
-        },
-        "the settled Model→Agent advance and agent authoring projection",
-    );
-
-    let snapshot = app
-        .onboarding_snapshot
-        .clone()
-        .expect("agent stage snapshot");
-    let operation_id = app
-        .onboarding_agent_operation_id
-        .clone()
-        .unwrap_or_else(|| format!("first-run-agent-{}", uuid::Uuid::new_v4()));
-    app.onboarding_agent_operation_id = Some(operation_id.clone());
-
-    use crate::tui::settings::SettingsDaemonEffect;
-    let effect = InProcessSettingsDaemonEffect;
-    let projection = match SettingsDaemonEffect::request(
-        &effect,
-        cockpit_proto::Request::GetAgentAuthoringProjection,
-    ) {
-        Ok(cockpit_proto::Response::AgentAuthoringProjection(projection)) => projection,
-        Ok(other) => panic!("unexpected agent projection response: {other:?}"),
-        Err(error) => panic!("agent projection unavailable: {error}"),
-    };
-    if let Some(shell) = app.onboarding_shell.as_mut() {
-        shell.present_agent_authoring(projection.clone(), operation_id.clone());
-    }
-
-    let draft = AgentAuthoringDraft::from_projection(&projection);
-    for (index, _) in draft
-        .pending_trust_route_indices(&projection)
-        .into_iter()
-        .enumerate()
-    {
-        let _ = index;
-        // Real routes that require explicit trust confirmation must be acknowledged
-        // before the canonical package builder will validate.
-    }
-    let mut draft = draft;
-    for index in draft.pending_trust_route_indices(&projection) {
-        draft.trust_confirmations[index] = true;
-    }
-    let package = build_package_draft(&projection, &draft).unwrap_or_else(|error| {
-        panic!("canonical package construction failed: {error}");
-    });
-    let correlation = AuthoredAgentOnboardingCorrelation {
-        run_id: snapshot.run_id,
-        attempt_id: snapshot.attempt_id,
-        stage_revision: snapshot.revision,
-    };
-    let preview_request = ApplyAuthoredAgentPackageRequest {
-        client_operation_id: format!("{operation_id}-preview"),
-        expected_policy_revision: package.policy_revision.clone(),
-        package: package.clone(),
-        onboarding: Some(correlation.clone()),
-        validate_only: true,
-    };
-    let preview = match SettingsDaemonEffect::request(
-        &effect,
-        cockpit_proto::Request::ApplyAuthoredAgentPackage(preview_request),
-    ) {
-        Ok(cockpit_proto::Response::AuthoredAgentPackage(outcome)) => outcome,
-        Ok(other) => panic!("unexpected preview response: {other:?}"),
-        Err(error) => panic!("preview failed: {error}"),
-    };
-    if let Some(shell) = app.onboarding_shell.as_mut() {
-        shell.apply_agent_authoring_outcome(preview);
-    }
-    let apply_request = ApplyAuthoredAgentPackageRequest {
-        client_operation_id: operation_id,
-        expected_policy_revision: package.policy_revision.clone(),
-        package,
-        onboarding: Some(correlation),
-        validate_only: false,
-    };
-    let apply = match SettingsDaemonEffect::request(
-        &effect,
-        cockpit_proto::Request::ApplyAuthoredAgentPackage(apply_request),
-    ) {
-        Ok(cockpit_proto::Response::AuthoredAgentPackage(outcome)) => outcome,
-        Ok(other) => panic!("unexpected apply response: {other:?}"),
-        Err(error) => panic!("apply failed: {error}"),
-    };
-    let generation = match &apply {
-        cockpit_proto::ApplyAuthoredAgentPackageOutcome::Receipt(receipt)
-            if receipt.status == cockpit_proto::AuthoredAgentReceiptStatus::Committed =>
-        {
-            receipt.result_config_generation
-        }
-        other => panic!("apply did not commit: {other:?}"),
-    };
-    if let Some(shell) = app.onboarding_shell.as_mut() {
-        shell.apply_agent_authoring_outcome(apply);
-    }
-    sync_config_generation_after_agent_apply(app, generation);
-    pump_onboarding(
-        app,
-        |app| agent_authoring_phase(app) == Some(crate::tui::onboarding::agent::Phase::Success),
-        "authored-agent receipt applied to the nested editor",
-    );
-    pump_onboarding(
-        app,
-        |app| stage(app) == Some(OnboardingStage::Lifetime),
-        "agent stage settlement advancing to lifetime",
-    );
-}
-
 fn complete_real_first_run_lifetime(app: &mut App, persistent_background_agents: bool) {
-    pump_onboarding(
-        app,
-        |app| {
-            stage(app) == Some(OnboardingStage::Lifetime)
-                && shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Lifetime)
-        },
-        "the settled Agent→Lifetime advance through the real installation",
-    );
-
-    if !persistent_background_agents {
-        shell_key(app, KeyCode::Down);
-    }
-    shell_key(app, KeyCode::Enter);
     pump_onboarding(
         app,
         |app| {
@@ -462,9 +301,8 @@ fn complete_real_first_run_lifetime(app: &mut App, persistent_background_agents:
                     .as_ref()
                     .is_some_and(|shell| shell.screen_is_complete())
         },
-        "the authoritative Complete revision to present the summary",
+        "default agent creation and automatic lifetime settlement to reach Start coding",
     );
-
     let global = cockpit_config::dirs::global_config_file().expect("isolated global config path");
     let cfg = cockpit_config::extended::ExtendedConfigDoc::load(&global)
         .expect("lifetime settlement wrote global config")
@@ -623,24 +461,49 @@ fn advance_real_first_run_to_provider(app: &mut App) {
 }
 
 fn advance_real_first_run_from_provider_search_to_agent(app: &mut App, root: &std::path::Path) {
+    // A previously trusted workspace may contain a provider with the same
+    // ID. Onboarding's global save and refresh must never use or mutate it.
+    seed_workspace_trust(root);
+    let project_config = root.join(".cockpit/config.json");
+    let mut shadow = ProvidersConfig::default();
+    shadow.providers.insert(
+        "localtest".into(),
+        cockpit_config::providers::ProviderEntry {
+            url: "http://127.0.0.1:9/project-must-not-be-used".into(),
+            allow_insecure_http: true,
+            auth: Some(cockpit_config::providers::AuthKind::None),
+            models: vec![cockpit_config::providers::ModelEntry {
+                id: "project-injected-model".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    with_trusted_fixture_root(root, || {
+        ConfigDoc::load(&project_config).unwrap().write(&shadow)
+    })
+    .unwrap();
+    let project_preimage = std::fs::read(&project_config).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
     let provider_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let provider = std::thread::spawn(move || {
         use std::io::{Read, Write};
-        let (mut socket, _) = listener.accept().expect("accept model fetch");
-        socket
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
-        let mut request = [0_u8; 4096];
-        let _ = socket.read(&mut request).expect("read model fetch");
-        let body = r#"{"data":[{"id":"manual-model","object":"model"}],"object":"list"}"#;
-        write!(
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().expect("accept model fetch");
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).expect("read model fetch");
+            let body = r#"{"data":[{"id":"manual-model","object":"model"}],"object":"list"}"#;
+            write!(
             socket,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         )
         .expect("write model catalog");
+        }
     });
 
     for ch in "compat".chars() {
@@ -689,9 +552,6 @@ fn advance_real_first_run_from_provider_search_to_agent(app: &mut App, root: &st
         },
         "the daemon model probe to connect the provider",
     );
-    provider
-        .join()
-        .expect("fake provider exits after verification");
     shell_key(app, KeyCode::Enter);
 
     pump_onboarding(
@@ -710,102 +570,124 @@ fn advance_real_first_run_from_provider_search_to_agent(app: &mut App, root: &st
         "the daemon-committed provider must be visible in the refreshed config"
     );
 
-    seed_workspace_trust(root);
-    seed_computer_use_catalog_capabilities();
+    // Quit at the durable Model checkpoint, then launch a new app against
+    // the same daemon/home. Resume must use the committed verified catalog,
+    // without asking for the key again. Only explicit Ctrl+R may issue the
+    // fixture's second catalog request.
+    shell_key(app, KeyCode::Char('c')); // text in the focused search is disposable
+    app.quit_from_onboarding();
+    assert!(app.exit_requested);
+    *app = real_first_run_app(root);
+    pump_onboarding(
+        app,
+        |app| stage(app) == Some(OnboardingStage::Model),
+        "relaunch at the durable Model checkpoint",
+    );
+    let rendered = render_app(app, 100, 30);
+    assert!(rendered.contains("localtest"), "{rendered}");
+    assert!(
+        rendered.contains("manual-model"),
+        "saved catalog must be restored: {rendered}"
+    );
+    assert!(rendered.contains("Search models"), "{rendered}");
+    assert!(
+        rendered.contains("Ctrl+R"),
+        "refresh must remain recoverable: {rendered}"
+    );
+    assert!(
+        app.config_snapshot.providers.providers["localtest"]
+            .credential_ref
+            .is_none(),
+        "presentation must not rehydrate credentials"
+    );
 
-    for ch in "manual-model".chars() {
-        shell_key(app, KeyCode::Char(ch));
-    }
-    let phase = |app: &App| {
+    app.handle_onboarding_shell_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(
         app.onboarding_shell
             .as_ref()
-            .and_then(|shell| shell.model_phase())
-    };
-    use crate::tui::onboarding::ModelPhase;
-    assert_eq!(phase(app), Some(ModelPhase::DefaultModel));
-    shell_key(app, KeyCode::Enter);
-
-    assert_eq!(phase(app), Some(ModelPhase::Trust));
-    shell_key(app, KeyCode::Down);
-    shell_key(app, KeyCode::Enter);
-
-    assert_eq!(phase(app), Some(ModelPhase::Capabilities));
-    shell_key(app, KeyCode::Char(' '));
-    shell_key(app, KeyCode::Down);
-    shell_key(app, KeyCode::Char(' '));
-    shell_key(app, KeyCode::Down);
-    shell_key(app, KeyCode::Char(' '));
-    shell_key(app, KeyCode::Enter);
-
-    assert_eq!(phase(app), Some(ModelPhase::Limits));
-    for ch in "32768".chars() {
-        shell_key(app, KeyCode::Char(ch));
-    }
-    shell_key(app, KeyCode::Tab);
-    for ch in "4096".chars() {
-        shell_key(app, KeyCode::Char(ch));
-    }
-    shell_key(app, KeyCode::Enter);
-
-    assert_eq!(phase(app), Some(ModelPhase::Thinking));
-    for _ in 0..3 {
-        shell_key(app, KeyCode::Down);
-    }
-    shell_key(app, KeyCode::Enter);
-
-    assert_eq!(phase(app), Some(ModelPhase::Delegation));
-    shell_key(app, KeyCode::Char(' '));
-    shell_key(app, KeyCode::Down);
-    shell_key(app, KeyCode::Char(' '));
-    shell_key(app, KeyCode::Enter);
+            .unwrap()
+            .model_refresh_pending()
+    );
     pump_onboarding(
         app,
         |app| {
-            stage(app) == Some(OnboardingStage::Agent)
-                && shell_kind(app)
-                    == Some(crate::tui::onboarding::OnboardingScreenKind::AgentAuthoring)
+            app.onboarding_shell
+                .as_ref()
+                .is_some_and(|shell| !shell.model_refresh_pending())
         },
-        "the settled Model→Agent advance through the real model wizard",
+        "catalog refresh uses the verified global provider rather than the trusted project overlay",
     );
-    let global = ConfigDoc::load(
-        &cockpit_config::dirs::global_config_file().expect("isolated global config path"),
-    )
-    .expect("native model settlement wrote global config")
-    .providers();
+    provider
+        .join()
+        .expect("fake provider exits after verify and refresh");
+    let refreshed = render_app(app, 100, 30);
+    assert!(refreshed.contains("manual-model"), "{refreshed}");
+    assert!(
+        !refreshed.contains("Refresh failed") && !refreshed.contains("Credential rejected"),
+        "global catalog refresh must succeed: {refreshed}"
+    );
+    assert!(
+        !refreshed.contains("project-injected-model"),
+        "refresh must preserve the global catalog: {refreshed}"
+    );
+    assert_eq!(
+        std::fs::read(&project_config).unwrap(),
+        project_preimage,
+        "onboarding must not mutate the trusted project provider layer"
+    );
+    seed_workspace_trust(root);
+    for ch in "manual-model".chars() {
+        shell_key(app, KeyCode::Char(ch));
+    }
+    shell_key(app, KeyCode::Enter);
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.transition_pending()),
+        "one selection must settle the model without visiting policy pages"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(phase) = app
+            .onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.test_agent_authoring_phase())
+        {
+            assert!(
+                matches!(
+                    phase,
+                    crate::tui::onboarding::agent::Phase::Pending
+                        | crate::tui::onboarding::agent::Phase::Success
+                ),
+                "required first-run must never enter advanced agent pages: {phase:?}"
+            );
+        }
+        if stage(app) == Some(OnboardingStage::Complete) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "short onboarding did not complete: {}",
+            render_app(app, 100, 30)
+        );
+        pump_once(app);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let global = ConfigDoc::load(&cockpit_config::dirs::global_config_file().unwrap())
+        .unwrap()
+        .providers();
     let active = global
         .active_model
         .as_ref()
-        .expect("native model settlement selected a default model");
-    assert_eq!(active.provider, "localtest");
-    assert_eq!(active.model, "manual-model");
+        .expect("short path commits default model");
+    assert_eq!(
+        (&*active.provider, &*active.model),
+        ("localtest", "manual-model")
+    );
     assert_eq!(
         global.resolve_trust("localtest", "manual-model"),
-        cockpit_config::providers::ModelTrust::Trusted
+        cockpit_config::providers::ModelTrust::Untrusted
     );
-    let capabilities = global.resolve_effective_model_capabilities(
-        "localtest",
-        "manual-model",
-        global.resolution_generation,
-    );
-    assert!(capabilities.supports_image_input());
-    assert_eq!(
-        capabilities.tool_calling,
-        cockpit_config::providers::CapabilityStatus::Supported
-    );
-    assert_eq!(
-        capabilities.reasoning,
-        cockpit_config::providers::CapabilityStatus::Supported
-    );
-    assert_eq!(capabilities.context_tokens, Some(32_768));
-    assert_eq!(capabilities.max_output_tokens, Some(4_096));
-    assert_eq!(
-        global.resolve_default_thinking_mode("localtest", "manual-model"),
-        Some(cockpit_config::providers::ThinkingMode::Medium)
-    );
-    assert!(global.resolve_subagent_invokable("localtest", "manual-model"));
-    assert!(!global.resolve_can_delegate("localtest", "manual-model"));
-
-    settle_agent_via_real_daemon_rpc(app);
 }
 
 #[test]
@@ -935,6 +817,11 @@ fn real_daemon_first_run_ephemeral_lifetime_persists_background_agents_false() {
 
             let mut app = real_first_run_app(tmp.path());
             advance_real_first_run_to_provider(&mut app);
+            let global = cockpit_config::dirs::global_config_file().unwrap();
+            let mut doc = cockpit_config::extended::ExtendedConfigDoc::load(&global).unwrap();
+            let mut config = doc.config();
+            config.daemon.background_agents = false;
+            doc.write(&config).unwrap();
             advance_real_first_run_from_provider_search_to_agent(&mut app, tmp.path());
             complete_real_first_run_lifetime(&mut app, false);
         },

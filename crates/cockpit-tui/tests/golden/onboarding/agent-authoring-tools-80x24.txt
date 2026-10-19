@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Grant tools · step 6/8                                                        
+  Grant tools · step 5/5                                                        
   Required tools are always on. Toggle the rest.                                
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Tools  ·  15 of 53 enabled ──────────────────────────────────────────────╮  

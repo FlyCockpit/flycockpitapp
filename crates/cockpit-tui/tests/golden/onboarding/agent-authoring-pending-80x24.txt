@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Creating your agent · step 6/8                                                
+  Creating your agent · step 5/5                                                
   Waiting for the authoritative create receipt…                                 
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Status ──────────────────────────────────────────────────────────────────╮  

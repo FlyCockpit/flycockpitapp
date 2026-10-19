@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Subagent models · step 6/8                                                    
+  Subagent models · step 5/5                                                    
   Tick every model this subagent may use. Star one as the default.              
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Models  ·  1 of 2 ───────────────────────────────────────────────────────╮  

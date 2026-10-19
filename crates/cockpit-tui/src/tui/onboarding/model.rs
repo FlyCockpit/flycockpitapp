@@ -1,4 +1,4 @@
-//! Native six-step model onboarding editor.
+//! Searchable first-run model picker and optional model policy editor.
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -74,8 +74,23 @@ impl ModelPhase {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerFocus {
+    Search,
+    List,
+    Provider,
+    Manual,
+}
+
 pub(crate) struct ModelScreen {
     phase: ModelPhase,
+    short_path: bool,
+    search: TextField,
+    focus: PickerFocus,
+    filtered: Vec<usize>,
+    refresh_requested: bool,
+    refreshing: bool,
+    rejected_providers: std::collections::BTreeSet<String>,
     config: ProvidersConfig,
     catalog: Vec<(String, String)>,
     selected_model: usize,
@@ -128,6 +143,13 @@ impl ModelScreen {
             .unwrap_or_default();
         let mut screen = Self {
             phase: ModelPhase::DefaultModel,
+            short_path: false,
+            search: TextField::new(String::new()),
+            focus: PickerFocus::Search,
+            filtered: (0..catalog.len()).collect(),
+            refresh_requested: false,
+            refreshing: false,
+            rejected_providers: std::collections::BTreeSet::new(),
             config: config.clone(),
             catalog,
             selected_model,
@@ -147,6 +169,108 @@ impl ModelScreen {
         screen.seed_policy();
         screen.reset_nav_for_phase();
         screen
+    }
+
+    pub(crate) fn short(config: &ProvidersConfig, preselect: Option<(&str, &str)>) -> Self {
+        let mut screen = Self::new(config, preselect);
+        screen.short_path = true;
+        screen.refilter();
+        screen
+    }
+
+    fn refilter(&mut self) {
+        let query = self.search.text().to_lowercase();
+        self.filtered = self
+            .catalog
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (provider, model))| {
+                (provider == &self.provider_id
+                    && format!("{provider}/{model}")
+                        .to_lowercase()
+                        .contains(&query))
+                .then_some(index)
+            })
+            .collect();
+        self.nav.cursor = self
+            .filtered
+            .iter()
+            .position(|index| *index == self.selected_model)
+            .unwrap_or(0);
+        self.nav.offset = 0;
+        self.nav.ensure_visible(self.filtered.len());
+    }
+
+    fn catalog_index(&self) -> Option<usize> {
+        if self.short_path {
+            self.filtered.get(self.nav.cursor).copied()
+        } else {
+            (self.nav.cursor < self.catalog.len()).then_some(self.nav.cursor)
+        }
+    }
+
+    fn cycle_provider(&mut self, delta: isize) {
+        let providers = self.config.providers.keys().cloned().collect::<Vec<_>>();
+        if providers.is_empty() {
+            return;
+        }
+        let current = providers
+            .iter()
+            .position(|id| id == &self.provider_id)
+            .unwrap_or(0);
+        self.provider_id = providers
+            [(current as isize + delta).rem_euclid(providers.len() as isize) as usize]
+            .clone();
+        self.model_id = TextField::new(String::new());
+        self.refreshing = false;
+        self.error = None;
+        self.search = TextField::new(String::new());
+        self.refilter();
+        if let Some(index) = self.filtered.first().copied() {
+            self.select_catalog_model(index);
+        }
+    }
+
+    pub(crate) fn take_refresh(&mut self) -> Option<String> {
+        if std::mem::take(&mut self.refresh_requested) {
+            Some(self.provider_id.clone())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn apply_refresh(
+        &mut self,
+        provider: &str,
+        outcome: super::VerifyOutcome,
+        config: &ProvidersConfig,
+    ) {
+        if self.provider_id != provider {
+            return;
+        }
+        self.refreshing = false;
+        match outcome {
+            super::VerifyOutcome::Models(_) | super::VerifyOutcome::NoEndpoint => {
+                let selection = self.model_id.text().to_string();
+                let mut rejected = std::mem::take(&mut self.rejected_providers);
+                rejected.remove(provider);
+                *self = Self::short(config, Some((provider, &selection)));
+                self.rejected_providers = rejected;
+            }
+            error => {
+                if matches!(error, super::VerifyOutcome::Unauthorized(_)) {
+                    self.rejected_providers.insert(provider.to_string());
+                }
+                self.error = Some(match error {
+                    super::VerifyOutcome::Unauthorized(status) => format!(
+                        "Credential rejected ({status}). Go Back to Provider to update the key, then refresh."
+                    ),
+                    other => format!(
+                        "Refresh failed: {other:?}. Ctrl+R retries; Back returns to Provider."
+                    ),
+                });
+            }
+        }
     }
 
     fn seed_policy(&mut self) {
@@ -214,6 +338,11 @@ impl ModelScreen {
     }
 
     #[cfg(test)]
+    pub(crate) fn refreshing(&self) -> bool {
+        self.refreshing
+    }
+
+    #[cfg(test)]
     pub(crate) fn phase(&self) -> ModelPhase {
         self.phase
     }
@@ -237,7 +366,9 @@ impl ModelScreen {
 
     pub(crate) fn subtitle(&self) -> &'static str {
         match self.phase {
-            ModelPhase::DefaultModel => "Star the model Cockpit should use for new sessions.",
+            ModelPhase::DefaultModel => {
+                "Choose one model. Advanced options are available later in /settings or /setup."
+            }
             ModelPhase::Trust => "Choose the model's data-custody policy.",
             ModelPhase::Capabilities => "Grant only capabilities this model supports.",
             ModelPhase::Limits => "Keep detected token limits or enter an override.",
@@ -247,6 +378,9 @@ impl ModelScreen {
     }
 
     pub(crate) fn help_text(&self) -> &'static str {
+        if self.short_path {
+            return "tab focus   ↑↓ / home/end/page move   ctrl+r refresh   enter choose";
+        }
         match self.phase {
             ModelPhase::DefaultModel if self.catalog.is_empty() => {
                 "type model id   enter continue   esc options"
@@ -274,9 +408,25 @@ impl ModelScreen {
     }
 
     pub(crate) fn advance(&mut self) -> Option<cockpit_core::wizard::OnboardingModelSubmission> {
+        if self.short_path
+            && (self.refreshing || self.rejected_providers.contains(&self.provider_id))
+        {
+            return None;
+        }
         match self.phase {
-            ModelPhase::DefaultModel if !self.catalog.is_empty() => {
-                self.select_catalog_model(self.nav.cursor);
+            ModelPhase::DefaultModel
+                if !self.catalog.is_empty()
+                    && (!self.short_path
+                        || self.catalog.iter().any(|(p, _)| p == &self.provider_id)) =>
+            {
+                if let Some(index) = self.catalog_index() {
+                    self.select_catalog_model(index);
+                } else {
+                    self.error = Some(
+                        "No matching models. Change the search or refresh the catalog.".into(),
+                    );
+                    return None;
+                }
             }
             ModelPhase::Trust => self.trust = self.nav.cursor.min(1),
             ModelPhase::Thinking => self.thinking = self.nav.cursor.min(THINKING.len() - 1),
@@ -298,9 +448,17 @@ impl ModelScreen {
             self.error = Some("Token limits must be positive numbers or blank.".to_string());
             return None;
         }
+        if self.short_path
+            && self
+                .catalog
+                .iter()
+                .all(|(provider, _)| provider != &self.provider_id)
+        {
+            self.seed_policy();
+        }
         self.error = None;
         let index = self.phase.index();
-        if index + 1 < ModelPhase::ALL.len() {
+        if !self.short_path && index + 1 < ModelPhase::ALL.len() {
             self.phase = ModelPhase::ALL[index + 1];
             self.reset_nav_for_phase();
             return None;
@@ -334,6 +492,7 @@ impl ModelScreen {
 
     fn row_count(&self) -> usize {
         match self.phase {
+            ModelPhase::DefaultModel if self.short_path => self.filtered.len(),
             ModelPhase::DefaultModel => self.catalog.len(),
             ModelPhase::Trust => 2,
             ModelPhase::Capabilities => CAPABILITIES.len(),
@@ -346,7 +505,9 @@ impl ModelScreen {
     fn activate_row(&mut self) {
         match self.phase {
             ModelPhase::DefaultModel if !self.catalog.is_empty() => {
-                self.select_catalog_model(self.nav.cursor);
+                if let Some(index) = self.catalog_index() {
+                    self.select_catalog_model(index);
+                }
             }
             ModelPhase::Trust => self.trust = self.nav.cursor.min(1),
             ModelPhase::Capabilities => {
@@ -363,6 +524,83 @@ impl ModelScreen {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
+        if self.short_path && self.phase == ModelPhase::DefaultModel {
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('r')
+            {
+                if !self.provider_id.is_empty() && !self.refreshing {
+                    self.refresh_requested = true;
+                    self.refreshing = true;
+                    self.error = None;
+                }
+                return;
+            }
+            match key.code {
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let order = [
+                        PickerFocus::Search,
+                        PickerFocus::List,
+                        PickerFocus::Provider,
+                        PickerFocus::Manual,
+                    ];
+                    let count = if self.filtered.is_empty()
+                        && self.catalog.iter().all(|(p, _)| p != &self.provider_id)
+                    {
+                        4
+                    } else {
+                        3
+                    };
+                    let index = order
+                        .iter()
+                        .position(|focus| *focus == self.focus)
+                        .unwrap_or(0);
+                    let delta = if key.code == KeyCode::Tab { 1 } else { -1 };
+                    self.focus = order[(index as isize + delta).rem_euclid(count) as usize];
+                }
+                KeyCode::Left | KeyCode::Up if self.focus == PickerFocus::Provider => {
+                    self.cycle_provider(-1)
+                }
+                KeyCode::Right | KeyCode::Down if self.focus == PickerFocus::Provider => {
+                    self.cycle_provider(1)
+                }
+                _ if self.focus == PickerFocus::Search
+                    && !matches!(
+                        key.code,
+                        KeyCode::Down | KeyCode::Up | KeyCode::PageDown | KeyCode::PageUp
+                    ) =>
+                {
+                    self.search.handle_key(key);
+                    self.refilter();
+                }
+                _ if self.focus == PickerFocus::Manual => {
+                    self.model_id.handle_key(key);
+                }
+                KeyCode::Char('j' | 'k') if self.focus == PickerFocus::Provider => {}
+                code => {
+                    self.focus = PickerFocus::List;
+                    let total = self.row_count();
+                    match code {
+                        KeyCode::Up | KeyCode::Char('k') => self.nav.move_by(-1, total),
+                        KeyCode::Down | KeyCode::Char('j') => self.nav.move_by(1, total),
+                        KeyCode::Home => {
+                            self.nav.cursor = 0;
+                            self.nav.ensure_visible(total);
+                        }
+                        KeyCode::End => {
+                            self.nav.cursor = total.saturating_sub(1);
+                            self.nav.ensure_visible(total);
+                        }
+                        KeyCode::PageUp => self.nav.page(false, total),
+                        KeyCode::PageDown => self.nav.page(true, total),
+                        KeyCode::Char(' ') => self.activate_row(),
+                        _ => {}
+                    }
+                }
+            }
+            return;
+        }
         if self.phase == ModelPhase::Limits {
             match key.code {
                 KeyCode::Tab | KeyCode::Down => self.nav.cursor = (self.nav.cursor + 1) % 2,
@@ -408,6 +646,9 @@ impl ModelScreen {
                     let index = self.nav.offset + index;
                     let was_focused = self.nav.cursor == index;
                     self.nav.cursor = index;
+                    if self.short_path {
+                        self.focus = PickerFocus::List;
+                    }
                     if was_focused
                         || !matches!(
                             self.phase,
@@ -419,7 +660,15 @@ impl ModelScreen {
                 } else if let Some(index) =
                     self.field_rects.iter().position(|rect| rect.contains(pos))
                 {
-                    self.nav.cursor = index;
+                    if self.short_path {
+                        self.focus = [
+                            PickerFocus::Provider,
+                            PickerFocus::Search,
+                            PickerFocus::Manual,
+                        ][index.min(2)];
+                    } else {
+                        self.nav.cursor = index;
+                    }
                 }
             }
             _ => {}
@@ -428,6 +677,10 @@ impl ModelScreen {
 
     pub(crate) fn paste(&mut self, text: &str) {
         match self.phase {
+            ModelPhase::DefaultModel if self.short_path && self.focus == PickerFocus::Search => {
+                self.search.paste(text);
+                self.refilter();
+            }
             ModelPhase::DefaultModel => self.model_id.paste(text),
             ModelPhase::Limits if self.nav.cursor == 0 => self.context_tokens.paste(text),
             ModelPhase::Limits => self.max_output_tokens.paste(text),
@@ -435,7 +688,6 @@ impl ModelScreen {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn selection(&self) -> (&str, &str) {
         (&self.provider_id, self.model_id.text())
     }
@@ -461,6 +713,79 @@ impl ModelScreen {
     }
 
     fn render_default(&mut self, frame: &mut Frame, area: Rect) {
+        if self.short_path {
+            let rows = ratatui::layout::Layout::vertical([
+                ratatui::layout::Constraint::Length(3),
+                ratatui::layout::Constraint::Length(3),
+                ratatui::layout::Constraint::Length(1),
+                ratatui::layout::Constraint::Min(0),
+            ])
+            .split(area);
+            self.field_rects.extend([rows[0], rows[1]]);
+            let provider = TextField::new(if self.provider_id.is_empty() {
+                "No provider configured"
+            } else {
+                &self.provider_id
+            });
+            ui::render_field(
+                frame,
+                rows[0],
+                "Provider · Tab then ←/→ to switch · Ctrl+R refresh",
+                &provider,
+                self.focus == PickerFocus::Provider,
+                "",
+            );
+            if let Some(caret) = ui::render_field(
+                frame,
+                rows[1],
+                "Search models",
+                &self.search,
+                self.focus == PickerFocus::Search,
+                "Type a model name",
+            ) {
+                frame.set_cursor_position(caret);
+            }
+            let selected = if self.model_id.text().is_empty() {
+                "none"
+            } else {
+                self.model_id.text()
+            };
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{STAR} Selected: {} / {selected}{}",
+                    self.provider_id,
+                    if self.refreshing {
+                        " · refreshing…"
+                    } else {
+                        ""
+                    }
+                ))
+                .style(Style::new().fg(BRASS)),
+                rows[2],
+            );
+            if self.catalog.iter().any(|(p, _)| p == &self.provider_id) {
+                self.render_list(frame, rows[3]);
+            } else {
+                let parts = ratatui::layout::Layout::vertical([
+                    ratatui::layout::Constraint::Length(3),
+                    ratatui::layout::Constraint::Min(0),
+                ])
+                .split(rows[3]);
+                self.field_rects.push(parts[0]);
+                if let Some(caret) = ui::render_field(
+                    frame,
+                    parts[0],
+                    "Model ID · no saved catalog; Ctrl+R to fetch",
+                    &self.model_id,
+                    self.focus == PickerFocus::Manual,
+                    "Exact provider model ID",
+                ) {
+                    frame.set_cursor_position(caret);
+                }
+                self.render_detail(frame, parts[1]);
+            }
+            return;
+        }
         if self.catalog.is_empty() {
             let field = Rect {
                 height: 3.min(area.height),
@@ -617,11 +942,16 @@ impl ModelScreen {
         };
         match self.phase {
             ModelPhase::DefaultModel => {
-                let (provider, model) = &self.catalog[index];
+                let catalog_index = if self.short_path {
+                    self.filtered[index]
+                } else {
+                    index
+                };
+                let (provider, model) = &self.catalog[catalog_index];
                 Line::from(vec![
                     ui::radio_mark(focused, focused),
                     Span::styled(
-                        if index == self.selected_model {
+                        if catalog_index == self.selected_model {
                             format!("{STAR} ")
                         } else {
                             "  ".to_string()
@@ -667,7 +997,7 @@ impl ModelScreen {
             }
             ModelPhase::DefaultModel => self
                 .catalog
-                .get(self.nav.cursor)
+                .get(self.catalog_index().unwrap_or(usize::MAX))
                 .map(|(provider, model)| format!("{provider} / {model}"))
                 .unwrap_or_default(),
             ModelPhase::Trust if self.nav.cursor == 0 => {

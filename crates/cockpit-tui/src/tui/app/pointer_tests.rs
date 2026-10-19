@@ -562,24 +562,186 @@ fn the_base_quit_key_passes_a_floating_layer_on_either_base() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
-    // Surface base: Ctrl-C arms the interrupt/exit window.
-    let mut app = chat_app(tmp.path());
-    open_floating(&mut app, Layer::KeysOverlay);
-    app.handle_key(ctrl_c);
-    assert!(
-        app.ctrl_c_armed_at.is_some(),
-        "Ctrl-C must reach the surface"
-    );
+    for layer in quit_passthrough_layers() {
+        // Idle surface: the guarded exit returns directly when unattached.
+        let mut app = chat_app(tmp.path());
+        open_floating(&mut app, layer);
+        assert!(
+            app.handle_key(ctrl_c),
+            "{layer:?}: idle Ctrl-C must request surface exit"
+        );
+        assert!(app.ctrl_c_armed_at.is_none(), "{layer:?}: idle exit");
+        assert!(floating_open(&app, layer), "{layer:?}: quit passed through");
 
-    // Onboarding base: its quit chord quits Cockpit (#548).
+        // Onboarding base: its quit chord quits Cockpit (#548).
+        let mut app = chat_app(tmp.path());
+        mount_onboarding(&mut app, cockpit_proto::OnboardingStage::Profile);
+        open_floating(&mut app, layer);
+        app.handle_key(ctrl_c);
+        assert!(
+            app.exit_requested,
+            "{layer:?}: Ctrl-C must reach the onboarding shell under the overlay"
+        );
+        assert!(floating_open(&app, layer), "{layer:?}: quit passed through");
+    }
+}
+
+fn quit_passthrough_layers() -> impl Iterator<Item = Layer> {
+    Layer::ALL
+        .iter()
+        .copied()
+        // The restart prompt owns quit after daemon shutdown itself.
+        .filter(|layer| layer.is_floating() && *layer != Layer::DaemonRestartPrompt)
+}
+
+#[test]
+fn idle_ctrl_c_passes_the_help_popover() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = chat_app(tmp.path());
-    mount_onboarding(&mut app, cockpit_proto::OnboardingStage::Profile);
-    open_floating(&mut app, Layer::KeysOverlay);
-    app.handle_key(ctrl_c);
-    assert!(
-        app.exit_requested,
-        "Ctrl-C must reach the onboarding shell under the overlay"
-    );
+    app.overlay = super::Overlay::Help(super::help_overlay::HelpOverlay::open());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    assert!(matches!(app.overlay, super::Overlay::Help(_)));
+    assert!(app.ctrl_c_armed_at.is_none());
+}
+
+#[test]
+fn busy_surface_ctrl_c_through_each_floating_layer_interrupts_then_guards_exit() {
+    use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
+    use cockpit_client::presentation::ControlRequestOutcome;
+    use cockpit_proto::Request;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    for layer in quit_passthrough_layers() {
+        let mut app = chat_app(tmp.path());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        app.agent_runner = Some(Ok(AgentRunner::test_fixture(TestRunnerOverrides {
+            control_tx: Some(tx),
+            ..Default::default()
+        })));
+        app.busy = true;
+        app.composer.set("keep my draft");
+        app.queue.push(queued_item());
+        open_floating(&mut app, layer);
+
+        assert!(!app.handle_key(ctrl_c), "{layer:?}: first press interrupts");
+        let interrupt = rx.try_recv().expect("floating Ctrl-C must send CancelTurn");
+        assert!(matches!(interrupt.request, Request::CancelTurn));
+        assert!(rx.try_recv().is_err(), "{layer:?}: only interrupt was sent");
+        assert!(app.ctrl_c_armed_at.is_some(), "{layer:?}: busy press arms");
+        assert!(
+            app.queue.is_empty(),
+            "{layer:?}: interrupt clears follow-ups"
+        );
+        assert_eq!(app.composer.text(), "keep my draft", "{layer:?}");
+        assert!(!app.exit_requested, "{layer:?}: interrupt must not quit");
+        assert!(
+            !app.busy,
+            "{layer:?}: interrupt ends the local working span"
+        );
+        assert!(floating_open(&app, layer), "{layer:?}: overlay stays open");
+
+        // Settle the interrupt receipt, then simulate a later busy
+        // projection: the second press must still request guarded exit.
+        let interrupt_id = *app.pending_control_requests.keys().next().unwrap();
+        app.apply_control_request_outcome(interrupt_id, ControlRequestOutcome::Applied);
+        app.busy = true;
+        assert!(app.busy);
+        assert!(
+            !app.handle_key(ctrl_c),
+            "{layer:?}: exit awaits daemon guard"
+        );
+        let exit_check = rx
+            .try_recv()
+            .expect("second Ctrl-C must request the exit guard");
+        assert!(matches!(exit_check.request, Request::ExitGuardStatus));
+        assert!(rx.try_recv().is_err(), "{layer:?}: no second interrupt");
+        assert!(app.ctrl_c_armed_at.is_none(), "{layer:?}: exit disarms");
+        let exit_id = *app.pending_control_requests.keys().next().unwrap();
+        app.apply_control_request_outcome(
+            exit_id,
+            ControlRequestOutcome::ExitGuardStatus {
+                ephemeral_owner: false,
+                has_live_work: false,
+            },
+        );
+        assert!(app.exit_requested, "{layer:?}: daemon-approved exit");
+    }
+}
+
+#[test]
+fn floating_layer_quit_keeps_the_surface_authority_fence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for layer in quit_passthrough_layers() {
+        let mut app = chat_app(tmp.path());
+        app.pending_prune_confirm = true;
+        open_floating(&mut app, layer);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(
+            !app.exit_requested,
+            "{layer:?}: unsettled authority fences quit"
+        );
+        assert!(app.pending_prune_confirm, "{layer:?}: preserve the owner");
+        assert!(
+            app.toast
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("verified terminal state")
+        );
+        assert!(floating_open(&app, layer));
+    }
+}
+
+#[test]
+fn floating_layer_close_keys_do_not_interrupt_the_busy_surface() {
+    use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for layer in quit_passthrough_layers() {
+        let close_keys = if layer == Layer::KeysOverlay {
+            vec![
+                key(KeyCode::Esc),
+                key(KeyCode::Char('q')),
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            ]
+        } else {
+            vec![key(KeyCode::Esc)]
+        };
+        for close_key in close_keys {
+            let mut app = chat_app(tmp.path());
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            app.agent_runner = Some(Ok(AgentRunner::test_fixture(TestRunnerOverrides {
+                control_tx: Some(tx),
+                ..Default::default()
+            })));
+            app.busy = true;
+            app.composer.set("keep my draft");
+            app.queue.push(queued_item());
+            open_floating(&mut app, layer);
+            assert!(!app.handle_key(close_key));
+            assert!(
+                !floating_open(&app, layer),
+                "{layer:?}: {close_key:?} closes"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "{layer:?}: close must not send CancelTurn"
+            );
+            assert!(
+                app.ctrl_c_armed_at.is_none(),
+                "{layer:?}: close must not arm quit"
+            );
+            assert!(!app.exit_requested);
+            assert!(app.busy);
+            assert_eq!(app.queue.len(), 1);
+            assert_eq!(app.composer.text(), "keep my draft");
+        }
+    }
 }
 
 // ── The onboarding confirmation boundary at app level ───────────────────

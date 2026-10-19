@@ -80,15 +80,8 @@ fn wait_until_durable_marker(db_path: &Path, session_id: Uuid, marker: &str, tim
 
 fn attach_with_durable_history() -> HermeticCockpit {
     let mut session = HermeticCockpit::launch_ready(HermeticProfile::Default);
-    submit_durable_marker(&mut session, HISTORY_MARKER);
-    session
-        .wait_until_screen(
-            "durable history marker",
-            Duration::from_secs(10),
-            |screen| screen.contains(HISTORY_MARKER) && screen.contains(COMPOSER_PLACEHOLDER),
-        )
-        .expect("submitted history is visible before daemon replacement");
-    std::thread::sleep(Duration::from_millis(500));
+    session.materialize_session(HISTORY_MARKER);
+    session_id_with_durable_marker(&session.home().db_path(), HISTORY_MARKER);
     session
 }
 

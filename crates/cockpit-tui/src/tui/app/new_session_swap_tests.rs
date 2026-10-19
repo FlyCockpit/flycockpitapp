@@ -41,7 +41,7 @@ fn new_session_swap_reads_no_config_from_disk() {
     cockpit_config::extended::reset_load_for_cwd_call_count();
     cockpit_config::providers::reset_load_effective_call_count();
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     let serviced = app
         .maybe_service_new_session_with_clear(|| Ok(()))
         .expect("/new should be serviced");
@@ -58,7 +58,7 @@ fn new_session_swap_makes_no_daemon_probe_or_connect() {
     cockpit_core::daemon::reset_blocking_probe_call_count();
     cockpit_client::reset_connect_call_count();
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     let serviced = app
         .maybe_service_new_session_with_clear(|| Ok(()))
         .expect("/new should be serviced");
@@ -73,7 +73,7 @@ fn new_session_swap_opens_no_database() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     let serviced = app
         .maybe_service_new_session_with_clear(|| Ok(()))
         .expect("/new should be serviced");
@@ -322,7 +322,7 @@ async fn new_session_swap_failure_preserves_old_state_and_exact_staged_submissio
     app.launch.session_short_id = Some("old001".to_string());
     app.foreground_input_target = Some(cockpit_proto::QueueTarget::root("Build"));
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     let cleared = Arc::new(AtomicBool::new(false));
     let cleared_flag = Arc::clone(&cleared);
     assert!(
@@ -424,7 +424,7 @@ async fn new_session_swap_failure_preserves_old_state_and_exact_staged_submissio
             .attachment_epoch
             .store(1, std::sync::atomic::Ordering::Release);
     }
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(
         app.maybe_service_new_session_with_clear(|| Ok(()))
             .expect("retry /new schedules")
@@ -469,7 +469,7 @@ async fn new_session_swap_draws_before_swap_completes() {
     app.launch.session_id = Some(uuid::Uuid::new_v4());
     app.launch.session_short_id = Some("old001".to_string());
     app.side_conversation = Some(side_conversation(tmp.path()));
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     let cleared = Arc::new(AtomicBool::new(false));
     let cleared_flag = Arc::clone(&cleared);
     assert!(
@@ -878,7 +878,7 @@ async fn new_session_swap_discards_old_epoch_events_while_provisional() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
     let outgoing_epoch = app.visible_attachment_epoch;
@@ -956,7 +956,7 @@ async fn new_session_swap_buffers_new_epoch_events_until_adoption() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     let new_epoch = 3;
     {
@@ -1024,7 +1024,7 @@ async fn new_session_swap_mismatched_epoch_rejects_adoption_and_discards_buffer(
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     {
         let runner = app.agent_runner.as_mut().unwrap().as_mut().unwrap();
@@ -1074,7 +1074,7 @@ async fn new_session_swap_failed_outcome_discards_buffered_replacement_events() 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     {
         let runner = app.agent_runner.as_mut().unwrap().as_mut().unwrap();
@@ -1111,7 +1111,7 @@ async fn new_session_swap_old_epoch_bookkeeping_settles_fence_without_presentati
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     let outgoing_epoch = app.visible_attachment_epoch;
     let fence_id = uuid::Uuid::new_v4();
@@ -1210,7 +1210,7 @@ async fn provisional_new_bookkeeping_records_dispatch_restored_without_history()
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
     let outgoing_epoch = app.visible_attachment_epoch;
@@ -1257,7 +1257,7 @@ async fn new_session_swap_failed_keeps_barrier_against_late_events_and_outgoing_
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (mut input_rx, _control_rx, outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     let outgoing_epoch = app.visible_attachment_epoch;
     outcome_tx
@@ -1317,7 +1317,7 @@ async fn new_session_swap_missing_runner_rejects_adoption() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
 
@@ -1346,7 +1346,7 @@ async fn new_session_switch_outcome_adopts_identity_after_immediate_reset() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (mut input_rx, _control_rx, outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
 
@@ -1413,12 +1413,12 @@ async fn new_session_swap_second_new_while_pending_is_busy_dedupe() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
     let pending_before = app.async_actions.pending_count();
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_eq!(app.async_actions.pending_count(), pending_before);
     assert!(app.history.iter().any(|entry| {
@@ -1484,7 +1484,7 @@ async fn new_session_swap_waits_for_possibly_sent_fence_before_clear() {
         },
     );
     app.event_loop_monotonic_now = SESSION_SWITCH_RECONCILIATION_TIMEOUT / 2;
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     let changed = app
         .maybe_service_new_session_with_clear(|| Ok(()))
         .expect("waiting gate is non-fatal");
@@ -1497,7 +1497,7 @@ async fn new_session_swap_waits_for_possibly_sent_fence_before_clear() {
             .has_pending_kind(&AsyncActionKind::Internal("session.switch"))
     );
     assert!(!app.provisional_new_session);
-    assert!(app.pending_new_session);
+    assert!(app.pending_session_materialization);
 }
 
 #[tokio::test]
@@ -1505,7 +1505,7 @@ async fn new_session_swap_suppresses_outgoing_delivery_receipt_while_provisional
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
 
@@ -1600,7 +1600,7 @@ async fn new_session_swap_cancelled_discards_replacement_buffer_and_keeps_cleare
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
 
@@ -1663,7 +1663,7 @@ async fn new_session_swap_suppresses_active_agent_sync_while_provisional() {
     let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
     app.launch.agent_name = "Build".into();
     app.agent_path = vec!["Build".into()];
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert!(app.provisional_new_session);
 
@@ -1684,7 +1684,7 @@ async fn new_session_swap_failed_barrier_does_not_mark_fence_possibly_sent() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (mut input_rx, _control_rx, outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     outcome_tx
         .send(Err("attach failed".to_string()))
@@ -1761,7 +1761,7 @@ async fn new_session_swap_captures_outgoing_epoch_before_switch_task_advances() 
         runner.test_advance_epoch_when_switch_task_created = true;
         runner.attachment_epoch()
     };
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_eq!(
         app.visible_attachment_epoch, outgoing_before,
@@ -1803,7 +1803,7 @@ async fn new_session_swap_failed_event_loop_retry_does_not_dispatch_outgoing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (mut input_rx, _control_rx, outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     outcome_tx
         .send(Err("attach failed".to_string()))
@@ -1868,7 +1868,7 @@ async fn new_session_swap_failed_pre_dispatch_retry_does_not_dispatch_outgoing()
             },
         });
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     outcome_tx
         .send(Err("attach failed".to_string()))
@@ -2022,7 +2022,7 @@ async fn provisional_new_ignores_same_session_resync_epoch_adoption() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     let outgoing = app.visible_attachment_epoch;
     assert!(app.provisional_new_session);
@@ -2105,7 +2105,7 @@ async fn provisional_new_fences_stale_async_action_completions() {
     app.history.push(HistoryEntry::Plain {
         line: "outgoing transcript".into(),
     });
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
 
@@ -2169,7 +2169,7 @@ async fn provisional_new_suppresses_caffeinate_presentation() {
     let mut app = App::new(Some(tmp.path()), false);
     let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
     app.caffeinate_active = false;
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
 
@@ -2279,7 +2279,7 @@ async fn provisional_new_clears_outgoing_model_and_config_chrome() {
     let (_input_rx, _control_rx, outcome_tx) = install_live_swappable_runner(&mut app, 1);
     seed_outgoing_model_and_config_chrome(&mut app);
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
     assert_empty_session_model_and_config_chrome(&app);
@@ -2303,7 +2303,7 @@ async fn provisional_new_staged_submission_omits_outgoing_model_fence_metadata()
     let (_input_rx, _control_rx, _outcome_tx) = install_live_swappable_runner(&mut app, 1);
     seed_outgoing_model_and_config_chrome(&mut app);
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
     assert_empty_session_model_and_config_chrome(&app);
@@ -2390,7 +2390,7 @@ async fn provisional_new_clears_pending_file_autocomplete_loading() {
         "stale empty cache shows popup"
     );
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
     assert!(
@@ -2477,7 +2477,7 @@ async fn provisional_new_clears_pending_file_autocomplete_loading() {
     app.at_suggestions_error = Some("stale".to_string());
     app.at_suggestions_loaded_query = Some("src".to_string());
     *app.at_cache.borrow_mut() = Some(("src".to_string(), Vec::new()));
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert!(!app.at_suggestions_loading);
     assert!(app.at_suggestions_error.is_none());
@@ -2538,7 +2538,7 @@ async fn provisional_new_suppresses_model_selection_cancel_notice() {
         queued_submission: None,
     });
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert_cleared_provisional_view(&app);
     assert!(
@@ -3045,4 +3045,298 @@ async fn day2_first_message_during_empty_discovery_materializes_after_resolution
         app.composer.display_text(),
         "first message while discovery is pending"
     );
+}
+
+/// Use the production ordering: retained auto-send runs before the local
+/// new-session service on each wake. Neither may release intent to the old id.
+fn day2_materialization_tick(app: &mut App) {
+    app.maybe_submit_startup_retained_message();
+    app.maybe_open_local_session_draft_with_clear(|| Ok(()))
+        .unwrap();
+}
+
+async fn day2_materialization_after_old_receipt(
+    timeout: bool,
+    attach_failure: bool,
+    reconciling: bool,
+) {
+    use crate::tui::structured_paste::{FenceLifecycle, SESSION_SWITCH_RECONCILIATION_TIMEOUT};
+    use cockpit_client::presentation::TurnEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    for control in 0..3 {
+        let mut app = App::new(None, false);
+        let (mut input, _control, outcome_tx) = install_live_swappable_runner(&mut app, 8);
+        let old_id = app
+            .agent_runner
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .session_id();
+        app.launch.session_id = Some(old_id);
+        app.startup_session_resolved = true;
+        app.first_paint_completed = true;
+        app.startup_background.workspace_ready = true;
+        super::seed_ready_model_for_tests(&mut app);
+        app.composer
+            .insert_str("old message awaiting durable receipt");
+        app.submit_input();
+        let RunnerInput::Submission(old) = input.try_recv().unwrap() else {
+            panic!("old submission")
+        };
+        assert_eq!(old.intended_session_id, old_id);
+        let old_submission_id = old.optimistic_submission_id;
+        assert_eq!(
+            app.submission_fences[&old_submission_id].lifecycle,
+            FenceLifecycle::PossiblySent
+        );
+        if reconciling {
+            app.mark_delivery_unconfirmed(&[old_submission_id]).unwrap();
+            assert_eq!(
+                app.submission_fences[&old_submission_id].lifecycle,
+                FenceLifecycle::Reconciling
+            );
+        }
+        match control {
+            0 => {
+                app.execute_slash(*super::slash::slash_command_by_name("new").unwrap());
+            }
+            1 => {
+                app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+            }
+            _ => {
+                app.apply_session_rail_outcome(Some(
+                    crate::tui::session_rail::RailOutcome::NewSession,
+                ));
+            }
+        }
+        app.maybe_open_local_session_draft_with_clear(|| Ok(()))
+            .unwrap();
+        assert!(app.local_session_draft);
+        app.composer
+            .insert_str("first message for replacement only");
+        app.submit_input();
+        let retained_id = app.startup_retained_submission_id.unwrap().1;
+        assert!(
+            input.try_recv().is_err(),
+            "first draft message must not enter old runner"
+        );
+
+        // Run two wakes while the old receipt is delayed, including an
+        // explicit Enter and a competing navigation request during the wait.
+        for _ in 0..2 {
+            day2_materialization_tick(&mut app);
+            app.submit_input();
+            assert!(
+                app.pending_session_materialization || app.session_switch_in_progress(),
+                "event loop must preserve pending materialization until adoption"
+            );
+            assert_eq!(app.startup_retained_submission_id.unwrap().1, retained_id);
+            assert_eq!(
+                app.composer.display_text(),
+                "first message for replacement only"
+            );
+            assert!(input.try_recv().is_err());
+        }
+        app.resume_session(uuid::Uuid::new_v4());
+        assert!(
+            app.draft_return_view.is_some(),
+            "navigation cannot replace an admitted transaction"
+        );
+        if timeout {
+            app.event_loop_monotonic_now += SESSION_SWITCH_RECONCILIATION_TIMEOUT;
+        } else {
+            let runner = app.agent_runner.as_ref().unwrap().as_ref().unwrap();
+            runner
+                .events
+                .lock()
+                .unwrap()
+                .push(crate::tui::agent_runner::QueuedTurnEvent {
+                    attachment_epoch: runner.attachment_epoch(),
+                    event: TurnEvent::UserMessageRecorded {
+                        seq: 1,
+                        client_submission_ids: vec![old_submission_id],
+                        preflight_cleaned: None,
+                    },
+                });
+            app.drain_agent_events();
+            assert!(!app.submission_fences.contains_key(&old_submission_id));
+        }
+        day2_materialization_tick(&mut app);
+        assert!(
+            app.session_switch_in_progress(),
+            "settlement must start the replacement attach"
+        );
+        assert!(!app.pending_session_materialization);
+        assert!(input.try_recv().is_err());
+        if timeout && !reconciling {
+            assert!(
+                app.delivery_unconfirmed_records
+                    .contains_key(&old_submission_id)
+            );
+        }
+        if attach_failure {
+            outcome_tx
+                .send(Err("replacement attach rejected".into()))
+                .unwrap();
+            drain_session_switch_until_complete(&mut app).await;
+            day2_materialization_tick(&mut app);
+            assert_eq!(app.launch.session_id, Some(old_id));
+            assert!(app.draft_return_view.is_none());
+            assert!(app.startup_retained_submission_id.is_none());
+            assert!(app.pending_session_switch_order.is_none());
+            assert_eq!(
+                app.composer.display_text(),
+                "first message for replacement only"
+            );
+            assert!(
+                input.try_recv().is_err(),
+                "failed attach preserves unsent intent"
+            );
+        } else {
+            let replacement_id = uuid::Uuid::new_v4();
+            let AsyncActionPayload::SessionSwitched(outcome) =
+                switch_outcome(replacement_id, "new456")
+            else {
+                unreachable!()
+            };
+            outcome_tx.send(Ok(*outcome)).unwrap();
+            drain_session_switch_until_complete(&mut app).await;
+            assert_eq!(app.launch.session_id, Some(replacement_id));
+            assert!(
+                input.try_recv().is_err(),
+                "replacement config must be adopted before send"
+            );
+            super::seed_ready_model_for_tests(&mut app);
+            day2_materialization_tick(&mut app);
+            let RunnerInput::Submission(sent) = input
+                .try_recv()
+                .expect("first message continues after adoption")
+            else {
+                panic!("replacement submission")
+            };
+            assert_eq!(sent.intended_session_id, replacement_id);
+            assert_eq!(sent.optimistic_submission_id, retained_id);
+            assert_eq!(sent.submission.text, "first message for replacement only");
+            day2_materialization_tick(&mut app);
+            assert!(input.try_recv().is_err(), "exactly one replacement send");
+            assert!(app.pending_session_switch_order.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn day2_draft_materialization_continues_after_delayed_old_receipt() {
+    day2_materialization_after_old_receipt(false, false, false).await;
+}
+
+#[tokio::test]
+async fn day2_draft_materialization_continues_after_old_receipt_timeout() {
+    day2_materialization_after_old_receipt(true, false, false).await;
+}
+
+#[tokio::test]
+async fn day2_draft_materialization_restores_saved_view_after_timeout_and_attach_failure() {
+    day2_materialization_after_old_receipt(true, true, false).await;
+}
+
+#[tokio::test]
+async fn day2_draft_materialization_settles_reconciling_receipt_and_attach_failure() {
+    // Cover attach rejection both after a delayed receipt and after an
+    // already-reconciling receipt permits immediate replacement admission.
+    day2_materialization_after_old_receipt(false, true, false).await;
+    day2_materialization_after_old_receipt(false, true, true).await;
+}
+
+#[tokio::test]
+async fn day2_startup_boundary_restores_ended_durable_sessions() {
+    use cockpit_client::{
+        ClientEndpoint, InProcessConnection, InProcessEndpoint, InProcessRequest,
+    };
+    use cockpit_proto::{CodeRootIdV1, CodeRootLifecycleV1, CodeRootSummaryV1, Request, Response};
+    let ended_id = uuid::Uuid::new_v4();
+    let ended = CodeRootSummaryV1 {
+        root_id: CodeRootIdV1(ended_id),
+        title: Some("ended saved conversation".into()),
+        short_id: "ended1".into(),
+        workspace_path: "/project".into(),
+        last_active_at_unix_ms: 2,
+        lifecycle: CodeRootLifecycleV1::Ended,
+        capture_generation: CodeRootIdV1(ended_id).capture_generation(),
+    };
+    let mut active = ended.clone();
+    active.root_id = CodeRootIdV1(uuid::Uuid::new_v4());
+    active.lifecycle = CodeRootLifecycleV1::Active;
+    active.last_active_at_unix_ms = 1;
+    let mut archived = ended.clone();
+    archived.root_id = CodeRootIdV1(uuid::Uuid::new_v4());
+    archived.lifecycle = CodeRootLifecycleV1::Archived;
+    archived.last_active_at_unix_ms = 3;
+    for (roots, expected) in [
+        (vec![ended.clone()], Some(ended_id)),
+        (vec![active, ended, archived.clone()], Some(ended_id)),
+        (vec![archived], None),
+        (vec![], None),
+    ] {
+        let (connections, mut incoming) = mpsc::channel(1);
+        let (sensitive, _sensitive_rx) = mpsc::channel(1);
+        let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
+        let server = tokio::spawn(async move {
+            let reply = incoming.recv().await.unwrap();
+            let (requests, mut requests_rx) = mpsc::channel::<InProcessRequest>(1);
+            let (_events_tx, events) = mpsc::channel(1);
+            assert!(
+                reply
+                    .send(Some(InProcessConnection { requests, events }))
+                    .is_ok()
+            );
+            let readiness = requests_rx.recv().await.unwrap();
+            assert!(matches!(readiness.request, Request::DaemonStatus));
+            assert!(readiness.reply.send(Ok(Response::Ack)).is_ok());
+            let request = requests_rx.recv().await.unwrap();
+            let Request::DiscoverCodeRootsV1(discover) = request.request else {
+                panic!("durable discovery")
+            };
+            assert_eq!(discover.workspace_selector.unwrap().path, "/project");
+            assert!(
+                request
+                    .reply
+                    .send(Ok(Response::CodeRootsDiscovered(
+                        cockpit_proto::DiscoverCodeRootsV1Result {
+                            roots,
+                            next_cursor: None,
+                        }
+                    )))
+                    .is_ok()
+            );
+        });
+        let mut app = App::new(Some(std::path::Path::new("/project")), false);
+        app.first_paint_completed = true;
+        app.startup_background.workspace_ready = true;
+        let mut selected = App::stub_startup_lifecycle_for_tests();
+        selected.endpoint = endpoint;
+        app.startup_lifecycle = Some(selected);
+        app.start_startup_session_resolution();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !app.startup_session_resolved {
+                app.drain_async_actions();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            app.launch.session_id, expected,
+            "startup must adopt last durable id, including Ended"
+        );
+        assert_eq!(app.local_session_draft, expected.is_none());
+        assert!(app.startup_background.retry.is_none());
+        if expected.is_none() {
+            app.ensure_session_for_display();
+            assert!(app.pending_runner_attach.is_none());
+            assert!(app.agent_runner.is_none());
+        }
+    }
 }

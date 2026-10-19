@@ -252,8 +252,7 @@ impl App {
         }
     }
 
-    /// `/new` was invoked: clear chat history and drop the daemon-
-    /// attached runner so the next user message opens a fresh session.
+    /// Service draft opening and any admitted first-message materialization.
     /// In alt-screen mode the chat pane is the whole canvas, so the
     /// "fresh session" visual is simply an empty pane.
     pub(super) fn maybe_service_new_session(
@@ -291,6 +290,22 @@ impl App {
         &mut self,
         mut clear_terminal: impl FnMut() -> Result<()>,
     ) -> Result<bool> {
+        // An admitted first-message intent is distinct from opening another
+        // draft. Re-enter its FIFO/reconciliation service on every wake.
+        if self.pending_session_materialization {
+            if std::mem::take(&mut self.pending_new_session) {
+                self.report_session_switch_busy("/new");
+            }
+            let result = self.maybe_service_new_session_with_clear(&mut clear_terminal);
+            if result.is_err()
+                || (!self.pending_session_materialization && !self.session_switch_in_progress())
+            {
+                self.restore_durable_view_after_draft_failure(
+                    "Could not create session; saved conversation restored. Send again or /new to retry.",
+                );
+            }
+            return result;
+        }
         if !self.pending_new_session {
             return Ok(self.clear_terminal_after_committed_new_session(&mut clear_terminal));
         }
@@ -338,6 +353,11 @@ impl App {
             return;
         };
         self.startup_retained_submission_id = None;
+        self.pending_session_materialization = false;
+        if let Some((sequence, _)) = self.pending_session_switch_order.take() {
+            self.submission_order.cancel(sequence);
+        }
+        self.pending_session_switch_reconcile_started_at = None;
         self.provisional_new_session = false;
         self.provisional_new_epoch_event_buffer.clear();
         self.same_session_resync_event_buffer.clear();
@@ -372,16 +392,17 @@ impl App {
         mut clear_terminal: impl FnMut() -> Result<()>,
     ) -> Result<bool> {
         let changed = self.clear_terminal_after_committed_new_session(&mut clear_terminal);
-        if !self.pending_new_session {
+        if !self.pending_session_materialization {
             return Ok(changed);
         }
-        if self.has_pending_session_switch_action() {
+        if self.session_switch_in_progress() || !self.pending_session_switch_submissions.is_empty()
+        {
             if let Some((sequence, _)) = self.pending_session_switch_order.take() {
                 self.submission_order.cancel(sequence);
                 self.dispatch_next_ready_paste_fence();
             }
             self.pending_session_switch_reconcile_started_at = None;
-            self.pending_new_session = false;
+            self.pending_session_materialization = false;
             self.report_session_switch_busy("/new");
             return Ok(true);
         }
@@ -435,7 +456,7 @@ impl App {
                                 .to_string(),
                         });
                     }
-                    self.pending_new_session = false;
+                    self.pending_session_materialization = false;
                     self.pending_session_switch_order = None;
                     self.pending_session_switch_reconcile_started_at = None;
                     self.submission_order.cancel(switch_sequence);
@@ -458,7 +479,7 @@ impl App {
                 }
             }
             if self.mark_delivery_unconfirmed(&possibly_sent).is_err() {
-                self.pending_new_session = false;
+                self.pending_session_materialization = false;
                 self.pending_session_switch_order = None;
                 self.pending_session_switch_reconcile_started_at = None;
                 self.submission_order.cancel(switch_sequence);
@@ -503,7 +524,7 @@ impl App {
         ) {
             return Ok(changed);
         }
-        self.pending_new_session = false;
+        self.pending_session_materialization = false;
 
         // Capture the outgoing epoch before constructing/spawning the switch
         // task. On a multithreaded runtime the replacement attach can advance
@@ -543,6 +564,10 @@ impl App {
             self.begin_session_switch_submission_target(agent_runner::SessionTarget::New);
             self.begin_provisional_new_session_view(outgoing_epoch);
             self.clear_terminal_after_committed_new_session(&mut clear_terminal);
+        } else if self.draft_return_view.is_some() {
+            self.submission_order.cancel(switch_sequence);
+            self.pending_session_switch_order = None;
+            // The caller restores the saved view and leaves the unsent composer.
         } else {
             // Without a replaceable attachment there is no old durable
             // runner/view transaction to protect. Commit the local reset

@@ -2758,6 +2758,12 @@ impl App {
             self.open_missing_model_setup(reason);
             return false;
         }
+        // The runner temporarily belongs to the outgoing session while the
+        // draft's materialization reconciles receipts or awaits attach. Keep
+        // the composer intent intact until replacement identity is adopted.
+        if self.draft_return_view.is_some() && !self.local_session_draft {
+            return false;
+        }
         if (self.first_paint_completed || self.startup_background.started)
             && (!self.startup_background.workspace_ready
                 || !matches!(self.agent_runner, Some(Ok(_))))

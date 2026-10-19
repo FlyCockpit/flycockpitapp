@@ -2728,11 +2728,11 @@ pub struct App {
     /// through it the same way ↑/↓ moves the highlight. `None` when not
     /// mid-cycle; cleared by any non-Tab composer edit via
     /// [`App::reset_slash_window`].
-    /// `/new` was invoked; the event loop services it on the next tick
-    /// (needs the terminal handle for `insert_before` so the existing
-    /// history spills to scrollback before the welcome header is
-    /// reprinted above the viewport).
+    /// A user requested a blank local draft (/new, Ctrl+N, or the rail).
+    /// The event loop clears the view without creating a durable session.
     pub(super) pending_new_session: bool,
+    /// First-message transaction, serviced until its switch action is admitted.
+    pub(super) pending_session_materialization: bool,
     /// Live-runner `/new` has scheduled `session.switch` and cleared the
     /// visible view; identity adoption waits for a matching successful
     /// outcome epoch. Old-epoch events are bookkeeping-only; replacement
@@ -4449,6 +4449,7 @@ impl App {
             session_rail_refresh_needed: false,
             session_rail_next_refresh: Instant::now(),
             pending_new_session: false,
+            pending_session_materialization: false,
             provisional_new_session: false,
             visible_attachment_epoch: 0,
             provisional_new_epoch_event_buffer: VecDeque::new(),

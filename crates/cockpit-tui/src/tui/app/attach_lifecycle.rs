@@ -6,6 +6,8 @@ impl App {
             .startup_retained_submission_id
             .is_some_and(|(generation, _)| generation == self.startup_background.generation)
             && matches!(self.agent_runner, Some(Ok(_)))
+            && self.draft_return_view.is_none()
+            && !self.pending_session_materialization
             && !self.provisional_new_session
             && !self.session_switch_in_progress()
             && !self.config_snapshot.providers.providers.is_empty()
@@ -266,8 +268,8 @@ impl App {
                 .and_then(|saved| saved.runner.take())
             {
                 self.agent_runner = Some(Ok(runner));
-                self.pending_new_session = true;
-                if let Err(error) = self.maybe_service_new_session_with_clear(|| Ok(())) {
+                self.pending_session_materialization = true;
+                if let Err(error) = self.maybe_open_local_session_draft_with_clear(|| Ok(())) {
                     self.restore_durable_view_after_draft_failure(&error.to_string());
                 }
                 return;

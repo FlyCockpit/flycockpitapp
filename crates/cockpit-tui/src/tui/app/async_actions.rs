@@ -1221,7 +1221,7 @@ impl App {
                     reload = self.session_rail.apply_mutation_completion(completion);
                 }
                 if reload {
-                    self.start_sessions_list_action();
+                    self.request_session_rail_refresh();
                 }
             }
             AsyncActionKind::DaemonRpc("sessions.favorite") => {
@@ -1809,7 +1809,7 @@ impl App {
                     self.session_rail.apply_inbox_result(main_session_id, items);
                 }
                 if reload_sessions {
-                    self.start_sessions_list_action();
+                    self.request_session_rail_refresh();
                 }
             }
             AsyncActionKind::DaemonRpc("skills.list") => {

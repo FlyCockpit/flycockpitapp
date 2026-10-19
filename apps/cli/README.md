@@ -920,7 +920,8 @@ explicit approval unless a matching session, project, or global grant exists.
 Apache-2.0. See [LICENSE](LICENSE).
 
 Launching `cockpit` again in the same project restores its most recently active
-saved Code session. If none exists, the composer starts as an unsaved draft.
+saved Code session, including an ended session. Archived sessions are excluded
+from automatic restore. If none exists, the composer starts as an unsaved draft.
 `/new`, Ctrl+N, and the rail's New session button open a blank draft; it becomes
 a saved session when you send the first message. The rail marks drafts as
 unsaved and refreshes saved titles, message previews, and activity.

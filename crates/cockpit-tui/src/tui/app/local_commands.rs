@@ -97,7 +97,9 @@ impl App {
     }
 
     pub(super) fn has_pending_session_switch_action(&self) -> bool {
-        self.session_switch_in_progress() || !self.pending_session_switch_submissions.is_empty()
+        self.pending_session_materialization
+            || self.session_switch_in_progress()
+            || !self.pending_session_switch_submissions.is_empty()
     }
 
     /// Cleared `/new` view is still waiting for a successful adoption (pending

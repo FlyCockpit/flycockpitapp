@@ -2718,7 +2718,12 @@ fn select_startup_code_session(
     }
     Ok(roots
         .iter()
-        .filter(|row| row.lifecycle == proto::CodeRootLifecycleV1::Active)
+        .filter(|row| {
+            matches!(
+                row.lifecycle,
+                proto::CodeRootLifecycleV1::Active | proto::CodeRootLifecycleV1::Ended
+            )
+        })
         .max_by_key(|row| (row.last_active_at_unix_ms, row.root_id))
         .map(|row| row.root_id.0))
 }
@@ -5780,6 +5785,35 @@ mod tests {
             select_startup_code_session(&[roots[0].clone(), archived], None),
             Ok(Some(first))
         );
+    }
+
+    #[test]
+    fn day2_session_selection_restores_ended_durable_and_excludes_archived() {
+        let active = day2_root(Uuid::new_v4(), "active", "older active", 1);
+        let mut ended = day2_root(Uuid::new_v4(), "ended1", "latest ended", 2);
+        ended.lifecycle = proto::CodeRootLifecycleV1::Ended;
+        let mut archived = day2_root(Uuid::new_v4(), "archiv", "newest archived", 3);
+        archived.lifecycle = proto::CodeRootLifecycleV1::Archived;
+        assert_eq!(
+            select_startup_code_session(&[ended.clone()], None),
+            Ok(Some(ended.root_id.0))
+        );
+        assert_eq!(
+            select_startup_code_session(&[active, ended.clone(), archived.clone()], None),
+            Ok(Some(ended.root_id.0))
+        );
+        assert_eq!(select_startup_code_session(&[archived], None), Ok(None));
+        for selector in [
+            ended.root_id.0.to_string(),
+            ended.short_id.clone(),
+            ended.title.clone().unwrap(),
+        ] {
+            assert_eq!(
+                select_startup_code_session(&[ended.clone()], Some(&selector)),
+                Ok(Some(ended.root_id.0))
+            );
+        }
+        assert_eq!(select_startup_code_session(&[], None), Ok(None));
     }
 
     #[tokio::test]

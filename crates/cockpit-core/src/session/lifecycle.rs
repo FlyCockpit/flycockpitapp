@@ -319,8 +319,8 @@ fn ensure_redaction_table_custody_on_conn(
     }
 }
 
-/// Insert a visible `sessions` row and establish redaction-table vault custody
-/// on the same connection.
+/// Insert a `sessions` row and establish redaction-table vault custody on the
+/// same connection. Ephemeral preparation rows remain excluded from saved lists.
 ///
 /// `conn` must already be inside a transaction so a failed vault write cannot
 /// leave a resumable row. Custody is written first: the database insert
@@ -1196,6 +1196,49 @@ impl Session {
         Ok(true)
     }
 
+    /// Installed-root preparation needs a parent FK before model validation.
+    /// Reuse the existing ephemeral-row boundary so that preparation is never
+    /// a saved conversation, including after a crash (the boot sweep owns it).
+    pub(crate) fn stage_new_code_attach(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.freshly_created
+                && self.session_entry_mode == crate::daemon::proto::SessionEntryMode::Code,
+            "only a new Code attach may be staged"
+        );
+        anyhow::ensure!(
+            self.stage_pending_row(|row| row.ephemeral = true),
+            "Code attach must be staged before persistence"
+        );
+        self.new_code_attach_pending.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Called with the worker start permit still held, after every fallible
+    /// preflight/spawn step and before registry publication or message ingress.
+    pub(crate) fn commit_new_code_attach(&self) -> Result<()> {
+        if !self.new_code_attach_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.stage_pending_row(|row| row.ephemeral = false) {
+            self.persist_if_needed()?;
+        } else {
+            let id = self.id;
+            self.db.blocking_write_for_sync_maintenance(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE sessions SET ephemeral = 0 WHERE session_id = ?1 AND ephemeral = 1",
+                    [id.to_string()],
+                )?;
+                anyhow::ensure!(
+                    changed == 1,
+                    "staged Code attach disappeared before publication"
+                );
+                Ok(())
+            })?;
+        }
+        self.new_code_attach_pending.store(false, Ordering::Release);
+        Ok(())
+    }
+
     pub(super) fn stage_pending_row(&self, update: impl FnOnce(&mut SessionRow)) -> bool {
         let mut slot = self.pending_row.lock().unwrap();
         if let Some(row) = slot.as_mut() {
@@ -1528,6 +1571,7 @@ impl Session {
             // Persisted by default; `create_deferred` overrides this with the
             // pending row right after construction.
             pending_row: Mutex::new(None),
+            new_code_attach_pending: AtomicBool::new(false),
             gitignore_session_allow: Mutex::new(Vec::new()),
             gitignore_session_reject: Mutex::new(std::collections::HashSet::new()),
             adopted_tip_tools: Mutex::new(std::collections::HashSet::new()),

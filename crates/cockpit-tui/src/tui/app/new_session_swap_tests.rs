@@ -2831,7 +2831,7 @@ async fn resume_header_adopts_identity_and_rehomes_outgoing_activity() {
 }
 
 #[tokio::test]
-async fn day2_new_is_a_local_draft_until_first_message_and_failed_create_restores_saved_view() {
+async fn day2_new_is_a_local_draft_until_first_message_and_failed_create_keeps_draft() {
     let mut app = App::new(None, false);
     let (_input, _control, outcome_tx) = install_live_swappable_runner(&mut app, 8);
     let old_id = app
@@ -2875,14 +2875,18 @@ async fn day2_new_is_a_local_draft_until_first_message_and_failed_create_restore
         .send(Err("opening held workspace definition: missing".into()))
         .unwrap();
     drain_session_switch_until_complete(&mut app).await;
-    assert_eq!(app.launch.session_id, Some(old_id));
-    assert!(app.current_session_persisted);
-    assert!(app.history.iter().any(
+    assert!(app.launch.session_id.is_none());
+    assert!(!app.current_session_persisted);
+    assert!(!app.history.iter().any(
         |entry| matches!(entry, HistoryEntry::Plain { line } if line == "saved conversation")
+    ));
+    assert!(app.history.iter().any(
+        |entry| matches!(entry, HistoryEntry::CommandError { line } if line.contains("missing"))
     ));
     assert_eq!(app.composer.display_text(), "first message");
     assert!(!app.provisional_new_session);
-    assert!(!app.local_session_draft);
+    assert!(app.local_session_draft);
+    assert!(app.draft_return_view.as_ref().unwrap().runner.is_some());
 }
 
 #[tokio::test]
@@ -3182,8 +3186,13 @@ async fn day2_materialization_after_old_receipt(
                 .unwrap();
             drain_session_switch_until_complete(&mut app).await;
             day2_materialization_tick(&mut app);
-            assert_eq!(app.launch.session_id, Some(old_id));
-            assert!(app.draft_return_view.is_none());
+            assert!(app.local_session_draft);
+            assert!(app.launch.session_id.is_none());
+            assert_eq!(
+                app.draft_return_view.as_ref().unwrap().session_id,
+                Some(old_id)
+            );
+            assert!(app.history.iter().any(|entry| matches!(entry, HistoryEntry::CommandError { line } if line.contains("rejected"))));
             assert!(app.startup_retained_submission_id.is_none());
             assert!(app.pending_session_switch_order.is_none());
             assert_eq!(
@@ -3237,7 +3246,7 @@ async fn day2_draft_materialization_continues_after_old_receipt_timeout() {
 }
 
 #[tokio::test]
-async fn day2_draft_materialization_restores_saved_view_after_timeout_and_attach_failure() {
+async fn day2_draft_materialization_keeps_draft_after_timeout_and_attach_failure() {
     day2_materialization_after_old_receipt(true, true, false).await;
 }
 
@@ -3701,6 +3710,17 @@ async fn day2_open_side_draft(
     (app, main_id, side_id, inputs, outcome_tx)
 }
 
+fn day2_return_from_failed_side_draft(app: &mut App, main_id: uuid::Uuid) {
+    assert!(app.local_session_draft);
+    assert!(app.launch.session_id.is_none());
+    assert!(!app.current_session_persisted);
+    assert!(app.draft_return_view.is_some());
+    assert!(app.history.iter().any(
+        |entry| matches!(entry, HistoryEntry::CommandError { line } if line.contains("rejected"))
+    ));
+    app.resume_session(main_id);
+}
+
 fn day2_assert_side_draft_restored_main(app: &App, main_id: uuid::Uuid, side_id: uuid::Uuid) {
     assert_ne!(
         app.launch.session_id,
@@ -3832,6 +3852,7 @@ async fn day2_failed_side_draft_create_restores_main_after_real_discard() {
             app.composer.display_text(),
             "first message for new durable session"
         );
+        day2_return_from_failed_side_draft(&mut app, main_id);
         day2_assert_side_draft_restored_main(&app, main_id, side_id);
         assert!(inputs.try_recv().is_err(), "failure preserves unsent text");
         day2_assert_main_reattach_target(&mut app, main_id);
@@ -3916,6 +3937,7 @@ async fn day2_disconnected_side_draft_attach_failure_restores_main() {
             app.composer.display_text(),
             "unsent after disconnected side"
         );
+        day2_return_from_failed_side_draft(&mut app, main_id);
         day2_assert_side_draft_restored_main(&app, main_id, side_id);
         day2_assert_main_reattach_target(&mut app, main_id);
     }
@@ -3932,6 +3954,7 @@ async fn day2_restored_side_draft_main_survives_another_draft_before_reattach() 
             .send(Err("replacement attach rejected".into()))
             .unwrap();
         drain_session_switch_until_complete(&mut app).await;
+        day2_return_from_failed_side_draft(&mut app, main_id);
         day2_assert_side_draft_restored_main(&app, main_id, side_id);
 
         // The normal display attach has not yet run. A second draft must
@@ -3954,6 +3977,7 @@ async fn day2_restored_side_draft_main_survives_another_draft_before_reattach() 
             .abort_kind(&AsyncActionKind::Internal("runner.attach"));
         app.apply_runner_attach_result(action_id, Err("second replacement rejected".into()));
         assert_eq!(app.composer.display_text(), "second rejected first message");
+        day2_return_from_failed_side_draft(&mut app, main_id);
         day2_assert_side_draft_restored_main(&app, main_id, side_id);
         day2_assert_main_reattach_target(&mut app, main_id);
     }

@@ -38,7 +38,8 @@ impl App {
         if !self.first_paint_completed {
             return;
         }
-        self.session_rail.set_local_draft(self.local_session_draft);
+        self.session_rail
+            .set_attachment(self.local_session_draft, self.launch.session_id);
         let connected =
             self.sessions_daemon_endpoint().is_some() || self.sessions_daemon_socket().is_some();
         if self.session_rail.set_daemon_connected(connected) {
@@ -1461,5 +1462,55 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn day2_session_rail_same_batch_mutation_preserves_list_live_preview() {
         day2_same_batch_rail_refresh(true).await;
+    }
+    #[test]
+    fn ux4_draft_and_attached_rail_selection_with_two_saved_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _env) = configured_app(&tmp);
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut first_row = summary(first, 2);
+        first_row.title = Some("UX4 first saved".into());
+        let mut second_row = summary(second, 1);
+        second_row.title = Some("UX4 second saved".into());
+        seed_rail_sessions(&mut app, vec![first_row.clone(), second_row.clone()]);
+        app.launch.session_id = Some(second);
+        app.local_session_draft = false;
+        let attached_buffer = render_buffer(&mut app, 140, 40);
+        let attached = (0..40)
+            .map(|y| row_text(&attached_buffer, y, 0, 36))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(attached.contains("+ New session"), "{attached}");
+        assert!(
+            attached
+                .lines()
+                .any(|line| line.contains("▌") && line.contains("UX4 second saved")),
+            "{attached}"
+        );
+        assert!(
+            !attached
+                .lines()
+                .any(|line| line.contains("▌") && line.contains("UX4 first saved")),
+            "{attached}"
+        );
+        app.current_session_persisted = true;
+        app.pending_new_session = true;
+        app.maybe_open_local_session_draft_with_clear(|| Ok(()))
+            .unwrap();
+        for focused in [false, true] {
+            if focused {
+                app.session_rail.focus_search();
+            }
+            seed_rail_sessions(&mut app, vec![first_row.clone(), second_row.clone()]);
+            let draft = render_width(&mut app, 140, 40);
+            assert!(draft.contains("Draft (unsaved)"), "{draft}");
+            assert!(
+                !draft
+                    .lines()
+                    .any(|line| line.contains("▌") && line.contains("UX4")),
+                "no saved row may be highlighted: {draft}"
+            );
+        }
     }
 }

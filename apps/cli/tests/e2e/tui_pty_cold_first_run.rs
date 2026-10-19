@@ -39,18 +39,63 @@ fn spawn_loopback_models_provider() -> (String, Arc<AtomicBool>) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_flag = Arc::clone(&shutdown);
     std::thread::spawn(move || {
-        let body = r#"{"data":[{"id":"scripted","object":"model"},{"id":"fallback","object":"model"}],"object":"list"}"#;
+        let body = r#"{"data":[{"id":"scripted","object":"model","context_length":131072,"max_output_tokens":8192,"supported_parameters":["tools"]},{"id":"fallback","object":"model","context_length":131072,"max_output_tokens":8192,"supported_parameters":["tools"]}],"object":"list"}"#;
         while !shutdown_flag.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut socket, _)) => {
                     socket.set_read_timeout(Some(Duration::from_secs(5))).ok();
                     let mut request = [0_u8; 4096];
-                    let _ = socket.read(&mut request);
+                    let read = socket.read(&mut request).unwrap_or(0);
+                    let mut received = request[..read].to_vec();
+                    let header_end = loop {
+                        if let Some(end) =
+                            received.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            break end + 4;
+                        }
+                        let read = socket.read(&mut request).unwrap_or(0);
+                        assert!(
+                            read > 0 && received.len() < 64 * 1024,
+                            "bounded provider request headers"
+                        );
+                        received.extend_from_slice(&request[..read]);
+                    };
+                    let headers = String::from_utf8_lossy(&received[..header_end]).to_string();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    assert!(length < 4 * 1024 * 1024, "bounded provider request body");
+                    while received.len() < header_end + length {
+                        let read = socket.read(&mut request).unwrap_or(0);
+                        assert!(read > 0, "complete provider request body");
+                        received.extend_from_slice(&request[..read]);
+                    }
+                    let request = headers;
+                    let (content_type, response) = if request.starts_with("GET ") {
+                        ("application/json", body.to_owned())
+                    } else {
+                        assert!(
+                            request
+                                .to_ascii_lowercase()
+                                .contains("authorization: bearer test-key"),
+                            "first inference must authenticate with the onboarded key"
+                        );
+                        ("text/event-stream", concat!(
+                            "data: {\"id\":\"ux4\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"scripted\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"UX4_FIRST_SEND_OK\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"ux4\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"scripted\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                            "data: [DONE]\n\n",
+                        ).to_owned())
+                    };
                     let _ = write!(
                         socket,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(),
+                        response
                     );
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -376,6 +421,36 @@ fn assert_daemon_onboarding_complete(session: &HermeticCockpit) {
     });
 }
 
+fn saved_code_sessions(session: &HermeticCockpit) -> usize {
+    let socket = session.socket_path();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let client = cockpit_client::DaemonClient::connect(&socket)
+                .await
+                .unwrap();
+            let response = client
+                .request_ok(cockpit_proto::Request::ListSessions {
+                    project_id: None,
+                    parent_session_id: None,
+                    assistant_id: None,
+                    compaction_lineage_root_id: None,
+                    include_archived: false,
+                })
+                .await
+                .unwrap();
+            let cockpit_proto::Response::Sessions { sessions } = response else {
+                panic!("expected session list");
+            };
+            sessions
+                .into_iter()
+                .filter(|session| session.session_entry_mode == "code")
+                .count()
+        })
+}
+
 fn complete_cold_first_run(input: WalkthroughInput) {
     let (provider_url, provider_shutdown) = spawn_loopback_models_provider();
     let mut session = HermeticCockpit::prepare_fresh(HermeticProfile::Default);
@@ -431,6 +506,114 @@ fn complete_cold_first_run(input: WalkthroughInput) {
         "ready chat after onboarding",
         COMPOSER_PLACEHOLDER,
     );
+
+    // The required path ends in a usable first conversation, not merely a
+    // Connected model catalog. Check persistence via the real daemon RPC.
+    assert_eq!(saved_code_sessions(&session), 0);
+    let provider_path = session.home().config_dir().join("providers/localtest.json");
+    let provider: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+    let reference = provider["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|header| {
+            header["name"]
+                .as_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("Authorization"))
+        })
+        .unwrap()["value"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("$secret:")
+        .unwrap()
+        .to_owned();
+    // Fault only this throwaway encrypted item. Preserve provider bytes and
+    // installed binding provenance; no plaintext or real-user store is read.
+    let vault_fixture = rusqlite::Connection::open(session.home().db_path()).unwrap();
+    vault_fixture.execute("CREATE TEMP TABLE ux4_saved_named_secret AS SELECT * FROM secret_vault_items WHERE kind = 'named_secret' AND item_id = ?1", [&reference]).unwrap();
+    assert_eq!(
+        vault_fixture
+            .execute(
+                "DELETE FROM secret_vault_items WHERE kind = 'named_secret' AND item_id = ?1",
+                [&reference]
+            )
+            .unwrap(),
+        1
+    );
+    keyboard_input(&mut session, b"Reply briefly without tools.");
+    for _ in 0..2 {
+        let failures_before = session
+            .snapshot()
+            .contents()
+            .matches("Could not create session")
+            .count();
+        keyboard_input(&mut session, b"\r");
+        session
+            .wait_until_screen(
+                "failed attach retains draft",
+                ASYNC_STAGE_TIMEOUT,
+                |screen| {
+                    let text = screen.contents();
+                    // The long opaque name wraps in a real terminal. Preserve
+                    // the exact ID assertion while ignoring layout whitespace.
+                    let latest_names =
+                        text.rsplit_once("Could not create session")
+                            .map(|(_, latest)| {
+                                latest
+                                    .chars()
+                                    .filter(|ch| !ch.is_whitespace())
+                                    .collect::<String>()
+                            });
+                    latest_names.is_some_and(|latest| latest.contains(&reference))
+                        && text.matches("Could not create session").count() > failures_before
+                },
+            )
+            .unwrap();
+        let screen = session.snapshot().contents();
+        assert!(screen.contains("Draft (unsaved)"), "{screen}");
+        assert!(screen.contains("Reply briefly without tools."), "{screen}");
+        assert_eq!(
+            saved_code_sessions(&session),
+            0,
+            "failed first send and retry must not save rows"
+        );
+        assert_eq!(
+            vault_fixture
+                .query_row(
+                    "SELECT count(*) FROM sessions WHERE session_entry_mode = 'code'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "failed preparation must be removed, including its internal parent"
+        );
+    }
+    assert_eq!(
+        vault_fixture
+            .execute(
+                "INSERT INTO secret_vault_items SELECT * FROM temp.ux4_saved_named_secret",
+                []
+            )
+            .unwrap(),
+        1
+    );
+    keyboard_input(&mut session, b"\r");
+    wait_for_text(
+        &mut session,
+        "authenticated first inference",
+        "UX4_FIRST_SEND_OK",
+    );
+    assert_eq!(saved_code_sessions(&session), 1);
+    assert!(
+        !session.snapshot().contents().contains("Draft (unsaved)"),
+        "successful first send must leave draft mode"
+    );
+    keyboard_input(&mut session, b"/new");
+    keyboard_input(&mut session, b"\r");
+    wait_for_text(&mut session, "unsaved second composer", "Draft (unsaved)");
+    assert_eq!(saved_code_sessions(&session), 1);
 
     // Advanced agent controls remain usable as an optional /setup route.
     // Keep the complete keyboard/mouse model grants, tuning, tool grants,

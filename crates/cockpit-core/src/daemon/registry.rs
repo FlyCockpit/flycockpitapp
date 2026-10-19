@@ -225,6 +225,34 @@ pub(crate) async fn require_startup_reconciled(
     }
 }
 
+/// Owns only a newly allocated, unpublished Code identity. Failed/cancelled
+/// preparation removes its ephemeral parent and FK dependents. A process crash
+/// leaves an invisible ephemeral row for the existing boot sweep instead.
+struct CodeAttachStaging {
+    db: Db,
+    session_id: Uuid,
+    committed: bool,
+}
+
+impl Drop for CodeAttachStaging {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let id = self.session_id;
+        if let Err(error) = self.db.blocking_write_for_sync_maintenance(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            if crate::db::Db::get_session_conn(&tx, id)?.is_some_and(|row| row.ephemeral) {
+                crate::db::sessions::delete_session_conn(&tx, id)?;
+            }
+            tx.commit()?;
+            Ok(())
+        }) {
+            tracing::warn!(session_id = %id, %error, "failed Code preparation cleanup remains pending for boot sweep");
+        }
+    }
+}
+
 /// Daemon-wide registry of active session workers.
 #[derive(Clone)]
 pub struct SessionRegistry {
@@ -1886,11 +1914,9 @@ impl SessionRegistry {
             } else {
                 None
             };
-        // Lazy persistence (session-id-display-and-lazy-persist): hold the
-        // new session in memory with its id assigned but its `sessions` row
-        // un-written until `start_worker` flushes it, immediately before
-        // durable lifecycle rows (agent-tree, write-scope) that foreign-key
-        // to `sessions`.
+        // Allocate identity in memory. Code preparation may need an ephemeral
+        // parent for profile/lifecycle FKs; only successful worker construction
+        // promotes it to a saved conversation before publication.
         let mut session = match assistant_identity_name {
             Some(name) => Session::create_assistant_deferred(
                 self.inner.db.clone(),
@@ -1910,6 +1936,18 @@ impl SessionRegistry {
         }
         .context("creating session")?;
         session.set_deferred_entry_mode(session_entry_mode)?;
+        let mut code_staging = if session_entry_mode == crate::daemon::proto::SessionEntryMode::Code
+        {
+            session.stage_new_code_attach()?;
+            Some(CodeAttachStaging {
+                db: self.inner.db.clone(),
+                session_id: session.id,
+                committed: false,
+            })
+        } else {
+            None
+        };
+
         if is_dream_session {
             session.set_deferred_dream_session()?;
         }
@@ -1972,25 +2010,32 @@ impl SessionRegistry {
             }
         }
         debug_assert!(trust_revision > 0);
-        self.start_worker(
-            worker_publication,
-            session,
-            &providers_cfg,
-            &extended_cfg,
-            client_no_sandbox,
-            worker_model_override.as_ref(),
-            preserve_root_model_override,
-            None,
-            trust_policy,
-            trust_revision,
-            workspace_root_authority,
-            workspace_layer,
-            hooks,
-            config_watch_paths,
-            env_snapshot,
-            generation,
-        )
-        .await
+        let result = self
+            .start_worker(
+                worker_publication,
+                session,
+                &providers_cfg,
+                &extended_cfg,
+                client_no_sandbox,
+                worker_model_override.as_ref(),
+                preserve_root_model_override,
+                None,
+                trust_policy,
+                trust_revision,
+                workspace_root_authority,
+                workspace_layer,
+                hooks,
+                config_watch_paths,
+                env_snapshot,
+                generation,
+            )
+            .await;
+        if result.is_ok()
+            && let Some(staging) = &mut code_staging
+        {
+            staging.committed = true;
+        }
+        result
     }
 
     /// Create a new assistant session through the normal daemon worker path,
@@ -2812,6 +2857,13 @@ impl SessionRegistry {
             },
         )
         .context("starting session worker")?;
+
+        // The worker is still parked behind its start permit: a failed commit
+        // cannot run a driver against a deleted provisional parent row.
+        handle
+            .session()
+            .commit_new_code_attach()
+            .context("materializing successful Code attach")?;
 
         crate::sync::lock_or_recover(&self.inner.workers)
             .live
@@ -4017,6 +4069,56 @@ mod tests {
         reg.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
         reg.set_secret_vault(vault);
         reg
+    }
+
+    #[tokio::test]
+    async fn ux4_code_attach_staging_is_hidden_and_cleans_failed_preparation() {
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+        let reg = test_registry();
+        let failed = test_session(&reg);
+        failed.stage_new_code_attach().unwrap();
+        let guard = CodeAttachStaging {
+            db: reg.inner.db.clone(),
+            session_id: failed.id,
+            committed: false,
+        };
+        failed.persist_if_needed().unwrap();
+        assert!(
+            reg.inner
+                .db
+                .list_sessions(false, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reg.inner
+                .db
+                .get_session(failed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .ephemeral
+        );
+        drop(guard);
+        assert!(reg.inner.db.get_session(failed.id).await.unwrap().is_none());
+        let success = test_session(&reg);
+        success.stage_new_code_attach().unwrap();
+        success.persist_if_needed().unwrap();
+        success.commit_new_code_attach().unwrap();
+        assert_eq!(
+            reg.inner.db.list_sessions(false, 100).await.unwrap().len(),
+            1
+        );
+        assert!(
+            !reg.inner
+                .db
+                .get_session(success.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .ephemeral
+        );
     }
 
     fn test_session(reg: &SessionRegistry) -> Arc<Session> {

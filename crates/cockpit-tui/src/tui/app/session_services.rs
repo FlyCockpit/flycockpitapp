@@ -300,8 +300,8 @@ impl App {
             if result.is_err()
                 || (!self.pending_session_materialization && !self.session_switch_in_progress())
             {
-                self.restore_durable_view_after_draft_failure(
-                    "Could not create session; saved conversation restored. Send again or /new to retry.",
+                self.retain_local_draft_after_attach_failure(
+                    "Could not create session; send to retry",
                 );
             }
             return result;
@@ -359,6 +359,36 @@ impl App {
         self.pending = None;
         self.clear_terminal_after_committed_new_session(&mut clear_terminal);
         Ok(true)
+    }
+
+    /// A rejected first attach leaves the unsaved conversation selected. Keep
+    /// the old attachment only as a return/retry resource, never as the visible
+    /// conversation or a destination for the draft's first message.
+    pub(super) fn retain_local_draft_after_attach_failure(&mut self, error: &str) {
+        if let Some(saved) = self.draft_return_view.as_mut()
+            && saved.runner.is_none()
+        {
+            saved.runner = self.agent_runner.take().and_then(Result::ok);
+        }
+        self.agent_runner = None;
+        self.local_session_draft = true;
+        self.launch.session_id = None;
+        self.launch.session_short_id = None;
+        self.startup_retained_submission_id = None;
+        self.pending_session_materialization = false;
+        if let Some((sequence, _)) = self.pending_session_switch_order.take() {
+            self.submission_order.cancel(sequence);
+        }
+        self.pending_session_switch_reconcile_started_at = None;
+        self.provisional_new_session = false;
+        self.provisional_new_epoch_event_buffer.clear();
+        self.same_session_resync_event_buffer.clear();
+        self.current_session_persisted = false;
+        self.busy = false;
+        self.session_setup_inline = None;
+        self.history.push(HistoryEntry::CommandError {
+            line: format!("Could not create session: {error}; send to retry"),
+        });
     }
 
     pub(super) fn restore_durable_view_after_draft_failure(&mut self, error: &str) {
@@ -843,6 +873,7 @@ impl App {
         self.history.extend(staged_history);
         self.queue.extend(staged_queue);
         self.adopt_session_switch_identity(&outcome);
+        self.local_session_draft = false;
         self.visible_attachment_epoch = outcome.attachment_epoch;
         self.provisional_new_session = false;
         self.same_session_resync_event_buffer.clear();

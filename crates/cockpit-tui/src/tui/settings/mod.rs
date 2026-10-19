@@ -10310,6 +10310,7 @@ fn providers_config_from_view(view: &cockpit_proto::ProviderConfigView) -> Provi
         on_unlisted_models_fetch: view.on_unlisted_models_fetch,
         active_model: view.active_model.clone(),
         resolution_generation: 0,
+        global_credential_source: None,
     }
 }
 

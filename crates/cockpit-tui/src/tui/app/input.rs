@@ -2811,7 +2811,11 @@ impl App {
         // The runner temporarily belongs to the outgoing session while the
         // draft's materialization reconciles receipts or awaits attach. Keep
         // the composer intent intact until replacement identity is adopted.
-        if self.draft_return_view.is_some() && !self.local_session_draft {
+        if self.draft_return_view.is_some()
+            && (self.pending_session_materialization
+                || self.provisional_new_session
+                || self.session_switch_in_progress())
+        {
             return false;
         }
         if (self.first_paint_completed || self.startup_background.started)

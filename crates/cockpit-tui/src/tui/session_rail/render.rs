@@ -182,7 +182,13 @@ impl SessionRail {
             } else {
                 " + New session "
             },
-            Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
+            Style::default()
+                .fg(resolve_color(BRASS, BRASS_INDEX))
+                .add_modifier(if self.local_draft {
+                    Modifier::BOLD | Modifier::REVERSED
+                } else {
+                    Modifier::empty()
+                }),
             self.pointer_position
                 .is_some_and(|(x, y)| point_in_rect(new_area, x, y)),
         );
@@ -266,13 +272,18 @@ impl SessionRail {
                 Style::default().fg(Color::Yellow),
             )));
         }
-        let selected_id = self.selected_id();
+        let selected_id = if self.local_draft {
+            None
+        } else {
+            self.attached_session_id.or_else(|| self.selected_id())
+        };
+        let cursor_id = self.focused.then(|| self.selected_id()).flatten();
         let show_project = matches!(self.scope, Scope::All) || self.levels.len() > 1;
         let mut spans: Vec<(usize, usize, usize)> = Vec::new();
         for (index, (summary, tier)) in cards.iter().enumerate() {
             let start = lines.len();
             let selected = Some(summary.session_id) == selected_id;
-            let card = card_lines(
+            let mut card = card_lines(
                 summary,
                 *tier,
                 selected,
@@ -280,6 +291,14 @@ impl SessionRail {
                 width,
                 self.use_emojis,
             );
+            // Browsing has a cursor; the filled marker/background belongs to
+            // the attached conversation. A local draft selects only its chip.
+            if !selected
+                && Some(summary.session_id) == cursor_id
+                && let Some(prefix) = card.first_mut().and_then(|line| line.spans.first_mut())
+            {
+                prefix.content = "›".into();
+            }
             let end = start + card.len();
             spans.push((index, start, end));
             lines.extend(card);

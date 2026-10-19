@@ -3805,6 +3805,8 @@ fn day2_assert_main_reattach_target(app: &mut App, main_id: uuid::Uuid) {
         "authoritative reattach replaces the saved main transcript"
     );
     assert!(app.history.iter().any(|entry| matches!(entry, HistoryEntry::User { text, .. } if text == "main work completed during side")));
+    assert_eq!(app.queue.len(), 1, "same-main refresh keeps main's queue");
+    assert!(app.restored_draft_session.is_none());
     assert_eq!(app.composer.display_text(), unsent);
     assert!(
         inputs.try_recv().is_err(),
@@ -3954,5 +3956,178 @@ async fn day2_restored_side_draft_main_survives_another_draft_before_reattach() 
         assert_eq!(app.composer.display_text(), "second rejected first message");
         day2_assert_side_draft_restored_main(&app, main_id, side_id);
         day2_assert_main_reattach_target(&mut app, main_id);
+    }
+}
+
+async fn day2_start_other_session_resume_from_side_draft(
+    control: usize,
+    connected: bool,
+) -> (App, uuid::Uuid, uuid::Uuid) {
+    let (mut app, main_id, side_id, _old_inputs, _old_outcome) =
+        day2_open_side_draft(control, connected).await;
+    let saved_main = app
+        .draft_return_view
+        .as_mut()
+        .unwrap()
+        .side_return
+        .as_mut()
+        .unwrap();
+    saved_main.saved_prunable_tokens = 713;
+    saved_main
+        .saved_elided_event_ids
+        .insert("main-elided-event".into());
+    app.composer
+        .insert_str("unsent while selecting another session");
+    app.startup_lifecycle = Some(App::stub_startup_lifecycle_for_tests());
+    let other_id = uuid::Uuid::new_v4();
+    assert_ne!(other_id, main_id);
+    assert_ne!(other_id, side_id);
+    app.apply_session_rail_outcome(Some(crate::tui::session_rail::RailOutcome::Resume(
+        other_id,
+    )));
+    let pending = app
+        .pending_runner_attach
+        .as_ref()
+        .expect("rail resumes another saved session");
+    assert_eq!(pending.requested_session_id, Some(other_id));
+    assert_eq!(app.restored_draft_session, Some(main_id));
+    assert_eq!(app.queue.len(), 1, "main remains a fallback until adoption");
+    assert_eq!(app.prunable_tokens, 713);
+    app.async_actions
+        .abort_kind(&AsyncActionKind::Internal("runner.attach"));
+    (app, main_id, other_id)
+}
+
+fn day2_complete_other_session_resume(app: &mut App, other_id: uuid::Uuid, empty: bool) {
+    let pending = app
+        .pending_runner_attach
+        .as_ref()
+        .expect("destination attach");
+    assert_eq!(pending.requested_session_id, Some(other_id));
+    let action_id = pending.action_id;
+    app.async_actions
+        .abort_kind(&AsyncActionKind::Internal("runner.attach"));
+    let (mut runner, mut inputs, _controls) = runner_with_input(8);
+    runner.adopt_live_session_id(other_id);
+    runner.project_id = "other-project".into();
+    runner.short_id = "other01".into();
+    if !empty {
+        runner.history = vec![cockpit_proto::HistoryEntry::User {
+            text: "selected other session history".into(),
+            seq: 1,
+            ts_ms: 1,
+            origin_principal: None,
+            display_text: None,
+            client_submission_ids: Vec::new(),
+            tag_expansions: Vec::new(),
+        }];
+    }
+    app.apply_runner_attach_result(
+        action_id,
+        Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner))),
+    );
+    assert_eq!(app.current_session_id(), Some(other_id));
+    assert_eq!(app.launch.session_short_id.as_deref(), Some("other01"));
+    assert_eq!(app.project_id.as_deref(), Some("other-project"));
+    assert!(app.current_session_persisted);
+    assert!(app.restored_draft_session.is_none());
+    assert!(app.draft_return_view.is_none());
+    assert!(!app.local_session_draft);
+    assert_eq!(
+        app.composer.display_text(),
+        "unsent while selecting another session"
+    );
+    assert!(
+        inputs.try_recv().is_err(),
+        "resume must not submit composer automatically"
+    );
+    if !empty {
+        assert!(app.history.iter().any(|entry| matches!(entry,
+            HistoryEntry::User { text, .. } if text == "selected other session history")));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_other_session_resume_does_not_inherit_main_transcript() {
+    for control in 0..3 {
+        for connected in [true, false] {
+            let (mut app, _main_id, other_id) =
+                day2_start_other_session_resume_from_side_draft(control, connected).await;
+            day2_complete_other_session_resume(&mut app, other_id, false);
+            assert!(
+                !app.history.iter().any(|entry| matches!(entry,
+                HistoryEntry::Plain { line } if line == "durable main view")),
+                "selected session must not display main transcript; control={control}, connected={connected}"
+            );
+            assert_eq!(
+                app.history.len(),
+                1,
+                "only the destination transcript remains"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_other_session_resume_does_not_inherit_main_queue() {
+    for control in 0..3 {
+        for connected in [true, false] {
+            let (mut app, _main_id, other_id) =
+                day2_start_other_session_resume_from_side_draft(control, connected).await;
+            day2_complete_other_session_resume(&mut app, other_id, false);
+            assert!(
+                app.queue.is_empty(),
+                "selected session must not display main queue; control={control}, connected={connected}"
+            );
+            assert_eq!(app.prunable_tokens, 0);
+            assert!(app.elided_event_ids.is_empty());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_other_session_resume_replaces_main_after_attach_failure_and_retry() {
+    for control in 0..3 {
+        let (mut app, main_id, other_id) =
+            day2_start_other_session_resume_from_side_draft(control, true).await;
+        let action_id = app.pending_runner_attach.as_ref().unwrap().action_id;
+        app.apply_runner_attach_result(
+            action_id,
+            Err("destination temporarily unavailable".into()),
+        );
+        assert_eq!(app.launch.session_id, Some(other_id));
+        assert_eq!(app.restored_draft_session, Some(main_id));
+        assert!(app.history.iter().any(|entry| matches!(entry,
+            HistoryEntry::Plain { line } if line == "durable main view")));
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.prunable_tokens, 713);
+        assert_eq!(
+            app.composer.display_text(),
+            "unsent while selecting another session"
+        );
+
+        app.ensure_agent_runner();
+        day2_complete_other_session_resume(&mut app, other_id, false);
+        assert_eq!(
+            app.history.len(),
+            1,
+            "replace fallback and failed-attach error on retry"
+        );
+        assert!(app.queue.is_empty());
+        assert_eq!(app.prunable_tokens, 0);
+        assert!(app.elided_event_ids.is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_other_session_resume_with_empty_history_replaces_main_state() {
+    for control in 0..3 {
+        let (mut app, _main_id, other_id) =
+            day2_start_other_session_resume_from_side_draft(control, true).await;
+        day2_complete_other_session_resume(&mut app, other_id, true);
+        assert!(app.history.is_empty());
+        assert!(app.queue.is_empty());
+        assert_eq!(app.prunable_tokens, 0);
+        assert!(app.elided_event_ids.is_empty());
     }
 }

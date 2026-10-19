@@ -554,15 +554,18 @@ impl App {
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         let mut runner = runner;
         if let Ok(r) = &mut runner {
-            if self.restored_draft_session.take() == Some(r.session_id()) {
-                // The saved main was shown while detached. Attach returns
-                // its complete current history, including any work completed
-                // during /side; appending would duplicate the saved view.
+            if let Some(restored_session_id) = self.restored_draft_session.take() {
+                // The detached main is a fallback, never part of the newly
+                // attached transcript. Same-main reattach refreshes history;
+                // another destination also replaces session-local state.
                 self.history.clear();
                 self.history_render_versions.clear();
                 self.history_render_fingerprints.clear();
                 self.history_render_cache_clear();
                 self.mark_chat_geometry_dirty_from(0);
+                if restored_session_id != r.session_id() {
+                    self.reset_session_live_state();
+                }
             }
             if self.mark_startup_trace_milestone("session-ready") {
                 tracing::info!(target: cockpit_core::startup::TARGET, event = "session-ready", "startup");

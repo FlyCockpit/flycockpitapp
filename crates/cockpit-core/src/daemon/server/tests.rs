@@ -47848,3 +47848,314 @@ async fn ux4_failed_first_attach_retry_has_no_saved_rows() {
     );
     ctx.registry.drain_all(Duration::from_secs(5)).await;
 }
+
+/// Teardown uses the real worker shutdown queue and observes registry retirement.
+/// The 50 ms destructive-stop test deadline is unrelated to create semantics.
+async fn ux4_settle_created_workers(ctx: &DaemonContext) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for id in ctx.registry.active_session_ids() {
+            if let Some(handle) = ctx.registry.live_handle(id) {
+                let _ = handle
+                    .send_work(crate::daemon::session_worker::SessionWork::Shutdown {
+                        pause_for_resume: true,
+                    })
+                    .await;
+            }
+        }
+        while !ctx.registry.active_session_ids().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("created workers retire before teardown or leak assertions");
+}
+
+/// Real config, owner vault and worker construction shared by late-create
+/// failure cases. The injected faults below are SQLite triggers, not mocks of
+/// the handler, credential resolver, registry or persistence layer.
+async fn ux4_configure_late_create(ctx: &mut Arc<DaemonContext>, workspace: &Path) {
+    use crate::config::providers::{
+        ActiveModelRef, ConfigDoc, HeaderSpec, ModelEntry, ProviderEntry, ProvidersConfig,
+    };
+    install_test_redaction_key_resolver(Arc::get_mut(ctx).unwrap());
+    let global = cockpit_config::dirs::ensure_global_config_dir().unwrap();
+    let path = global.join("config.json");
+    let mut providers = ProvidersConfig::default();
+    providers.providers.insert(
+        "openrouter".into(),
+        ProviderEntry {
+            url: "https://openrouter.ai/api/v1".into(),
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: "$secret:ux4-late-create-key".into(),
+            }],
+            models: vec![ModelEntry {
+                id: "ux4-model".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    providers.active_model = Some(ActiveModelRef {
+        provider: "openrouter".into(),
+        model: "ux4-model".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    ConfigDoc::load(&path).unwrap().write(&providers).unwrap();
+    ux4_seed_global_default(&path, providers.active_model.as_ref().unwrap());
+    ctx.secret_vault
+        .mutate_owner_named_secret_guarded(
+            "ux4-late-create-key",
+            b"Bearer ux4-late-create-fake-key",
+            "provider",
+            &crate::secret_ownership::canonical_owner_root(&global.to_string_lossy()),
+        )
+        .unwrap();
+    set_workspace_trust_mode(
+        ctx,
+        workspace,
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    )
+    .await;
+}
+
+async fn ux4_late_create_rejection_and_retry(promotion: bool) {
+    let (_env, _tmp, mut ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    ux4_configure_late_create(&mut ctx, &workspace).await;
+    ctx.db
+        .write(move |conn| {
+            conn.execute_batch(if promotion {
+            "CREATE TRIGGER ux4_late_create_failure BEFORE UPDATE OF ephemeral ON sessions
+             WHEN OLD.ephemeral = 1 AND NEW.ephemeral = 0
+             BEGIN SELECT RAISE(ABORT, 'ux4-late-create-rejected'); END;"
+        } else {
+            "CREATE TRIGGER ux4_late_create_failure BEFORE INSERT ON code_root_projection_deliveries
+             WHEN NEW.source_key LIKE 'initial:%'
+             BEGIN SELECT RAISE(ABORT, 'ux4-late-create-rejected'); END;"
+        })?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let fresh_request = || {
+        proto::create_code_root_v1_request(
+            workspace.to_string_lossy().into_owned(),
+            None,
+            false,
+            true,
+            None,
+            None,
+            EnvDriftPolicy::Daemon,
+        )
+    };
+    let first = fresh_request();
+    let retry = fresh_request();
+    let (Request::CreateCodeRootV1(first_identity), Request::CreateCodeRootV1(retry_identity)) =
+        (&first, &retry)
+    else {
+        panic!("first-party create helper must use the closed Code route");
+    };
+    assert_ne!(
+        first_identity.logical_client_id,
+        retry_identity.logical_client_id
+    );
+    assert_ne!(
+        first_identity.client_request_id,
+        retry_identity.client_request_id
+    );
+    let mut saved_counts = Vec::new();
+    let mut parent_counts = Vec::new();
+    let mut registry_counts = Vec::new();
+    let mut attached_after_error = Vec::new();
+    for request in [first.clone(), retry, first] {
+        let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
+        assert!(
+            error.message.contains("ux4-late-create-rejected"),
+            "must reach late rejection: {}",
+            error.message
+        );
+        saved_counts.push(ctx.db.list_sessions(false, 100).await.unwrap().len());
+        parent_counts.push(
+            ctx.db
+                .blocking_read_for_sync_ui(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT count(*) FROM sessions WHERE session_entry_mode = 'code'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                })
+                .unwrap(),
+        );
+        registry_counts.push(ctx.registry.active_session_ids().len());
+        attached_after_error.push(state.attached.is_some());
+    }
+    // Settle workers even on the historical/fault implementation before any
+    // assertion deliberately discriminates its leaked rows.
+    ux4_settle_created_workers(&ctx).await;
+    assert_eq!(
+        saved_counts,
+        [0, 0, 0],
+        "a rejected create and fresh/exact retries must remain unsaved"
+    );
+    assert_eq!(
+        parent_counts,
+        [0, 0, 0],
+        "rollback removes provisional parents and FK dependents"
+    );
+    assert_eq!(
+        registry_counts,
+        [0, 0, 0],
+        "rejected creates publish no workers"
+    );
+    assert_eq!(
+        attached_after_error,
+        [false, false, false],
+        "rejected attachment cannot remain usable"
+    );
+    ctx.db
+        .write(|conn| {
+            conn.execute_batch("DROP TRIGGER ux4_late_create_failure;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let request = fresh_request();
+    let Response::CodeRootCreated(created) = handle_request(request.clone(), &mut state, &ctx)
+        .await
+        .unwrap()
+    else {
+        panic!("expected successful repair");
+    };
+    let Response::CodeRootCreated(replayed) =
+        handle_request(request, &mut state, &ctx).await.unwrap()
+    else {
+        panic!("expected exact successful replay");
+    };
+    assert_eq!(created.root.root_id, replayed.root.root_id);
+    assert_eq!(
+        ctx.db.list_sessions(false, 100).await.unwrap().len(),
+        1,
+        "successful create promotes once"
+    );
+    assert_eq!(ctx.registry.active_session_ids(), [created.root.root_id.0]);
+    ux4_settle_created_workers(&ctx).await;
+
+    // Inverse: an explicit saved-session resume failing at the same late
+    // projection boundary must retain its durable row.
+    state.attached = None;
+    ctx.db.write(|conn| {
+        conn.execute_batch("CREATE TRIGGER ux4_saved_resume_failure BEFORE INSERT ON code_root_projection_deliveries
+            WHEN NEW.source_key LIKE 'initial:%'
+            BEGIN SELECT RAISE(ABORT, 'ux4-saved-resume-rejected'); END;")?;
+        Ok(())
+    }).await.unwrap();
+    let error = handle_request(
+        proto::attach_existing_code_root_v1_request(
+            created.root.root_id.0,
+            None,
+            None,
+            false,
+            true,
+            None,
+            None,
+            EnvDriftPolicy::Daemon,
+        ),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    ctx.registry.drain_all(Duration::from_secs(5)).await;
+    assert!(
+        error.message.contains("ux4-saved-resume-rejected"),
+        "must reject saved resume at projection: {}",
+        error.message
+    );
+    let saved = ctx
+        .db
+        .get_session(created.root.root_id.0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !saved.ephemeral,
+        "saved resume must never acquire provisional deletion ownership"
+    );
+    assert_eq!(ctx.db.list_sessions(false, 100).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn ux4_post_worker_projection_rejection_and_fresh_retry_keep_no_saved_rows() {
+    ux4_late_create_rejection_and_retry(false).await;
+}
+
+#[tokio::test]
+async fn ux4_final_promotion_rejection_and_fresh_retry_keep_no_saved_rows() {
+    ux4_late_create_rejection_and_retry(true).await;
+}
+
+#[tokio::test]
+async fn ux4_cancelled_provisional_create_settles_worker_before_parent_cleanup() {
+    let (_env, _tmp, mut ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    ux4_configure_late_create(&mut ctx, &workspace).await;
+    let mut staging = None;
+    let env = ctx.env_baseline.read().unwrap().clone();
+    let handle = ctx
+        .registry
+        .attach_provisional_code_root(Some(workspace), None, false, None, env, &mut staging)
+        .await
+        .unwrap();
+    handle.persist_if_needed().unwrap();
+    let id = handle.session_id();
+    let staging = staging.expect("fresh Code creation transfers cleanup ownership");
+    assert!(ctx.db.get_session(id).await.unwrap().unwrap().ephemeral);
+    assert!(ctx.db.list_sessions(false, 100).await.unwrap().is_empty());
+    assert!(ctx.registry.active_session_ids().is_empty());
+    assert!(!handle.is_closed(), "the worker is alive but parked");
+    // Cancellation/Drop must retain the publication fence through cleanup.
+    // A subsequent publication owner cannot observe an unsettled predecessor.
+    drop(staging);
+    let _publication = tokio::time::timeout(
+        Duration::from_secs(5),
+        ctx.registry.lock_worker_publication(),
+    )
+    .await
+    .expect("cancelled create releases its publication fence after cleanup");
+    assert!(
+        handle.is_closed(),
+        "the parked worker is settled before parent deletion"
+    );
+    assert!(ctx.db.get_session(id).await.unwrap().is_none());
+    assert!(ctx.registry.active_session_ids().is_empty());
+}
+
+#[tokio::test]
+async fn ux4_drain_during_provisional_create_rejects_promotion_and_settles_worker() {
+    let (_env, _tmp, mut ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    ux4_configure_late_create(&mut ctx, &workspace).await;
+    let mut staging = None;
+    let env = ctx.env_baseline.read().unwrap().clone();
+    let handle = ctx
+        .registry
+        .attach_provisional_code_root(Some(workspace), None, false, None, env, &mut staging)
+        .await
+        .unwrap();
+    handle.persist_if_needed().unwrap();
+    let id = handle.session_id();
+    let mut staging = staging.unwrap();
+    assert!(ctx.shutdown.begin_drain());
+    let error = staging.commit().unwrap_err();
+    assert!(error.to_string().contains("shutting down"));
+    assert!(ctx.db.get_session(id).await.unwrap().unwrap().ephemeral);
+    assert!(ctx.registry.active_session_ids().is_empty());
+    staging.rollback().await.unwrap();
+    assert!(
+        handle.is_closed(),
+        "drain rejection settles the parked worker"
+    );
+    assert!(ctx.db.get_session(id).await.unwrap().is_none());
+    assert!(ctx.db.list_sessions(false, 100).await.unwrap().is_empty());
+    assert!(ctx.registry.active_session_ids().is_empty());
+}

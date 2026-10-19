@@ -914,25 +914,35 @@ async fn exercise_initial_delivery_cancellation(
         .await
         .expect("initial projection reaches the selected real writer boundary")
         .unwrap();
+    let original_session_id = ctx
+        .db
+        .read(|conn| {
+            let id: String =
+                conn.query_row("SELECT session_id FROM sessions", [], |row| row.get(0))?;
+            Ok(Uuid::parse_str(&id)?)
+        })
+        .await
+        .unwrap();
     // This drops the stream and joins the real transport, which must abort and
     // join its executor while the write is paused. No dispatch future remains.
     connection.close().await;
     let sessions = ctx.db.list_sessions(false, u32::MAX).await.unwrap();
     assert_eq!(
         sessions.len(),
-        1,
-        "cancelled create has exactly one durable root"
+        usize::from(!create),
+        "cancelled fresh create stays unsaved; saved attach retains its root"
     );
-    let session_id = sessions[0].session_id;
+    let session_id = original_session_id;
     // No response receipt was recorded at either pause. Check the real
     // authority after the transport joined, then relinquish this probe claim.
     {
         use crate::daemon::code_roots::CodeRootRequestStart;
         let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
         if create {
-            assert!(
-                matches!(authority.start_create(&base).unwrap(), CodeRootRequestStart::Recovering(id) if id.0 == session_id)
-            );
+            assert!(matches!(
+                authority.start_create(&base).unwrap(),
+                CodeRootRequestStart::Started
+            ));
             authority.abandon_code_root_request(
                 &base.logical_client_id,
                 &base.client_request_id,
@@ -959,12 +969,64 @@ async fn exercise_initial_delivery_cancellation(
     // The FIFO writer barrier drains the accepted job even though its reply
     // receiver was cancelled. Pre-enqueue cancellation has no job to drain.
     ctx.db.write(|_| Ok(())).await.unwrap();
+    // Provisional cleanup owns the publication gate until the parked worker
+    // is joined and its parent/dependents are deleted, including accepted DB
+    // jobs whose response receiver was cancelled.
+    let publication = tokio::time::timeout(
+        Duration::from_secs(20),
+        ctx.registry.lock_worker_publication(),
+    )
+    .await
+    .expect("cancelled provisional cleanup completes");
+    drop(publication);
+    if create {
+        assert!(
+            ctx.db.get_session(session_id).await.unwrap().is_none(),
+            "cancelled create deletes its provisional parent"
+        );
+        assert!(
+            ctx.registry.active_session_ids().is_empty(),
+            "cancelled create publishes no worker"
+        );
+    } else {
+        assert!(
+            !ctx.db
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .ephemeral,
+            "cancelled saved attach preserves the durable root"
+        );
+    }
     let before_retry = initial_operation_rows(&ctx.db, session_id).await;
     let preceding_create = usize::from(!create);
-    assert_eq!(before_retry.len(), preceding_create + usize::from(accepted));
+    assert_eq!(
+        before_retry.len(),
+        if create {
+            0
+        } else {
+            preceding_create + usize::from(accepted)
+        }
+    );
     let mut connection = ReceiptConnection::open(&ctx).await;
     let (receipt, _, _) = connection.project(&request).await;
-    assert_eq!(receipt.root_id.0, session_id);
+    if create {
+        assert_ne!(
+            receipt.root_id.0, session_id,
+            "retry allocates after provisional rollback"
+        );
+        assert_eq!(
+            ctx.db.list_sessions(false, u32::MAX).await.unwrap().len(),
+            1
+        );
+    } else {
+        assert_eq!(
+            receipt.root_id.0, session_id,
+            "saved attach retries the same durable root"
+        );
+    }
+    let session_id = receipt.root_id.0;
     let after_retry = initial_operation_rows(&ctx.db, session_id).await;
     assert_eq!(
         after_retry.len(),
@@ -972,10 +1034,22 @@ async fn exercise_initial_delivery_cancellation(
         "cancel/retry must leave exactly one initial delivery for the logical operation"
     );
     if accepted {
-        assert_eq!(
-            after_retry, before_retry,
-            "accepted delivery identity, cursor and complete row survive cancellation"
-        );
+        if create {
+            assert!(
+                before_retry.is_empty(),
+                "cancelled provisional delivery is deleted with its parent"
+            );
+            assert_eq!(
+                after_retry.len(),
+                1,
+                "successful retry owns one new initial delivery"
+            );
+        } else {
+            assert_eq!(
+                after_retry, before_retry,
+                "accepted saved-root delivery identity, cursor and complete row survive cancellation"
+            );
+        }
     }
     let deliveries = ctx
         .db
@@ -1031,7 +1105,7 @@ async fn exercise_initial_delivery_cancellation(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn code_root_create_initial_delivery_survives_accepted_cancel() {
+async fn code_root_create_accepted_cancel_removes_provisional_root() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
         exercise_initial_delivery_cancellation(true, acp, true, false).await;
@@ -1047,7 +1121,7 @@ async fn code_root_attach_initial_delivery_survives_accepted_cancel() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn code_root_create_initial_delivery_follows_preaccept_cancel() {
+async fn code_root_create_preaccept_cancel_removes_provisional_root() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
         exercise_initial_delivery_cancellation(true, acp, false, false).await;
@@ -1075,7 +1149,7 @@ async fn code_root_environment_attach_initial_delivery_survives_accepted_cancel_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn code_root_environment_create_initial_delivery_survives_accepted_cancel() {
+async fn code_root_environment_create_accepted_cancel_removes_provisional_root() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
         exercise_initial_delivery_cancellation(true, acp, true, true).await;
@@ -1083,7 +1157,7 @@ async fn code_root_environment_create_initial_delivery_survives_accepted_cancel(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn code_root_environment_initial_delivery_follows_preaccept_cancel() {
+async fn code_root_environment_preaccept_cancel_removes_provisional_root() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for create in [false, true] {
         for acp in [false, true] {

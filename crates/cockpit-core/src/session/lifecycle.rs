@@ -1213,8 +1213,8 @@ impl Session {
         Ok(())
     }
 
-    /// Called with the worker start permit still held, after every fallible
-    /// preflight/spawn step and before registry publication or message ingress.
+    /// Called with the worker start permit still held, after the owning create
+    /// operation's fallible finalization and before publication or message ingress.
     pub(crate) fn commit_new_code_attach(&self) -> Result<()> {
         if !self.new_code_attach_pending.load(Ordering::Acquire) {
             return Ok(());

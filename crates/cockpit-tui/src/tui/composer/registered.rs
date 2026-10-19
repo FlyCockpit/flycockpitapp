@@ -531,6 +531,7 @@ impl RegisteredComposer {
     /// Insert a terminal text paste. A returned tuple requests asynchronous
     /// token counting for the newly-condensed block.
     pub(crate) fn insert_pasted_text(&mut self, data: String) -> Option<(u64, String)> {
+        let data = super::normalize_paste_newlines(&data);
         let cursor = self.composer.cursor();
         if let Some((start, end, full)) = self.paste_registry.expandable_text_at(cursor, &data) {
             let _ = self.delete_range(start, end);

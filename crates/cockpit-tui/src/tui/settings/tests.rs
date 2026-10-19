@@ -10372,7 +10372,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     enter_root_node(&mut d, "Interface");
 
     // Mutate display toggles away from their defaults.
-    d.extended.tui.vim_mode = VimModeSetting::Disabled;
+    d.extended.tui.vim_mode = VimModeSetting::Enabled;
     d.extended.tui.thinking = ThinkingDisplay::Verbose;
     d.extended.tui.render_agent_markdown = false;
     d.extended.tui.render_user_markdown = true;
@@ -10393,7 +10393,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
         other => panic!("expected Category, got {other:?}"),
     }
     // Arming must not change anything.
-    assert_eq!(d.extended.tui.vim_mode, VimModeSetting::Disabled);
+    assert_eq!(d.extended.tui.vim_mode, VimModeSetting::Enabled);
 
     move_to_reset_row(&mut d);
     match d.test_page() {

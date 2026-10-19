@@ -11,11 +11,15 @@ Conversation rules are lineage-scoped advisory directives. `/rules` opens the pa
 | Key | Action | Description |
 | --- | --- | --- |
 | `Ctrl+K` | keys | open/close this which-key overlay (also /keys) |
-| `Ctrl+C` | interrupt | stop the running agent; press twice to quit |
+| `Ctrl+C` | interrupt | quit when idle; stop a running agent, press twice to quit |
 | `Ctrl+D` | quit | exit when idle; guarded while work is active |
 | `/` | commands | open the slash-command menu |
 
 ## Composer
+
+Insert editing is the default. Enable vim editing in `/settings` to use modal keys.
+Bracketed paste preserves newlines and tabs. `/quit` exits; `/rename Title` renames the current session.
+An unknown slash command leaves the text in place; press Enter again to send it as a message.
 
 | Key | Action | Description |
 | --- | --- | --- |
@@ -60,7 +64,7 @@ Box-level `[Send now] [Steer] [Held] [edit] [cancel]` also sit on the top border
 | `Home` | sticky header | jump to the pinned previous user message when the composer is empty |
 | `Ctrl+K n` | scratchpad | open the project scratchpad |
 | `Ctrl+G` | $EDITOR | edit the composer text in $EDITOR |
-| `Esc` | normal/cancel | vim Normal mode, or cancel a slash query |
+| `Esc` | stop/mode | stop turn in insert; vim Normal or dismiss completion |
 
 ## Slash menu
 

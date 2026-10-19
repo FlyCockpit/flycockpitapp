@@ -3585,7 +3585,16 @@ impl App {
                     pre.to_string(),
                     Style::default().fg(Color::White),
                 )];
-                spans.extend(self.paste_styled_spans(&chunk_text, chunk_byte_start));
+                spans.extend(
+                    self.paste_styled_spans(&chunk_text, chunk_byte_start)
+                        .into_iter()
+                        .map(|span| {
+                            Span::styled(
+                                crate::tui::composer::display_editor_text(&span.content),
+                                span.style,
+                            )
+                        }),
+                );
                 lines.push(Line::from(spans));
             }
             // Advance past this line + its '\n' separator.

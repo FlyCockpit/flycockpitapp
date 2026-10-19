@@ -332,6 +332,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "quit",
+        description: "Exit Cockpit (same as /exit)",
+        takes_args: false,
+        run: run_exit,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "export",
         description: "Export the current conversation to .cockpit/exports/ (arg: debug for the full bundle)",
         takes_args: true,
@@ -1386,6 +1394,11 @@ fn run_version(app: &mut App, _: &str) -> bool {
 
 impl App {
     pub(super) fn execute_slash(&mut self, cmd: SlashCommand) -> bool {
+        // Exiting requires no workspace effects. Every other builtin retains
+        // the same startup/trust guard as menu dispatch.
+        if !matches!(cmd.name, "exit" | "quit") && !self.guard_startup_workspace_effects() {
+            return false;
+        }
         let raw = self.composer.text().to_string();
         self.clear_composer_buffer();
         self.reset_slash_window();

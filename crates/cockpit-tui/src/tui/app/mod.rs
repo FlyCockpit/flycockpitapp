@@ -171,10 +171,9 @@ const RUN_CAPTURE_MAX_BYTES: usize = 256 * 1024;
 const RUN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUN_CAPTURE_POLL: Duration = Duration::from_millis(10);
 
-/// Double-press window for ctrl+c (GOALS §3a). A single ctrl+c interrupts
-/// the running agent (never quits); a second press within this window of
-/// the previous press exits the TUI. Sliding from the last press, so a
-/// steady stream of slow presses interrupts repeatedly and never exits.
+/// Double-press window while an agent is running. A single Ctrl+C stops the
+/// turn; a second within this window requests exit. Idle Ctrl+C requests
+/// exit immediately. Every exit still crosses the authority fence.
 pub(super) const CTRL_C_EXIT_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1276,7 +1275,7 @@ impl<S: TerminalModeSink> Drop for TerminalModeGuard<S> {
 /// terminal or daemon. See [`decide_ctrl_c`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CtrlCAction {
-    /// Second press inside the window — exit the TUI now (regardless of
+    /// Idle press or second press inside the window — request exit (regardless of
     /// agent state). During a run, this is the "interrupt AND exit" case:
     /// the first press already sent the interrupt.
     Exit,
@@ -1284,9 +1283,6 @@ pub(super) enum CtrlCAction {
     /// running — arm the exit window, show the hint, and interrupt the
     /// agent.
     ArmAndInterrupt,
-    /// First press while the agent is idle — arm the exit window and show
-    /// the hint only (nothing to interrupt).
-    ArmOnly,
 }
 
 /// Pure double-press decision (GOALS §3a). `now` is a monotonic clock
@@ -1296,28 +1292,49 @@ pub(super) enum CtrlCAction {
 /// when exiting (window is moot), `Some(now)` when arming/re-arming.
 ///
 /// Rules:
-/// - A press within `window` of `armed_at` → [`CtrlCAction::Exit`].
-/// - Otherwise it's a fresh first press: re-arm at `now`, and interrupt
-///   iff the agent is running.
+/// - Idle or a press within `window` of `armed_at` → [`CtrlCAction::Exit`].
+/// - Otherwise re-arm at `now` and interrupt the running agent.
 pub(super) fn decide_ctrl_c(
     now: Instant,
     armed_at: Option<Instant>,
     window: Duration,
     agent_busy: bool,
 ) -> (CtrlCAction, Option<Instant>) {
+    if !agent_busy {
+        return (CtrlCAction::Exit, None);
+    }
     if let Some(prev) = armed_at
         && now.duration_since(prev) <= window
     {
         // Second press inside the window: exit regardless of agent state.
         return (CtrlCAction::Exit, None);
     }
-    // Fresh first press (or the window lapsed): arm and, if busy, interrupt.
-    let action = if agent_busy {
-        CtrlCAction::ArmAndInterrupt
-    } else {
-        CtrlCAction::ArmOnly
-    };
-    (action, Some(now))
+    (CtrlCAction::ArmAndInterrupt, Some(now))
+}
+
+/// Read-only repository pollers belong to the presentation that consumes
+/// them. Dropping a JoinHandle detaches its task and would retain lifecycle
+/// senders forever, preventing the CLI's lifecycle actor from retiring.
+#[derive(Default)]
+struct BackgroundProjections(Vec<tokio::task::JoinHandle<()>>);
+
+impl BackgroundProjections {
+    async fn shutdown(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+        for task in self.0.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for BackgroundProjections {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// Pure gate for the eager display attach (session-id-shown-before-first-
@@ -2425,6 +2442,7 @@ pub struct App {
     /// session). `None` until resolved or when the cwd is not in a repo. Panes
     /// read this instead of shelling out to git themselves.
     pub(super) worktree_root: Arc<Mutex<Option<std::path::PathBuf>>>,
+    background_projections: BackgroundProjections,
     pub(super) dialog: Dialog,
     /// User-opened modal/pane overlays. Required question dialogs stay separate so they can shadow and resume this
     /// state without destroying the user's underlying overlay.
@@ -4337,6 +4355,7 @@ impl App {
             daemon_link: None,
             repo_status,
             worktree_root,
+            background_projections: BackgroundProjections::default(),
             dialog: Dialog::None,
             overlay: Overlay::None,
             session_rail: {
@@ -4753,6 +4772,7 @@ impl App {
         }
 
         let result = self.event_loop(&mut terminal).await;
+        self.background_projections.shutdown().await;
 
         // Process-exit cleanup for an open `/side` (no orphaned ephemeral
         // sessions): discard the throwaway fork *before* the daemon guard
@@ -5597,3 +5617,6 @@ mod vim_mouse_pending_state_tests;
 mod working_msg_tests;
 #[cfg(test)]
 mod working_span_lifecycle_tests;
+
+#[cfg(test)]
+mod composer_contract_tests;

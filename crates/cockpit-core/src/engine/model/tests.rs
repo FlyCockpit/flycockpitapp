@@ -8201,6 +8201,68 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
     );
 }
 
+#[tokio::test]
+async fn composer_paste_whitespace_keeps_trusted_and_untrusted_wire_redaction() {
+    for trusted in [false, true] {
+        let mut provider = sse_capture_provider().await;
+        let table = TestArc::new(
+            RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "composer paste test".to_string())
+                .unwrap(),
+        );
+        let model = build_openai_model_from_resolved(
+            "p",
+            &resolved_local_request(provider.base_url()),
+            "m",
+            &TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            WireApi::Completions,
+            true,
+            trusted,
+            None,
+            0,
+            0,
+            false,
+            table.clone(),
+            table,
+        )
+        .unwrap();
+        assert_eq!(model.is_trusted(), trusted);
+        let paste = format!(
+            "<user_paste id=\"test\">\ndef item():\n\treturn '{SECRET}'\n</user_paste id=\"test\">"
+        );
+        let cancel = CancellationToken::new();
+        let result = model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user(paste),
+                &[],
+                ModelParams::default(),
+                "Build",
+                None,
+                &cancel,
+                None,
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        let body = request_body_string(&provider.next_request().await);
+        assert!(
+            !body.contains(SECRET),
+            "trusted={trusted}: secret reached provider wire"
+        );
+        assert!(
+            body.contains(&crate::config::extended::RedactConfig::default().placeholder),
+            "the configured redaction marker must be observable: {body}"
+        );
+        assert!(
+            body.contains("def item():\\n\\treturn"),
+            "wire must retain pasted whitespace: {body}"
+        );
+    }
+}
+
 // AC6: every content variant carries a declared policy, asserted through the
 // production scrub walk. The `match` arms below are exhaustive with no wildcard
 // over the exhaustive-capable rig enums, so a new rig variant is a compile error

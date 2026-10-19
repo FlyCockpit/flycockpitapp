@@ -14,19 +14,19 @@
                                 TPS  │/ opens the command menu; Ctrl+K opens keybindings.                       │      █
                                 Cache│/setup lists provider, model-configuration, and workspace setup wizards;  │      █
                                 ▾ Tho│use /setup model to configure models.                                     │      █
-                                Map e│Esc closes overlays and dialogs. Ctrl+C interrupts the running agent.     │      █
-                                The o│                                                                          │      █
-                                     │Slash commands                                                            │      █
-                                ▸ rea│/caffeinate        Keep the machine awake so agents survive a closed lid  │      █
-                                     │                   (arg: on/off/until-idle)                               │      █
-                                ─ exp│/agent             Switch the primary agent (arg: name; bare lists the    │      █
-                              ▌ inter│                   chat-owning agents)                                    │      █
-                              ▌ Inter│/assistant         Open or create the latest session for a persistent     │      █
-                                     │                   assistant                                              │      █
-                              ▌ backg│/build             Switch the primary agent to Build (make changes)       │      █
-                                Backg│/btw               Open a persistent side conversation pane (arg:         │      █
-                                     │                   question/new/tangent/end)                              │      █
-                                ◇ Edi│/clear             Clear the chat and start a fresh session (alias of     │      █
+                                Map e│Esc stops a turn (vim off) or closes a dialog. Ctrl+C stops a turn or     │      █
+                                The o│quits when idle.                                                          │      █
+                                     │                                                                          │      █
+                                ▸ rea│Slash commands                                                            │      █
+                                     │/caffeinate        Keep the machine awake so agents survive a closed lid  │      █
+                                ─ exp│                   (arg: on/off/until-idle)                               │      █
+                              ▌ inter│/agent             Switch the primary agent (arg: name; bare lists the    │      █
+                              ▌ Inter│                   chat-owning agents)                                    │      █
+                                     │/assistant         Open or create the latest session for a persistent     │      █
+                              ▌ backg│                   assistant                                              │      █
+                                Backg│/build             Switch the primary agent to Build (make changes)       │      █
+                                     │/btw               Open a persistent side conversation pane (arg:         │      █
+                                ◇ Edi│                   question/new/tangent/end)                              │      █
                                 │ - o╰──────────────────────────────────────────────────────────────────────────╯      █
                                 │ + new line                                                                           █
                                 │   shared line                                                                        █

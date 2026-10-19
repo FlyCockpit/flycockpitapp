@@ -1,11 +1,10 @@
 //! Prompt composer.
 //!
-//! Vim mode is **default on** (`the design notes` §1b). This deviates from codex
-//! (vim is opt-in there) — Vim users shouldn't have to discover a slash
-//! command before they can `dd` a line.
+//! Insert editing is the default; vim is opt-in in `/settings`.
 //!
 //! Modes:
-//!   - `Insert`  — standard editor; `Esc` -> Normal.
+//!   - `Insert`  — standard editor; `Esc` stops a turn, or enters Normal
+//!     when vim is enabled.
 //!   - `Normal`  — motions `h l w W b B e ge 0 $ gg G f F t T ; , %`
 //!     (`j`/`k` navigate prompt history, not buffer lines); edits
 //!     `x D C o O i I a A p P`; operators `d c y` over those motions plus
@@ -54,12 +53,29 @@ pub struct VisualChunk {
 
 pub fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
-    s.width()
+    s.split('\t').map(|part| part.width()).sum::<usize>()
+        + s.bytes().filter(|byte| *byte == b'\t').count() * COMPOSER_TAB_WIDTH
+}
+
+const COMPOSER_TAB_WIDTH: usize = 4;
+
+pub(crate) fn display_editor_text(text: &str) -> String {
+    text.replace('\t', &" ".repeat(COMPOSER_TAB_WIDTH))
+}
+
+/// Terminals (including tmux paste-buffer) may encode pasted line breaks as
+/// CR or CRLF. Keep one logical newline for each, without changing tabs.
+pub(crate) fn normalize_paste_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 pub fn display_width_char(ch: char) -> usize {
     use unicode_width::UnicodeWidthChar;
-    ch.width().unwrap_or(0)
+    if ch == '\t' {
+        COMPOSER_TAB_WIDTH
+    } else {
+        ch.width().unwrap_or(0)
+    }
 }
 
 fn semantic_boundaries(text: &str) -> Vec<usize> {

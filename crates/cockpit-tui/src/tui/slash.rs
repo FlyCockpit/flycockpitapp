@@ -7,7 +7,8 @@
 //!     and any `.cockpit/commands/*.md` on the discovered config path.
 //!
 //! cockpit-specific commands:
-//!   - `/vim` — toggle composer vim mode (default ON in cockpit).
+//!   - `/settings` — opt into vim editing (insert editing is the default).
+//!   - `/quit` — exit through the same work guard as `/exit`.
 //!   - `/redact` — show what would be substituted in the next outbound prompt.
 //!   - `/mcp` — print the mcp2cli pointer and exit.
 //!

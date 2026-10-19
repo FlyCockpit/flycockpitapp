@@ -17,14 +17,13 @@ fn install_ephemeral_runner(
     control_rx
 }
 
-/// Idle + single (first) press: arm the window + show hint only,
-/// nothing to interrupt. The window is armed at `now`.
+/// Phase C contract: a single idle press requests a guarded exit.
 #[test]
-fn idle_first_press_arms_only() {
+fn idle_first_press_exits() {
     let now = Instant::now();
     let (action, armed) = decide_ctrl_c(now, None, CTRL_C_EXIT_WINDOW, false);
-    assert_eq!(action, CtrlCAction::ArmOnly);
-    assert_eq!(armed, Some(now));
+    assert_eq!(action, CtrlCAction::Exit);
+    assert_eq!(armed, None);
 }
 
 /// Busy + single (first) press: arm the window AND interrupt the agent.
@@ -74,8 +73,8 @@ fn second_press_at_window_boundary_exits() {
 fn presses_outside_window_never_exit() {
     let first = Instant::now();
     let second = first + Duration::from_millis(501); // > 500ms
-    let (action, armed) = decide_ctrl_c(second, Some(first), CTRL_C_EXIT_WINDOW, false);
-    assert_eq!(action, CtrlCAction::ArmOnly);
+    let (action, armed) = decide_ctrl_c(second, Some(first), CTRL_C_EXIT_WINDOW, true);
+    assert_eq!(action, CtrlCAction::ArmAndInterrupt);
     assert_eq!(
         armed,
         Some(second),
@@ -97,14 +96,14 @@ fn presses_outside_window_never_exit() {
 fn window_slides_from_last_press() {
     let t0 = Instant::now();
     // First press, armed at t0.
-    let (_a, armed) = decide_ctrl_c(t0, None, CTRL_C_EXIT_WINDOW, false);
+    let (_a, armed) = decide_ctrl_c(t0, None, CTRL_C_EXIT_WINDOW, true);
     // A press > window later: fresh first press, re-arm.
     let t1 = t0 + Duration::from_millis(800);
-    let (a, armed) = decide_ctrl_c(t1, armed, CTRL_C_EXIT_WINDOW, false);
-    assert_eq!(a, CtrlCAction::ArmOnly);
+    let (a, armed) = decide_ctrl_c(t1, armed, CTRL_C_EXIT_WINDOW, true);
+    assert_eq!(a, CtrlCAction::ArmAndInterrupt);
     // A press < window after t1: exits (slides from t1, not t0).
     let t2 = t1 + Duration::from_millis(100);
-    let (a, _armed) = decide_ctrl_c(t2, armed, CTRL_C_EXIT_WINDOW, false);
+    let (a, _armed) = decide_ctrl_c(t2, armed, CTRL_C_EXIT_WINDOW, true);
     assert_eq!(a, CtrlCAction::Exit);
 }
 
@@ -219,9 +218,8 @@ fn busy_ctrl_c_interrupts_and_clears_the_queue() {
     assert!(app.ctrl_c_armed_at.is_some());
 }
 
-/// A ctrl+c while idle must not clear a draft queue spuriously: an idle
-/// press only arms the exit hint (there is no working span to cancel), so
-/// any locally-queued content is left intact.
+/// An idle Ctrl+C requests exit without cancelling queued work. The daemon
+/// work guard owns any required background/stop decision on a real attachment.
 #[test]
 fn idle_ctrl_c_leaves_queue_intact() {
     use super::App;
@@ -233,7 +231,7 @@ fn idle_ctrl_c_leaves_queue_intact() {
         .push(input::optimistic_queue_item("still pending".to_string()));
 
     let exit = app.handle_ctrl_c();
-    assert!(!exit, "a first idle ctrl+c only arms the exit hint");
+    assert!(exit, "phase C: an idle Ctrl+C requests a guarded exit");
     assert_eq!(
         app.queue
             .iter()

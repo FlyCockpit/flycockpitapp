@@ -2384,6 +2384,9 @@ fn slash_commands_remain_reachable_from_composer() {
 fn composer_modes_remain_reachable() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);
+    assert!(!app.composer.vim_enabled());
+    app.config_snapshot.extended.tui.vim_mode = cockpit_config::extended::VimModeSetting::Hint;
+    app.apply_tui_config_from_snapshot();
     assert!(app.composer.vim_enabled());
     app.handle_key(press(KeyCode::Esc));
     assert_eq!(app.composer.vim_mode(), VimMode::Normal);

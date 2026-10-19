@@ -1035,6 +1035,11 @@ fn vim_mode_round_trips_through_extended_doc() {
     std::fs::write(&path, "{}").unwrap();
     let mut doc = ExtendedConfigDoc::load(&path).unwrap();
     let mut cfg = doc.config();
+    assert_eq!(
+        cfg.tui.vim_mode,
+        VimModeSetting::Disabled,
+        "omitted vim setting uses insert editing"
+    );
     cfg.tui.vim_mode = VimModeSetting::Enabled;
     cfg.tui.thinking = ThinkingDisplay::Verbose;
     cfg.name = Some("Christopher".into());

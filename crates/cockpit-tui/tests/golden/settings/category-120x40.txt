@@ -3,38 +3,38 @@
                               ──│[Close settings]  [Back]                                                            │──
   + New session               ▌R│Interface                                        █  How the terminal UI looks and   │ │
                               ▌ │                                                 █  how you type into it. These are │ │
- SESSIONS                       │› vim mode                 hint (default — vim on█  pure display and input          │ │
- no active sessions in all pr   │                           , hint chip on Normal █  preferences — nothing here      │ │
-                                │                           entry)                █  changes what the agent does,    │ │
-                              no│  thinking display         condensed (default — c█  only what you see.              │ │
-                              ┊ │                           hip, ctrl+t expands ev█                                  │ │
-                              ▌ │                           ery block)            █  vim mode                        │ │
-                                │  render agent markdown    ▣ on (default)        █  Keystroke model for the message │ █
-                                │  render user markdown     ▢ off (default)       █  composer. `hint` (default)      │ █
-                                │  mouse                    ▣ on (default — click █  enables vim keybindings and     │ █
-                                │                           + drag-select)        █  shows a one-time hint chip when │ █
-                                │  rich-text copy           ▣ on (default — Ctrl+S█  you enter Normal mode; `enabled`│ █
-                                │                           hift+Y copies as rich █  is vim with no hint; `disabled` │ █
-                                │                           text)                 █  is a plain text input with no   │ █
-                                │  emojis                   ▢ disabled (default — █  modal editing.                  │ █
-                                │                           text-only)            █                                  │ █
+ SESSIONS                       │› vim mode                 disabled (default — in█  pure display and input          │ │
+ no active sessions in all pr   │                           sert editing)         █  preferences — nothing here      │ │
+                                │  thinking display         condensed (default — c█  changes what the agent does,    │ │
+                              no│                           hip, ctrl+t expands ev█  only what you see.              │ │
+                              ┊ │                           ery block)            █                                  │ │
+                              ▌ │  render agent markdown    ▣ on (default)        █  vim mode                        │ │
+                                │  render user markdown     ▢ off (default)       █  Keystroke model for the message │ █
+                                │  mouse                    ▣ on (default — click █  composer. `disabled` (default)  │ █
+                                │                           + drag-select)        █  uses insert editing; Esc stops a│ █
+                                │  rich-text copy           ▣ on (default — Ctrl+S█  running turn. Opt into `hint`   │ █
+                                │                           hift+Y copies as rich █  for vim keybindings with a      │ █
+                                │                           text)                 █  one-time hint chip when you     │ █
+                                │  emojis                   ▢ disabled (default — █  enter Normal mode; `enabled` is │ █
+                                │                           text-only)            █  vim with no hint.               │ █
                                 │  file-type icons          auto (default — nerd-f█                                  │ █
                                 │                           ont icons on kitty/Wez█                                  │ █
-                              ▌ │                           Term/Ghostty)         █                                  │ █
+                                │                           Term/Ghostty)         █                                  │ █
                               ▌ │  diff style               side-by-side (default █                                  │ █
-                                │                           — two columns; falls b█                                  │ █
-                              ▌ │                           ack to inline under 80█                                  │ █
-                                │                            cols)                █                                  │ █
+                              ▌ │                           — two columns; falls b█                                  │ █
+                                │                           ack to inline under 80█                                  │ █
+                              ▌ │                            cols)                █                                  │ █
                                 │  startup banner           ▣ on (default — show s█                                  │ █
                                 │                           tartup banner)        █                                  │ █
-                                │  show cwd                 ▣ on (default — cwd in│                                  │ █
-                                │                            chrome)              │                                  │ █
+                                │  show cwd                 ▣ on (default — cwd in█                                  │ █
+                                │                            chrome)              █                                  │ █
                                 │  show branch              ▣ on (default — branch│                                  │ █
-                               ⋯│                            in chrome)           │                                  │ █
-                                │  caffeinate display       ▢ system only (default│                                  │ █
+                                │                            in chrome)           │                                  │ █
+                               ⋯│  caffeinate display       ▢ system only (default│                                  │ █
                                 │                           )                     │                                  │ █
                                 │  attention notifications  ▣ on (default — toast │                                  │ █
-                              ▌ │                           for attention events) │                                  │ █
+                                │                           for attention events) │                                  │ █
+                              ▌ │  attention title marker   ▣ on (default — title │                                  │ █
  ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: edit / cycle / dril [ reset display settings to defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

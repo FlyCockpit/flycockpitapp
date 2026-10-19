@@ -2014,9 +2014,19 @@ impl App {
         let lifecycle = self.lifecycle.clone();
         let cwd = self.launch.cwd.clone();
         let repo_status = Arc::clone(&self.repo_status);
-        let _git_refresh = super::spawn_git_refresh(cwd.clone(), lifecycle.clone(), repo_status);
+        self.background_projections.0.push(super::spawn_git_refresh(
+            cwd.clone(),
+            lifecycle.clone(),
+            repo_status,
+        ));
         let worktree_root = Arc::clone(&self.worktree_root);
-        let _worktree_resolve = super::spawn_worktree_root_resolve(cwd, lifecycle, worktree_root);
+        self.background_projections
+            .0
+            .push(super::spawn_worktree_root_resolve(
+                cwd,
+                lifecycle,
+                worktree_root,
+            ));
 
         #[cfg(feature = "remote")]
         self.start_startup_disclosures_fetch();

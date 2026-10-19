@@ -2,7 +2,7 @@
 //!
 //! Modeled on codex (see `kcl ask codex`). Key components:
 //!   - `app`           top-level state machine + event loop
-//!   - `composer`      bottom input area; vim mode default-on (GOALS §1b)
+//!   - `composer`      bottom input area; insert default, vim opt-in
 //!   - `chrome`        status line — always shows cwd + git branch (GOALS §1a)
 //!   - `chat`          scrollback of user/assistant turns
 //!   - `slash`         leader-less slash menu

@@ -23,7 +23,7 @@
                               ▌ backg│  @            file tag       tag a file into the message                 │      █
                                 Backg│Global                                                                    │      █
                                      │  Ctrl+K       keys           open/close this which-key overlay (also /key│      █
-                                ◇ Edi│  Ctrl+C       interrupt      stop the running agent; press twice to quit │      █
+                                ◇ Edi│  Ctrl+C       interrupt      quit when idle; stop a running agent, press │      █
                                 │ - o│  Ctrl+D       quit           exit when idle; guarded while work is active│      █
                                 │ + n│  /            commands       open the slash-command menu                 │      █
                                 │   s│Esc/q/Ctrl+K close  ↑/↓ scroll  g/G top/bottom                            │      █

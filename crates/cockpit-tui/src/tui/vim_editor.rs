@@ -4,7 +4,6 @@ use ratatui::layout::{Margin, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use std::cell::Cell;
-use unicode_width::UnicodeWidthStr;
 
 use crate::tui::composer::{Composer, VimMode};
 use crate::tui::markdown;
@@ -37,7 +36,8 @@ impl VimEditor {
 
     pub fn paste(&mut self, text: &str) {
         if !text.is_empty() {
-            self.composer.insert_str(text);
+            self.composer
+                .insert_str(&crate::tui::composer::normalize_paste_newlines(text));
         }
     }
 
@@ -57,7 +57,7 @@ impl VimEditor {
         let mut display = 0usize;
         let mut byte = 0usize;
         for grapheme in markdown::semantic_graphemes(line) {
-            let width = UnicodeWidthStr::width(grapheme.as_str());
+            let width = crate::tui::composer::display_width(&grapheme);
             if col < display.saturating_add(width) {
                 break;
             }
@@ -135,7 +135,7 @@ impl VimEditor {
             .split('\n')
             .skip(scroll)
             .take(content_height)
-            .map(|line| Line::from(line.to_string()))
+            .map(|line| Line::from(crate::tui::composer::display_editor_text(line)))
             .collect();
         while lines.len() < content_height {
             lines.push(Line::from(""));
@@ -215,6 +215,22 @@ mod tests {
             editor.handle_key(key(KeyCode::Esc)),
             VimEditorOutcome::Cancel
         ));
+    }
+
+    #[test]
+    fn paste_normalizes_terminal_newlines_but_retains_tabs_and_cursor_geometry() {
+        for vim in [false, true] {
+            let mut editor = VimEditor::new("", vim);
+            editor.paste("\talpha\r\n\tbeta");
+            assert_eq!(editor.text(), "\talpha\n\tbeta");
+            assert_eq!(editor.composer.cursor_line_col(), (1, 8));
+            editor.set_cursor_from_visible_cell(0, 4);
+            assert_eq!(
+                editor.composer.cursor(),
+                1,
+                "four cells map to one tab byte"
+            );
+        }
     }
 
     #[test]

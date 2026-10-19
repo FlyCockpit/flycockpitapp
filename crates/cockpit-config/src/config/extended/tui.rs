@@ -417,14 +417,14 @@ impl FileIconsSetting {
     }
 }
 
-/// Tri-state vim mode: `hint` (default; vim enabled, hint shown on
-/// entry to Normal), `enabled` (vim on, no hint), `disabled` (vim off).
+/// Insert editing is the default. Opt into vim with `hint` (hint shown on
+/// entry to Normal) or `enabled` (no hint) in settings.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum VimModeSetting {
-    #[default]
     Hint,
     Enabled,
+    #[default]
     Disabled,
 }
 

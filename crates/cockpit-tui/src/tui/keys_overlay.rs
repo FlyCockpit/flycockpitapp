@@ -168,7 +168,7 @@ const GLOBAL: KeyGroup = KeyGroup {
         KeyBinding {
             key: "Ctrl+C",
             action: "interrupt",
-            desc: "stop the running agent; press twice to quit",
+            desc: "quit when idle; stop a running agent, press twice to quit",
         },
         KeyBinding {
             key: "Ctrl+D",
@@ -289,8 +289,8 @@ const COMPOSER: KeyGroup = KeyGroup {
         },
         KeyBinding {
             key: "Esc",
-            action: "normal/cancel",
-            desc: "vim Normal mode, or cancel a slash query",
+            action: "stop/mode",
+            desc: "stop turn in insert; vim Normal or dismiss completion",
         },
     ],
 };

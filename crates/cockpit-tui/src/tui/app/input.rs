@@ -537,7 +537,7 @@ impl App {
     /// The base layer's global keys: the only keys that reach the base while
     /// a floating layer is on top. They go straight to the base's global
     /// handlers. The chat surface (and the workspace-trust dialog over it)
-    /// has Ctrl-C (interrupt, or exit on a second press) and Ctrl-D (guarded
+    /// has Ctrl-C (idle exit, or interrupt and double-press exit) and Ctrl-D (guarded
     /// exit); the onboarding shell has its quit chord (Ctrl-C). Unlike the
     /// same keys with no floating layer up, they are never forwarded to a
     /// focused embedded PTY or btw pane underneath: that pane does not own
@@ -865,8 +865,8 @@ impl App {
             return self.handle_onboarding_shell_key(key);
         }
 
-        // Ctrl+C: interrupt the running agent; exit only on a second press
-        // within the 0.5s window (GOALS §3a). Routed through the
+        // Ctrl+C: exit when idle; interrupt a running agent, then exit on a
+        // second press within the 0.5s window. Routed through the
         // double-press state machine. Explicitly exclude Shift so that
         // Ctrl+Shift+C (copy-selection, plan.md T8.f) isn't mistaken for it
         // on terminals that report the shift state in `modifiers` even when
@@ -1569,6 +1569,12 @@ impl App {
     }
 
     pub(super) fn handle_key_insert(&mut self, key: KeyEvent) -> bool {
+        // Plain insert Esc is a stop gesture, even while a completion popup
+        // is visible. Vim's opt-in Esc retains its modal editing behavior.
+        if key.code == KeyCode::Esc && !self.composer.vim_enabled() && self.busy {
+            self.stop_composer_turn();
+            return false;
+        }
         // `@`-popup intercepts navigation + accept keys when active.
         if self.at_popup_active() {
             match key.code {
@@ -1659,9 +1665,8 @@ impl App {
             KeyCode::Esc => {
                 // Esc dismisses the slash palette but preserves the query.
                 // when vim is enabled, it drops the composer into
-                // Normal mode. When vim is disabled it's a no-op
-                // (deliberate — too easy to hit accidentally for an
-                // exit path; `/exit`, Ctrl+C, Ctrl+D cover that).
+                // Normal mode. Plain insert's active-turn stop was handled
+                // above; an idle Esc leaves the text intact.
                 if self.slash_query().is_some() {
                     self.slash_dismissed = true;
                     self.slash_menu_cache.borrow_mut().take();
@@ -2077,9 +2082,6 @@ impl App {
         if self.slash_query().is_none() {
             return false;
         }
-        if !self.guard_startup_workspace_effects() {
-            return false;
-        }
         if let Some(query) = self.slash_query().map(str::to_owned)
             && let Some(command) = super::hidden_slash_alias(&query)
         {
@@ -2098,9 +2100,17 @@ impl App {
             }
         };
         match chosen {
-            None => false,
+            None => {
+                self.report_unknown_slash();
+                false
+            }
             Some(Ok(cmd)) => self.execute_slash(cmd),
-            Some(Err(name)) => self.invoke_skill_slash(&name),
+            Some(Err(name)) => {
+                if !self.guard_startup_workspace_effects() {
+                    return false;
+                }
+                self.invoke_skill_slash(&name)
+            }
         }
     }
 
@@ -2654,10 +2664,50 @@ impl App {
             }
             return false;
         }
+        // Command dispatch is independent of completion-menu visibility:
+        // whitespace (arguments / Tab completion) closes that menu.
+        if let Some(name) = self
+            .composer
+            .text()
+            .strip_prefix('/')
+            .and_then(|rest| rest.split(char::is_whitespace).next())
+        {
+            if !name.is_empty()
+                && let Some(command) = super::hidden_slash_alias(name).or_else(|| {
+                    super::slash::slash_command_by_name(name)
+                        .filter(|command| command.is_available(self))
+                        .copied()
+                })
+            {
+                return self.execute_slash(command);
+            }
+            if !name.is_empty()
+                && let Some(skill) = self.skill_commands.iter().find(|skill| skill.name == name)
+            {
+                let name = skill.name.clone();
+                if !self.guard_startup_workspace_effects() {
+                    return false;
+                }
+                return self.invoke_skill_slash(&name);
+            }
+            if !self.slash_dismissed && self.slash_query().is_none() {
+                self.report_unknown_slash();
+                return false;
+            }
+        }
         if self.slash_query().is_some() {
             return self.dispatch_slash_selection();
         }
         self.submit_input()
+    }
+
+    fn report_unknown_slash(&mut self) {
+        self.slash_dismissed = true;
+        self.slash_menu_cache.borrow_mut().take();
+        self.show_toast(
+            "Unknown slash command. Use /help for commands, or press Enter again to send this text.",
+            super::ToastKind::Info,
+        );
     }
 
     /// Guard every Enter route before shell and slash dispatch can consume the
@@ -6784,6 +6834,7 @@ mod shift_enter_keyboard_protocol_tests {
     fn ctrl_c_without_shift_still_uses_interrupt_exit_path() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app(&tmp);
+        app.busy = true;
         app.composer.set("draft".to_string());
 
         let exit = app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));

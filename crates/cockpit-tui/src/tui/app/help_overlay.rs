@@ -176,7 +176,7 @@ fn help_lines(inner_width: u16) -> Vec<Line<'static>> {
     push_wrapped(
         &mut lines,
         Line::from(Span::styled(
-            "Esc closes overlays and dialogs. Ctrl+C interrupts the running agent.",
+            "Esc stops a turn (vim off) or closes a dialog. Ctrl+C stops a turn or quits when idle.",
             muted,
         )),
         width,

@@ -101,9 +101,8 @@ impl App {
             return message;
         };
         self.exit_check_escape = Some(binding);
-        let message = format!(
-            "{message}. Press Ctrl+C twice or run /exit again to quit without the daemon check."
-        );
+        let message =
+            format!("{message}. Try /quit again (or Ctrl+C) to quit without the daemon check.");
         self.show_toast(message.clone(), ToastKind::Error);
         message
     }
@@ -207,8 +206,8 @@ impl App {
         }
     }
 
-    /// Handle a ctrl+c press (GOALS §3a). Single press interrupts a
-    /// running agent (never quits); a second press within
+    /// Handle a ctrl+c press. An idle press requests exit; a busy press
+    /// interrupts, and a second press within
     /// [`CTRL_C_EXIT_WINDOW`] of the previous exits. Returns `true` to
     /// exit the TUI (the event loop breaks). Drives the double-press
     /// state machine via the pure [`decide_ctrl_c`] unit, sends the
@@ -225,24 +224,19 @@ impl App {
         match action {
             CtrlCAction::Exit => self.request_guarded_exit(),
             CtrlCAction::ArmAndInterrupt => {
-                self.interrupt_agent();
-                self.end_working_span();
-                // A ctrl+c cancels the whole working span the user is looking
-                // at — including any messages they queued *during* it (typed +
-                // submitted while the turn was in flight). The daemon discards
-                // those un-dispatched queued messages on cancel so it returns
-                // to idle rather than rolling straight into the next one; clear
-                // our mirror of the queue here so the pending rows above the
-                // composer disappear in lockstep and don't masquerade as still
-                self.queue.clear();
-                self.show_ctrl_c_hint();
-                false
-            }
-            CtrlCAction::ArmOnly => {
+                self.stop_composer_turn();
                 self.show_ctrl_c_hint();
                 false
             }
         }
+    }
+
+    /// Both stop gestures cancel the visible span and queued follow-ups.
+    /// Keep the editable draft intact, and leave daemon receipts authoritative.
+    pub(super) fn stop_composer_turn(&mut self) {
+        self.interrupt_agent();
+        self.end_working_span();
+        self.queue.clear();
     }
 
     /// Send the daemon a `CancelTurn` for the attached session (GOALS

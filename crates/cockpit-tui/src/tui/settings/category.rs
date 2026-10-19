@@ -74,9 +74,9 @@ fn cycle_vim(v: VimModeSetting) -> VimModeSetting {
 
 fn vim_label(v: VimModeSetting) -> &'static str {
     match v {
-        VimModeSetting::Hint => "hint (default — vim on, hint chip on Normal entry)",
+        VimModeSetting::Hint => "hint (vim on, hint chip on Normal entry)",
         VimModeSetting::Enabled => "enabled (vim on, no hint chip)",
-        VimModeSetting::Disabled => "disabled (vim off)",
+        VimModeSetting::Disabled => "disabled (default — insert editing)",
     }
 }
 
@@ -636,10 +636,10 @@ impl SettingId {
     fn help_text(self) -> &'static str {
         match self {
             SettingId::VimMode => {
-                "Keystroke model for the message composer. `hint` (default) enables \
-                 vim keybindings and shows a one-time hint chip when you enter \
-                 Normal mode; `enabled` is vim with no hint; `disabled` is a plain \
-                 text input with no modal editing."
+                "Keystroke model for the message composer. `disabled` (default) uses \
+                 insert editing; Esc stops a running turn. Opt into `hint` for \
+                 vim keybindings with a one-time hint chip when you enter \
+                 Normal mode; `enabled` is vim with no hint."
             }
             SettingId::Thinking => {
                 "How a model's reasoning is shown. `condensed` (default) collapses \

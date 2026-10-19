@@ -45,6 +45,7 @@ pub enum RailOutcome {
     NewSession,
     Resume(Uuid),
     LoadList,
+    RefreshList,
     LoadPreview {
         session_id: Uuid,
         before_seq: Option<i64>,
@@ -1328,7 +1329,9 @@ impl SessionRail {
                 None
             }
             KeyCode::Char('f') => self.toggle_selected_favorite(),
-            KeyCode::Char('r') if self.error.is_some() => self.load_list_if_connected(),
+            KeyCode::Char('r') if self.error.is_some() => self
+                .load_list_if_connected()
+                .map(|_| RailOutcome::RefreshList),
             _ => None,
         }
     }

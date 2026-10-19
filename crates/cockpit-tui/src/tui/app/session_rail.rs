@@ -121,6 +121,10 @@ impl App {
                 self.start_sessions_list_action();
                 true
             }
+            Some(RailOutcome::RefreshList) => {
+                self.request_session_rail_refresh();
+                true
+            }
             Some(RailOutcome::LoadPreview {
                 session_id,
                 before_seq,
@@ -458,6 +462,84 @@ mod tests {
             2,
             "coalesced bit is consumed once"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn day2_session_rail_retry_coalesces_behind_pending_preview() {
+        use cockpit_client::{ClientEndpoint, InProcessEndpoint};
+        use cockpit_proto::{Request, Response};
+        use tokio::sync::mpsc;
+        let (connections, mut incoming) = mpsc::channel(4);
+        let (sensitive, _sensitive_rx) = mpsc::channel(1);
+        let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
+        let mut app = App::new(None, false);
+        app.first_paint_completed = true;
+        app.startup_background.daemon_endpoint = Some(endpoint);
+        let id = Uuid::new_v4();
+        seed_rail_sessions(&mut app, vec![summary(id, 1)]);
+        app.start_sessions_list_action();
+        let generation = app.session_rail.list_generation();
+        let started = app.session_rail.request_counts().list_started;
+        let (list, _list_rx, _list_events) = day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(list.request, Request::ListSessions { .. }));
+        // A real invalid list response leaves confirmed cards and an error;
+        // the list consumer still starts their preview.
+        assert!(list.reply.send(Ok(Response::Ack)).is_ok());
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().preview_in_flight == 1
+        })
+        .await;
+        assert!(app.session_rail.error().is_some());
+        let (preview, _preview_rx, _preview_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        assert!(
+            matches!(preview.request, Request::ReadSessionMessages { session_id, .. } if session_id == id)
+        );
+        app.session_rail.focus();
+        app.handle_session_rail_key(press(KeyCode::Char('r')));
+        assert_eq!(
+            app.session_rail.list_generation(),
+            generation,
+            "same-scope retry must preserve pending preview"
+        );
+        assert_eq!(app.session_rail.request_counts().list_started, started);
+        assert!(app.session_rail_refresh_needed);
+        assert!(
+            preview
+                .reply
+                .send(Ok(Response::SessionMessages {
+                    session_id: id,
+                    messages: vec![cockpit_proto::SessionMessage {
+                        seq: 1,
+                        ts_ms: 1,
+                        role: cockpit_proto::MessageRole::User,
+                        text: "preview survives retry".into(),
+                    }],
+                    has_more: false,
+                }))
+                .is_ok()
+        );
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().preview_in_flight == 0
+        })
+        .await;
+        assert_eq!(app.session_rail.preview_message_count(), 1);
+        app.maybe_start_session_rail_list();
+        assert_eq!(app.session_rail.request_counts().list_started, started + 1);
+        let (refresh, _refresh_rx, _refresh_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(refresh.request, Request::ListSessions { .. }));
+        assert!(
+            refresh
+                .reply
+                .send(Ok(Response::Sessions { sessions: vec![] }))
+                .is_ok()
+        );
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().list_in_flight == 0
+        })
+        .await;
+        assert!(!app.session_rail_refresh_needed);
     }
 
     #[test]

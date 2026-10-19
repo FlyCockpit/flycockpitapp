@@ -290,7 +290,7 @@ impl App {
         latch_error: bool,
         continuation: RunnerAttachContinuation,
     ) {
-        if !self.guard_startup_workspace_effects() {
+        if !self.guard_startup_workspace_effects() || !self.guard_session_effect("session attach") {
             return;
         }
         if self.session_mode.unwrap_or(SessionMode::Code) == SessionMode::Code

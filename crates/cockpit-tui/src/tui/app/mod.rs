@@ -2174,6 +2174,7 @@ pub struct App {
     startup_session_selector: Option<String>,
     startup_session_resolved: bool,
     session_rail_refresh_needed: bool,
+    reducing_async_action_batch: bool,
     session_rail_next_refresh: Instant,
     /// Requested before attach, then replaced by the daemon-owned session
     /// value from `Attached`. It never grants or changes execution authority.
@@ -4447,6 +4448,7 @@ impl App {
             startup_session_selector: None,
             startup_session_resolved: false,
             session_rail_refresh_needed: false,
+            reducing_async_action_batch: false,
             session_rail_next_refresh: Instant::now(),
             pending_new_session: false,
             pending_session_materialization: false,

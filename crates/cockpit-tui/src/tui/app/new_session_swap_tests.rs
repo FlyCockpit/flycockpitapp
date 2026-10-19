@@ -3340,3 +3340,265 @@ async fn day2_startup_boundary_restores_ended_durable_sessions() {
         }
     }
 }
+
+/// Exercise actual slash dispatch while the old PossiblySent receipt prevents
+/// switch-task admission. Both attached RPCs and endpoint RPCs are observable.
+async fn day2_draft_control_waits_for_adoption(command: &str) {
+    use cockpit_client::{
+        ClientEndpoint, InProcessConnection, InProcessEndpoint, InProcessRequest,
+    };
+    use cockpit_proto::{Request, Response};
+
+    let mut app = App::new(None, false);
+    let (mut input, mut controls, outcome_tx) = install_live_swappable_runner(&mut app, 8);
+    let (attached_tx, mut attached) = mpsc::channel(8);
+    let (connections, mut incoming) = mpsc::channel(4);
+    let (sensitive, _sensitive_rx) = mpsc::channel(1);
+    let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
+    let runner = app.agent_runner.as_mut().unwrap().as_mut().unwrap();
+    runner.attached_request_tx = attached_tx;
+    runner.endpoint = endpoint;
+    let old_id = runner.session_id();
+    app.launch.session_id = Some(old_id);
+    app.startup_session_resolved = true;
+    app.first_paint_completed = true;
+    app.startup_background.workspace_ready = true;
+    super::seed_ready_model_for_tests(&mut app);
+    app.composer.insert_str("old message");
+    app.submit_input();
+    let RunnerInput::Submission(old) = input.try_recv().unwrap() else {
+        panic!("old submission")
+    };
+    app.pending_new_session = true;
+    app.maybe_open_local_session_draft_with_clear(|| Ok(()))
+        .unwrap();
+    app.composer.insert_str("replacement first message");
+    app.submit_input();
+    assert!(app.pending_session_materialization);
+    assert!(
+        !app.session_switch_in_progress(),
+        "receipt wait precedes switch task"
+    );
+    assert_eq!(
+        app.agent_runner
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .session_id(),
+        old_id
+    );
+    let run = |app: &mut App| {
+        app.clear_composer_buffer();
+        if command == "queue.edit" {
+            app.edit_queued_messages();
+            return;
+        }
+        if command == "fork.stale" {
+            app.fork_at_seq(0, 1);
+            return;
+        }
+        app.composer.insert_str(command);
+        let name = command
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .trim_start_matches('/');
+        app.execute_slash(*super::slash::slash_command_by_name(name).unwrap());
+        if command == "/prune" {
+            app.commit_prune();
+        }
+    };
+    run(&mut app);
+    assert!(
+        input.try_recv().is_err(),
+        "{command} must not submit to outgoing id"
+    );
+    assert!(
+        controls.try_recv().is_err(),
+        "{command} must not control outgoing id"
+    );
+    assert!(
+        attached.try_recv().is_err(),
+        "{command} must not issue outgoing attached RPC"
+    );
+    assert!(
+        incoming.try_recv().is_err(),
+        "{command} must not open outgoing endpoint RPC"
+    );
+    assert_eq!(
+        app.async_actions.pending_count(),
+        0,
+        "{command} must refuse before scheduling an RPC"
+    );
+    assert!(app.pending_session_materialization);
+    assert!(app.current_session_id().is_none());
+
+    // Restore the retained first-message document after using the composer to
+    // dispatch the control; its reservation is unchanged by command rejection.
+    app.composer.insert_str("replacement first message");
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::UserMessageRecorded {
+            seq: 1,
+            client_submission_ids: vec![old.optimistic_submission_id],
+            preflight_cleaned: None,
+        },
+    );
+    day2_materialization_tick(&mut app);
+    assert!(app.session_switch_in_progress());
+    let replacement_id = uuid::Uuid::new_v4();
+    let AsyncActionPayload::SessionSwitched(outcome) = switch_outcome(replacement_id, "newctl")
+    else {
+        unreachable!()
+    };
+    outcome_tx.send(Ok(*outcome)).unwrap();
+    drain_session_switch_until_complete(&mut app).await;
+    super::seed_ready_model_for_tests(&mut app);
+    day2_materialization_tick(&mut app);
+    let RunnerInput::Submission(first) = input.try_recv().expect("retained first message") else {
+        panic!("first message")
+    };
+    assert_eq!(first.intended_session_id, replacement_id);
+    assert_eq!(first.submission.text, "replacement first message");
+    assert_eq!(app.current_session_id(), Some(replacement_id));
+    run(&mut app);
+    match command {
+        "/compact" => {
+            let RunnerInput::Submission(sent) = input.try_recv().expect("compact after adoption")
+            else {
+                panic!("compaction submission")
+            };
+            assert_eq!(sent.intended_session_id, replacement_id);
+            assert_eq!(
+                sent.submission.kind,
+                cockpit_client::submission::UserSubmissionKind::Compact
+            );
+        }
+        "/btw question" | "/goal ship" | "queue.edit" => {
+            let rpc = tokio::time::timeout(Duration::from_secs(3), attached.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(rpc.intended_session_id, replacement_id);
+            match rpc.request {
+                Request::CreateBtwFork {
+                    parent_session_id, ..
+                } => assert_eq!(parent_session_id, replacement_id),
+                Request::CreateGoal { session_id, .. } => assert_eq!(session_id, replacement_id),
+                Request::RemoveEditableQueuedUserMessages { target_id: None } => {}
+                other => panic!("unexpected attached request: {other:?}"),
+            }
+            rpc.response_tx
+                .send(Err("test boundary observed".into()))
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while app.async_actions.pending_count() > 0 {
+                    app.drain_async_actions();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        "/prune" => {
+            // /prune first arms a confirmation; exercise the shared control
+            // sender directly as well, independent of projection token count.
+            let rpc = controls.try_recv().expect("control after adoption");
+            assert_eq!(rpc.intended_session_id, replacement_id);
+            assert!(matches!(rpc.request, Request::Prune));
+        }
+        _ => {
+            let reply = tokio::time::timeout(Duration::from_secs(3), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let (requests, mut requests_rx) = mpsc::channel::<InProcessRequest>(2);
+            let (events_tx, events) = mpsc::channel(1);
+            assert!(
+                reply
+                    .send(Some(InProcessConnection { requests, events }))
+                    .is_ok()
+            );
+            let readiness = requests_rx.recv().await.unwrap();
+            assert!(matches!(readiness.request, Request::DaemonStatus));
+            assert!(readiness.reply.send(Ok(Response::Ack)).is_ok());
+            let rpc = requests_rx.recv().await.unwrap();
+            let response = match rpc.request {
+                Request::RenameSession { session_id, title } => {
+                    assert_eq!(session_id, replacement_id);
+                    assert_eq!(title, "replacement title");
+                    Response::Ack
+                }
+                Request::ForkSession {
+                    parent_session_id, ..
+                } => {
+                    assert_eq!(parent_session_id, replacement_id);
+                    Response::Ack
+                }
+                Request::AutoTitle { session_id } => {
+                    assert_eq!(session_id, replacement_id);
+                    Response::AutoTitle {
+                        session_id,
+                        title: "generated replacement title".into(),
+                    }
+                }
+                Request::RecordSessionNote { session_id, .. } => {
+                    assert_eq!(session_id, replacement_id);
+                    Response::NoteRecorded { seq: 2 }
+                }
+                other => panic!("unexpected endpoint request: {other:?}"),
+            };
+            assert!(rpc.reply.send(Ok(response)).is_ok());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while app.async_actions.pending_count() > 0 {
+                    app.drain_async_actions();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(events_tx);
+        }
+    }
+    assert!(
+        input.try_recv().is_err(),
+        "no duplicate dispatch after adoption"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_draft_materialization_compact_cannot_target_outgoing_session() {
+    day2_draft_control_waits_for_adoption("/compact").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_draft_materialization_rename_cannot_target_outgoing_session() {
+    day2_draft_control_waits_for_adoption("/rename replacement title").await;
+    day2_draft_control_waits_for_adoption("/rename").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_draft_materialization_btw_cannot_target_outgoing_session() {
+    day2_draft_control_waits_for_adoption("/btw question").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_draft_materialization_goal_and_note_cannot_target_outgoing_session() {
+    day2_draft_control_waits_for_adoption("/goal ship").await;
+    day2_draft_control_waits_for_adoption("/note replacement note").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_draft_materialization_generic_control_cannot_target_outgoing_session() {
+    day2_draft_control_waits_for_adoption("/prune").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_draft_materialization_queue_edit_cannot_target_outgoing_session() {
+    day2_draft_control_waits_for_adoption("queue.edit").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn day2_draft_materialization_stale_fork_cannot_target_outgoing_session() {
+    day2_draft_control_waits_for_adoption("fork.stale").await;
+}

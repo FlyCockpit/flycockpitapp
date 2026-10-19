@@ -57,9 +57,14 @@ impl App {
     /// generation. Only scope/search/attachment changes replace those reads.
     pub(super) fn request_session_rail_refresh(&mut self) {
         self.session_rail_refresh_needed = true;
-        // The action remains pending through completion until its result is
-        // drained. A timed-out/aborted action has settled even if it could not
-        // return a fenced payload, and must not strand the next refresh.
+        // drain_completed removes all pending owners before any reducer runs.
+        // A routine refresh from an earlier completion must wait for the rest
+        // of that batch to publish. The next wake admits the coalesced refresh.
+        if self.reducing_async_action_batch {
+            return;
+        }
+        // Outside reduction, pending includes completed-but-undrained reads.
+        // Expired/aborted reads settle without a payload and cannot strand us.
         let pending = ["sessions.list", "sessions.live", "sessions.preview"]
             .into_iter()
             .any(|kind| {
@@ -1168,5 +1173,293 @@ mod tests {
             app.pending_link_activation.is_none(),
             "hidden transcript links under the overlay rail must not activate"
         );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_r2_same_batch_inbox_refresh_must_not_drop_completed_list() {
+        use cockpit_client::{ClientEndpoint, InProcessEndpoint};
+        use cockpit_proto::{Request, Response};
+        use tokio::sync::mpsc;
+        let (connections, mut incoming) = mpsc::channel(4);
+        let (sensitive, _sensitive_rx) = mpsc::channel(1);
+        let mut app = App::new(None, false);
+        app.first_paint_completed = true;
+        app.startup_background.daemon_endpoint = Some(ClientEndpoint::InProcess(
+            InProcessEndpoint::new(connections, sensitive),
+        ));
+        app.maybe_start_session_rail_list();
+        let generation = app.session_rail.list_generation();
+        let (list, _list_rx, _list_events) = day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(list.request, Request::ListSessions { .. }));
+        let id = Uuid::new_v4();
+        app.start_sessions_inbox_action(id);
+        let (inbox, _inbox_rx, _inbox_events) = day2_pending_rail_request(&mut incoming).await;
+        assert!(
+            matches!(inbox.request, Request::ReadAssistantInbox { main_session_id, .. } if main_session_id == id)
+        );
+        let notifier = app.async_actions.notifier();
+        assert!(
+            inbox
+                .reply
+                .send(Ok(Response::AssistantInbox {
+                    main_session_id: id,
+                    items: vec![]
+                }))
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        let mut row = summary(id, 2);
+        row.title = Some("completed list data must be consumed".into());
+        assert!(
+            list.reply
+                .send(Ok(Response::Sessions {
+                    sessions: vec![row]
+                }))
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        // Both terminal payloads are queued. The real App drain removes all
+        // completed actions before applying inbox first and list second.
+        app.drain_async_actions();
+        let after = app.session_rail.list_generation();
+        let title = app
+            .session_rail
+            .session_summary(id)
+            .and_then(|row| row.title.clone());
+        let started = app.session_rail.request_counts().list_started;
+        drop(incoming);
+        assert_eq!(
+            after, generation,
+            "same-batch refresh must retain the completed list fence until adoption"
+        );
+        assert_eq!(
+            title.as_deref(),
+            Some("completed list data must be consumed"),
+            "a successful list response must publish its rows"
+        );
+        assert_eq!(
+            started, 1,
+            "same-scope refresh waits until result consumption"
+        );
+    }
+    // Real RPCs finish in a controlled order before one real App drain. A
+    // mutation/inbox refresh producer must not replace any later read payload.
+    async fn day2_same_batch_rail_refresh(mutation_first: bool) {
+        use cockpit_client::{ClientEndpoint, InProcessEndpoint};
+        use cockpit_proto::{Request, Response};
+        use tokio::sync::mpsc;
+        let (connections, mut incoming) = mpsc::channel(4);
+        let (sensitive, _sensitive_rx) = mpsc::channel(1);
+        let mut app = App::new(None, false);
+        app.first_paint_completed = true;
+        app.startup_background.daemon_endpoint = Some(ClientEndpoint::InProcess(
+            InProcessEndpoint::new(connections, sensitive),
+        ));
+        let first = Uuid::new_v4();
+        let live = Uuid::new_v4();
+        seed_rail_sessions(&mut app, vec![summary(first, 2), summary(live, 1)]);
+        app.start_sessions_list_action();
+        let generation = app.session_rail.list_generation();
+        let started = app.session_rail.request_counts().list_started;
+        let (list, _list_rx, _list_events) = day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(list.request, Request::ListSessions { .. }));
+        let notifier = app.async_actions.notifier();
+
+        if mutation_first {
+            app.session_rail.focus();
+            app.handle_session_rail_key(press(KeyCode::Char('d')));
+            app.handle_session_rail_key(press(KeyCode::Right));
+            app.handle_session_rail_key(press(KeyCode::Enter));
+            assert!(app.session_rail.has_unsettled_local_authority());
+        } else {
+            app.start_sessions_inbox_action(first);
+        }
+        let (producer, _producer_rx, _producer_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        let response = if mutation_first {
+            assert!(matches!(producer.request, Request::ArchiveSession { .. }));
+            Response::Ack
+        } else {
+            assert!(matches!(
+                producer.request,
+                Request::ReadAssistantInbox { .. }
+            ));
+            Response::AssistantInbox {
+                main_session_id: first,
+                items: vec![],
+            }
+        };
+        assert!(producer.reply.send(Ok(response)).is_ok());
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        let mut row = summary(first, 2);
+        row.title = Some("same-batch saved title".into());
+        assert!(
+            list.reply
+                .send(Ok(Response::Sessions {
+                    sessions: vec![row, summary(live, 1)]
+                }))
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        app.drain_async_actions();
+        assert_eq!(
+            app.session_rail.list_generation(),
+            generation,
+            "producer must not invalidate completed list before adoption"
+        );
+        assert_eq!(
+            app.session_rail
+                .session_summary(first)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("same-batch saved title")
+        );
+        assert_eq!(app.session_rail.request_counts().list_started, started);
+        assert!(app.session_rail_refresh_needed);
+        assert!(!app.session_rail.has_unsettled_local_authority());
+
+        let (read_a, _a_rx, _a_events) = day2_pending_rail_request(&mut incoming).await;
+        let (read_b, _b_rx, _b_events) = day2_pending_rail_request(&mut incoming).await;
+        let (live_rpc, preview_rpc) = if matches!(read_a.request, Request::SessionLiveStatus { .. })
+        {
+            (read_a, read_b)
+        } else {
+            (read_b, read_a)
+        };
+        assert!(matches!(
+            live_rpc.request,
+            Request::SessionLiveStatus { .. }
+        ));
+        assert!(
+            matches!(preview_rpc.request, Request::ReadSessionMessages { session_id, .. } if session_id == first)
+        );
+        // Now repeat with both live and preview already completed behind the
+        // producer, without draining any of the three terminal payloads early.
+        if mutation_first {
+            app.session_rail.focus();
+            app.handle_session_rail_key(press(KeyCode::Char('d')));
+            app.handle_session_rail_key(press(KeyCode::Right));
+            app.handle_session_rail_key(press(KeyCode::Enter));
+            assert!(app.session_rail.has_unsettled_local_authority());
+        } else {
+            app.start_sessions_inbox_action(first);
+        }
+        let (producer, _producer2_rx, _producer2_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        let response = if mutation_first {
+            assert!(matches!(producer.request, Request::ArchiveSession { .. }));
+            Response::Ack
+        } else {
+            assert!(matches!(
+                producer.request,
+                Request::ReadAssistantInbox { .. }
+            ));
+            Response::AssistantInbox {
+                main_session_id: first,
+                items: vec![],
+            }
+        };
+        assert!(producer.reply.send(Ok(response)).is_ok());
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        assert!(
+            live_rpc
+                .reply
+                .send(Ok(Response::SessionLiveStatus {
+                    statuses: vec![cockpit_proto::LiveStatus {
+                        session_id: live,
+                        has_active_schedules: true,
+                        processing: false,
+                        project_root: None
+                    }]
+                }))
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        assert!(
+            preview_rpc
+                .reply
+                .send(Ok(Response::SessionMessages {
+                    session_id: first,
+                    messages: vec![cockpit_proto::SessionMessage {
+                        seq: 1,
+                        ts_ms: 1,
+                        role: cockpit_proto::MessageRole::User,
+                        text: "same-batch preview".into()
+                    }],
+                    has_more: false,
+                }))
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        app.drain_async_actions();
+        assert_eq!(
+            app.session_rail.list_generation(),
+            generation,
+            "producer must not invalidate completed live/preview before adoption"
+        );
+        assert_eq!(
+            app.session_rail.visible_cards()[0].session_id,
+            live,
+            "live status must publish its reordering"
+        );
+        assert_eq!(
+            app.session_rail.preview_message_count(),
+            1,
+            "preview must publish its messages"
+        );
+        assert_eq!(app.session_rail.request_counts().list_started, started);
+        assert!(app.session_rail_refresh_needed);
+        assert!(!app.session_rail.has_unsettled_local_authority());
+        app.session_rail_next_refresh = Instant::now() + Duration::from_secs(60);
+        app.maybe_start_session_rail_list();
+        assert_eq!(
+            app.session_rail.request_counts().list_started,
+            started + 1,
+            "one later refresh after adoption"
+        );
+        assert!(!app.session_rail_refresh_needed);
+        let (refresh, _refresh_rx, _refresh_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(refresh.request, Request::ListSessions { .. }));
+        assert!(
+            refresh
+                .reply
+                .send(Ok(Response::Sessions { sessions: vec![] }))
+                .is_ok()
+        );
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().list_in_flight == 0
+        })
+        .await;
+        app.maybe_start_session_rail_list();
+        assert_eq!(
+            app.session_rail.request_counts().list_started,
+            started + 1,
+            "settled refresh must not loop"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn day2_session_rail_same_batch_inbox_preserves_list_live_preview() {
+        day2_same_batch_rail_refresh(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn day2_session_rail_same_batch_mutation_preserves_list_live_preview() {
+        day2_same_batch_rail_refresh(true).await;
     }
 }

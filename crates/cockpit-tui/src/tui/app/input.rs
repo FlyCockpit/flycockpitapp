@@ -3605,9 +3605,7 @@ impl App {
         #[cfg(test)]
         let barrier = self.take_owned_test_barrier(operation);
         let attached_request = self
-            .agent_runner
-            .as_ref()
-            .and_then(|runner| runner.as_ref().ok())
+            .session_effect_runner()
             .map(|runner| runner.attached_request_binding());
         if attached_request.is_none() {
             #[cfg(test)]

@@ -23,7 +23,7 @@ impl App {
 
     /// Fetch the agent tree and its attention list in one coalesced action.
     pub(super) fn request_agent_tree_refresh(&mut self) {
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+        let Some(runner) = self.session_effect_runner() else {
             if let Overlay::AgentTree(pane) = &mut self.overlay {
                 pane.set_error("The agent tree is only available once attached to a session.");
             }
@@ -97,7 +97,7 @@ impl App {
         decision_request_id: Uuid,
         _agent_instance_id: Uuid,
     ) {
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+        let Some(runner) = self.session_effect_runner() else {
             return;
         };
         let attached = runner.attached_request_binding();
@@ -126,7 +126,7 @@ impl App {
     /// Fetch the focused node's daemon-resolved effective settings and open the
     /// per-node override controls inside the agent-tree overlay (modes AC5/6/7).
     pub(super) fn request_agent_effective_settings(&mut self, agent_instance_id: Uuid) {
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+        let Some(runner) = self.session_effect_runner() else {
             if let Overlay::AgentTree(pane) = &mut self.overlay {
                 pane.set_override_error(
                     "Per-node settings are only available once attached to a session.",
@@ -136,6 +136,8 @@ impl App {
         };
         let attached = runner.attached_request_binding();
         let session_id = attached.session_id();
+        let model_attached = runner.attached_request_binding();
+        let model_session_id = model_attached.session_id();
         const EFFECTIVE_SETTINGS_ACTION: &str = "agent_tree.effective_settings";
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc(EFFECTIVE_SETTINGS_ACTION),
@@ -158,8 +160,6 @@ impl App {
         // the override view's Model section (modes AC5/AC6). Sourced from the
         // daemon-owned session-setup snapshot; the daemon re-validates
         // hard-compatibility on apply.
-        let model_attached = runner.attached_request_binding();
-        let model_session_id = model_attached.session_id();
         const MODEL_CHOICES_ACTION: &str = "agent_tree.override_model_choices";
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc(MODEL_CHOICES_ACTION),
@@ -221,7 +221,7 @@ impl App {
         expected_override_revision: u64,
         field: cockpit_proto::AgentSessionOverrideFieldV1,
     ) {
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+        let Some(runner) = self.session_effect_runner() else {
             return;
         };
         let attached = runner.attached_request_binding();

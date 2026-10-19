@@ -868,9 +868,7 @@ fn run_goal(app: &mut App, args: &str) -> bool {
 
 fn run_guidance(app: &mut App, _: &str) -> bool {
     let attached = app
-        .agent_runner
-        .as_ref()
-        .and_then(|runner| runner.as_ref().ok())
+        .session_effect_runner()
         .map(|runner| runner.attached_request_binding());
     app.overlay = Overlay::GuidanceReview(crate::tui::guidance_review::GuidanceReviewPane::open(
         attached,
@@ -2354,13 +2352,13 @@ impl App {
     /// without a title asks the utility model to generate a fresh auto title
     /// from the durable user-authored transcript.
     pub(super) fn handle_rename_command(&mut self, arg: &str) {
+        if !self.guard_session_effect("/rename") {
+            return;
+        }
         let title = arg.trim();
         // Authoritative current session: the live runner if attached,
         // else the last-attached id tracked on launch info.
-        let session_id = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => Some(runner.session_id()),
-            _ => self.launch.session_id,
-        };
+        let session_id = self.current_session_id();
         let Some(session_id) = session_id else {
             self.push_plain("/rename: no active session yet — send a message first".to_string());
             return;
@@ -2410,6 +2408,9 @@ impl App {
     /// the full CLI bundle `.zip`. Both overwrite their own prior file
     /// and surface success/failure as a chat line, never a panic.
     pub(super) fn handle_export_command(&mut self, arg: &str) {
+        if !self.guard_session_effect("/export") {
+            return;
+        }
         // Authoritative current session: the live runner if attached,
         // else the last-attached ids tracked on launch info.
         let (session_id, short_id) = match self.agent_runner.as_ref() {
@@ -2452,6 +2453,9 @@ impl App {
     /// before a session exists shows the same "send a message first" error as
     /// `/rename`/`/export` and creates no phantom session.
     pub(super) fn handle_note_command(&mut self, arg: &str) {
+        if !self.guard_session_effect("/note") {
+            return;
+        }
         let text = arg.trim();
         if text.is_empty() {
             self.push_plain("Usage: `/note <text>`".to_string());
@@ -2460,10 +2464,7 @@ impl App {
         // Authoritative current session: the live runner if attached, else the
         // last-attached id tracked on launch info (same resolution as
         // `/rename`/`/export`).
-        let session_id = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => Some(runner.session_id()),
-            _ => self.launch.session_id,
-        };
+        let session_id = self.current_session_id();
         let Some(session_id) = session_id else {
             self.push_plain("/note: no active session yet — send a message first".to_string());
             return;
@@ -2535,6 +2536,9 @@ impl App {
     /// overlay; recover reveals into an ephemeral overlay; reset and promote use
     /// literal-free owner controls; delete has no owner RPC.
     pub(super) fn handle_sealed_command(&mut self, args: &str) {
+        if !self.guard_session_effect("/sealed") {
+            return;
+        }
         use crate::tui::sealed_overlay::{SealedDispatch, SealedScopeContext, plan_dispatch};
         let tokens: Vec<&str> = args.split_whitespace().collect();
         // Route through the redacting funnel: a parse failure surfaces ONLY a
@@ -2550,7 +2554,7 @@ impl App {
         // Every sealed-owner operation rides the attached session's persistent
         // daemon connection (one stable `client_instance_id`), so begin/apply/
         // cancel share the minting connection the capability is bound to.
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+        let Some(runner) = self.session_effect_runner() else {
             self.push_plain("/sealed: attach a session first".to_string());
             return;
         };
@@ -2574,10 +2578,8 @@ impl App {
     /// The attached session's persistent request binding, or `None` when no
     /// session is attached.
     fn attached_sealed_binding(&self) -> Option<agent_runner::AttachedRequestBinding> {
-        match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => Some(runner.attached_request_binding()),
-            _ => None,
-        }
+        self.session_effect_runner()
+            .map(|runner| runner.attached_request_binding())
     }
 
     fn start_sealed_effect(

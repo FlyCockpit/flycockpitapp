@@ -126,6 +126,9 @@ impl App {
     /// The main-session view is snapshotted into `side_conversation` so a
     /// later `/side end` / exit restores it verbatim.
     pub(super) fn enter_side_conversation(&mut self) {
+        if !self.guard_session_effect("/side") {
+            return;
+        }
         // Need a live runner: the side fork goes onto the same daemon, and
         // forking off an un-persisted session has nothing to branch from.
         let (parent_session_id, endpoint, socket) = match self.agent_runner.as_ref() {

@@ -398,9 +398,7 @@ impl App {
         let is_edit_reservation = edit_correlation
             .is_some_and(|(_, _, action)| action == cockpit_proto::QueueEditAction::Reserve);
         let Some(attached) = self
-            .agent_runner
-            .as_ref()
-            .and_then(|runner| runner.as_ref().ok())
+            .session_effect_runner()
             .map(|runner| runner.attached_request_binding())
         else {
             let notice = if is_edit_reservation {

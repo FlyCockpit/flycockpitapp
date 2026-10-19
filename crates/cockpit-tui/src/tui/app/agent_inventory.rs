@@ -10,7 +10,7 @@ impl App {
             return;
         }
         let (name, path) = {
-            let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            let Some(runner) = self.session_effect_runner() else {
                 return;
             };
             (
@@ -72,6 +72,10 @@ impl App {
 
     /// Schedule an async GetInventoryBundle refresh (coalesced via InventoryState).
     pub(super) fn request_inventory_refresh(&mut self, allow_equal_generations: bool) {
+        let Some(runner) = self.session_effect_runner() else {
+            return;
+        };
+        let attached = runner.attached_request_binding();
         let selected = self.launch.agent_name.clone();
         let Some(_ticket) = self
             .inventory
@@ -79,10 +83,6 @@ impl App {
         else {
             return;
         };
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
-            return;
-        };
-        let attached = runner.attached_request_binding();
         let cwd = self.launch.cwd.clone();
         let agent_name = selected;
         const INVENTORY_REFRESH_ACTION: &str = "inventory.bundle";

@@ -123,6 +123,9 @@ impl App {
 
     /// `/compact`: enqueue a compaction turn that seeds a new linked window.
     pub(super) fn start_compact(&mut self) {
+        if !self.guard_session_effect("/compact") {
+            return;
+        }
         let submission = ClientUserSubmission::compact_notice();
         if !matches!(self.agent_runner, Some(Ok(_))) {
             self.start_runner_attach(true, RunnerAttachContinuation::Compact);
@@ -378,6 +381,9 @@ impl App {
         pending: PendingResumeRepair,
         selected_id: Option<&str>,
     ) {
+        if !self.guard_session_effect("/resume repair") {
+            return;
+        }
         match selected_id {
             Some("fork") => {
                 let Some(seq) = pending.state.safe_last_turn_seq else {

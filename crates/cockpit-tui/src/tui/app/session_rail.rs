@@ -14,6 +14,7 @@ impl App {
 
     pub(super) fn focus_session_rail_search(&mut self) {
         let worktree = self.resolved_worktree_root();
+        let previous_scope = self.session_rail.root_request();
         self.session_rail
             .set_project_scope(worktree.as_deref(), &self.launch.cwd);
         if self.session_rail.set_daemon_connected(
@@ -25,7 +26,11 @@ impl App {
             .set_use_emojis(self.config_snapshot.extended.tui.use_emojis);
         self.session_rail.focus_search();
         if self.session_rail.needs_initial_list() || self.session_rail.daemon_connected() {
-            self.start_sessions_list_action();
+            if previous_scope != self.session_rail.root_request() {
+                self.start_sessions_list_action();
+            } else {
+                self.request_session_rail_refresh();
+            }
         }
     }
 
@@ -33,12 +38,40 @@ impl App {
         if !self.first_paint_completed {
             return;
         }
+        self.session_rail.set_local_draft(self.local_session_draft);
         let connected =
             self.sessions_daemon_endpoint().is_some() || self.sessions_daemon_socket().is_some();
         if self.session_rail.set_daemon_connected(connected) {
             self.abort_session_rail_runner_actions(false);
         }
-        if connected && self.session_rail.needs_initial_list() {
+        if connected
+            && (self.session_rail.needs_initial_list()
+                || self.session_rail_refresh_needed
+                || Instant::now() >= self.session_rail_next_refresh)
+        {
+            self.request_session_rail_refresh();
+        }
+    }
+
+    /// Timer and event refreshes coalesce behind all reads in the current
+    /// generation. Only scope/search/attachment changes replace those reads.
+    pub(super) fn request_session_rail_refresh(&mut self) {
+        self.session_rail_refresh_needed = true;
+        // drain_completed removes all pending owners before any reducer runs.
+        // A routine refresh from an earlier completion must wait for the rest
+        // of that batch to publish. The next wake admits the coalesced refresh.
+        if self.reducing_async_action_batch {
+            return;
+        }
+        // Outside reduction, pending includes completed-but-undrained reads.
+        // Expired/aborted reads settle without a payload and cannot strand us.
+        let pending = ["sessions.list", "sessions.live", "sessions.preview"]
+            .into_iter()
+            .any(|kind| {
+                self.async_actions
+                    .has_pending_kind(&AsyncActionKind::DaemonRpc(kind))
+            });
+        if !pending {
             self.start_sessions_list_action();
         }
     }
@@ -91,6 +124,10 @@ impl App {
             }
             Some(RailOutcome::LoadList) => {
                 self.start_sessions_list_action();
+                true
+            }
+            Some(RailOutcome::RefreshList) => {
+                self.request_session_rail_refresh();
                 true
             }
             Some(RailOutcome::LoadPreview {
@@ -215,6 +252,330 @@ mod tests {
             compaction_lineage_root_id: None,
             lineage_window_count: 1,
         }
+    }
+
+    async fn day2_pending_rail_request(
+        incoming: &mut tokio::sync::mpsc::Receiver<
+            tokio::sync::oneshot::Sender<Option<cockpit_client::InProcessConnection>>,
+        >,
+    ) -> (
+        cockpit_client::InProcessRequest,
+        tokio::sync::mpsc::Receiver<cockpit_client::InProcessRequest>,
+        tokio::sync::mpsc::Sender<cockpit_proto::Event>,
+    ) {
+        use cockpit_client::{InProcessConnection, InProcessRequest};
+        use tokio::sync::mpsc;
+        let reply = tokio::time::timeout(Duration::from_secs(3), incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (requests, mut requests_rx) = mpsc::channel::<InProcessRequest>(2);
+        let (events_tx, events) = mpsc::channel(1);
+        assert!(
+            reply
+                .send(Some(InProcessConnection { requests, events }))
+                .is_ok()
+        );
+        let readiness = tokio::time::timeout(Duration::from_secs(3), requests_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            readiness.request,
+            cockpit_proto::Request::DaemonStatus
+        ));
+        assert!(
+            readiness
+                .reply
+                .send(Ok(cockpit_proto::Response::Ack))
+                .is_ok()
+        );
+        let request = tokio::time::timeout(Duration::from_secs(3), requests_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        (request, requests_rx, events_tx)
+    }
+
+    async fn day2_drain_rail_until(app: &mut App, settled: impl Fn(&App) -> bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                app.drain_async_actions();
+                if settled(app) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("real rail response must settle");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn day2_session_rail_coalesces_timer_and_events_until_list_live_preview_settle() {
+        use cockpit_client::{ClientEndpoint, InProcessEndpoint};
+        use cockpit_proto::{Request, Response};
+        use tokio::sync::mpsc;
+        let (connections, mut incoming) = mpsc::channel(4);
+        let (sensitive, _sensitive_rx) = mpsc::channel(1);
+        let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
+        let mut app = App::new(None, false);
+        app.first_paint_completed = true;
+        app.startup_background.daemon_endpoint = Some(endpoint);
+        app.session_rail.set_project_scope(None, &app.launch.cwd);
+        app.maybe_start_session_rail_list();
+        let generation = app.session_rail.list_generation();
+        let (list, _list_rx, _list_events) = day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(list.request, Request::ListSessions { .. }));
+        app.session_rail_next_refresh = Instant::now() - Duration::from_millis(1);
+        app.maybe_start_session_rail_list();
+        assert_eq!(
+            app.session_rail.list_generation(),
+            generation,
+            "periodic refresh must not invalidate the still-pending list response"
+        );
+        assert!(app.session_rail_refresh_needed);
+        app.apply_event(TurnEvent::ThinkingStarted {
+            agent: "Build".into(),
+            turn_id: None,
+        });
+        app.maybe_start_session_rail_list();
+        assert_eq!(app.session_rail.request_counts().list_started, 1);
+        let first = Uuid::new_v4();
+        let live = Uuid::new_v4();
+        let mut row = summary(first, 2);
+        row.title = Some("fresh title from real list".into());
+        assert!(
+            list.reply
+                .send(Ok(Response::Sessions {
+                    sessions: vec![row, summary(live, 1)]
+                }))
+                .is_ok()
+        );
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().live_in_flight == 1
+                && app.session_rail.request_counts().preview_in_flight == 1
+        })
+        .await;
+        assert_eq!(
+            app.session_rail
+                .session_summary(first)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("fresh title from real list")
+        );
+        let (read_a, _a_rx, _a_events) = day2_pending_rail_request(&mut incoming).await;
+        let (read_b, _b_rx, _b_events) = day2_pending_rail_request(&mut incoming).await;
+        let (live_request, preview_request) =
+            if matches!(read_a.request, Request::SessionLiveStatus { .. }) {
+                (read_a, read_b)
+            } else {
+                (read_b, read_a)
+            };
+        assert!(
+            matches!(live_request.request, Request::SessionLiveStatus { ref session_ids } if session_ids.contains(&live))
+        );
+        assert!(
+            matches!(preview_request.request, Request::ReadSessionMessages { session_id, .. } if session_id == first)
+        );
+        app.maybe_start_session_rail_list();
+        app.focus_session_rail_search(); // refocusing the same scope is also a refresh
+        assert_eq!(
+            app.session_rail.list_generation(),
+            generation,
+            "live and preview fences must survive refresh"
+        );
+        assert!(
+            live_request
+                .reply
+                .send(Ok(Response::SessionLiveStatus {
+                    statuses: vec![cockpit_proto::LiveStatus {
+                        session_id: live,
+                        has_active_schedules: true,
+                        processing: false,
+                        project_root: None,
+                    }]
+                }))
+                .is_ok()
+        );
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().live_in_flight == 0
+        })
+        .await;
+        assert_eq!(
+            app.session_rail.visible_cards()[0].session_id,
+            live,
+            "real live status must reorder cards"
+        );
+        app.maybe_start_session_rail_list();
+        assert_eq!(
+            app.session_rail.list_generation(),
+            generation,
+            "pending preview retains its generation after live settles"
+        );
+        assert!(
+            preview_request
+                .reply
+                .send(Ok(Response::SessionMessages {
+                    session_id: first,
+                    messages: vec![cockpit_proto::SessionMessage {
+                        seq: 1,
+                        ts_ms: 1,
+                        role: cockpit_proto::MessageRole::User,
+                        text: "settled preview".into(),
+                    }],
+                    has_more: false,
+                }))
+                .is_ok()
+        );
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().preview_in_flight == 0
+        })
+        .await;
+        assert_eq!(
+            app.session_rail.preview_message_count(),
+            1,
+            "real preview response must be consumed"
+        );
+        assert_eq!(app.session_rail.request_counts().list_started, 1);
+        // The event during I/O survives even if the timer is no longer due.
+        app.session_rail_next_refresh = Instant::now() + Duration::from_secs(60);
+        app.maybe_start_session_rail_list();
+        assert_eq!(
+            app.session_rail.request_counts().list_started,
+            2,
+            "coalesced refresh fires after settlement"
+        );
+        assert!(!app.session_rail_refresh_needed);
+        let (refresh, _refresh_rx, _refresh_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(refresh.request, Request::ListSessions { .. }));
+        assert!(
+            refresh
+                .reply
+                .send(Ok(Response::Sessions { sessions: vec![] }))
+                .is_ok()
+        );
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().list_in_flight == 0
+        })
+        .await;
+        app.maybe_start_session_rail_list();
+        assert_eq!(
+            app.session_rail.request_counts().list_started,
+            2,
+            "coalesced bit is consumed once"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn day2_session_rail_retry_coalesces_behind_pending_preview() {
+        use cockpit_client::{ClientEndpoint, InProcessEndpoint};
+        use cockpit_proto::{Request, Response};
+        use tokio::sync::mpsc;
+        let (connections, mut incoming) = mpsc::channel(4);
+        let (sensitive, _sensitive_rx) = mpsc::channel(1);
+        let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
+        let mut app = App::new(None, false);
+        app.first_paint_completed = true;
+        app.startup_background.daemon_endpoint = Some(endpoint);
+        let id = Uuid::new_v4();
+        seed_rail_sessions(&mut app, vec![summary(id, 1)]);
+        app.start_sessions_list_action();
+        let generation = app.session_rail.list_generation();
+        let started = app.session_rail.request_counts().list_started;
+        let (list, _list_rx, _list_events) = day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(list.request, Request::ListSessions { .. }));
+        // A real invalid list response leaves confirmed cards and an error;
+        // the list consumer still starts their preview.
+        assert!(list.reply.send(Ok(Response::Ack)).is_ok());
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().preview_in_flight == 1
+        })
+        .await;
+        assert!(app.session_rail.error().is_some());
+        let (preview, _preview_rx, _preview_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        assert!(
+            matches!(preview.request, Request::ReadSessionMessages { session_id, .. } if session_id == id)
+        );
+        app.session_rail.focus();
+        app.handle_session_rail_key(press(KeyCode::Char('r')));
+        assert_eq!(
+            app.session_rail.list_generation(),
+            generation,
+            "same-scope retry must preserve pending preview"
+        );
+        assert_eq!(app.session_rail.request_counts().list_started, started);
+        assert!(app.session_rail_refresh_needed);
+        assert!(
+            preview
+                .reply
+                .send(Ok(Response::SessionMessages {
+                    session_id: id,
+                    messages: vec![cockpit_proto::SessionMessage {
+                        seq: 1,
+                        ts_ms: 1,
+                        role: cockpit_proto::MessageRole::User,
+                        text: "preview survives retry".into(),
+                    }],
+                    has_more: false,
+                }))
+                .is_ok()
+        );
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().preview_in_flight == 0
+        })
+        .await;
+        assert_eq!(app.session_rail.preview_message_count(), 1);
+        app.maybe_start_session_rail_list();
+        assert_eq!(app.session_rail.request_counts().list_started, started + 1);
+        let (refresh, _refresh_rx, _refresh_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(refresh.request, Request::ListSessions { .. }));
+        assert!(
+            refresh
+                .reply
+                .send(Ok(Response::Sessions { sessions: vec![] }))
+                .is_ok()
+        );
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().list_in_flight == 0
+        })
+        .await;
+        assert!(!app.session_rail_refresh_needed);
+    }
+
+    #[test]
+    fn day2_rail_marks_draft_and_requests_fresh_saved_title_and_activity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _env) = configured_app(&tmp);
+        let id = Uuid::new_v4();
+        let mut row = summary(id, 1);
+        row.title = None;
+        seed_rail_sessions(&mut app, vec![row.clone()]);
+        app.local_session_draft = true;
+        app.session_rail.set_local_draft(true);
+        assert!(render_width(&mut app, 140, 40).contains("Draft (unsaved)"));
+        app.session_rail_refresh_needed = false;
+        app.apply_event(TurnEvent::ThinkingStarted {
+            agent: "Build".into(),
+            turn_id: None,
+        });
+        assert!(app.session_rail_refresh_needed);
+        row.title = Some("Fix word count".into());
+        row.turns = 1;
+        row.last_active_at_unix_ms = 2;
+        row.activity_state = Some(cockpit_proto::SessionActivityState::InferenceInProgress);
+        seed_rail_sessions(&mut app, vec![row]);
+        let text = render_width(&mut app, 140, 40);
+        assert!(text.contains("Fix word count"), "{text}");
+        assert_eq!(app.session_rail.session_summary(id).unwrap().turns, 1);
+        assert_eq!(
+            app.session_rail.session_summary(id).unwrap().activity_state,
+            Some(cockpit_proto::SessionActivityState::InferenceInProgress)
+        );
     }
 
     fn seed_rail_sessions(app: &mut App, sessions: Vec<SessionSummary>) {
@@ -812,5 +1173,293 @@ mod tests {
             app.pending_link_activation.is_none(),
             "hidden transcript links under the overlay rail must not activate"
         );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_r2_same_batch_inbox_refresh_must_not_drop_completed_list() {
+        use cockpit_client::{ClientEndpoint, InProcessEndpoint};
+        use cockpit_proto::{Request, Response};
+        use tokio::sync::mpsc;
+        let (connections, mut incoming) = mpsc::channel(4);
+        let (sensitive, _sensitive_rx) = mpsc::channel(1);
+        let mut app = App::new(None, false);
+        app.first_paint_completed = true;
+        app.startup_background.daemon_endpoint = Some(ClientEndpoint::InProcess(
+            InProcessEndpoint::new(connections, sensitive),
+        ));
+        app.maybe_start_session_rail_list();
+        let generation = app.session_rail.list_generation();
+        let (list, _list_rx, _list_events) = day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(list.request, Request::ListSessions { .. }));
+        let id = Uuid::new_v4();
+        app.start_sessions_inbox_action(id);
+        let (inbox, _inbox_rx, _inbox_events) = day2_pending_rail_request(&mut incoming).await;
+        assert!(
+            matches!(inbox.request, Request::ReadAssistantInbox { main_session_id, .. } if main_session_id == id)
+        );
+        let notifier = app.async_actions.notifier();
+        assert!(
+            inbox
+                .reply
+                .send(Ok(Response::AssistantInbox {
+                    main_session_id: id,
+                    items: vec![]
+                }))
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        let mut row = summary(id, 2);
+        row.title = Some("completed list data must be consumed".into());
+        assert!(
+            list.reply
+                .send(Ok(Response::Sessions {
+                    sessions: vec![row]
+                }))
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        // Both terminal payloads are queued. The real App drain removes all
+        // completed actions before applying inbox first and list second.
+        app.drain_async_actions();
+        let after = app.session_rail.list_generation();
+        let title = app
+            .session_rail
+            .session_summary(id)
+            .and_then(|row| row.title.clone());
+        let started = app.session_rail.request_counts().list_started;
+        drop(incoming);
+        assert_eq!(
+            after, generation,
+            "same-batch refresh must retain the completed list fence until adoption"
+        );
+        assert_eq!(
+            title.as_deref(),
+            Some("completed list data must be consumed"),
+            "a successful list response must publish its rows"
+        );
+        assert_eq!(
+            started, 1,
+            "same-scope refresh waits until result consumption"
+        );
+    }
+    // Real RPCs finish in a controlled order before one real App drain. A
+    // mutation/inbox refresh producer must not replace any later read payload.
+    async fn day2_same_batch_rail_refresh(mutation_first: bool) {
+        use cockpit_client::{ClientEndpoint, InProcessEndpoint};
+        use cockpit_proto::{Request, Response};
+        use tokio::sync::mpsc;
+        let (connections, mut incoming) = mpsc::channel(4);
+        let (sensitive, _sensitive_rx) = mpsc::channel(1);
+        let mut app = App::new(None, false);
+        app.first_paint_completed = true;
+        app.startup_background.daemon_endpoint = Some(ClientEndpoint::InProcess(
+            InProcessEndpoint::new(connections, sensitive),
+        ));
+        let first = Uuid::new_v4();
+        let live = Uuid::new_v4();
+        seed_rail_sessions(&mut app, vec![summary(first, 2), summary(live, 1)]);
+        app.start_sessions_list_action();
+        let generation = app.session_rail.list_generation();
+        let started = app.session_rail.request_counts().list_started;
+        let (list, _list_rx, _list_events) = day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(list.request, Request::ListSessions { .. }));
+        let notifier = app.async_actions.notifier();
+
+        if mutation_first {
+            app.session_rail.focus();
+            app.handle_session_rail_key(press(KeyCode::Char('d')));
+            app.handle_session_rail_key(press(KeyCode::Right));
+            app.handle_session_rail_key(press(KeyCode::Enter));
+            assert!(app.session_rail.has_unsettled_local_authority());
+        } else {
+            app.start_sessions_inbox_action(first);
+        }
+        let (producer, _producer_rx, _producer_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        let response = if mutation_first {
+            assert!(matches!(producer.request, Request::ArchiveSession { .. }));
+            Response::Ack
+        } else {
+            assert!(matches!(
+                producer.request,
+                Request::ReadAssistantInbox { .. }
+            ));
+            Response::AssistantInbox {
+                main_session_id: first,
+                items: vec![],
+            }
+        };
+        assert!(producer.reply.send(Ok(response)).is_ok());
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        let mut row = summary(first, 2);
+        row.title = Some("same-batch saved title".into());
+        assert!(
+            list.reply
+                .send(Ok(Response::Sessions {
+                    sessions: vec![row, summary(live, 1)]
+                }))
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        app.drain_async_actions();
+        assert_eq!(
+            app.session_rail.list_generation(),
+            generation,
+            "producer must not invalidate completed list before adoption"
+        );
+        assert_eq!(
+            app.session_rail
+                .session_summary(first)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("same-batch saved title")
+        );
+        assert_eq!(app.session_rail.request_counts().list_started, started);
+        assert!(app.session_rail_refresh_needed);
+        assert!(!app.session_rail.has_unsettled_local_authority());
+
+        let (read_a, _a_rx, _a_events) = day2_pending_rail_request(&mut incoming).await;
+        let (read_b, _b_rx, _b_events) = day2_pending_rail_request(&mut incoming).await;
+        let (live_rpc, preview_rpc) = if matches!(read_a.request, Request::SessionLiveStatus { .. })
+        {
+            (read_a, read_b)
+        } else {
+            (read_b, read_a)
+        };
+        assert!(matches!(
+            live_rpc.request,
+            Request::SessionLiveStatus { .. }
+        ));
+        assert!(
+            matches!(preview_rpc.request, Request::ReadSessionMessages { session_id, .. } if session_id == first)
+        );
+        // Now repeat with both live and preview already completed behind the
+        // producer, without draining any of the three terminal payloads early.
+        if mutation_first {
+            app.session_rail.focus();
+            app.handle_session_rail_key(press(KeyCode::Char('d')));
+            app.handle_session_rail_key(press(KeyCode::Right));
+            app.handle_session_rail_key(press(KeyCode::Enter));
+            assert!(app.session_rail.has_unsettled_local_authority());
+        } else {
+            app.start_sessions_inbox_action(first);
+        }
+        let (producer, _producer2_rx, _producer2_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        let response = if mutation_first {
+            assert!(matches!(producer.request, Request::ArchiveSession { .. }));
+            Response::Ack
+        } else {
+            assert!(matches!(
+                producer.request,
+                Request::ReadAssistantInbox { .. }
+            ));
+            Response::AssistantInbox {
+                main_session_id: first,
+                items: vec![],
+            }
+        };
+        assert!(producer.reply.send(Ok(response)).is_ok());
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        assert!(
+            live_rpc
+                .reply
+                .send(Ok(Response::SessionLiveStatus {
+                    statuses: vec![cockpit_proto::LiveStatus {
+                        session_id: live,
+                        has_active_schedules: true,
+                        processing: false,
+                        project_root: None
+                    }]
+                }))
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        assert!(
+            preview_rpc
+                .reply
+                .send(Ok(Response::SessionMessages {
+                    session_id: first,
+                    messages: vec![cockpit_proto::SessionMessage {
+                        seq: 1,
+                        ts_ms: 1,
+                        role: cockpit_proto::MessageRole::User,
+                        text: "same-batch preview".into()
+                    }],
+                    has_more: false,
+                }))
+                .is_ok()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notifier.notified())
+            .await
+            .unwrap();
+        app.drain_async_actions();
+        assert_eq!(
+            app.session_rail.list_generation(),
+            generation,
+            "producer must not invalidate completed live/preview before adoption"
+        );
+        assert_eq!(
+            app.session_rail.visible_cards()[0].session_id,
+            live,
+            "live status must publish its reordering"
+        );
+        assert_eq!(
+            app.session_rail.preview_message_count(),
+            1,
+            "preview must publish its messages"
+        );
+        assert_eq!(app.session_rail.request_counts().list_started, started);
+        assert!(app.session_rail_refresh_needed);
+        assert!(!app.session_rail.has_unsettled_local_authority());
+        app.session_rail_next_refresh = Instant::now() + Duration::from_secs(60);
+        app.maybe_start_session_rail_list();
+        assert_eq!(
+            app.session_rail.request_counts().list_started,
+            started + 1,
+            "one later refresh after adoption"
+        );
+        assert!(!app.session_rail_refresh_needed);
+        let (refresh, _refresh_rx, _refresh_events) =
+            day2_pending_rail_request(&mut incoming).await;
+        assert!(matches!(refresh.request, Request::ListSessions { .. }));
+        assert!(
+            refresh
+                .reply
+                .send(Ok(Response::Sessions { sessions: vec![] }))
+                .is_ok()
+        );
+        day2_drain_rail_until(&mut app, |app| {
+            app.session_rail.request_counts().list_in_flight == 0
+        })
+        .await;
+        app.maybe_start_session_rail_list();
+        assert_eq!(
+            app.session_rail.request_counts().list_started,
+            started + 1,
+            "settled refresh must not loop"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn day2_session_rail_same_batch_inbox_preserves_list_live_preview() {
+        day2_same_batch_rail_refresh(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn day2_session_rail_same_batch_mutation_preserves_list_live_preview() {
+        day2_same_batch_rail_refresh(true).await;
     }
 }

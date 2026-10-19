@@ -678,6 +678,15 @@ impl App {
     }
 
     pub(super) fn apply_event(&mut self, event: TurnEvent) {
+        if matches!(
+            &event,
+            TurnEvent::UserMessageRecorded { .. }
+                | TurnEvent::ThinkingStarted { .. }
+                | TurnEvent::AgentIdle { .. }
+                | TurnEvent::AssistantDisplayComplete { .. }
+        ) {
+            self.session_rail_refresh_needed = true;
+        }
         match event {
             TurnEvent::ControlRequestFinished {
                 request_id,

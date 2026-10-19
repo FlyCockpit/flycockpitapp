@@ -21,9 +21,7 @@ impl App {
         let cwd = self.launch.cwd.clone();
         let agent_name = self.launch.agent_name.clone();
         let attached_request = self
-            .agent_runner
-            .as_ref()
-            .and_then(|runner| runner.as_ref().ok())
+            .session_effect_runner()
             .map(|runner| runner.attached_request_binding());
 
         if let Some(attached_request) = attached_request {

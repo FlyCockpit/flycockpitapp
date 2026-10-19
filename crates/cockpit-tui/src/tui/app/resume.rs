@@ -123,6 +123,9 @@ impl App {
 
     /// `/compact`: enqueue a compaction turn that seeds a new linked window.
     pub(super) fn start_compact(&mut self) {
+        if !self.guard_session_effect("/compact") {
+            return;
+        }
         let submission = ClientUserSubmission::compact_notice();
         if !matches!(self.agent_runner, Some(Ok(_))) {
             self.start_runner_attach(true, RunnerAttachContinuation::Compact);
@@ -177,6 +180,18 @@ impl App {
         if self.has_pending_session_switch_action() {
             self.report_session_switch_busy("/resume");
             return;
+        }
+        if self.local_session_draft {
+            self.restore_durable_view_after_draft_failure("");
+            if self.launch.session_id == Some(session_id) {
+                return;
+            }
+            if self.agent_runner.is_none() {
+                self.local_session_draft = false;
+                self.launch.session_id = Some(session_id);
+                self.start_runner_attach(true, RunnerAttachContinuation::RetryRetainedSubmissions);
+                return;
+            }
         }
         self.cancel_outgoing_turn_if_busy();
 
@@ -366,6 +381,9 @@ impl App {
         pending: PendingResumeRepair,
         selected_id: Option<&str>,
     ) {
+        if !self.guard_session_effect("/resume repair") {
+            return;
+        }
         match selected_id {
             Some("fork") => {
                 let Some(seq) = pending.state.safe_last_turn_seq else {

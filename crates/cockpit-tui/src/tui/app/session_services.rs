@@ -252,15 +252,14 @@ impl App {
         }
     }
 
-    /// `/new` was invoked: clear chat history and drop the daemon-
-    /// attached runner so the next user message opens a fresh session.
+    /// Service draft opening and any admitted first-message materialization.
     /// In alt-screen mode the chat pane is the whole canvas, so the
     /// "fresh session" visual is simply an empty pane.
     pub(super) fn maybe_service_new_session(
         &mut self,
         terminal: &mut DefaultTerminal,
     ) -> Result<bool> {
-        self.maybe_service_new_session_with_clear(|| terminal.clear().map_err(Into::into))
+        self.maybe_open_local_session_draft_with_clear(|| terminal.clear().map_err(Into::into))
     }
 
     /// Force a full alt-screen clear after the `/leaks` reveal buffer was
@@ -285,21 +284,163 @@ impl App {
         true
     }
 
+    /// User entry (/new, Ctrl+N, rail): a draft owns no daemon worker or DB row.
+    /// Keep the durable runner alive until the first-message replacement succeeds.
+    pub(super) fn maybe_open_local_session_draft_with_clear(
+        &mut self,
+        mut clear_terminal: impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        // An admitted first-message intent is distinct from opening another
+        // draft. Re-enter its FIFO/reconciliation service on every wake.
+        if self.pending_session_materialization {
+            if std::mem::take(&mut self.pending_new_session) {
+                self.report_session_switch_busy("/new");
+            }
+            let result = self.maybe_service_new_session_with_clear(&mut clear_terminal);
+            if result.is_err()
+                || (!self.pending_session_materialization && !self.session_switch_in_progress())
+            {
+                self.restore_durable_view_after_draft_failure(
+                    "Could not create session; saved conversation restored. Send again or /new to retry.",
+                );
+            }
+            return result;
+        }
+        if !self.pending_new_session {
+            return Ok(self.clear_terminal_after_committed_new_session(&mut clear_terminal));
+        }
+        self.pending_new_session = false;
+        if !self.guard_startup_workspace_effects() {
+            return Ok(true);
+        }
+        if self.has_pending_session_switch_action()
+            || self.pending_runner_attach.is_some()
+            || self.submission_order.front().is_some()
+        {
+            self.report_session_switch_busy("/new");
+            return Ok(true);
+        }
+        if !self.local_session_draft {
+            self.restored_draft_session = None;
+            // Supersede the ephemeral side immediately, but retain its main
+            // snapshot until the replacement is adopted. The side runner is
+            // useful for switching on the same daemon, never for rollback.
+            let side_return = self.side_conversation.take();
+            if let Some(side) = &side_return {
+                self.schedule_created_session_discard(side.endpoint.clone(), side.side_session_id);
+            }
+            let runner = self.agent_runner.take().and_then(Result::ok);
+            self.draft_return_view = (runner.is_some()
+                || side_return.is_some()
+                || (self.current_session_persisted && self.launch.session_id.is_some()))
+            .then(|| DraftReturnView {
+                side_return,
+                runner,
+                session_id: self.launch.session_id,
+                session_short_id: self.launch.session_short_id.clone(),
+                project_id: self.project_id.clone(),
+                history: std::mem::take(&mut self.history),
+                queue: std::mem::take(&mut self.queue),
+                pending: self.pending.take(),
+                busy: self.busy,
+                persisted: self.current_session_persisted,
+            });
+        }
+        self.async_actions.advance_view_generation();
+        self.commit_new_session_without_swappable_runner();
+        self.local_session_draft = true;
+        self.startup_session_resolved = true;
+        self.startup_retained_submission_id = None;
+        self.session_setup_inline = None;
+        self.launch.provider_line.clear();
+        self.clear_composer_buffer();
+        self.busy = false;
+        self.queue.clear();
+        self.pending = None;
+        self.clear_terminal_after_committed_new_session(&mut clear_terminal);
+        Ok(true)
+    }
+
+    pub(super) fn restore_durable_view_after_draft_failure(&mut self, error: &str) {
+        let Some(mut saved) = self.draft_return_view.take() else {
+            return;
+        };
+        self.startup_retained_submission_id = None;
+        self.pending_session_materialization = false;
+        if let Some((sequence, _)) = self.pending_session_switch_order.take() {
+            self.submission_order.cancel(sequence);
+        }
+        self.pending_session_switch_reconcile_started_at = None;
+        self.provisional_new_session = false;
+        self.provisional_new_epoch_event_buffer.clear();
+        self.same_session_resync_event_buffer.clear();
+        self.local_session_draft = false;
+        self.restored_draft_session = None;
+        self.history = saved.history;
+        self.queue = saved.queue;
+        self.pending = saved.pending;
+        self.busy = saved.busy;
+        self.current_session_persisted = saved.persisted;
+        if let Some(side) = saved.side_return {
+            // Production side switches reuse the runner: it still names the
+            // now-discarded side after a rejected replacement. Drop it and
+            // let the ordinary display/submit attach resume the saved main.
+            // A separately saved main runner, if present, is restored by the
+            // snapshot instead.
+            self.agent_runner = None;
+            self.foreground_input_target = None;
+            self.busy = false;
+            self.restore_side_snapshot(side);
+            if self.agent_runner.is_none() {
+                self.restored_draft_session = self.launch.session_id;
+            }
+            self.reset_display_attach_backoff();
+        } else if let Some(runner) = saved
+            .runner
+            .take()
+            .or_else(|| self.agent_runner.take().and_then(Result::ok))
+        {
+            self.visible_attachment_epoch = runner.attachment_epoch();
+            self.adopt_runner(Ok(runner));
+        } else {
+            // Re-entering /new before a restored main has reattached still
+            // needs a durable rollback target, even without a live runner.
+            self.agent_runner = None;
+            self.launch.session_id = saved.session_id;
+            self.launch.session_short_id = saved.session_short_id;
+            self.project_id = saved.project_id;
+            self.foreground_input_target = None;
+            self.restored_draft_session = saved.session_id;
+            self.reset_display_attach_backoff();
+        }
+        self.prepare_session_setup_for_resume(!self.history.is_empty());
+        if !error.is_empty() {
+            self.history.push(HistoryEntry::CommandError {
+                line: error.to_string(),
+            });
+        }
+        self.mark_chat_geometry_dirty_from(0);
+        self.new_session_terminal_clear_pending = true;
+    }
+
+    /// First-message materialization of an existing local draft. The attach is
+    /// transactional; no message dispatch can cross its session-switch fence.
     pub(super) fn maybe_service_new_session_with_clear(
         &mut self,
         mut clear_terminal: impl FnMut() -> Result<()>,
     ) -> Result<bool> {
         let changed = self.clear_terminal_after_committed_new_session(&mut clear_terminal);
-        if !self.pending_new_session {
+        if !self.pending_session_materialization {
             return Ok(changed);
         }
-        if self.has_pending_session_switch_action() {
+        if self.session_switch_in_progress() || !self.pending_session_switch_submissions.is_empty()
+        {
             if let Some((sequence, _)) = self.pending_session_switch_order.take() {
                 self.submission_order.cancel(sequence);
                 self.dispatch_next_ready_paste_fence();
             }
             self.pending_session_switch_reconcile_started_at = None;
-            self.pending_new_session = false;
+            self.pending_session_materialization = false;
             self.report_session_switch_busy("/new");
             return Ok(true);
         }
@@ -353,7 +494,7 @@ impl App {
                                 .to_string(),
                         });
                     }
-                    self.pending_new_session = false;
+                    self.pending_session_materialization = false;
                     self.pending_session_switch_order = None;
                     self.pending_session_switch_reconcile_started_at = None;
                     self.submission_order.cancel(switch_sequence);
@@ -376,7 +517,7 @@ impl App {
                 }
             }
             if self.mark_delivery_unconfirmed(&possibly_sent).is_err() {
-                self.pending_new_session = false;
+                self.pending_session_materialization = false;
                 self.pending_session_switch_order = None;
                 self.pending_session_switch_reconcile_started_at = None;
                 self.submission_order.cancel(switch_sequence);
@@ -421,7 +562,7 @@ impl App {
         ) {
             return Ok(changed);
         }
-        self.pending_new_session = false;
+        self.pending_session_materialization = false;
 
         // Capture the outgoing epoch before constructing/spawning the switch
         // task. On a multithreaded runtime the replacement attach can advance
@@ -461,6 +602,10 @@ impl App {
             self.begin_session_switch_submission_target(agent_runner::SessionTarget::New);
             self.begin_provisional_new_session_view(outgoing_epoch);
             self.clear_terminal_after_committed_new_session(&mut clear_terminal);
+        } else if self.draft_return_view.is_some() {
+            self.submission_order.cancel(switch_sequence);
+            self.pending_session_switch_order = None;
+            // The caller restores the saved view and leaves the unsent composer.
         } else {
             // Without a replaceable attachment there is no old durable
             // runner/view transaction to protect. Commit the local reset
@@ -719,6 +864,8 @@ impl App {
         &mut self,
         outcome: agent_runner::SessionSwitchOutcome,
     ) {
+        self.local_session_draft = false;
+        self.draft_return_view = None;
         self.apply_session_switch_outcome_inner(outcome, true);
     }
 

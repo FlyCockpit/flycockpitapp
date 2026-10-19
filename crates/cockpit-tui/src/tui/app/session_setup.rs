@@ -254,7 +254,7 @@ impl App {
         command: Option<String>,
         auth: String,
     ) {
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+        let Some(runner) = self.session_effect_runner() else {
             self.set_session_setup_notice("Add MCP requires an attached session.".to_string());
             return;
         };
@@ -373,7 +373,7 @@ impl App {
             );
             return;
         }
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+        let Some(runner) = self.session_effect_runner() else {
             self.set_session_setup_notice("Add MCP requires an attached session.".to_string());
             return;
         };
@@ -444,7 +444,7 @@ impl App {
     pub(super) fn request_session_setup_snapshot_refresh(
         &mut self,
     ) -> Option<super::SessionSetupSnapshotCorrelation> {
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+        let Some(runner) = self.session_effect_runner() else {
             let message = "Session setup is only available once attached to a session.";
             if let Overlay::SessionSetup(pane) = &mut self.overlay {
                 pane.set_error(message);
@@ -589,12 +589,7 @@ impl App {
                     })
             });
         }
-        let current_session = self
-            .agent_runner
-            .as_ref()
-            .and_then(|runner| runner.as_ref().ok())
-            .map(|runner| runner.session_id())
-            .or(self.launch.session_id);
+        let current_session = self.current_session_id();
         let snapshot_session = uuid::Uuid::parse_str(&snapshot.session_id).ok();
         let identity_matches = current_session.is_some()
             && snapshot_session == current_session

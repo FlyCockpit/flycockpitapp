@@ -643,6 +643,7 @@ impl App {
                 AsyncActionKind::Internal("oauth.codex.poll" | "oauth.grok.complete")
             )
         });
+        self.reducing_async_action_batch = true;
         for result in session_switch_cancellations {
             self.apply_async_action_result(result);
         }
@@ -655,6 +656,7 @@ impl App {
         for result in results {
             self.apply_async_action_result(result);
         }
+        self.reducing_async_action_batch = false;
         // Applying a correlated OAuth completion may enqueue its next typed
         // effect (begin -> host presentation -> poll). Adopt it in this same
         // event-loop turn; never require an unrelated keypress to advance or
@@ -839,9 +841,7 @@ impl App {
             let work = effect.work;
             let lifecycle = self.lifecycle.clone();
             let attached = self
-                .agent_runner
-                .as_ref()
-                .and_then(|runner| runner.as_ref().ok())
+                .session_effect_runner()
                 .map(|runner| runner.attached_request_binding());
             self.async_actions.start(
                 AsyncActionKind::DaemonRpc("settings.effect"),
@@ -1221,7 +1221,7 @@ impl App {
                     reload = self.session_rail.apply_mutation_completion(completion);
                 }
                 if reload {
-                    self.start_sessions_list_action();
+                    self.request_session_rail_refresh();
                 }
             }
             AsyncActionKind::DaemonRpc("sessions.favorite") => {
@@ -1809,7 +1809,7 @@ impl App {
                     self.session_rail.apply_inbox_result(main_session_id, items);
                 }
                 if reload_sessions {
-                    self.start_sessions_list_action();
+                    self.request_session_rail_refresh();
                 }
             }
             AsyncActionKind::DaemonRpc("skills.list") => {
@@ -2208,6 +2208,14 @@ impl App {
                     let _ = self.submission_order.complete(sequence);
                     self.dispatch_next_ready_paste_fence();
                 }
+                if label == "session.switch" && self.draft_return_view.is_some() {
+                    if self.provisional_new_session {
+                        self.restore_durable_view_after_draft_failure("Could not create session; saved conversation restored. Send again or /new to retry.");
+                    } else {
+                        self.draft_return_view = None;
+                        self.maybe_submit_startup_retained_message();
+                    }
+                }
             }
             AsyncActionKind::Internal("session.fork") => match result.payload {
                 Ok(AsyncActionPayload::ForkSessionSwitched {
@@ -2363,6 +2371,19 @@ impl App {
                 Err(error) => self.show_toast(
                     format!("Startup disclosures Unavailable — {error}; Retry"),
                     ToastKind::Warning,
+                ),
+            },
+            AsyncActionKind::Internal("startup.session") => match result.payload {
+                Ok(AsyncActionPayload::StartupSessionResolved { generation, result }) => {
+                    self.apply_startup_session_resolution(generation, result);
+                }
+                Err(error) => self.apply_startup_session_resolution(
+                    self.startup_background.generation,
+                    Err(error),
+                ),
+                Ok(_) => self.apply_startup_session_resolution(
+                    self.startup_background.generation,
+                    Err("unexpected session lookup response".into()),
                 ),
             },
             AsyncActionKind::DaemonRpc("assistant.resolve") => match result.payload {
@@ -4123,6 +4144,9 @@ impl App {
     }
 
     fn start_resource_promote_request_action(&mut self, request: cockpit_proto::Request) {
+        if !self.guard_session_effect("/resources promote") {
+            return;
+        }
         let pane_generation = match &self.overlay {
             Overlay::Resources(pane) => Some(pane.generation()),
             _ => None,
@@ -4191,6 +4215,8 @@ impl App {
     }
 
     pub(super) fn start_sessions_list_action(&mut self) {
+        self.session_rail_refresh_needed = false;
+        self.session_rail_next_refresh = Instant::now() + Duration::from_secs(2);
         if !self.session_rail.begin_list() {
             return;
         }

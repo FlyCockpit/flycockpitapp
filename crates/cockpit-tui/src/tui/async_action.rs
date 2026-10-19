@@ -628,6 +628,10 @@ pub enum AsyncActionPayload {
         snapshot: Option<cockpit_proto::OnboardingBootstrapSnapshot>,
         error: String,
     },
+    StartupSessionResolved {
+        generation: u64,
+        result: Result<Option<uuid::Uuid>, String>,
+    },
     StartupAssistantSessionResolved {
         generation: u64,
         result: Result<uuid::Uuid, String>,

@@ -177,7 +177,11 @@ impl SessionRail {
         paint_chip(
             frame,
             new_area,
-            " + New session ",
+            if self.local_draft {
+                "Draft (unsaved)"
+            } else {
+                " + New session "
+            },
             Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
             self.pointer_position
                 .is_some_and(|(x, y)| point_in_rect(new_area, x, y)),

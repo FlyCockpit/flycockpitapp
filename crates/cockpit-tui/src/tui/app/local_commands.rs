@@ -97,7 +97,32 @@ impl App {
     }
 
     pub(super) fn has_pending_session_switch_action(&self) -> bool {
-        self.session_switch_in_progress() || !self.pending_session_switch_submissions.is_empty()
+        self.pending_session_materialization
+            || self.session_switch_in_progress()
+            || !self.pending_session_switch_submissions.is_empty()
+    }
+
+    /// The outgoing runner remains available to receipt/lifecycle reducers,
+    /// but is not the visible session's effect target until identity adoption.
+    pub(super) fn session_effects_blocked(&self) -> bool {
+        self.has_pending_session_switch_action() || self.provisional_new_session
+    }
+
+    pub(super) fn session_effect_runner(&self) -> Option<&AgentRunner> {
+        if self.session_effects_blocked() {
+            return None;
+        }
+        self.agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+    }
+
+    pub(super) fn guard_session_effect(&mut self, label: &str) -> bool {
+        if self.session_effects_blocked() {
+            self.report_session_switch_busy(label);
+            return false;
+        }
+        true
     }
 
     /// Cleared `/new` view is still waiting for a successful adoption (pending
@@ -211,7 +236,10 @@ impl App {
         // Cleared `/new` barrier (pending attach or post-failure): never
         // dispatch staged payloads through the still-attached outgoing runner.
         // Successful adoption clears `provisional_new_session` before flush.
-        if self.provisional_new_session {
+        if self.provisional_new_session
+            || self.pending_session_materialization
+            || self.session_switch_in_progress()
+        {
             return;
         }
         let mut pending = std::mem::take(&mut self.pending_session_switch_submissions);
@@ -404,10 +432,7 @@ impl App {
     pub(super) fn retry_retained_pre_dispatch_submissions(&mut self) -> bool {
         // Cleared `/new` (pending attach or post-failure) must not flush
         // QueueFull leftovers through the still-attached outgoing runner.
-        if self.provisional_new_session
-            || self.session_switch_in_progress()
-            || self.retained_pre_dispatch_submissions.is_empty()
-        {
+        if self.session_effects_blocked() || self.retained_pre_dispatch_submissions.is_empty() {
             return false;
         }
         let current_session_id = match self.agent_runner.as_ref() {
@@ -621,6 +646,9 @@ impl App {
             .skip(optimistic_history_start)
             .cloned()
             .collect();
+        if !self.has_pending_session_switch_action() {
+            self.ensure_agent_runner();
+        }
         if self.has_pending_session_switch_action() {
             self.queue_pending_session_switch_submission_with_optimistic_state(
                 submission,
@@ -635,7 +663,6 @@ impl App {
             );
             return DispatchOutcome::Sent;
         }
-        self.ensure_agent_runner();
         let intended_session_id = self
             .agent_runner
             .as_ref()
@@ -823,8 +850,8 @@ impl App {
     }
 
     fn goal_session_id(&mut self, label: &str) -> Option<uuid::Uuid> {
-        match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => Some(runner.session_id()),
+        match self.session_effect_runner() {
+            Some(runner) => Some(runner.session_id()),
             _ => {
                 self.report_control_not_delivered(
                     label,
@@ -836,8 +863,8 @@ impl App {
     }
 
     fn start_goal_request(&mut self, kind: &'static str, request: cockpit_proto::Request) {
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
-            unreachable!("goal_session_id checks the attached runner first");
+        let Some(runner) = self.session_effect_runner() else {
+            unreachable!("goal_session_id checks the session effect boundary first");
         };
         let attached_request = runner.attached_request_binding();
         self.async_actions.start(
@@ -938,12 +965,15 @@ impl App {
 
     /// The id of the session this client is attached to (live runner if
     /// connected, else the last-attached id from launch info). `None`
-    /// before the first session exists. Same resolution `/rename` uses.
+    /// before the first session exists or while a replacement identity is
+    /// pending adoption. Same resolution `/rename` uses.
     pub(super) fn current_session_id(&self) -> Option<uuid::Uuid> {
-        match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => Some(runner.session_id()),
-            _ => self.launch.session_id,
+        if self.session_effects_blocked() {
+            return None;
         }
+        self.session_effect_runner()
+            .map(AgentRunner::session_id)
+            .or(self.launch.session_id)
     }
 
     /// Job ids in `active_schedules` that belong to the current session, in the

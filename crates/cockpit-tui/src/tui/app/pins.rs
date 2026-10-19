@@ -436,6 +436,9 @@ impl App {
     }
 
     pub(super) fn fork_preconditions_ok(&mut self) -> bool {
+        if !self.guard_session_effect("/fork") {
+            return false;
+        }
         if self.side_conversation.is_some() {
             self.history.push(HistoryEntry::CommandError {
                 line: "/fork: end the side conversation first (`/side end`)".to_string(),
@@ -507,6 +510,9 @@ impl App {
     }
 
     pub(super) fn fork_at_seq(&mut self, _idx: usize, seq: i64) {
+        if !self.guard_session_effect("/fork") {
+            return;
+        }
         // Threads retain an anchor reference, not a copied message body. Leave
         // the new composer empty so opening one does not silently recreate the
         // parent turn in its fresh transcript.

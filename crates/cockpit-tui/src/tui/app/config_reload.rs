@@ -24,6 +24,11 @@ impl App {
     /// exactly one RefreshConfig for that final candidate and arms
     /// confirmation pending state.
     pub(super) fn resync_config_after_local_write(&mut self) {
+        // Replacement attach supplies its own authoritative config snapshot.
+        // Do not bind a tokenizer confirmation to the outgoing attachment.
+        if self.session_effects_blocked() {
+            return;
+        }
         if matches!(self.agent_runner.as_ref(), Some(Ok(_))) {
             let applied = if let Some(candidate) = self.dirty_response_metrics_tokenizer.take() {
                 // Supersede any prior pending confirmation silently.

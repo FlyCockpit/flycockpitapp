@@ -1527,10 +1527,28 @@ impl WorkerWorkspaceConfigAuthority {
                     // are authority failures, not recoverable parse warnings.
                     // In particular this bounds the allocation before a
                     // hostile hook file can reach the parser.
-                    let bytes = layer
+                    let bytes = match layer
                         .config_directory
                         .held_directory
-                        .read_regular_file_relative_bounded(&[leaf], MAX_HOOK_CONFIG_BYTES)?;
+                        .read_regular_file_relative_bounded(&[leaf], MAX_HOOK_CONFIG_BYTES)
+                    {
+                        Ok(bytes) => bytes,
+                        // Conventional config directories may contain only providers or
+                        // agents. Missing config is an empty layer, including on refresh.
+                        // Explicit overrides and all other acquisition failures stay fatal.
+                        Err(error)
+                            if !matches!(
+                                source.kind,
+                                cockpit_config::config::extended::hooks::HookSourceKind::Explicit
+                            ) && error
+                                .chain()
+                                .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                                .any(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     retained_execution_source_directories
                         .insert(source.path.clone(), layer.config_directory.clone());
                     captured.push((source.clone(), Ok(Some(bytes))));
@@ -9412,6 +9430,99 @@ mod tests {
                 .map(|vnext| vnext.agent_id.as_str()),
             Some("authored/helper")
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn day2_retained_hooks_allow_missing_conventional_configs_on_attach_and_refresh() {
+        let parent = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let workspace = parent.path().join("workspace");
+        // A common post-onboarding layout: providers/agents exist, config.json does not.
+        std::fs::create_dir_all(workspace.join(".cockpit/providers")).unwrap();
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&workspace).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = WorkerWorkspaceConfigAuthority::capture(&workspace, &policy).unwrap();
+        assert!(
+            authority
+                .resolve_hooks_for_policy(&policy)
+                .unwrap()
+                .hooks
+                .is_empty()
+        );
+        std::fs::write(
+            workspace.join(".cockpit/config.json"),
+            r#"{"hooks":{"sessionStart":[{"command":["retained-hook"]}]}}"#,
+        )
+        .unwrap();
+        assert!(
+            authority
+                .resolve_hooks_for_policy(&policy)
+                .unwrap()
+                .hooks
+                .iter()
+                .any(|hook| hook.command == ["retained-hook"])
+        );
+        std::fs::remove_file(workspace.join(".cockpit/config.json")).unwrap();
+        assert!(
+            authority
+                .resolve_hooks_for_policy(&policy)
+                .unwrap()
+                .hooks
+                .is_empty()
+        );
+        assert_eq!(
+            authority.attached_root.canonical_path(),
+            workspace.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn day2_optional_hook_config_still_rejects_symlinks_and_hides_ignored_sources() {
+        let parent = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(parent.path());
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".cockpit")).unwrap();
+        let mut policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&workspace).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let authority = WorkerWorkspaceConfigAuthority::capture(&workspace, &policy).unwrap();
+        assert!(
+            authority
+                .resolve_hooks_for_policy(&policy)
+                .unwrap()
+                .hooks
+                .is_empty()
+        );
+        let target = parent.path().join("outside.json");
+        std::fs::write(
+            &target,
+            r#"{"hooks":{"sessionStart":[{"command":["must-not-open"]}]}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, workspace.join(".cockpit/config.json")).unwrap();
+        assert!(
+            authority.resolve_hooks_for_policy(&policy).is_err(),
+            "a symlink is never absence"
+        );
+        for mode in [
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            crate::db::workspace_trust::WorkspaceTrustMode::Untrusted,
+        ] {
+            policy.mode = mode;
+            assert!(
+                authority
+                    .resolve_hooks_for_policy(&policy)
+                    .unwrap()
+                    .hooks
+                    .is_empty(),
+                "hidden project config must never be opened, even when a held directory exists"
+            );
+        }
     }
 
     #[cfg(any(unix, windows))]

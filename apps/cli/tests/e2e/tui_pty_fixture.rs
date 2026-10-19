@@ -1,6 +1,8 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
+use rusqlite::{Connection, OpenFlags};
+
 use crate::support::{
     COMPOSER_PLACEHOLDER, EXCLUDED_POISON_KEYS, HERMETIC_ENV_KEYS, HERMETIC_LOCALE,
     HERMETIC_PTY_SHELL, HERMETIC_TERM, HermeticCockpit, HermeticLaunchKind, HermeticLaunchSpec,
@@ -12,6 +14,16 @@ use crate::support::{
 fn tui_pty_fixture_launches_and_reaps() {
     let mut session = HermeticCockpit::launch_ready(HermeticProfile::Default);
     let screen = session.snapshot();
+    assert!(screen.contains("Draft (unsaved)"), "{}", screen.contents());
+    assert_eq!(
+        session_row_count(&session),
+        0,
+        "ready draft must not persist"
+    );
+    assert!(
+        session.wait_until_attached(Duration::ZERO).is_err(),
+        "attached readiness must reject a usable draft"
+    );
     assert!(
         screen.contains(COMPOSER_PLACEHOLDER),
         "ready composer missing:\n{}",
@@ -55,6 +67,13 @@ fn tui_pty_fixture_launches_and_reaps() {
 #[test]
 fn tui_pty_ctrl_p_changes_session_model_and_ctrl_enter_persists_default() {
     let mut session = HermeticCockpit::launch_ready(HermeticProfile::Default);
+    assert_eq!(session_row_count(&session), 0, "launch must remain a draft");
+    session.materialize_session("model persistence first message");
+    assert_eq!(
+        session_row_count(&session),
+        1,
+        "first message persists once"
+    );
 
     session.write_bytes(b"\x10");
     session
@@ -129,11 +148,23 @@ fn tui_pty_ctrl_p_changes_session_model_and_ctrl_enter_persists_default() {
                 == Some("fallback")
         },
     );
+    assert_eq!(
+        session_row_count(&session),
+        1,
+        "model changes must retain the materialized session"
+    );
 
     session.type_line("/exit");
     session.wait_for_child_exit();
     session.reap();
     session.assert_reaped();
+}
+
+fn session_row_count(session: &HermeticCockpit) -> i64 {
+    Connection::open_with_flags(session.home().db_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("inspect hermetic ledger read-only")
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .expect("count persisted sessions")
 }
 
 #[test]

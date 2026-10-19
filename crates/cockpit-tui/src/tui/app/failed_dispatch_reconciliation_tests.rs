@@ -202,7 +202,7 @@ fn seed_new_session_reset_state(app: &mut App) -> mpsc::Receiver<ControlRequest>
         control_tx,
         Arc::new(Mutex::new(Vec::new())),
     )));
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     app.busy = true;
     app.history.push(HistoryEntry::Plain {
         line: "old transcript".to_string(),
@@ -701,7 +701,7 @@ fn new_session_clear_failure_is_nonfatal_and_finishes_reset() {
         Ok(cockpit_proto::Request::CancelTurn)
     ));
     assert!(control_rx.try_recv().is_err(), "only one cancel is sent");
-    assert!(!app.pending_new_session);
+    assert!(!app.pending_session_materialization);
     assert!(app.history.is_empty());
     assert!(app.queue.is_empty());
     assert!(app.pending.is_none());
@@ -729,7 +729,7 @@ fn new_session_clear_failure_is_nonfatal_and_finishes_reset() {
 fn new_session_success_invokes_terminal_clear_and_requests_redraw() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     let mut clear_count = 0;
 
     let changed = app
@@ -805,7 +805,7 @@ fn paste_fence_session_switch_ordering_bounds_unconfirmed_and_recovers_after_lin
         fence(ready_id, ready_sequence, FenceLifecycle::Ready, None),
     );
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert!(app.submission_fences.contains_key(&ready_id));
     assert_eq!(
@@ -814,7 +814,7 @@ fn paste_fence_session_switch_ordering_bounds_unconfirmed_and_recovers_after_lin
     );
     assert!(app.delivery_unconfirmed_records.contains_key(&sent_id));
 
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
     assert!(!app.submission_fences.contains_key(&ready_id));
     assert!(app.delivery_unconfirmed_records[&sent_id].surfaced);
@@ -829,7 +829,7 @@ async fn new_session_from_side_conversation_discards_side_before_resetting() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     app.side_conversation = Some(fake_side_conversation(tmp.path()));
-    app.pending_new_session = true;
+    app.pending_session_materialization = true;
     app.history.push(HistoryEntry::Plain {
         line: "side-only history".to_string(),
     });
@@ -961,7 +961,7 @@ async fn pending_switch_rejects_new_before_any_destructive_pre_effects() {
 
     assert!(changed);
     assert!(!clear_called);
-    assert!(!app.pending_new_session);
+    assert!(!app.pending_session_materialization);
     assert!(app.busy, "the outgoing turn must not be interrupted");
     assert!(app.agent_runner.is_some());
     assert!(app.current_session_persisted);
@@ -977,7 +977,7 @@ async fn pending_switch_rejects_resume_without_discarding_active_side() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     let mut control_rx = seed_new_session_reset_state(&mut app);
-    app.pending_new_session = false;
+    app.pending_session_materialization = false;
     app.side_conversation = Some(fake_side_conversation(tmp.path()));
     app.history.push(HistoryEntry::Plain {
         line: "side remains visible".to_string(),

@@ -84,6 +84,13 @@ pub const HERMETIC_ENV_KEYS: [&str; 10] = [
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_RUNNER_STATUS: &str = "[Build]─[local/scripted]";
+const READY_DRAFT_STATUS: &str = "Draft (unsaved)";
+
+#[derive(Clone, Copy)]
+enum ComposerReadiness {
+    DraftOrAttached,
+    Attached,
+}
 
 /// Sole profile variation. `RemoteOsc52` adds one literal SSH variable to
 /// the PTY child only.
@@ -779,8 +786,8 @@ impl HermeticCockpit {
     }
 
     /// Trust the isolated project, start the detached daemon, spawn the
-    /// 100×30 PTY child, and wait until its composer is attached to the
-    /// hermetic scripted runner.
+    /// 100×30 PTY child, and wait for a usable composer. An empty project
+    /// stays a local draft until its first message; readiness must not attach.
     pub fn launch_ready(profile: HermeticProfile) -> Self {
         let mut session = Self::prepare(profile);
         session.start_trusted_daemon();
@@ -1395,6 +1402,45 @@ impl HermeticCockpit {
     }
 
     pub fn wait_until_ready(&mut self, timeout: Duration) -> Result<(), ReadyTimeout> {
+        self.wait_for_composer(timeout, ComposerReadiness::DraftOrAttached)
+    }
+
+    /// Attached-session scenarios must cross the first-message boundary (or
+    /// restore durable history) before expecting runner chrome or reconnects.
+    pub fn wait_until_attached(&mut self, timeout: Duration) -> Result<(), ReadyTimeout> {
+        self.wait_for_composer(timeout, ComposerReadiness::Attached)
+    }
+
+    /// Materialize a fresh draft through the real composer, retaining the
+    /// message as visible history before an attached-session scenario starts.
+    pub fn materialize_session(&mut self, first_message: &str) {
+        assert!(
+            self.settled_snapshot().contains(READY_DRAFT_STATUS),
+            "first message requires a ready local draft"
+        );
+        self.write_str(first_message);
+        self.wait_until_screen(
+            "first message in composer",
+            DEFAULT_READY_TIMEOUT,
+            |screen| screen.contains(first_message) && !screen.contains(COMPOSER_PLACEHOLDER),
+        )
+        .expect("first message reaches draft composer");
+        self.send_enter();
+        self.wait_until_attached(DEFAULT_READY_TIMEOUT)
+            .expect("first message attaches the hermetic runner");
+        self.wait_until_screen(
+            "first message in history",
+            DEFAULT_READY_TIMEOUT,
+            |screen| screen.contains(first_message) && screen.contains(COMPOSER_PLACEHOLDER),
+        )
+        .expect("materialized session displays first message");
+    }
+
+    fn wait_for_composer(
+        &mut self,
+        timeout: Duration,
+        readiness: ComposerReadiness,
+    ) -> Result<(), ReadyTimeout> {
         // Production TUI always opens the workspace-trust modal on launch
         // (`StartupWorkspaceTrust::Pending`) even after `cockpit trust set`.
         // Confirm the pre-seeded trust decision so readiness observes the
@@ -1403,13 +1449,19 @@ impl HermeticCockpit {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(2);
         loop {
-            let snapshot = self.snapshot();
-            // The composer is rendered before the asynchronous daemon attach
-            // completes. Treat the attached runner's deterministic hermetic
-            // status as part of readiness so a first prompt or `/exit` cannot
-            // race the lifecycle fence.
+            let snapshot = self.settled_snapshot();
+            // The draft rail marker is published only after empty-session
+            // discovery completes. A placeholder alone can precede startup
+            // resolution; an attached-session wait must never accept a draft.
+            let attached =
+                snapshot.contains(READY_RUNNER_STATUS) && !snapshot.contains(READY_DRAFT_STATUS);
+            let resolved = attached
+                || (matches!(readiness, ComposerReadiness::DraftOrAttached)
+                    && snapshot.contains(READY_DRAFT_STATUS));
             let ready = snapshot.contains(COMPOSER_PLACEHOLDER)
-                && snapshot.contains(READY_RUNNER_STATUS)
+                && resolved
+                && !snapshot.contains("Loading session setup")
+                && !snapshot.contains("Reconnecting")
                 && UNWANTED_STARTUP_MARKERS
                     .iter()
                     .all(|marker| !snapshot.contains(marker));
@@ -1418,7 +1470,11 @@ impl HermeticCockpit {
             }
             if Instant::now() >= deadline {
                 return Err(ReadyTimeout {
-                    label: "ready composer marker".into(),
+                    label: match readiness {
+                        ComposerReadiness::DraftOrAttached => "ready composer marker",
+                        ComposerReadiness::Attached => "attached composer marker",
+                    }
+                    .into(),
                     screen: snapshot.contents(),
                     log: log_tail(&self.home),
                 });

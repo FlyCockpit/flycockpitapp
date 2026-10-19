@@ -2687,6 +2687,93 @@ pub async fn attach_to_session(
     .await
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum SessionSelectionError {
+    #[error("unknown saved session `{0}`")]
+    NotFound(String),
+    #[error("ambiguous saved session `{0}`; use its full UUID")]
+    Ambiguous(String),
+    #[error("session lookup failed: {0}")]
+    Lookup(String),
+}
+
+fn select_startup_code_session(
+    roots: &[proto::CodeRootSummaryV1],
+    selector: Option<&str>,
+) -> Result<Option<Uuid>, SessionSelectionError> {
+    if let Some(selector) = selector {
+        let uuid = Uuid::parse_str(selector).ok();
+        let matches = roots
+            .iter()
+            .filter(|row| match uuid {
+                Some(id) => row.root_id.0 == id,
+                None => row.short_id == selector || row.title.as_deref() == Some(selector),
+            })
+            .collect::<Vec<_>>();
+        return match matches.as_slice() {
+            [] => Err(SessionSelectionError::NotFound(selector.to_string())),
+            [row] => Ok(Some(row.root_id.0)),
+            _ => Err(SessionSelectionError::Ambiguous(selector.to_string())),
+        };
+    }
+    Ok(roots
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.lifecycle,
+                proto::CodeRootLifecycleV1::Active | proto::CodeRootLifecycleV1::Ended
+            )
+        })
+        .max_by_key(|row| (row.last_active_at_unix_ms, row.root_id))
+        .map(|row| row.root_id.0))
+}
+
+/// Use the existing paginated durable discovery boundary, not the rail's
+/// capped list: even an older name match must participate in ambiguity checks.
+pub(crate) async fn resolve_startup_code_session(
+    endpoint: &ClientEndpoint,
+    cwd: &Path,
+    selector: Option<&str>,
+) -> Result<Option<Uuid>, SessionSelectionError> {
+    let client = DaemonClient::connect_endpoint(endpoint)
+        .await
+        .map_err(|error| SessionSelectionError::Lookup(error.to_string()))?;
+    let logical_client_id = proto::OpaqueAsciiId128V1::new(Uuid::new_v4().to_string())
+        .expect("UUID is a bounded ASCII id");
+    let workspace_selector = selector
+        .is_none()
+        .then(|| proto::CodeRootWorkspaceSelectorV1 {
+            path: cwd.to_string_lossy().into_owned(),
+        });
+    let mut cursor = None;
+    let mut roots = Vec::new();
+    loop {
+        let response = client
+            .request(Request::DiscoverCodeRootsV1(
+                proto::DiscoverCodeRootsV1Request {
+                    workspace_selector: workspace_selector.clone(),
+                    logical_client_id: logical_client_id.clone(),
+                    cursor,
+                    limit: proto::acp::CODE_ROOT_DISCOVERY_PAGE_MAX,
+                },
+            ))
+            .await
+            .map_err(|error| SessionSelectionError::Lookup(error.to_string()))?
+            .map_err(|error| SessionSelectionError::Lookup(error.to_string()))?;
+        let Response::CodeRootsDiscovered(page) = response else {
+            return Err(SessionSelectionError::Lookup(
+                "unexpected discovery response".into(),
+            ));
+        };
+        roots.extend(page.roots);
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    select_startup_code_session(&roots, selector)
+}
+
 /// The one daemon owner selected by the interactive startup lifecycle request.
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedLifecycle {
@@ -5653,6 +5740,139 @@ mod tests {
             forced_skill: Some("review".to_string()),
             ..Default::default()
         }
+    }
+
+    fn day2_root(id: Uuid, short_id: &str, title: &str, activity: i64) -> proto::CodeRootSummaryV1 {
+        proto::CodeRootSummaryV1 {
+            root_id: proto::CodeRootIdV1(id),
+            title: Some(title.into()),
+            short_id: short_id.into(),
+            workspace_path: "/project".into(),
+            last_active_at_unix_ms: activity,
+            lifecycle: proto::CodeRootLifecycleV1::Active,
+            capture_generation: proto::CodeRootIdV1(id).capture_generation(),
+        }
+    }
+
+    #[test]
+    fn day2_session_selection_accepts_uuid_short_id_name_and_restores_last_durable() {
+        let first = Uuid::new_v4();
+        let last = Uuid::new_v4();
+        let roots = [
+            day2_root(first, "r5b71q", "word count", 1),
+            day2_root(last, "a1b2c3", "second", 2),
+        ];
+        for selector in [first.to_string(), "r5b71q".into(), "word count".into()] {
+            assert_eq!(
+                select_startup_code_session(&roots, Some(&selector)),
+                Ok(Some(first))
+            );
+        }
+        assert_eq!(select_startup_code_session(&roots, None), Ok(Some(last)));
+        assert_eq!(select_startup_code_session(&[], None), Ok(None));
+        assert_eq!(
+            select_startup_code_session(&roots, Some("missing")),
+            Err(SessionSelectionError::NotFound("missing".into()))
+        );
+        let duplicates = [roots[0].clone(), day2_root(last, "a1b2c3", "word count", 2)];
+        assert_eq!(
+            select_startup_code_session(&duplicates, Some("word count")),
+            Err(SessionSelectionError::Ambiguous("word count".into()))
+        );
+        let mut archived = roots[1].clone();
+        archived.lifecycle = proto::CodeRootLifecycleV1::Archived;
+        assert_eq!(
+            select_startup_code_session(&[roots[0].clone(), archived], None),
+            Ok(Some(first))
+        );
+    }
+
+    #[test]
+    fn day2_session_selection_restores_ended_durable_and_excludes_archived() {
+        let active = day2_root(Uuid::new_v4(), "active", "older active", 1);
+        let mut ended = day2_root(Uuid::new_v4(), "ended1", "latest ended", 2);
+        ended.lifecycle = proto::CodeRootLifecycleV1::Ended;
+        let mut archived = day2_root(Uuid::new_v4(), "archiv", "newest archived", 3);
+        archived.lifecycle = proto::CodeRootLifecycleV1::Archived;
+        assert_eq!(
+            select_startup_code_session(&[ended.clone()], None),
+            Ok(Some(ended.root_id.0))
+        );
+        assert_eq!(
+            select_startup_code_session(&[active, ended.clone(), archived.clone()], None),
+            Ok(Some(ended.root_id.0))
+        );
+        assert_eq!(select_startup_code_session(&[archived], None), Ok(None));
+        for selector in [
+            ended.root_id.0.to_string(),
+            ended.short_id.clone(),
+            ended.title.clone().unwrap(),
+        ] {
+            assert_eq!(
+                select_startup_code_session(&[ended.clone()], Some(&selector)),
+                Ok(Some(ended.root_id.0))
+            );
+        }
+        assert_eq!(select_startup_code_session(&[], None), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn day2_session_resolution_checks_every_discovery_page_for_ambiguity() {
+        use cockpit_client::{InProcessConnection, InProcessEndpoint, InProcessRequest};
+        let (connections, mut incoming) = mpsc::channel(1);
+        let (sensitive, _sensitive_rx) = mpsc::channel(1);
+        let endpoint = ClientEndpoint::InProcess(InProcessEndpoint::new(connections, sensitive));
+        let server = tokio::spawn(async move {
+            let reply = incoming.recv().await.unwrap();
+            let (requests, mut requests_rx) = mpsc::channel::<InProcessRequest>(1);
+            let (_events_tx, events) = mpsc::channel(1);
+            assert!(
+                reply
+                    .send(Some(InProcessConnection { requests, events }))
+                    .is_ok()
+            );
+            let readiness = requests_rx.recv().await.unwrap();
+            assert!(matches!(readiness.request, Request::DaemonStatus));
+            assert!(readiness.reply.send(Ok(Response::Ack)).is_ok());
+            let cursor = proto::CodeRootDiscoveryCursorV1::from_daemon_random(Uuid::new_v4());
+            let mut client_id = None;
+            for page in 0..2 {
+                let request = requests_rx.recv().await.unwrap();
+                let Request::DiscoverCodeRootsV1(discover) = request.request else {
+                    panic!("only durable discovery is allowed")
+                };
+                assert!(discover.workspace_selector.is_none());
+                if page == 0 {
+                    assert!(discover.cursor.is_none());
+                    client_id = Some(discover.logical_client_id);
+                } else {
+                    assert_eq!(Some(discover.logical_client_id), client_id);
+                    assert_eq!(discover.cursor, Some(cursor.clone()));
+                }
+                let roots = vec![day2_root(
+                    Uuid::new_v4(),
+                    if page == 0 { "abc123" } else { "def456" },
+                    "duplicate",
+                    page,
+                )];
+                assert!(
+                    request
+                        .reply
+                        .send(Ok(Response::CodeRootsDiscovered(
+                            proto::DiscoverCodeRootsV1Result {
+                                roots,
+                                next_cursor: (page == 0).then(|| cursor.clone()),
+                            }
+                        )))
+                        .is_ok()
+                );
+            }
+        });
+        assert_eq!(
+            resolve_startup_code_session(&endpoint, Path::new("/project"), Some("duplicate")).await,
+            Err(SessionSelectionError::Ambiguous("duplicate".into()))
+        );
+        server.await.unwrap();
     }
 
     #[test]

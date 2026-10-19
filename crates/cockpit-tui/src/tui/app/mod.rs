@@ -2084,6 +2084,7 @@ enum StartupRetry {
     Onboarding,
     Workspace(Option<cockpit_proto::OnboardingBootstrapSnapshot>),
     NamedAssistant,
+    Session,
 }
 
 /// Daemon-resolved config the TUI renders from (`tui-config-single-source`).
@@ -2157,8 +2158,33 @@ fn providers_from_view(
 /// requests until it adopts the daemon-returned authoritative value.
 pub type SessionMode = cockpit_proto::SessionEntryMode;
 
+struct DraftReturnView {
+    // The runner may still be the discarded side's transport for a New
+    // switch. Only this snapshot is authoritative for a return to main.
+    side_return: Option<SideConversation>,
+    runner: Option<AgentRunner>,
+    session_id: Option<uuid::Uuid>,
+    session_short_id: Option<String>,
+    project_id: Option<String>,
+    history: history_window::HistoryWindow,
+    queue: Vec<QueuedUserMessage>,
+    pending: Option<PendingMsg>,
+    busy: bool,
+    persisted: bool,
+}
+
 #[allow(private_interfaces)]
 pub struct App {
+    local_session_draft: bool,
+    draft_return_view: Option<DraftReturnView>,
+    // A detached main snapshot is provisional until its authoritative
+    // reattach history replaces it. Keep this through transient failures.
+    restored_draft_session: Option<uuid::Uuid>,
+    startup_session_selector: Option<String>,
+    startup_session_resolved: bool,
+    session_rail_refresh_needed: bool,
+    reducing_async_action_batch: bool,
+    session_rail_next_refresh: Instant,
     /// Requested before attach, then replaced by the daemon-owned session
     /// value from `Attached`. It never grants or changes execution authority.
     pub(super) session_mode: Option<SessionMode>,
@@ -2712,11 +2738,11 @@ pub struct App {
     /// through it the same way ↑/↓ moves the highlight. `None` when not
     /// mid-cycle; cleared by any non-Tab composer edit via
     /// [`App::reset_slash_window`].
-    /// `/new` was invoked; the event loop services it on the next tick
-    /// (needs the terminal handle for `insert_before` so the existing
-    /// history spills to scrollback before the welcome header is
-    /// reprinted above the viewport).
+    /// A user requested a blank local draft (/new, Ctrl+N, or the rail).
+    /// The event loop clears the view without creating a durable session.
     pub(super) pending_new_session: bool,
+    /// First-message transaction, serviced until its switch action is admitted.
+    pub(super) pending_session_materialization: bool,
     /// Live-runner `/new` has scheduled `session.switch` and cleared the
     /// visible view; identity adoption waits for a matching successful
     /// outcome epoch. Old-epoch events are bookkeeping-only; replacement
@@ -4426,7 +4452,16 @@ impl App {
             slash_dismissed: false,
             slash_scroll: 0,
             slash_menu_cache: std::cell::RefCell::new(None),
+            local_session_draft: false,
+            draft_return_view: None,
+            restored_draft_session: None,
+            startup_session_selector: None,
+            startup_session_resolved: false,
+            session_rail_refresh_needed: false,
+            reducing_async_action_batch: false,
+            session_rail_next_refresh: Instant::now(),
             pending_new_session: false,
+            pending_session_materialization: false,
             provisional_new_session: false,
             visible_attachment_epoch: 0,
             provisional_new_epoch_event_buffer: VecDeque::new(),
@@ -5038,6 +5073,7 @@ impl App {
         changed |= self.drain_fetch_progress();
         changed |= self.drain_agent_events();
         changed |= self.drain_async_actions();
+        changed |= self.maybe_submit_startup_retained_message();
         self.maybe_start_session_rail_list();
         changed |= self.drain_leak_reveal();
         changed |= self.retry_pending_session_switch_submissions();

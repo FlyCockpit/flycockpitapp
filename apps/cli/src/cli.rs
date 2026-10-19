@@ -20,6 +20,10 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub project: Option<PathBuf>,
 
+    /// Open a saved TUI session by UUID, short id, or exact name.
+    #[arg(long, value_name = "ID-OR-NAME")]
+    pub session: Option<String>,
+
     /// Print logs to stderr instead of dropping them.
     #[arg(long, global = true)]
     pub print_logs: bool,
@@ -78,6 +82,9 @@ pub fn public_v0_1_command() -> clap::Command {
 pub struct PublicCli {
     #[arg(long, value_name = "PATH")]
     pub project: Option<PathBuf>,
+    /// Open a saved TUI session by UUID, short id, or exact name.
+    #[arg(long, value_name = "ID-OR-NAME")]
+    pub session: Option<String>,
     #[arg(long, global = true)]
     pub print_logs: bool,
     #[arg(long, global = true, value_name = "LEVEL")]
@@ -219,6 +226,7 @@ impl From<PublicCli> for Cli {
     fn from(value: PublicCli) -> Self {
         Self {
             project: value.project,
+            session: value.session,
             print_logs: value.print_logs,
             log_level: value.log_level,
             pure: value.pure,
@@ -2885,6 +2893,36 @@ mod tests {
         ]);
         assert_eq!(args.prompt_file, Some(PathBuf::from("/tmp/p.md")));
         assert_eq!(args.output_format(), OutputFormat::Json);
+    }
+
+    #[test]
+    fn day2_tui_session_selector_parses_uuid_short_id_and_name_without_changing_run() {
+        for selector in [
+            "019933a0-0000-7000-8000-000000000001",
+            "r5b71q",
+            "fix word count",
+        ] {
+            let public = PublicCli::try_parse_from(["cockpit", "--session", selector]).unwrap();
+            let cli: Cli = public.into();
+            assert_eq!(cli.session.as_deref(), Some(selector));
+            assert!(cli.command.is_none());
+        }
+        let public = PublicCli::try_parse_from([
+            "cockpit",
+            "run",
+            "--session",
+            "019933a0-0000-7000-8000-000000000001",
+            "hello",
+        ])
+        .unwrap();
+        assert!(public.session.is_none());
+        let Some(PublicCommand::Run(args)) = public.command else {
+            panic!("expected run")
+        };
+        assert_eq!(
+            args.session.as_deref(),
+            Some("019933a0-0000-7000-8000-000000000001")
+        );
     }
 
     #[test]

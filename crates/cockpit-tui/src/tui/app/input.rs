@@ -2758,6 +2758,12 @@ impl App {
             self.open_missing_model_setup(reason);
             return false;
         }
+        // The runner temporarily belongs to the outgoing session while the
+        // draft's materialization reconciles receipts or awaits attach. Keep
+        // the composer intent intact until replacement identity is adopted.
+        if self.draft_return_view.is_some() && !self.local_session_draft {
+            return false;
+        }
         if (self.first_paint_completed || self.startup_background.started)
             && (!self.startup_background.workspace_ready
                 || !matches!(self.agent_runner, Some(Ok(_))))
@@ -2774,6 +2780,9 @@ impl App {
                 super::ToastKind::Info,
             );
             self.retry_startup_background();
+            if self.startup_background.workspace_ready && self.startup_session_resolved {
+                self.ensure_agent_runner();
+            }
             return false;
         }
         // A selection in flight is deliberately *not* a missing-model state.
@@ -3596,9 +3605,7 @@ impl App {
         #[cfg(test)]
         let barrier = self.take_owned_test_barrier(operation);
         let attached_request = self
-            .agent_runner
-            .as_ref()
-            .and_then(|runner| runner.as_ref().ok())
+            .session_effect_runner()
             .map(|runner| runner.attached_request_binding());
         if attached_request.is_none() {
             #[cfg(test)]

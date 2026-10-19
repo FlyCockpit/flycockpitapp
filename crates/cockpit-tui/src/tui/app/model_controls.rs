@@ -692,7 +692,20 @@ impl App {
         applied: ControlApplied,
     ) {
         let tool_surface_override = matches!(applied, ControlApplied::ToolSurfaceOverride { .. });
-        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+        let runner = if matches!(
+            applied,
+            ControlApplied::ExitGuardStatus
+                | ControlApplied::ExitAfterStoppingWork
+                | ControlApplied::ExitAfterBackgroundPromotion
+        ) {
+            // Quit follows its existing lifecycle owner during attach.
+            self.agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+        } else {
+            self.session_effect_runner()
+        };
+        let Some(runner) = runner else {
             let message =
                 Self::control_not_delivered_message(label, ControlRequestNotDelivered::NoRunner);
             let selection_id = match applied {

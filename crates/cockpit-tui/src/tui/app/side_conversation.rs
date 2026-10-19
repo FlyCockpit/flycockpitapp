@@ -105,7 +105,7 @@ impl App {
         });
     }
 
-    fn schedule_created_session_discard(
+    pub(super) fn schedule_created_session_discard(
         &mut self,
         endpoint: cockpit_client::ClientEndpoint,
         session_id: uuid::Uuid,
@@ -126,6 +126,9 @@ impl App {
     /// The main-session view is snapshotted into `side_conversation` so a
     /// later `/side end` / exit restores it verbatim.
     pub(super) fn enter_side_conversation(&mut self) {
+        if !self.guard_session_effect("/side") {
+            return;
+        }
         // Need a live runner: the side fork goes onto the same daemon, and
         // forking off an un-persisted session has nothing to branch from.
         let (parent_session_id, endpoint, socket) = match self.agent_runner.as_ref() {
@@ -322,7 +325,8 @@ impl App {
     /// conversation. Discard its ephemeral row without first launching the
     /// normal side-return attach (which would compete for the shared switch
     /// key). Resume restores the main snapshot as a coherent fallback while
-    /// its claimed switch is pending; `/new` is about to clear it anyway.
+    /// its claimed switch is pending. Local drafts retain their main fallback
+    /// separately in DraftReturnView before scheduling the discard.
     pub(super) fn discard_side_conversation_for_replacement(&mut self, restore_main: bool) {
         let Some(side) = self.side_conversation.take() else {
             return;

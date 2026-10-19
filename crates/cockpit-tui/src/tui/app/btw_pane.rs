@@ -945,6 +945,9 @@ fn optimistic_queue_item(id: Uuid, text: String) -> QueuedUserMessage {
 
 impl App {
     pub(super) fn handle_btw_command(&mut self, args: &str) {
+        if !self.guard_session_effect("/btw") {
+            return;
+        }
         if self.side_conversation.is_some() {
             self.history.push(HistoryEntry::CommandError {
                 line: "/btw: end /side first".to_string(),
@@ -973,10 +976,7 @@ impl App {
         let has_test_gate = barrier.is_some();
         #[cfg(not(test))]
         let has_test_gate = false;
-        let runner = self
-            .agent_runner
-            .as_ref()
-            .and_then(|runner| runner.as_ref().ok());
+        let runner = self.session_effect_runner();
         if runner.is_none() && !has_test_gate {
             self.start_runner_attach(true, RunnerAttachContinuation::BtwCommand(args.to_string()));
             self.push_plain("/btw: connecting".to_string());

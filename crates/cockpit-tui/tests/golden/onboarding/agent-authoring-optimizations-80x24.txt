@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Tune the agent · step 6/8                                                     
+  Tune the agent · step 5/5                                                     
   These settings are independent; the defaults are a sane starting point.       
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Optimizations ───────────────────────────────────────────────────────────╮  

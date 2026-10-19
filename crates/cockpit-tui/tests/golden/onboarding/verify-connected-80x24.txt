@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  ✓ Connected · step 4/8                                                        
+  ✓ Connected · step 3/5                                                        
   openai · 3 model(s) available                                                 
-  ✓  ✓  ✓  ◆ Provider  ·  ·  ·  ·                                               
+  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Models ──────────────────────────────────────────────────────────────────╮  

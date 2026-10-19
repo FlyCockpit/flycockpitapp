@@ -1,7 +1,7 @@
  ‹ Back                                                                                                                 
-                 How much does this subagent see? · step 6/8                                                            
+                 How much does this subagent see? · step 5/5                                                            
                  Confirm the shared trust classification for every unset model.                                         
-                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Agent  · Background  · Ready                      
+                 ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                                                 
                  ──────────────────────────────────────────────────────────────────────────────────────                 
                                                                                                                         
                  ╭ Trust ─────────────────────────────────────────────────────────────────────────────╮                 

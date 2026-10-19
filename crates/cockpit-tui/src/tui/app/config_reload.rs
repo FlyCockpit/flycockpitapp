@@ -121,6 +121,21 @@ impl App {
         self.apply_tui_config_from_extended(&extended);
     }
 
+    /// First-run model selection is user-global, independent of project
+    /// trust and overlays. Use the sanctioned masked, credential-free bootstrap
+    /// read while detached, and preserve its held generation.
+    pub(super) fn refresh_onboarding_model_config_snapshot(&mut self) -> Result<(), String> {
+        let global =
+            cockpit_config::dirs::global_config_dir().map_err(|error| error.to_string())?;
+        let bundle = welcome::load_bundle_bootstrap_redacted(Some(&global), false);
+        self.config_snapshot.providers = bundle.providers;
+        self.config_snapshot.extended = bundle.extended;
+        self.config_snapshot
+            .providers
+            .set_resolution_generation(self.config_snapshot.generation);
+        Ok(())
+    }
+
     /// Apply TUI-side settings (vim mode, thinking display, markdown
     /// rendering, …) from the held config snapshot so a `/settings` change
     /// takes effect without a restart. Reads the held snapshot — never disk.

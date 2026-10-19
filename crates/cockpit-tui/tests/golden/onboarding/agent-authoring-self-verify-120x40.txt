@@ -1,7 +1,7 @@
  ‹ Back                                                                                                                 
-                 Self-verify risky actions · step 6/8                                                                   
+                 Self-verify risky actions · step 5/5                                                                   
                  Re-check writes, commands, and Monty before they land.                                                 
-                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Agent  · Background  · Ready                      
+                 ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                                                 
                  ──────────────────────────────────────────────────────────────────────────────────────                 
                                                                                                                         
                  ╭ Self-verify ───────────────────────────────────────────────────────────────────────╮                 

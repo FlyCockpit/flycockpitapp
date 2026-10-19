@@ -1,7 +1,7 @@
  ‹ Back                                                                                                                 
-                 Add your API key · step 4/8                                                                            
+                 Add your API key · step 3/5                                                                            
                  Paste a key for OpenAI-compatible.                                                                     
-                 ✓ Welcome  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Agent  · Background  · Ready                      
+                 ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Start coding                                                 
                  ──────────────────────────────────────────────────────────────────────────────────────                 
                                                                                                                         
                  ╭ Provider id ───────────────────────────────────────────────────────────────────────╮                 

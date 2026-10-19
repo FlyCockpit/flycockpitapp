@@ -1029,7 +1029,31 @@ impl App {
             None => {
                 if self.onboarding_shell.is_none() {
                     if let Some(snapshot) = self.onboarding_snapshot.clone() {
-                        self.reopen_onboarding_shell(&snapshot);
+                        if snapshot.stage == cockpit_proto::OnboardingStage::Complete {
+                            // Explicit /setup is a settings entry, not a new
+                            // onboarding attempt. Automatic Complete snapshots
+                            // continue to leave the composer alone.
+                            self.onboarding_force = false;
+                            if !matches!(self.agent_runner, Some(Ok(_)))
+                                && let Err(error) = self.refresh_onboarding_model_config_snapshot()
+                            {
+                                self.show_toast(
+                                    format!("Could not load saved setup: {error}"),
+                                    super::ToastKind::Error,
+                                );
+                                return;
+                            }
+                            let summary = self.onboarding_completion_summary();
+                            let mut shell = crate::tui::onboarding::OnboardingShell::new(
+                                &snapshot,
+                                crate::tui::onboarding::reduced_motion_enabled(),
+                            );
+                            shell.present_completion(summary);
+                            self.onboarding_shell = Some(Box::new(shell));
+                            self.dialog = Dialog::None;
+                        } else {
+                            self.reopen_onboarding_shell(&snapshot);
+                        }
                     } else {
                         self.start_onboarding_bootstrap_fetch();
                     }
@@ -1089,6 +1113,29 @@ impl App {
                     cockpit_core::wizard::SECURITY_WIZARD_ID,
                     None,
                 );
+            }
+            Some(cockpit_core::wizard::AGENT_WIZARD_ID) => {
+                if !self.require_onboarding_snapshot_for_named_route(
+                    cockpit_core::wizard::AGENT_WIZARD_ID,
+                ) || !self.focus_named_setup_wizard(cockpit_core::wizard::AGENT_WIZARD_ID)
+                {
+                    return;
+                }
+                let snapshot = self
+                    .onboarding_snapshot
+                    .as_ref()
+                    .expect("named route checkpoint");
+                let mut shell = crate::tui::onboarding::OnboardingShell::new(
+                    snapshot,
+                    crate::tui::onboarding::reduced_motion_enabled(),
+                );
+                shell.begin_agent_setup();
+                self.onboarding_shell = Some(Box::new(shell));
+                self.dialog = Dialog::None;
+                let operation = uuid::Uuid::new_v4().to_string();
+                self.onboarding_agent_operation_id = Some(operation.clone());
+                self.pending_startup_agent_authoring_receipt = None;
+                self.request_agent_authoring_projection(operation);
             }
             Some(cockpit_core::wizard::MODEL_WIZARD_ID) => {
                 if !self.require_onboarding_snapshot_for_named_route(
@@ -1727,25 +1774,25 @@ impl App {
                 }
             }
             OnboardingStage::Model => {
-                // Seed the model wizard with the committed provider's first
-                // catalog model when one exists; manual entry stays available
-                // when it does not.
+                // The bootstrap starts with a held, empty provider view. Re-read
+                // committed, redacted metadata at this durable checkpoint on
+                // both entry and relaunch; credentials remain daemon-owned.
+                if let Err(error) = self.refresh_onboarding_model_config_snapshot() {
+                    self.show_toast(
+                        format!("Could not load saved providers: {error}"),
+                        super::ToastKind::Error,
+                    );
+                    return;
+                }
                 let preselected = self
                     .config_snapshot
                     .providers
-                    .providers
-                    .iter()
-                    .next()
-                    .and_then(|(provider_id, entry)| {
-                        entry
-                            .models
-                            .first()
-                            .map(|model| (provider_id.clone(), model.id.clone()))
-                    });
-                let preselected = preselected.as_ref().map(|(p, m)| (p.as_str(), m.as_str()));
+                    .active_model
+                    .as_ref()
+                    .map(|active| (active.provider.as_str(), active.model.as_str()));
                 self.dialog = crate::tui::settings::Dialog::None;
                 if let Some(shell) = self.onboarding_shell.as_mut() {
-                    shell.present_model(&self.config_snapshot.providers, preselected);
+                    shell.present_default_model(&self.config_snapshot.providers, preselected);
                 }
             }
             OnboardingStage::Agent => {
@@ -2232,6 +2279,9 @@ impl App {
                     );
                 }
             }
+            Some(OnboardingShellAction::OpenAgentSetup) => {
+                self.open_onboarding_setup(Some(cockpit_core::wizard::AGENT_WIZARD_ID));
+            }
             Some(OnboardingShellAction::ReturnToCompletion) => {
                 // Shell-local: leave the completion screen's "add another
                 // provider" detour. The detour engine's in-flight provider
@@ -2281,13 +2331,16 @@ impl App {
             .startup_lifecycle
             .as_ref()
             .map(|selected| selected.endpoint.clone());
-        let project_root = self.launch.cwd.display().to_string();
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.provider.verify"),
             crate::tui::async_action::AsyncActionPolicy::Replace(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.provider.verify"),
             ),
             async move {
+                let project_root = cockpit_config::dirs::global_config_dir()
+                    .map_err(|error| format!("resolving global provider configuration: {error}"))?
+                    .display()
+                    .to_string();
                 use cockpit_proto::{
                     ProviderMutationBatch, ProviderMutationUpsert, Request, Response,
                 };
@@ -2446,13 +2499,16 @@ impl App {
             .startup_lifecycle
             .as_ref()
             .map(|selected| selected.endpoint.clone());
-        let project_root = self.launch.cwd.display().to_string();
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.provider.verify"),
             crate::tui::async_action::AsyncActionPolicy::Replace(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.provider.verify"),
             ),
             async move {
+                let project_root = cockpit_config::dirs::global_config_dir()
+                    .map_err(|error| format!("resolving global provider configuration: {error}"))?
+                    .display()
+                    .to_string();
                 let endpoint =
                     onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
@@ -2609,6 +2665,16 @@ impl App {
             );
             return;
         };
+        if !matches!(
+            snapshot.stage,
+            cockpit_proto::OnboardingStage::Agent | cockpit_proto::OnboardingStage::Complete
+        ) {
+            self.show_toast(
+                "Agent setup is not active at this checkpoint",
+                super::ToastKind::Error,
+            );
+            return;
+        }
         let lifecycle = self.lifecycle.clone();
         let selected_endpoint = self
             .startup_lifecycle
@@ -2647,7 +2713,8 @@ impl App {
             client_operation_id: rpc_operation_id,
             expected_policy_revision: package.policy_revision.clone(),
             package,
-            onboarding: Some(correlation),
+            onboarding: (snapshot.stage == cockpit_proto::OnboardingStage::Agent)
+                .then_some(correlation),
             validate_only,
         };
         let started = self.async_actions.start(
@@ -3204,7 +3271,14 @@ impl App {
                 );
                 true
             }
-            cockpit_proto::OnboardingStage::Lifetime => false,
+            cockpit_proto::OnboardingStage::Lifetime => {
+                // Keep the configured lifetime preference. It can be changed
+                // later from /settings; it needs no first-run decision.
+                self.apply_onboarding_lifetime(
+                    self.config_snapshot.extended.daemon.background_agents,
+                );
+                true
+            }
         }
     }
 

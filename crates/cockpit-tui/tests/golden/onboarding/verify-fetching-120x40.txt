@@ -1,7 +1,7 @@
  ‹ Back                                                                                                                 
-                 Verifying provider · step 4/8                                                                          
+                 Verifying provider · step 3/5                                                                          
                  Checking openai through the Cockpit daemon.                                                            
-                 ✓ Welcome  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Agent  · Background  · Ready                      
+                 ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Start coding                                                 
                  ──────────────────────────────────────────────────────────────────────────────────────                 
                                                                                                                         
                  ⠋ Fetching models from the provider…                                                                   

@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Let's check what happened · step 6/8                                          
+  Let's check what happened · step 5/5                                          
   Create outcome unknown — query the receipt before retrying.                   
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Status ──────────────────────────────────────────────────────────────────╮  

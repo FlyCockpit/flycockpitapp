@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Trust this publisher? · step 6/8                                              
+  Trust this publisher? · step 5/5                                              
   Confirm who published this pinned definition before it can run.               
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Trust ───────────────────────────────────────────────────────────────────╮  

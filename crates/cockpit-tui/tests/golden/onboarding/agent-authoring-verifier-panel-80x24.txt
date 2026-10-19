@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Verifier panel — Writes & edits · step 6/8                                    
+  Verifier panel — Writes & edits · step 5/5                                    
   Writes & edits verifier models and copy counts.                               
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Verifier panel — Writes & edits ─────────────────────────────────────────╮  

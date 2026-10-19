@@ -49,6 +49,10 @@ named_setup_wizard_rows! {
     MODEL_WIZARD_ID = "model",
     stage: None,
     complete: true,
+    // Native authoring uses the package RPC rather than a generic descriptor.
+    AGENT_WIZARD_ID = "agent",
+    stage: None,
+    complete: true,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

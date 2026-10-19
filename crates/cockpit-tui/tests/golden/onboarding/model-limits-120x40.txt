@@ -1,7 +1,7 @@
  ‹ Back                                                                                                                 
-                 Model limits · step 5/8                                                                                
+                 Model limits · step 4/5                                                                                
                  Keep detected token limits or enter an override.                                                       
-                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Agent  · Background  · Ready                      
+                 ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Start coding                                                 
                  ──────────────────────────────────────────────────────────────────────────────────────                 
                                                                                                                         
                  ╭ Context window tokens ─────────────────────────────────────────────────────────────╮                 

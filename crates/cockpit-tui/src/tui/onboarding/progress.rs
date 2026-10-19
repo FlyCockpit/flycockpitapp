@@ -23,7 +23,7 @@
 //! 1. [`ProgressTier::Full`]: every step with its label;
 //! 2. [`ProgressTier::Compact`]: only the current step keeps its label, the
 //!    others are glyph-only;
-//! 3. [`ProgressTier::Minimal`]: plain text, `Step 3 of 8 · Secrets`.
+//! 3. [`ProgressTier::Minimal`]: plain text, `2/5 · Secrets`.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -34,16 +34,7 @@ use crate::tui::theme::{BRASS, FOG, NIGHT};
 /// step's entry-screen title (`Secure your secrets` → `Secrets`,
 /// `Background agents` → `Background`), so the row and the header never name
 /// the same step differently.
-pub(super) const STEPS: [&str; 8] = [
-    "Welcome",
-    "Name",
-    "Secrets",
-    "Provider",
-    "Model",
-    "Agent",
-    "Background",
-    "Ready",
-];
+pub(super) const STEPS: [&str; 5] = ["Name", "Secrets", "Provider", "Model", "Start coding"];
 
 pub(super) const DONE_MARK: &str = "\u{2713}"; // ✓
 pub(super) const CURRENT_MARK: &str = "\u{25C6}"; // ◆
@@ -128,7 +119,7 @@ fn stepped_line(current: usize, tier: ProgressTier) -> Line<'static> {
 fn minimal_line(current: usize) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("Step {} of {} · ", current + 1, STEPS.len()),
+            format!("{}/{} · ", current + 1, STEPS.len()),
             Style::new().fg(FOG),
         ),
         Span::styled(STEPS[current], StepState::Current.style()),
@@ -148,48 +139,44 @@ mod tests {
 
     #[test]
     fn tiers_degrade_by_width_and_never_exceed_the_area() {
-        // Secrets (index 2) at the widths the onboarding column gets on
-        // 120/80/60/40-column terminals, plus a sub-40 column.
+        // Five visible checkpoints: automatic agent/lifetime bookkeeping
+        // belongs to Start coding, rather than advertising more decisions.
         let cases = [
             (86, ProgressTier::Full),
-            (76, ProgressTier::Compact),
-            (56, ProgressTier::Compact),
+            (76, ProgressTier::Full),
+            (56, ProgressTier::Full),
             (36, ProgressTier::Compact),
-            (26, ProgressTier::Minimal),
+            (16, ProgressTier::Minimal),
         ];
         for (width, expected) in cases {
-            let (tier, line) = progress_line(2, width);
+            let (tier, line) = progress_line(1, width);
             assert_eq!(tier, expected, "width {width}: {}", text(&line));
             assert!(line.width() <= usize::from(width), "width {width}");
         }
         assert_eq!(
-            text(&progress_line(2, 86).1),
-            "✓ Welcome  ✓ Name  ◆ Secrets  · Provider  · Model  · Agent  · Background  · Ready"
+            text(&progress_line(1, 86).1),
+            "✓ Name  ◆ Secrets  · Provider  · Model  · Start coding"
         );
-        assert_eq!(
-            text(&progress_line(2, 76).1),
-            "✓  ✓  ◆ Secrets  ·  ·  ·  ·  ·"
-        );
-        assert_eq!(text(&progress_line(2, 26).1), "Step 3 of 8 · Secrets");
+        assert_eq!(text(&progress_line(1, 36).1), "✓  ◆ Secrets  ·  ·  ·");
+        assert_eq!(text(&progress_line(1, 16).1), "2/5 · Secrets");
     }
 
     #[test]
     fn every_step_fits_its_tier_at_each_supported_terminal_width() {
         for (current, label) in STEPS.iter().enumerate() {
-            // Full needs the wide (120-column) layout; the 80-column
-            // column must still carry the current label in compact form.
-            assert_eq!(progress_line(current, 86).0, ProgressTier::Full);
-            for width in [76, 56, 36] {
-                let (tier, line) = progress_line(current, width);
-                assert_eq!(tier, ProgressTier::Compact, "step {current} @ {width}");
-                assert!(text(&line).contains(label));
+            for width in [86, 76, 56] {
+                assert_eq!(progress_line(current, width).0, ProgressTier::Full);
             }
+            let (tier, line) = progress_line(current, 36);
+            assert_eq!(tier, ProgressTier::Compact, "step {current}");
+            assert!(text(&line).contains(label));
+            assert!(line.width() <= 36);
         }
     }
 
     #[test]
     fn states_are_distinguished_by_glyph_not_only_colour() {
-        let (_, line) = progress_line(3, 76);
+        let (_, line) = progress_line(3, 36);
         let marks: Vec<&str> = line
             .spans
             .iter()
@@ -199,16 +186,7 @@ mod tests {
             .collect();
         assert_eq!(
             marks,
-            [
-                DONE_MARK,
-                DONE_MARK,
-                DONE_MARK,
-                CURRENT_MARK,
-                PENDING_MARK,
-                PENDING_MARK,
-                PENDING_MARK,
-                PENDING_MARK,
-            ]
+            [DONE_MARK, DONE_MARK, DONE_MARK, CURRENT_MARK, PENDING_MARK]
         );
         let distinct: std::collections::BTreeSet<_> = [DONE_MARK, CURRENT_MARK, PENDING_MARK]
             .into_iter()

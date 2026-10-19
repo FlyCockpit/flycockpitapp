@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Background agents · step 7/8                                                  
+  Background agents · step 5/5                                                  
   Choose what happens after the last Cockpit window closes.                     
-  ✓  ✓  ✓  ✓  ✓  ✓  ◆ Background  ·                                             
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ◉ Keep agents running in the background                                       

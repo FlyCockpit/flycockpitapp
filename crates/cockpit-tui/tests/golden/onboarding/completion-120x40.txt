@@ -1,7 +1,7 @@
  ‹ Back                                                                                                                 
-                 You're ready to fly · step 8/8                                                                         
+                 You're ready to fly · step 5/5                                                                         
                  Your setup is complete.                                                                                
-                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ✓ Agent  ✓ Background  ◆ Ready                      
+                 ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                                                 
                  ──────────────────────────────────────────────────────────────────────────────────────                 
                                                                                                                         
                  ╭ Summary ───────────────────────────────────────────────────────────────────────────╮                 
@@ -9,6 +9,7 @@
                  │ Name: Amelia · Provider: OpenAI · Agent: cockpit                                   │                 
                  │                                                                                    │                 
                  │ Next: run /setup security to choose project trust and approval defaults.           │                 
+                 │ Optional: Agent setup (g) opens tuning, tools and subagents.                       │                 
                  │ Use /help any time to see available commands.                                      │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
@@ -34,7 +35,6 @@
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
-                 │                                                                                    │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
-                 ↑/↓  enter: choose                           [ Add another provider ] [ Start coding ]                 
+                 g agent setup   ↑/↓ enter ch [ Add another provider ] [ Start coding ] [ Agent setup ]                 
                                                                                                                         

@@ -87,6 +87,7 @@ fn post_onboarding_wizards_reject_active_onboarding_stages() {
     for wizard_id in [
         cockpit_core::wizard::SECURITY_WIZARD_ID,
         cockpit_core::wizard::MODEL_WIZARD_ID,
+        cockpit_core::wizard::AGENT_WIZARD_ID,
     ] {
         for stage in [
             cockpit_proto::OnboardingStage::Welcome,
@@ -550,5 +551,112 @@ fn unsent_usage_after_a_failed_pre_session_attach_never_fences_quit() {
     assert!(
         app.request_guarded_exit(),
         "quit must not wait on unsent usage"
+    );
+}
+
+#[test]
+fn setup_agent_keeps_optional_tuning_reachable_after_short_first_run() {
+    use crate::tui::onboarding::agent::Phase;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_onboarding_bootstrap_snapshot(Some(snapshot(
+        cockpit_proto::OnboardingStage::Complete,
+    )));
+    app.open_onboarding_setup(Some(cockpit_core::wizard::AGENT_WIZARD_ID));
+    assert!(
+        app.onboarding_shell.is_some(),
+        "the optional authoring route must mount"
+    );
+    let (id, request_id) = app
+        .pending_startup_onboarding_operations
+        .iter()
+        .next()
+        .map(|(id, request)| (*id, request.clone()))
+        .expect("optional authoring requests a projection");
+    let operation = app.onboarding_agent_operation_id.clone().unwrap();
+    app.apply_async_action_result(crate::tui::async_action::AsyncActionResult {
+        id,
+        kind: crate::tui::async_action::AsyncActionKind::DaemonRpc("agent_authoring.projection"),
+        presentation_stale: false,
+        payload: Ok(
+            crate::tui::async_action::AsyncActionPayload::StartupAgentAuthoringProjection {
+                client_operation_id: operation,
+                request_id,
+                projection: crate::tui::onboarding::agent::golden_sample_projection(),
+            },
+        ),
+    });
+    let phase = |app: &App| {
+        app.onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.test_agent_authoring_phase())
+    };
+    assert_eq!(phase(&app), Some(Phase::SourceIdentity));
+    app.onboarding_shell
+        .as_mut()
+        .unwrap()
+        .paste("Optional Pilot");
+    let press = |app: &mut App, code| {
+        app.handle_onboarding_shell_key(KeyEvent::new(code, KeyModifiers::NONE))
+    };
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(phase(&app), Some(Phase::ModelGrants));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(phase(&app), Some(Phase::ModelTrust));
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(phase(&app), Some(Phase::Optimizations));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(phase(&app), Some(Phase::ToolTiers));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(phase(&app), Some(Phase::SubagentsList));
+    assert_eq!(
+        app.onboarding_snapshot.as_ref().unwrap().stage,
+        cockpit_proto::OnboardingStage::Complete,
+        "optional tuning must not reopen first-run authority"
+    );
+    // A same-revision authority refresh must retain the optional editor.
+    app.apply_onboarding_bootstrap_snapshot(Some(snapshot(
+        cockpit_proto::OnboardingStage::Complete,
+    )));
+    assert_eq!(phase(&app), Some(Phase::SubagentsList));
+}
+
+#[test]
+fn completed_setup_can_be_explicitly_reopened_without_restarting_authority_or_a_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    let completed = snapshot(cockpit_proto::OnboardingStage::Complete);
+    app.apply_onboarding_bootstrap_snapshot(Some(completed.clone()));
+    assert!(
+        app.onboarding_shell.is_none(),
+        "completed startup must keep its composer"
+    );
+    let session = app.launch.session_id;
+    let draft = app.local_session_draft;
+    let command = *super::slash::slash_command_by_name("setup").unwrap();
+    app.composer.set("/setup".to_string());
+    app.execute_slash(command);
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.screen_is_complete()),
+        "explicit /setup must expose optional controls after first run"
+    );
+    assert_eq!(app.onboarding_snapshot.as_ref(), Some(&completed));
+    assert!(
+        !app.onboarding_force,
+        "settings must not begin a new onboarding attempt on a retry"
+    );
+    assert_eq!(app.launch.session_id, session);
+    assert_eq!(app.local_session_draft, draft);
+    app.apply_onboarding_bootstrap_snapshot(Some(completed));
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.screen_is_complete())
     );
 }

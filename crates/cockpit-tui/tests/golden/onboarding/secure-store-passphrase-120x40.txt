@@ -1,7 +1,7 @@
  ‹ Back                                                                                                                 
-                 Secure your secrets · step 3/8                                                                         
+                 Secure your secrets · step 2/5                                                                         
                  Choose how Cockpit protects your API keys and sealed values.                                           
-                 ✓ Welcome  ✓ Name  ◆ Secrets  · Provider  · Model  · Agent  · Background  · Ready                      
+                 ✓ Name  ◆ Secrets  · Provider  · Model  · Start coding                                                 
                  ──────────────────────────────────────────────────────────────────────────────────────                 
                                                                                                                         
                  ╭ Password ──────────────────────────────────────────────────────────────────────────╮                 

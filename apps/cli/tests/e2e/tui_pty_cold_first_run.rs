@@ -115,7 +115,7 @@ fn wait_for_settled_secure_store(session: &mut HermeticCockpit) {
             "settled secure-store capability rows",
             ASYNC_STAGE_TIMEOUT,
             |screen| {
-                screen.contains("step 3/8")
+                screen.contains("step 2/5")
                     && screen.contains("Secure your secrets")
                     && screen.contains("Machine-bound encrypted file  —  ")
                     && !screen.contains("checking…")
@@ -218,18 +218,31 @@ fn configure_custom_provider(
 }
 
 fn complete_model(session: &mut HermeticCockpit, input: WalkthroughInput) {
-    for (label, next) in [
-        ("[ Continue ]", "Provider trust"),
-        ("[ Continue ]", "Model capabilities"),
-        ("[ Continue ]", "Model limits"),
-        ("[ Continue ]", "Default thinking"),
-        ("[ Continue ]", "Delegation"),
-    ] {
-        activate(session, input, label);
-        wait_for_text(session, "next model sub-step", next);
-    }
+    let screen = session.snapshot().contents();
+    assert!(
+        screen.contains("Search models"),
+        "required picker must expose focused search: {screen}"
+    );
+    keyboard_input(session, b"scripted");
     activate(session, input, "[ Continue ]");
-    wait_for_text(session, "agent authoring screen", "Create your first agent");
+    session
+        .wait_until_screen(
+            "short model selection reaches workspace trust",
+            ASYNC_STAGE_TIMEOUT,
+            |screen| {
+                screen.contains("Choose workspace trust:")
+                    || screen.contains("Provider trust")
+                    || screen.contains("Model capabilities")
+                    || screen.contains("Create an agent")
+                    || screen.contains("Grant tools")
+            },
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    let screen = session.snapshot().contents();
+    assert!(
+        screen.contains("Choose workspace trust:"),
+        "default model must bypass optional model/agent pages: {screen}"
+    );
 }
 
 fn confirm_first_unset_trust(session: &mut HermeticCockpit, input: WalkthroughInput) {
@@ -257,10 +270,17 @@ fn confirm_first_unset_trust(session: &mut HermeticCockpit, input: WalkthroughIn
 
 fn complete_runner_editor(session: &mut HermeticCockpit, input: WalkthroughInput) {
     match input {
-        WalkthroughInput::Keyboard => keyboard_input(session, b"e"),
-        WalkthroughInput::Mouse => click_text(session, "▸ runner"),
+        WalkthroughInput::Keyboard => {
+            keyboard_input(session, b"\x1b[H");
+            keyboard_input(session, b"e");
+        }
+        WalkthroughInput::Mouse => click_text(session, "runner  ·"),
     }
-    wait_for_text(session, "runner identity", "Subagent");
+    session
+        .wait_until_screen("runner identity", TRANSITION_TIMEOUT, |screen| {
+            screen.contains("Subagent · step") && screen.contains("runner")
+        })
+        .expect("the runner row must open its identity editor");
     activate(session, input, "[ Continue ]");
     wait_for_text(session, "runner model grants", "Subagent models");
     activate(session, input, "[ Continue ]");
@@ -303,6 +323,7 @@ fn complete_runner_editor(session: &mut HermeticCockpit, input: WalkthroughInput
 }
 
 fn complete_agent(session: &mut HermeticCockpit, input: WalkthroughInput) {
+    keyboard_input(session, b"Optional Pilot");
     activate(session, input, "[ Continue ]");
     wait_for_text(session, "agent model grants", "Choose the agent's models");
     activate(session, input, "[ Continue ]");
@@ -331,7 +352,7 @@ fn complete_agent(session: &mut HermeticCockpit, input: WalkthroughInput) {
     activate(session, input, "[ Create agent ]");
     wait_for_text(session, "agent creation confirmation", "Create your agent");
     activate(session, input, "[ Create agent ]");
-    wait_for_text(session, "lifetime screen", "Background agents");
+    wait_for_text(session, "optional agent committed", "Your agent is ready");
 }
 
 fn assert_daemon_onboarding_complete(session: &HermeticCockpit) {
@@ -394,8 +415,6 @@ fn complete_cold_first_run(input: WalkthroughInput) {
     configure_custom_provider(&mut session, input, &provider_url);
 
     complete_model(&mut session, input);
-    complete_agent(&mut session, input);
-    activate(&mut session, input, "[ Continue ]");
     // Complete unlocks the real workspace decision; it is deliberately not
     // seeded by the fixture. Both input routes answer the visible modal.
     wait_for_text(
@@ -410,6 +429,31 @@ fn complete_cold_first_run(input: WalkthroughInput) {
     wait_for_text(
         &mut session,
         "ready chat after onboarding",
+        COMPOSER_PLACEHOLDER,
+    );
+
+    // Advanced agent controls remain usable as an optional /setup route.
+    // Keep the complete keyboard/mouse model grants, tuning, tool grants,
+    // runner editing, review, and Create coverage off the required path.
+    session.settle_visible_state(TRANSITION_TIMEOUT);
+    keyboard_input(&mut session, b"/setup");
+    keyboard_input(&mut session, b"\r");
+    wait_for_text(
+        &mut session,
+        "optional setup summary",
+        "You're ready to fly",
+    );
+    match input {
+        WalkthroughInput::Keyboard => keyboard_input(&mut session, b"g"),
+        WalkthroughInput::Mouse => click_text(&mut session, "[ Agent setup ]"),
+    }
+    wait_for_text(&mut session, "optional agent setup", "Create an agent");
+    complete_agent(&mut session, input);
+    assert_daemon_onboarding_complete(&session);
+    activate(&mut session, input, "[ Done ]");
+    wait_for_text(
+        &mut session,
+        "ready after optional agent authoring",
         COMPOSER_PLACEHOLDER,
     );
 
@@ -477,7 +521,7 @@ fn tui_pty_cold_first_run_advances_from_welcome_with_one_key() {
         .wait_until_screen(
             "Profile stage after one key",
             TRANSITION_TIMEOUT,
-            |screen| screen.contains("step 2/8"),
+            |screen| screen.contains("step 1/5"),
         )
         .expect("one keystroke advances Welcome to the Profile stage");
     let profile = session.snapshot().contents();
@@ -534,7 +578,7 @@ fn tui_pty_cold_first_run_mouse_walkthrough_to_provider_catalog() {
             "Profile stage after Welcome click",
             TRANSITION_TIMEOUT,
             |screen| {
-                screen.contains("step 2/8") && screen.contains("What should Cockpit call you?")
+                screen.contains("step 1/5") && screen.contains("What should Cockpit call you?")
             },
         )
         .expect("Welcome pointer advance reaches Profile");
@@ -545,7 +589,7 @@ fn tui_pty_cold_first_run_mouse_walkthrough_to_provider_catalog() {
         .wait_until_screen(
             "Secure store after profile save",
             TRANSITION_TIMEOUT,
-            |screen| screen.contains("step 3/8") && screen.contains("Secure your secrets"),
+            |screen| screen.contains("step 2/5") && screen.contains("Secure your secrets"),
         )
         .expect("Profile Continue reaches Secure store");
     wait_for_settled_secure_store(&mut session);
@@ -556,7 +600,7 @@ fn tui_pty_cold_first_run_mouse_walkthrough_to_provider_catalog() {
             "Provider catalog after secure-store choice",
             TRANSITION_TIMEOUT,
             |screen| {
-                screen.contains("step 4/8")
+                screen.contains("step 3/5")
                     && screen.contains("Let's add a provider")
                     && screen.contains("Providers")
             },
@@ -590,7 +634,7 @@ const ONBOARDING_MARKERS: [&str; 4] = [
     "[press any button to continue]",
     "What should Cockpit call you?",
     "Secure your secrets",
-    "step 1/8",
+    "step 1/5",
 ];
 
 /// Flicker-free startup: the TUI asks the daemon whether onboarding is needed

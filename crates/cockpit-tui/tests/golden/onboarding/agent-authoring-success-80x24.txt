@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Your agent is ready · step 6/8                                                
+  Your agent is ready · step 5/5                                                
   The agent package was committed successfully.                                 
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Status ──────────────────────────────────────────────────────────────────╮  

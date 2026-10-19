@@ -1,7 +1,7 @@
  ‹ Back                                                                                                                 
-                 ✗ Couldn't verify · step 4/8                                                                           
+                 ✗ Couldn't verify · step 3/5                                                                           
                  Credential rejected (401)                                                                              
-                 ✓ Welcome  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Agent  · Background  · Ready                      
+                 ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Start coding                                                 
                  ──────────────────────────────────────────────────────────────────────────────────────                 
                                                                                                                         
                  The provider rejected this credential.                                                                 

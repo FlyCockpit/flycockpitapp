@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Create your agent · step 6/8                                                  
+  Create your agent · step 5/5                                                  
   Everything is ready for the stable create operation.                          
-  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   ╭ Status ──────────────────────────────────────────────────────────────────╮  

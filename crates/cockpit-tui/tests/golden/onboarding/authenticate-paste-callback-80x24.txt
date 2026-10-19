@@ -1,7 +1,7 @@
  ‹ Back                                                                         
-  Sign in to your subscription · step 4/8                                       
+  Sign in to your subscription · step 3/5                                       
   Approve access in the browser, then paste the result back.                    
-  ✓  ✓  ✓  ◆ Provider  ·  ·  ·  ·                                               
+  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Start coding                        
   ────────────────────────────────────────────────────────────────────────────  
                                                                                 
   Open this URL and approve access:                                             

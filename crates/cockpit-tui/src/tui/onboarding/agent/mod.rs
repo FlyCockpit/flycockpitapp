@@ -142,6 +142,8 @@ pub struct AgentAuthoringScreen {
     cursor: usize,
     scroll_offset: usize,
     name_field: TextField,
+    name_focused: bool,
+    name_field_rect: Rect,
     third_party_field: TextField,
     list_row_rects: Vec<Rect>,
     list_row_indices: Vec<usize>,
@@ -192,6 +194,8 @@ impl AgentAuthoringScreen {
             cursor: 0,
             scroll_offset: 0,
             name_field: TextField::new(&name),
+            name_focused: true,
+            name_field_rect: Rect::default(),
             third_party_field: TextField::new(""),
             list_row_rects: Vec::new(),
             list_row_indices: Vec::new(),
@@ -205,6 +209,35 @@ impl AgentAuthoringScreen {
             tool_catalog: tool_surface_catalog(),
             draft_diagnostics: Vec::new(),
         }
+    }
+
+    /// New optional packages require an explicit display name rather than
+    /// reusing the first-run pilot's identity and failing at Create.
+    pub(crate) fn clear_name_for_new_agent(&mut self) {
+        self.draft.name.clear();
+        self.name_field.set("");
+        self.name_focused = true;
+    }
+
+    /// The default coding package is committed by the same authority as the
+    /// optional editor. No trust confirmations or remote sidecars are inferred.
+    pub(crate) fn first_run(
+        projection: AgentAuthoringProjection,
+        client_operation_id: String,
+    ) -> Self {
+        let mut screen = Self::new(projection, client_operation_id);
+        screen.draft.name = "pilot".into();
+        screen.draft.source_selection = SourceSelection::Authored;
+        screen.draft.children.clear();
+        screen.draft.interactive_subagents = false;
+        screen.draft.goal_skeptics = GoalSkepticsPolicy::Off;
+        for surface in &mut screen.draft.self_verification {
+            surface.copies.fill(0);
+        }
+        screen.draft.sidecar_route_index = None;
+        screen.name_field.set("pilot");
+        screen.pending_action = screen.request_apply();
+        screen
     }
 
     pub fn take_pending_action(&mut self) -> Option<AgentAuthoringAction> {
@@ -276,6 +309,7 @@ impl AgentAuthoringScreen {
                 let status = receipt.status;
                 self.review = Some(receipt.review.clone());
                 self.receipt = Some(receipt);
+                self.pending_action = None;
                 self.phase = match status {
                     AuthoredAgentReceiptStatus::Committed => Phase::Success,
                     AuthoredAgentReceiptStatus::Pending => Phase::Pending,
@@ -415,7 +449,7 @@ impl AgentAuthoringScreen {
 
     pub(super) fn phase_title(&self) -> &'static str {
         match self.phase {
-            Phase::SourceIdentity => "Create your first agent",
+            Phase::SourceIdentity => "Create an agent",
             Phase::ThirdPartyLocator => "Pin a third-party agent",
             Phase::ThirdPartyTrust => "Trust this publisher?",
             Phase::ModelGrants => "Choose the agent's models",
@@ -555,7 +589,10 @@ impl AgentAuthoringScreen {
 
     pub fn help_text(&self) -> &'static str {
         match self.phase {
-            Phase::SourceIdentity => "type name   enter continue   esc back   ^c quit",
+            Phase::SourceIdentity if self.name_focused => {
+                "type name   tab sources   enter continue   esc back"
+            }
+            Phase::SourceIdentity => "↑↓ source   space choose   tab name   enter continue",
             Phase::ThirdPartyLocator | Phase::SubagentEdit(SubagentPhase::Identity) => {
                 "type text   enter continue   esc back"
             }
@@ -690,6 +727,9 @@ impl AgentAuthoringScreen {
     /// opens at its first row, whatever row the previous list was on, and
     /// its cursor always stays on a listed row.
     fn settle_trust_cursor(&mut self, previous_phase: Phase) {
+        if self.phase == Phase::SourceIdentity && self.phase != previous_phase {
+            self.name_focused = true;
+        }
         if !self.trust_phase() {
             return;
         }
@@ -709,14 +749,48 @@ impl AgentAuthoringScreen {
 
     fn handle_list_key(&mut self, key: KeyEvent) -> Option<AgentAuthoringAction> {
         match key.code {
+            KeyCode::Tab | KeyCode::BackTab if self.phase == Phase::SourceIdentity => {
+                self.name_focused = !self.name_focused;
+                None
+            }
+            KeyCode::Char(' ')
+                if (self.phase == Phase::SourceIdentity && self.name_focused)
+                    || self.phase == Phase::SubagentEdit(SubagentPhase::Identity) =>
+            {
+                self.name_field.paste(" ");
+                None
+            }
             KeyCode::Esc => self.handle_back(),
             KeyCode::Enter => self.handle_advance(),
             KeyCode::Up => {
+                if self.phase == Phase::SourceIdentity {
+                    self.name_focused = false;
+                }
                 self.move_cursor(-1);
                 None
             }
             KeyCode::Down => {
+                if self.phase == Phase::SourceIdentity {
+                    self.name_focused = false;
+                }
                 self.move_cursor(1);
+                None
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                None
+            }
+            KeyCode::End => {
+                self.cursor = self.visible_row_count().saturating_sub(1);
+                None
+            }
+            KeyCode::PageUp => {
+                self.cursor = self.cursor.saturating_sub(self.list_nav.view_h);
+                None
+            }
+            KeyCode::PageDown => {
+                self.cursor = (self.cursor + self.list_nav.view_h)
+                    .min(self.visible_row_count().saturating_sub(1));
                 None
             }
             KeyCode::Left => {
@@ -780,7 +854,7 @@ impl AgentAuthoringScreen {
                 if matches!(
                     self.phase,
                     Phase::SourceIdentity | Phase::SubagentEdit(SubagentPhase::Identity)
-                ) =>
+                ) && (self.phase != Phase::SourceIdentity || self.name_focused) =>
             {
                 let ch = crate::tui::textfield::normalize_shift_char(&key, ch);
                 let mut encoded = [0u8; 4];
@@ -797,7 +871,7 @@ impl AgentAuthoringScreen {
                 if matches!(
                     self.phase,
                     Phase::SourceIdentity | Phase::SubagentEdit(SubagentPhase::Identity)
-                ) =>
+                ) && (self.phase != Phase::SourceIdentity || self.name_focused) =>
             {
                 self.name_field
                     .handle_key(KeyEvent::new(KeyCode::Backspace, key.modifiers));
@@ -869,6 +943,13 @@ impl AgentAuthoringScreen {
     fn route_mouse(&mut self, mouse: MouseEvent) -> bool {
         self.note_pointer_event(&mouse);
         let pos = Position::new(mouse.column, mouse.row);
+        if self.phase == Phase::SourceIdentity
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.name_field_rect.contains(pos)
+        {
+            self.name_focused = true;
+            return true;
+        }
         if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
             // Hover is owned by the host's action bar (the onboarding shell
             // renders this screen's buttons); nothing here tracks it.
@@ -906,6 +987,9 @@ impl AgentAuthoringScreen {
             .iter()
             .position(|rect| rect.contains(pos));
         if let Some(index) = index {
+            if self.phase == Phase::SourceIdentity {
+                self.name_focused = false;
+            }
             let logical = self.list_row_indices.get(index).copied().unwrap_or(index);
             if let Phase::VerifierPanel(surface) = self.phase {
                 self.cursor = logical;
@@ -947,6 +1031,7 @@ impl AgentAuthoringScreen {
         self.disarm();
         match self.phase {
             Phase::SourceIdentity | Phase::SubagentEdit(SubagentPhase::Identity) => {
+                self.name_focused = true;
                 self.name_field.paste(text);
             }
             Phase::ThirdPartyLocator => {
@@ -1602,16 +1687,21 @@ impl AgentAuthoringScreen {
         self.status = None;
         match self.phase {
             Phase::SourceIdentity => {
-                self.draft.name = match self.name_field.text().trim() {
-                    "" => "pilot".to_string(),
-                    name => name.to_string(),
-                };
+                self.draft.name = self.name_field.text().trim().to_string();
+                if let Err(error) =
+                    cockpit_core::onboarding_agent::authored_agent_slug(&self.draft.name)
+                {
+                    self.name_focused = true;
+                    self.status = Some(error.message);
+                    return None;
+                }
                 self.name_field.set(&self.draft.name);
                 if self.draft.source_selection == SourceSelection::ThirdParty {
                     self.third_party_field.set(&self.draft.third_party_locator);
                     self.phase = Phase::ThirdPartyLocator;
                 } else if self.editing_root() {
                     self.phase = Phase::ModelGrants;
+                    self.cursor = self.draft.default_route_index;
                 } else {
                     self.phase = Phase::SubagentEdit(SubagentPhase::ModelGrants);
                 }
@@ -1745,6 +1835,10 @@ impl AgentAuthoringScreen {
             Phase::SubagentsList => self.request_preview(),
             Phase::SubagentEdit(SubagentPhase::Identity) => {
                 let name = self.name_field.text().trim().to_string();
+                if let Err(error) = cockpit_core::onboarding_agent::authored_agent_slug(&name) {
+                    self.status = Some(error.message);
+                    return None;
+                }
                 if let Some(child) = self.current_child_mut() {
                     child.name = name;
                 }
@@ -2064,6 +2158,7 @@ impl AgentAuthoringScreen {
         self.list_row_rects.clear();
         self.list_row_indices.clear();
         self.model_picker_row_rects.clear();
+        self.name_field_rect = Rect::default();
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -2094,14 +2189,52 @@ impl AgentAuthoringScreen {
     }
 
     fn render_source_identity(&mut self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).split(area);
-        if let Some(caret) =
-            ui::render_field(frame, rows[0], "Name", &self.name_field, true, "e.g. pilot")
-        {
+        let rows = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Min(3),
+        ])
+        .split(area);
+        self.name_field_rect = rows[0];
+        if let Some(caret) = ui::render_field(
+            frame,
+            rows[0],
+            "Display name",
+            &self.name_field,
+            self.name_focused,
+            "e.g. Pilot Noteworthy",
+        ) {
             frame.set_cursor_position(caret);
         }
+        self.render_name_reason(frame, rows[1]);
         let source_rows = self.source_selection_rows();
-        self.render_rows_block(frame, rows[1], " Agent ", source_rows);
+        self.render_rows_block(frame, rows[2], " Agent ", source_rows);
+    }
+
+    fn render_name_reason(&self, frame: &mut Frame, area: Rect) {
+        if self.name_field.text().trim().is_empty() && self.status.is_none() {
+            frame.render_widget(
+                Paragraph::new("Enter a display name; Cockpit derives a lowercase slug.")
+                    .style(Style::new().fg(theme::FOG))
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
+        let derived = cockpit_core::onboarding_agent::authored_agent_slug(self.name_field.text());
+        let (text, color) = match derived {
+            Ok(slug) => (
+                format!("Slug: {slug}. Display name is preserved. Spaces become hyphens."),
+                theme::FOG,
+            ),
+            Err(error) => (error.message, theme::BAD),
+        };
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(Style::new().fg(color))
+                .wrap(ratatui::widgets::Wrap { trim: true }),
+            area,
+        );
     }
 
     fn render_third_party_locator(&mut self, frame: &mut Frame, area: Rect) {
@@ -2125,9 +2258,10 @@ impl AgentAuthoringScreen {
             .padding(Padding::horizontal(1));
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(inner);
         if let Some(caret) = ui::render_field(
             frame,
-            inner,
+            rows[0],
             "Name",
             &self.name_field,
             true,
@@ -2135,6 +2269,7 @@ impl AgentAuthoringScreen {
         ) {
             frame.set_cursor_position(caret);
         }
+        self.render_name_reason(frame, rows[1]);
     }
 
     fn block_title(&self) -> String {

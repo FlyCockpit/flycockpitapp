@@ -586,6 +586,41 @@ impl App {
         Some(false)
     }
 
+    pub(super) fn close_active_dialog(&mut self) {
+        self.drain_oauth_actions();
+        let open_default_model_from_settings =
+            self.dialog.take_pending_default_model_from_settings();
+        // Closing the settings dialog can change the active
+        // provider/model — reload launch info so the status
+        // line and header refresh. TUI-side settings (vim
+        // mode, thinking display, markdown) are also reloaded
+        // so they apply without a restart.
+        self.capture_response_metrics_tokenizer_dirty_from_dialog();
+        self.dialog = Dialog::None;
+        self.invalidate_primary_paste();
+        self.sync_mouse_capture_from_dialog();
+        // The daemon re-resolves and pushes a fresh snapshot; the UI
+        // updates when it arrives (no optimistic render of the written
+        // value). Detached, this refreshes the bootstrap snapshot once.
+        self.resync_config_after_local_write();
+        // Closing is itself terminal for the attached add-model
+        // flow. The daemon may suppress an unchanged snapshot on
+        // cancel, so never make picker restoration depend on a push.
+        // If a changed snapshot already restored it, the marker is
+        // gone and this is a no-op.
+        self.reopen_composer_model_after_provider_settings();
+        if open_default_model_from_settings {
+            self.open_default_model_from_settings();
+        }
+    }
+
+    pub(super) fn send_pending_settings_request(&mut self) {
+        if let Some(req) = self.dialog.take_daemon_request() {
+            let _ = self.dialog.take_pending_default_model_update_id();
+            self.send_daemon_request("/settings", req, ControlApplied::None);
+        }
+    }
+
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
         if let Some(exit) = self.route_key_through_layer_stack(key) {
@@ -1092,36 +1127,9 @@ impl App {
 
         if self.dialog.is_active() {
             if self.dialog.handle_key(key) {
-                self.drain_oauth_actions();
-                let open_default_model_from_settings =
-                    self.dialog.take_pending_default_model_from_settings();
-                // Closing the settings dialog can change the active
-                // provider/model — reload launch info so the status
-                // line and header refresh. TUI-side settings (vim
-                // mode, thinking display, markdown) are also reloaded
-                // so they apply without a restart.
-                self.capture_response_metrics_tokenizer_dirty_from_dialog();
-                self.dialog = Dialog::None;
-                self.invalidate_primary_paste();
-                self.sync_mouse_capture_from_dialog();
-                // The daemon re-resolves and pushes a fresh snapshot; the UI
-                // updates when it arrives (no optimistic render of the written
-                // value). Detached, this refreshes the bootstrap snapshot once.
-                self.resync_config_after_local_write();
-                // Closing is itself terminal for the attached add-model
-                // flow. The daemon may suppress an unchanged snapshot on
-                // cancel, so never make picker restoration depend on a push.
-                // If a changed snapshot already restored it, the marker is
-                // gone and this is a no-op.
-                self.reopen_composer_model_after_provider_settings();
-                if open_default_model_from_settings {
-                    self.open_default_model_from_settings();
-                }
-            } else if let Some(req) = self.dialog.take_daemon_request() {
-                // The send boundary binds the id carried by SetDefaultModel
-                // and retires it on non-delivery or a failed receipt.
-                let _ = self.dialog.take_pending_default_model_update_id();
-                self.send_daemon_request("/settings", req, ControlApplied::None);
+                self.close_active_dialog();
+            } else {
+                self.send_pending_settings_request();
             }
             self.drain_oauth_actions();
             // Provider editors can persist credentials without closing the

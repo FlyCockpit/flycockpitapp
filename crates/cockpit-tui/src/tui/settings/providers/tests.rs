@@ -49,6 +49,22 @@ struct ProviderDaemonFixture {
 }
 
 impl ProviderDaemonFixture {
+    fn shutdown(&mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            // The daemon owns an independent runtime. Its completion includes
+            // joining that runtime, so no inventory/setup reader can carry the
+            // process-global authority fence into the next fixture.
+            let result = futures::executor::block_on(daemon.shutdown());
+            if std::thread::panicking() {
+                if let Err(error) = result {
+                    eprintln!("provider fixture shutdown failed during unwind: {error:#}");
+                }
+            } else {
+                result.expect("provider fixture daemon must shut down cleanly");
+            }
+        }
+    }
+
     fn new() -> Self {
         Self::with_config_path(None)
     }
@@ -86,6 +102,9 @@ impl ProviderDaemonFixture {
 
 impl Drop for ProviderDaemonFixture {
     fn drop(&mut self) {
+        // Keep the environment and fixture lock until daemon request handlers
+        // and their follow-on work have actually been destroyed.
+        self.shutdown();
         PROVIDER_DAEMON_FIXTURE_DEPTH.with(|depth| {
             depth.set(depth.get().saturating_sub(1));
         });
@@ -12554,4 +12573,700 @@ fn r17_fetch_all_recovers_typed_observations_after_failed_readbacks() {
 #[test]
 fn r17_single_fetch_recovers_typed_observations_after_failed_readbacks() {
     r17_readback_recovery_preserves_fetch_observations(false);
+}
+
+fn lmstudio_settings_config() -> ProvidersConfig {
+    let mut config = ProvidersConfig::default();
+    config.providers.insert(
+        "lmstudio".into(),
+        ProviderEntry {
+            url: "http://127.0.0.1:1234/v1".into(),
+            template: Some("lmstudio".into()),
+            auth: Some(AuthKind::None),
+            models: vec![model("lfm2.5-24b-a2b", false)],
+            ..Default::default()
+        },
+    );
+    config
+}
+
+fn open_lmstudio_model_settings(dialog: &mut SettingsDialog) {
+    let entry = dialog.config.providers["lmstudio"].clone();
+    dialog.set_test_page(Page::Providers(ProvidersPage::ModelSettings {
+        editor: SettingsEditor::for_model_with_generation(
+            "lmstudio",
+            &entry,
+            "lfm2.5-24b-a2b",
+            dialog.config.resolution_generation.max(1),
+        ),
+        models: Box::new(ModelEditor::new(
+            Some("lmstudio".into()),
+            entry.models.clone(),
+        )),
+        parent: Box::new(EditState::new("lmstudio".into(), entry)),
+    }));
+}
+
+fn edit_model_setting(dialog: &mut SettingsDialog, field: ProviderSettingId) {
+    let Some(ProvidersPage::ModelSettings { editor, .. }) =
+        dialog.page.downcast_mut::<ProvidersPage>()
+    else {
+        panic!("expected model settings");
+    };
+    editor.cursor = editor.fields().iter().position(|id| *id == field).unwrap();
+    dialog.handle_key(press(KeyCode::Enter));
+}
+
+fn minimum_context_slot() -> cockpit_core::agents::ModelSlot {
+    cockpit_core::agents::ModelSlot {
+        purpose: "Primary".into(),
+        min_context_tokens: 1,
+        required_capabilities: vec![cockpit_core::agents::ModelCapability::TextGeneration],
+        locality: cockpit_core::agents::ModelLocality::Any,
+        allow_default_fallback: false,
+        suggested_models: Vec::new(),
+        models: Vec::new(),
+    }
+}
+
+#[test]
+fn model_settings_footer_and_keyboard_save_persist_through_daemon_reopen_and_profile() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
+    use cockpit_config::providers::{CapabilityStatus, ModelLocation};
+    use cockpit_core::agents::{AgentProfileModelOffering, ranked_compatible_offerings};
+
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        for footer in [true, false] {
+            let (tmp, mut dialog) = dialog_with_config(lmstudio_settings_config());
+            let root = tmp.path().display().to_string();
+            let client = runtime
+                .block_on(crate::tui::settings::settings_daemon_client(
+                    &crate::tui::settings::test_lifecycle_client(),
+                ))
+                .unwrap();
+            let initial = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            dialog
+                .adopt_refreshed_provider_snapshot(Ok(initial))
+                .unwrap();
+            let offering = AgentProfileModelOffering {
+                offering_id: "local-lfm".into(),
+                provider_profile_handle: "lmstudio".into(),
+                provider_id: "lmstudio".into(),
+                model_id: "lfm2.5-24b-a2b".into(),
+            };
+            let slot = minimum_context_slot();
+            assert!(
+                ranked_compatible_offerings(&slot, std::slice::from_ref(&offering), &dialog.config)
+                    .is_empty(),
+                "unset context must fail closed before saving"
+            );
+            open_lmstudio_model_settings(&mut dialog);
+            edit_model_setting(&mut dialog, ProviderSettingId::Location);
+            edit_model_setting(&mut dialog, ProviderSettingId::CapabilityTools);
+            edit_model_setting(&mut dialog, ProviderSettingId::CapabilityContextTokens);
+            for ch in "131072".chars() {
+                dialog.handle_key(press(KeyCode::Char(ch)));
+            }
+            if footer {
+                // Click the actual footer while the numeric buffer is still open.
+                let action = SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                    ProviderRowEditorAction::SettingSave,
+                ));
+                let screen = render_provider_rows(&dialog, 80, 24).join("\n");
+                assert!(screen.contains("save changes"));
+                let target = dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .find(|target| {
+                        target.enabled
+                            && target.action
+                                == super::super::shell::SettingsPointerAction::Page(action.clone())
+                    })
+                    .cloned()
+                    .expect("rendered save footer");
+                for kind in [
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                ] {
+                    dialog.handle_pointer(super::super::tests::settings_mouse(
+                        kind,
+                        target.rect.x,
+                        target.rect.y,
+                    ));
+                }
+            } else {
+                dialog.handle_key(press(KeyCode::Enter));
+                dialog.handle_key(press(KeyCode::Char('s')));
+            }
+            dialog.settle_test_effects();
+            assert!(
+                dialog.cx.last_provider_mutation_operation_id.is_some(),
+                "save must cross ApplyProviderMutation"
+            );
+            let current = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            let effective = super::super::providers_config_from_view(&current.config);
+            let caps = effective.resolve_effective_model_capabilities(
+                "lmstudio",
+                "lfm2.5-24b-a2b",
+                current.authority.config_generation,
+            );
+            assert_eq!(caps.context_tokens, Some(131_072));
+            assert!(
+                render_provider_rows(&dialog, 80, 24)
+                    .join("\n")
+                    .contains("saved"),
+                "save outcome must stay visible at the context field"
+            );
+
+            assert_eq!(caps.tool_calling, CapabilityStatus::Supported);
+            assert_eq!(
+                effective.resolve_location("lmstudio", "lfm2.5-24b-a2b"),
+                Some(ModelLocation::Local)
+            );
+            assert_eq!(
+                ranked_compatible_offerings(&slot, std::slice::from_ref(&offering), &effective),
+                vec![offering]
+            );
+
+            let persisted = load_provider(&dialog.config_path, "lmstudio");
+            assert_eq!(
+                persisted.models[0].capability_overrides.context_tokens,
+                Some(131_072)
+            );
+            assert_eq!(
+                persisted.models[0].capability_overrides.tool_calling,
+                Some(CapabilityStatus::Supported)
+            );
+            assert_eq!(persisted.models[0].location, Some(ModelLocation::Local));
+            let merged = merge_fetched_models_with_policy(
+                Some("lmstudio"),
+                &persisted.models,
+                vec![model("lfm2.5-24b-a2b", false)],
+                ModelMergePolicy::KeepUnlisted,
+            );
+            assert_eq!(
+                merged[0].capability_overrides,
+                persisted.models[0].capability_overrides
+            );
+            assert_eq!(merged[0].location, persisted.models[0].location);
+
+            // A new dialog reads the daemon catalog, not the prior editor draft.
+            let mut reopened = SettingsDialog::open_with_config(
+                dialog.config_path.clone(),
+                ProvidersConfig::default(),
+            );
+            reopened.active_project_root = Some(tmp.path().to_path_buf());
+            reopened
+                .adopt_refreshed_provider_snapshot(Ok(current))
+                .unwrap();
+            open_lmstudio_model_settings(&mut reopened);
+            let TestPageRef::Providers(ProvidersPage::ModelSettings { editor, .. }) =
+                reopened.test_page()
+            else {
+                panic!("reopened model settings");
+            };
+            assert_eq!(
+                editor.value_str(ProviderSettingId::CapabilityContextTokens),
+                "131072"
+            );
+            assert_eq!(
+                editor.value_str(ProviderSettingId::CapabilityTools),
+                "supported"
+            );
+            assert_eq!(editor.value_str(ProviderSettingId::Location), "local");
+        }
+    });
+}
+
+#[test]
+fn model_settings_save_status_pending_failure_and_noop_stay_visible() {
+    let (_tmp, mut dialog) = dialog_with_config(lmstudio_settings_config());
+    open_lmstudio_model_settings(&mut dialog);
+    edit_model_setting(&mut dialog, ProviderSettingId::CapabilityContextTokens);
+    for ch in "131072".chars() {
+        dialog.handle_key(press(KeyCode::Char(ch)));
+    }
+    dialog.handle_key(press(KeyCode::Enter));
+    // Drive the reducer and completion separately, as the App does, so the
+    // saving state is rendered before the daemon result is consumed.
+    let nav = dialog
+        .page
+        .handle_key(&mut dialog.cx, press(KeyCode::Char('s')));
+    dialog.apply_nav(nav);
+    assert!(
+        render_provider_rows(&dialog, 80, 24)
+            .join("\n")
+            .contains("saving provider…")
+    );
+    dialog.cx.completed_provider_mutation = Some(Err("daemon rejected the model settings".into()));
+    dialog.apply_pending_provider_completions();
+    assert!(
+        render_provider_rows(&dialog, 80, 24)
+            .join("\n")
+            .contains("daemon rejected the model settings")
+    );
+
+    // Failure from the real save reducer must retain its actionable error.
+    if let Some(ProvidersPage::ModelSettings { editor, .. }) =
+        dialog.page.downcast_mut::<ProvidersPage>()
+    {
+        editor.status = Some("media capabilities refreshed".into());
+    }
+    dialog.provider_edit_authority = None;
+    dialog.handle_key(press(KeyCode::Char('s')));
+    let screen = render_provider_rows(&dialog, 80, 24).join("\n");
+    assert!(screen.contains("save failed:"), "{screen}");
+    assert!(screen.contains("no edit capability"), "{screen}");
+    assert!(!screen.contains("media capabilities refreshed"));
+
+    // Reopen a valid authoritative snapshot: an unchanged save finishes
+    // immediately, without queueing a mutation or leaving a pending status.
+    let (_tmp2, mut unchanged) = dialog_with_config(lmstudio_settings_config());
+    open_lmstudio_model_settings(&mut unchanged);
+    unchanged.handle_key(press(KeyCode::Char('s')));
+    unchanged.settle_test_effects();
+    assert!(
+        render_provider_rows(&unchanged, 80, 24)
+            .join("\n")
+            .contains("saved")
+    );
+    assert!(unchanged.pending_settings.is_empty());
+}
+
+#[test]
+fn model_settings_missing_target_and_invalid_footer_save_fail_without_mutation() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
+    let (_tmp, mut dialog) = dialog_with_config(lmstudio_settings_config());
+    open_lmstudio_model_settings(&mut dialog);
+    edit_model_setting(&mut dialog, ProviderSettingId::CapabilityContextTokens);
+    for ch in "invalid".chars() {
+        dialog.handle_key(press(KeyCode::Char(ch)));
+    }
+    click_rendered_provider_action(
+        &mut dialog,
+        &SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::SettingSave,
+        )),
+    );
+    assert!(
+        render_provider_rows(&dialog, 80, 24)
+            .join("\n")
+            .contains("must be a number")
+    );
+    assert!(dialog.cx.last_provider_mutation_operation_id.is_none());
+    dialog.handle_key(press(KeyCode::Esc));
+    let Some(ProvidersPage::ModelSettings { models, .. }) =
+        dialog.page.downcast_mut::<ProvidersPage>()
+    else {
+        panic!("model settings");
+    };
+    models.rows.clear();
+    for key in [KeyCode::Char('s'), KeyCode::Esc, KeyCode::Char('q')] {
+        dialog.handle_key(press(key));
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Providers(ProvidersPage::ModelSettings { .. })
+        ));
+        assert!(
+            render_provider_rows(&dialog, 80, 24)
+                .join("\n")
+                .contains("no longer available")
+        );
+        assert!(dialog.cx.last_provider_mutation_operation_id.is_none());
+        assert_eq!(
+            load_provider(&dialog.config_path, "lmstudio").models.len(),
+            1
+        );
+    }
+}
+
+fn check_capability_token_boundary(overflow: bool) {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        for field in [
+            ProviderSettingId::CapabilityContextTokens,
+            ProviderSettingId::CapabilityMaxOutputTokens,
+        ] {
+            for footer in [true, false] {
+                let mut config = lmstudio_settings_config();
+                let caps = &mut config.providers.get_mut("lmstudio").unwrap().models[0]
+                    .capability_overrides;
+                caps.context_tokens = Some(131_072);
+                caps.max_output_tokens = Some(4_096);
+                let (tmp, mut dialog) = dialog_with_config(config);
+                let root = tmp.path().display().to_string();
+                let client = runtime
+                    .block_on(super::super::settings_daemon_client(
+                        &super::super::test_lifecycle_client(),
+                    ))
+                    .unwrap();
+                let initial = runtime
+                    .block_on(super::super::auth::provider_snapshot(&client, &root))
+                    .unwrap();
+                dialog
+                    .adopt_refreshed_provider_snapshot(Ok(initial))
+                    .unwrap();
+                let before = std::fs::read(&dialog.config_path).unwrap();
+                open_lmstudio_model_settings(&mut dialog);
+                edit_model_setting(&mut dialog, field);
+                dialog.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+                let input = (u64::from(u32::MAX) + u64::from(overflow)).to_string();
+                for ch in input.chars() {
+                    dialog.handle_key(press(KeyCode::Char(ch)));
+                }
+                if footer {
+                    click_rendered_provider_action(
+                        &mut dialog,
+                        &SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                            ProviderRowEditorAction::SettingSave,
+                        )),
+                    );
+                } else {
+                    dialog.handle_key(press(KeyCode::Enter));
+                    // Invalid input must still be an active buffer, not a saved None.
+                    if !overflow {
+                        dialog.handle_key(press(KeyCode::Char('s')));
+                    }
+                }
+                dialog.settle_test_effects();
+                let current = runtime
+                    .block_on(super::super::auth::provider_snapshot(&client, &root))
+                    .unwrap();
+                let effective = super::super::providers_config_from_view(&current.config);
+                let persisted = load_provider(&dialog.config_path, "lmstudio");
+                let expected_context =
+                    if !overflow && field == ProviderSettingId::CapabilityContextTokens {
+                        u32::MAX
+                    } else {
+                        131_072
+                    };
+                let expected_output =
+                    if !overflow && field == ProviderSettingId::CapabilityMaxOutputTokens {
+                        u32::MAX
+                    } else {
+                        4_096
+                    };
+                for caps in [
+                    &persisted.models[0].capability_overrides,
+                    &effective.providers["lmstudio"].models[0].capability_overrides,
+                ] {
+                    assert_eq!(caps.context_tokens, Some(expected_context));
+                    assert_eq!(caps.max_output_tokens, Some(expected_output));
+                }
+                assert_eq!(
+                    dialog.cx.last_provider_mutation_operation_id.is_some(),
+                    !overflow
+                );
+                let ProvidersPage::ModelSettings { editor, parent, .. } =
+                    dialog.page.downcast_ref::<ProvidersPage>().unwrap()
+                else {
+                    panic!("model settings retained")
+                };
+                if overflow {
+                    assert_eq!(editor.editing, Some(field));
+                    assert_eq!(editor.buf.text(), input);
+                    assert_eq!(
+                        parent.entry.models[0].capability_overrides.context_tokens,
+                        Some(131_072)
+                    );
+                    assert_eq!(
+                        parent.entry.models[0]
+                            .capability_overrides
+                            .max_output_tokens,
+                        Some(4_096)
+                    );
+                    assert!(dialog.cx.pending_settings.is_empty());
+                    assert!(dialog.cx.daemon_effects.is_empty());
+                    assert_eq!(std::fs::read(&dialog.config_path).unwrap(), before);
+                    assert!(
+                        render_provider_rows(&dialog, 80, 24)
+                            .join("\n")
+                            .contains("must be at most 4294967295")
+                    );
+                } else {
+                    assert_eq!(editor.editing, None);
+                    assert!(
+                        render_provider_rows(&dialog, 80, 24)
+                            .join("\n")
+                            .contains("saved")
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn capability_token_limits_save_at_u32_max() {
+    check_capability_token_boundary(false);
+}
+
+#[test]
+fn capability_token_overflow_rejects_without_mutation_or_override_loss() {
+    check_capability_token_boundary(true);
+}
+
+/// Shared fixture for App input/effect-drain coverage. Only initialization uses
+/// the synchronous harness; all input and mutation settlement are deferred.
+pub(crate) fn with_settings_q_fixture(
+    provider_scope: bool,
+    reject_preflight: bool,
+    test: impl FnOnce(&std::path::Path, &tokio::runtime::Runtime, SettingsDialog),
+) {
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let (tmp, mut dialog) = dialog_with_config(lmstudio_settings_config());
+        let client = runtime
+            .block_on(super::super::settings_daemon_client(
+                &super::super::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(
+                &client,
+                &tmp.path().display().to_string(),
+            ))
+            .unwrap();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        if provider_scope {
+            let entry = dialog.config.providers["lmstudio"].clone();
+            let mut editor = SettingsEditor::for_provider("lmstudio", &entry);
+            editor.cursor = editor
+                .fields()
+                .iter()
+                .position(|id| *id == ProviderSettingId::Location)
+                .unwrap();
+            dialog.set_test_page(Page::Providers(ProvidersPage::ProviderSettings {
+                editor,
+                parent: Box::new(EditState::new("lmstudio".into(), entry)),
+            }));
+        } else {
+            open_lmstudio_model_settings(&mut dialog);
+            let ProvidersPage::ModelSettings { editor, .. } =
+                dialog.page.downcast_mut::<ProvidersPage>().unwrap()
+            else {
+                unreachable!()
+            };
+            editor.cursor = editor
+                .fields()
+                .iter()
+                .position(|id| *id == ProviderSettingId::CapabilityContextTokens)
+                .unwrap();
+        }
+        if reject_preflight {
+            dialog.provider_edit_authority = None;
+        }
+        dialog.cx.defer_test_effects = true;
+        test(tmp.path(), &runtime, dialog);
+    });
+}
+
+/// Active-model fixture with a real supported retention capability on disk.
+/// Runtime selection is attached by App; config-only defaults start unset.
+pub(crate) fn with_settings_retention_q_fixture(
+    test: impl FnOnce(&std::path::Path, &tokio::runtime::Runtime, SettingsDialog),
+) {
+    let (mut fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let mut config = lmstudio_settings_config();
+        // This fixture's identity is local to the test. Resolve it as an
+        // explicit custom OpenAI-compatible endpoint, without a template id.
+        let provider = config.providers.get_mut("lmstudio").unwrap();
+        provider.template = None;
+        provider.wire_api = cockpit_config::providers::WireApi::Completions;
+        let model = &mut config.providers.get_mut("lmstudio").unwrap().models[0];
+        model.capability_overrides.context_tokens = Some(8192);
+        model.capabilities.prompt_cache_retention =
+            cockpit_config::providers::CapabilityStatus::Supported;
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let client = runtime
+            .block_on(super::super::settings_daemon_client(
+                &super::super::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(
+                &client,
+                &tmp.path().display().to_string(),
+            ))
+            .unwrap();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        // Reuse the already-promoted production-config context and install
+        // the existing fake secure-key actor seam required for real attaches.
+        // No OS keyring or production secret values participate.
+        let daemon = runtime
+            .block_on(cockpit_core::daemon::boot_test_persistent_daemon())
+            .unwrap();
+        let context = daemon.context().unwrap();
+        let (_key_actor, resolver) =
+            cockpit_core::redact::start_fake_redaction_key_resolver(&context.db).unwrap();
+        context.registry.set_redaction_key_resolver(resolver);
+        let active = cockpit_config::providers::ActiveModelRef {
+            provider: "lmstudio".into(),
+            model: "lfm2.5-24b-a2b".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+        dialog.config.active_model = Some(active.clone());
+        dialog.original_config.active_model = Some(active);
+        dialog.page = super::super::providers_page(active_model_settings_page(&dialog.config));
+        dialog.focus_settings_q_field(ProviderSettingId::PromptCacheRetention);
+        dialog.cx.defer_test_effects = true;
+        // App/runner Drop aborts client tasks, but does not join the daemon's
+        // admitted inventory/setup requests. Reap that owner while its project,
+        // key actor, environment and the client runtime are all still alive,
+        // including when a fault probe deliberately panics in the callback.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            test(tmp.path(), &runtime, dialog);
+        }));
+        fixture.shutdown();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    });
+}
+
+impl SettingsDialog {
+    pub(crate) fn focus_settings_q_context(&mut self) {
+        self.focus_settings_q_field(ProviderSettingId::CapabilityContextTokens);
+    }
+
+    fn focus_settings_q_field(&mut self, field: ProviderSettingId) {
+        let Some(ProvidersPage::ModelSettings { editor, .. }) =
+            self.page.downcast_mut::<ProvidersPage>()
+        else {
+            panic!("model settings");
+        };
+        editor.cursor = editor.fields().iter().position(|id| *id == field).unwrap();
+    }
+}
+
+#[test]
+fn settings_q_provider_completion_identity_cannot_close_another_save() {
+    with_settings_q_fixture(false, false, |_root, runtime, mut dialog| {
+        dialog.handle_key(press(KeyCode::Enter));
+        for ch in "131072".chars() {
+            dialog.handle_key(press(KeyCode::Char(ch)));
+        }
+        dialog.handle_key(press(KeyCode::Enter));
+        assert!(!dialog.handle_key(press(KeyCode::Char('q'))));
+        let effect = dialog.cx.daemon_effects.front().unwrap();
+        let good = super::super::SettingsDaemonEffectCompletion {
+            dialog_id: effect.dialog_id,
+            operation_id: effect.operation_id,
+            target: effect.target.clone(),
+            response: Ok(cockpit_proto::Response::Ack),
+            authoritative_rejection: false,
+            committed_refresh_needed: None,
+        };
+        let mut wrapper = super::super::Dialog::Settings(Box::new(dialog));
+        for mismatch in 0..3 {
+            let mut stale = super::super::SettingsDaemonEffectCompletion {
+                dialog_id: good.dialog_id,
+                operation_id: good.operation_id,
+                target: good.target.clone(),
+                response: good.response.clone(),
+                authoritative_rejection: good.authoritative_rejection,
+                committed_refresh_needed: good.committed_refresh_needed.clone(),
+            };
+            match mismatch {
+                0 => stale.dialog_id = uuid::Uuid::new_v4(),
+                1 => stale.operation_id = uuid::Uuid::new_v4(),
+                2 => stale.target.owner.push_str("-wrong"),
+                _ => unreachable!(),
+            }
+            wrapper.apply_settings_daemon_completion(stale);
+            assert!(!wrapper.take_settings_save_close());
+            assert!(!wrapper.handle_key(press(KeyCode::Esc)));
+        }
+        // Use the same execution/error projection as App: an ambiguous
+        // result must settle through its queued same-operation query.
+        while let Some(effect) = wrapper.take_settings_daemon_effect() {
+            let (response, authoritative_rejection, committed_refresh_needed) = match runtime
+                .block_on(super::super::execute_settings_daemon_work(
+                    effect.work,
+                    super::super::test_lifecycle_client(),
+                )) {
+                Ok(outcome) => (
+                    outcome.response,
+                    outcome.authoritative_rejection,
+                    outcome.committed_refresh_needed,
+                ),
+                Err(error) => (Err(error), false, None),
+            };
+            wrapper.apply_settings_daemon_completion(
+                super::super::SettingsDaemonEffectCompletion {
+                    dialog_id: effect.dialog_id,
+                    operation_id: effect.operation_id,
+                    target: effect.target,
+                    response,
+                    authoritative_rejection,
+                    committed_refresh_needed,
+                },
+            );
+        }
+        assert!(wrapper.take_settings_save_close());
+        assert!(!wrapper.take_settings_save_close());
+    });
+}
+
+#[test]
+fn settings_q_noop_classification_uses_the_whole_provider_plan() {
+    for provider_scope in [false, true] {
+        for metadata in [false, true] {
+            with_settings_q_fixture(provider_scope, false, |_root, runtime, mut dialog| {
+                if metadata {
+                    dialog.config.on_unlisted_models_fetch = Some(OnUnlistedModelsFetch::Remove);
+                } else {
+                    let sibling = dialog.config.providers["lmstudio"].clone();
+                    dialog.config.providers.insert("sibling".into(), sibling);
+                }
+                assert!(
+                    !dialog.handle_key(press(KeyCode::Char('q'))),
+                    "unchanged current provider does not imply an empty whole-config plan"
+                );
+                let effect = dialog.cx.take_daemon_effect().unwrap();
+                let outcome = runtime
+                    .block_on(super::super::execute_settings_daemon_work(
+                        effect.work,
+                        super::super::test_lifecycle_client(),
+                    ))
+                    .unwrap();
+                dialog.apply_daemon_completion(super::super::SettingsDaemonEffectCompletion {
+                    dialog_id: effect.dialog_id,
+                    operation_id: effect.operation_id,
+                    target: effect.target,
+                    response: outcome.response,
+                    authoritative_rejection: outcome.authoritative_rejection,
+                    committed_refresh_needed: outcome.committed_refresh_needed,
+                });
+                assert!(dialog.cx.settings_save_close_ready);
+                if metadata {
+                    assert_eq!(
+                        dialog.original_config.on_unlisted_models_fetch,
+                        Some(OnUnlistedModelsFetch::Remove)
+                    );
+                } else {
+                    assert!(dialog.original_config.providers.contains_key("sibling"));
+                }
+            });
+        }
+    }
 }

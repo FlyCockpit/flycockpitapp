@@ -54,7 +54,6 @@ use ratatui::widgets::{Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use super::auth::FetchOutcome;
-use crate::tui::settings::provider_entries_equal;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, INK, INK_INDEX, resolve_color};
 use cockpit_config::providers::{
@@ -993,6 +992,21 @@ pub(super) struct AddState {
 }
 
 struct FallbackOffer;
+
+/// Whether the complete settings save has succeeded or still owns daemon work.
+enum EditCommitOutcome {
+    Saved,
+    Pending,
+}
+
+impl EditCommitOutcome {
+    fn status(&self) -> String {
+        match self {
+            Self::Saved => "saved".into(),
+            Self::Pending => "saving provider…".into(),
+        }
+    }
+}
 
 pub(super) struct EditState {
     pub(super) provider_id: String,
@@ -2355,11 +2369,36 @@ impl SettingsCx {
 
     /// Commit a staged provider [`EditState`] to disk: insert its entry
     /// into the config map under its id and persist. Returns the `saved`
-    /// (or `save failed: …`) status. This is the single sink every commit
-    /// path — the `[save changes]` row, the `s` accelerator, and
-    /// auto-commit-on-exit — routes through, so no Providers edit is ever
-    /// dropped (no silent data loss).
+    /// (or `save failed: …`) status. All commit paths share the typed
+    /// `try_commit_edit_entry` sink; settings `q` also retains save ownership.
     fn commit_edit_entry(&mut self, s: &EditState) -> Option<String> {
+        Some(match self.try_commit_edit_entry(s) {
+            Ok(outcome) => outcome.status(),
+            Err(error) => format!("save failed: {error}"),
+        })
+    }
+
+    /// Settings `q` owns its draft and queued save until confirmed settlement.
+    fn commit_settings_and_close(&mut self, parent: &mut EditState) -> Nav {
+        match self.try_commit_edit_entry(parent) {
+            Ok(outcome) => {
+                parent.status = Some(outcome.status());
+                match outcome {
+                    EditCommitOutcome::Saved => Nav::Close,
+                    EditCommitOutcome::Pending => {
+                        self.close_after_settings_save = true;
+                        Nav::Stay
+                    }
+                }
+            }
+            Err(error) => {
+                parent.status = Some(format!("save failed: {error}"));
+                Nav::Stay
+            }
+        }
+    }
+
+    fn try_commit_edit_entry(&mut self, s: &EditState) -> Result<EditCommitOutcome, String> {
         // Transactional: keep the prior entry so a failed disk write leaves
         // effective in-memory config unchanged (failed multimodal saves must
         // not publish drafts as authoritative).
@@ -2367,18 +2406,17 @@ impl SettingsCx {
         self.config
             .providers
             .insert(s.provider_id.clone(), (*s.entry).clone());
-        let provider_is_unchanged = self
-            .original_config
-            .providers
-            .get(&s.provider_id)
-            .is_some_and(|original| provider_entries_equal(original, s.entry.as_ref()));
         match self.save_config() {
-            // A no-op save has no daemon effect to settle. Reporting it as
-            // pending would leave the Models/Headers sub-pages permanently
-            // on "saving provider…" even though their visible state is
-            // already authoritative.
-            Ok(()) if provider_is_unchanged => Some("saved".to_string()),
-            Ok(()) => Some("saving provider…".to_string()),
+            // Classify the actual whole-config plan, including metadata,
+            // other providers and the separately staged default-model save.
+            Ok(())
+                if self.provider_save_pending()
+                    || self.completed_provider_mutation.is_some()
+                    || self.settings_default_model_save.is_some() =>
+            {
+                Ok(EditCommitOutcome::Pending)
+            }
+            Ok(()) => Ok(EditCommitOutcome::Saved),
             Err(error) => {
                 match previous {
                     Some(entry) => {
@@ -2388,7 +2426,7 @@ impl SettingsCx {
                         self.config.providers.remove(&s.provider_id);
                     }
                 }
-                Some(format!("save failed: {error}"))
+                Err(error)
             }
         }
     }
@@ -2948,11 +2986,13 @@ impl SettingsCx {
             }
             let mut tmp = parent.entry.clone();
             tmp.models = models.rows.clone();
-            editor.write_into(&mut tmp);
+            if let Err(error) = editor.write_into(&mut tmp) {
+                editor.status = Some(format!("save failed: {error}"));
+                return Nav::Stay;
+            }
             parent.entry.models = tmp.models;
             self.apply_active_prompt_cache_retention_from_editor(editor);
-            let _ = self.commit_edit_entry(parent);
-            return Nav::Close;
+            return self.commit_settings_and_close(parent);
         }
         // Multimodal recovery / refresh keys that need the live entry.
         if editor.active_text_field().is_none() {
@@ -3006,7 +3046,11 @@ impl SettingsCx {
                         let prior_parent_entry = parent.entry.clone();
                         let mut tmp = parent.entry.clone();
                         tmp.models = models.rows.clone();
-                        editor.write_into(&mut tmp);
+                        if let Err(error) = editor.write_into(&mut tmp) {
+                            editor.status = Some(format!("save failed: {error}"));
+                            return Nav::Stay;
+                        }
+                        models.rows = tmp.models.clone();
                         parent.entry.models = tmp.models.clone();
                         self.apply_active_prompt_cache_retention_from_editor(editor);
                         parent.status = self.commit_edit_entry(parent);
@@ -3089,7 +3133,11 @@ impl SettingsCx {
                 let prior_parent_entry = parent.entry.clone();
                 let mut tmp = parent.entry.clone();
                 tmp.models = models.rows.clone();
-                editor.write_into(&mut tmp);
+                if let Err(error) = editor.write_into(&mut tmp) {
+                    editor.status = Some(format!("save failed: {error}"));
+                    return Nav::Stay;
+                }
+                models.rows = tmp.models.clone();
                 parent.entry.models = tmp.models.clone();
                 self.apply_active_prompt_cache_retention_from_editor(editor);
                 parent.status = self.commit_edit_entry(parent);
@@ -3154,8 +3202,11 @@ impl SettingsCx {
                 // model rows, then lift the updated rows back into the model
                 // editor so the Models page sees them.
                 let mut tmp = parent.entry.clone();
-                tmp.models = std::mem::take(&mut models.rows);
-                editor.write_into(&mut tmp);
+                tmp.models = models.rows.clone();
+                if let Err(error) = editor.write_into(&mut tmp) {
+                    editor.status = Some(format!("save failed: {error}"));
+                    return Nav::Stay;
+                }
                 let mut owned = std::mem::replace(
                     parent.as_mut(),
                     EditState::new(String::new(), ProviderEntry::default()),
@@ -3191,25 +3242,33 @@ impl SettingsCx {
         parent: &mut Box<EditState>,
     ) -> Nav {
         if editor.active_text_field().is_none() && matches!(key.code, KeyCode::Char('q')) {
-            editor.write_into(&mut parent.entry);
-            let _ = self.commit_edit_entry(parent);
-            return Nav::Close;
+            if let Err(error) = editor.write_into(&mut parent.entry) {
+                editor.status = Some(format!("save failed: {error}"));
+                return Nav::Stay;
+            }
+            return self.commit_settings_and_close(parent);
         }
         match editor.handle_key(key) {
             SettingsResult::Stay => Nav::Stay,
             SettingsResult::Save => {
                 // `[save changes]` / `s`: write the concrete values into the
                 // parent entry, commit to disk, and STAY on the sub-dialog.
-                editor.write_into(&mut parent.entry);
+                if let Err(error) = editor.write_into(&mut parent.entry) {
+                    editor.status = Some(format!("save failed: {error}"));
+                    return Nav::Stay;
+                }
                 parent.status = self.commit_edit_entry(parent);
                 Nav::Stay
             }
             SettingsResult::Back => {
+                if let Err(error) = editor.write_into(&mut parent.entry) {
+                    editor.status = Some(format!("save failed: {error}"));
+                    return Nav::Stay;
+                }
                 let mut owned = std::mem::replace(
                     parent.as_mut(),
                     EditState::new(String::new(), ProviderEntry::default()),
                 );
-                editor.write_into(&mut owned.entry);
                 owned.cursor = 3;
                 // Persist immediately on leaving the dialog
                 // (implementation note).
@@ -4701,13 +4760,33 @@ impl SettingsCx {
             }
             super::settings_editor::SettingsScope::Provider => parent.provider_id.clone(),
         };
-        let mut lines: Vec<Line<'static>> = vec![
-            Line::from(vec![
-                Span::styled("Settings: ", muted),
-                Span::styled(scope_label, Style::default().add_modifier(Modifier::BOLD)),
-            ]),
-            Line::default(),
-        ];
+        let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
+            Span::styled("Settings: ", muted),
+            Span::styled(scope_label, Style::default().add_modifier(Modifier::BOLD)),
+        ])];
+        // Save feedback belongs to this page and must stay visible even when
+        // its long field list scrolls away from the title or the final row.
+        let status_lines = parent
+            .status
+            .iter()
+            .chain(editor.status.iter())
+            .map(|status| Line::from(Span::styled(status.clone(), yellow)))
+            .collect();
+        let (status_lines, _) = crate::tui::message_block::wrap_lines_to_width(
+            status_lines,
+            usize::from(area.width).max(1),
+        );
+        let status_height = status_lines.len().min(usize::from(area.height / 2)) as u16;
+        let status_area = Rect {
+            y: area.bottom().saturating_sub(status_height),
+            height: status_height,
+            ..area
+        };
+        let area = Rect {
+            height: area.height.saturating_sub(status_height),
+            ..area
+        };
+        lines.push(Line::default());
         let mut bindings = Vec::new();
         let mut inline_edit_field = None;
 
@@ -4950,9 +5029,7 @@ impl SettingsCx {
             lines.push(Line::from(Span::styled(help.to_string(), muted)));
         }
 
-        if let Some(status) = &editor.status {
-            lines.push(Line::from(Span::styled(status.clone(), yellow)));
-        } else if matches!(
+        if matches!(
             editor.scope,
             super::settings_editor::SettingsScope::Model { .. }
         ) {
@@ -5017,6 +5094,7 @@ impl SettingsCx {
                     });
             }
         }
+        frame.render_widget(Paragraph::new(status_lines), status_area);
     }
 
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {
@@ -5986,6 +6064,30 @@ impl SettingsPage for ProvidersPage {
         else {
             return Nav::Stay;
         };
+        if matches!(
+            provider_action,
+            super::pointer_actions::ProvidersAction::RowEditor(
+                super::pointer_actions::ProviderRowEditorAction::SettingSave
+            )
+        ) {
+            let editor = match self {
+                ProvidersPage::ModelSettings { editor, .. }
+                | ProvidersPage::ProviderSettings { editor, .. } => editor,
+                _ => return Nav::Stay,
+            };
+            // The footer remains available during inline editing. Apply and
+            // validate that buffer before dispatching the shared save key.
+            if editor.editing.is_some() {
+                editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                if editor.editing.is_some() {
+                    return Nav::Stay;
+                }
+            }
+            return cx.handle_providers_page_key(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                self,
+            );
+        }
         if matches!(self, ProvidersPage::Add(_)) {
             match &provider_action {
                 super::pointer_actions::ProvidersAction::LocalBack => {
@@ -6419,12 +6521,6 @@ impl SettingsPage for ProvidersPage {
                         return Nav::Stay;
                     };
                     index
-                }
-                super::pointer_actions::ProviderRowEditorAction::SettingSave => {
-                    return cx.handle_providers_page_key(
-                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
-                        self,
-                    );
                 }
                 _ => return Nav::Stay,
             },

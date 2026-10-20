@@ -708,6 +708,13 @@ impl App {
         let Some(runner) = runner else {
             let message =
                 Self::control_not_delivered_message(label, ControlRequestNotDelivered::NoRunner);
+            if let cockpit_proto::Request::SetDefaultModel {
+                default_update_id, ..
+            } = &req
+            {
+                self.dialog
+                    .fail_settings_default_model_save(*default_update_id, message.clone());
+            }
             let selection_id = match applied {
                 ControlApplied::ModelSelection { selection_id } => Some(selection_id),
                 _ => None,
@@ -817,7 +824,13 @@ impl App {
         // Ack can retire the control correlation before the separately
         // stamped DefaultModelUpdateResult arrives. Retire that owner even
         // when its control entry has already completed.
-        self.pending_default_model_update_id = None;
+        if let Some(update_id) = self.pending_default_model_update_id.take() {
+            self.dialog.fail_settings_default_model_save(
+                update_id,
+                "daemon connection changed before the save was confirmed; reload before retrying"
+                    .into(),
+            );
+        }
         let pending = std::mem::take(&mut self.pending_control_requests);
         let mut refresh_snapshot = false;
         let interruption = match reason {
@@ -1136,8 +1149,14 @@ impl App {
     }
 
     fn clear_pending_default_model_update(&mut self, id: Option<uuid::Uuid>) {
-        if id.is_some() && self.pending_default_model_update_id == id {
+        if let Some(id) = id
+            && self.pending_default_model_update_id == Some(id)
+        {
             self.pending_default_model_update_id = None;
+            self.dialog.fail_settings_default_model_save(
+                id,
+                "daemon did not confirm the default-model save; reload before retrying".into(),
+            );
         }
     }
 

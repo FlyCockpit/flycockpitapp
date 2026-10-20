@@ -2422,6 +2422,17 @@ impl TestPersistentDaemon {
     pub fn context(&self) -> Option<&std::sync::Arc<server::DaemonContext>> {
         self.ctx.as_ref()
     }
+
+    /// Settle the owning runtime, including detached request handlers, before
+    /// a fixture retires its environment or starts another daemon in process.
+    /// A borrowed handle has no shutdown authority.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.ctx.take();
+        if let Some(owner) = self._owner.take() {
+            owner.shutdown().await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2743,15 +2754,32 @@ static AUTO_PROMOTED_DAEMON: std::sync::Mutex<Option<TestPersistentDaemon>> =
 pub struct InProcessAutoPromoteGuard;
 
 #[cfg(any(test, feature = "test-support"))]
-impl Drop for InProcessAutoPromoteGuard {
-    fn drop(&mut self) {
+impl InProcessAutoPromoteGuard {
+    fn take_daemon(&mut self) -> Option<TestPersistentDaemon> {
         IN_PROCESS_AUTO_PROMOTE.store(false, std::sync::atomic::Ordering::SeqCst);
         IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG.store(false, std::sync::atomic::Ordering::SeqCst);
         IN_PROCESS_AUTO_PROMOTE_PRODUCTION_FIRST_RUN
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        *AUTO_PROMOTED_DAEMON
+        AUTO_PROMOTED_DAEMON
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// Disable promotion and join the exact owner before releasing fixture
+    /// resources. Drop remains the cancellation-safe, asynchronous fallback.
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(daemon) = self.take_daemon() {
+            daemon.shutdown().await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for InProcessAutoPromoteGuard {
+    fn drop(&mut self) {
+        drop(self.take_daemon());
     }
 }
 

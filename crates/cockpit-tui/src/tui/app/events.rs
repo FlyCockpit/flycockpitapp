@@ -1079,6 +1079,12 @@ impl App {
                 if self.pending_default_model_update_id != Some(default_update_id) {
                     return;
                 }
+                if !self
+                    .dialog
+                    .apply_settings_default_model_result(default_update_id, &outcome)
+                {
+                    return;
+                }
                 self.pending_default_model_update_id = None;
                 match outcome {
                     cockpit_proto::DefaultModelStandaloneOutcome::Applied {
@@ -1107,6 +1113,9 @@ impl App {
                     } => {
                         self.push_plain(format!("Default model was not changed — {user_message}"));
                     }
+                }
+                if self.dialog.take_settings_save_close() {
+                    self.close_active_dialog();
                 }
             }
             TurnEvent::ThinkingStarted { agent, turn_id } => {

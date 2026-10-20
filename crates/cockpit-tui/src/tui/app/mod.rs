@@ -38,6 +38,8 @@ mod inventory_tests;
 mod queue_controls;
 mod response_metrics_tokenizer;
 mod session_setup;
+#[cfg(test)]
+mod settings_persist_tests;
 pub(crate) use response_metrics_tokenizer::{TokenizerConfirmOutcome, TokenizerConfirmPending};
 #[cfg(test)]
 pub(crate) use response_metrics_tokenizer::{

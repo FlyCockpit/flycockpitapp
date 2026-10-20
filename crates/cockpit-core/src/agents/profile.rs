@@ -2808,6 +2808,107 @@ mod tests {
     }
 
     #[test]
+    fn agent_profile_resolution_saved_context_override_reloads_and_merge_preserves_it() {
+        use cockpit_config::providers::{
+            ConfigDoc, ModelCapabilityOverrides, ModelMergePolicy, merge_fetched_models_with_policy,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "lmstudio".into(),
+            ProviderEntry {
+                url: "http://127.0.0.1:1234/v1".into(),
+                template: Some("lmstudio".into()),
+                models: vec![ModelEntry {
+                    id: "lfm2.5-24b-a2b".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let mut definition = definition("");
+        let slot = definition
+            .vnext
+            .as_mut()
+            .unwrap()
+            .model_slots
+            .get_mut("primary")
+            .unwrap();
+        slot.min_context_tokens = 1;
+        let slot = slot.clone();
+        let offering = AgentProfileModelOffering {
+            offering_id: "local-lfm".into(),
+            provider_profile_handle: "lmstudio-profile".into(),
+            provider_id: "lmstudio".into(),
+            model_id: "lfm2.5-24b-a2b".into(),
+        };
+        let (location, unknown) = offering_capabilities(&offering, &config);
+        assert_eq!(unknown.context_tokens, None);
+        assert!(!hard_requirements_satisfied(&slot, location, &unknown));
+        assert!(!offering_is_compatible(&slot, &offering, &config));
+
+        config.providers.get_mut("lmstudio").unwrap().models[0].capability_overrides =
+            ModelCapabilityOverrides {
+                context_tokens: Some(131_072),
+                tool_calling: Some(CapabilityStatus::Supported),
+                ..Default::default()
+            };
+        let mut doc = ConfigDoc::load(&path).unwrap();
+        doc.write(&config).unwrap();
+        let mut reloaded = ConfigDoc::load_effective_from_paths(&[path]);
+        for owner_handle in [false, true] {
+            if owner_handle {
+                let entry = reloaded.providers.remove("lmstudio").unwrap();
+                reloaded.providers.insert("lmstudio-profile".into(), entry);
+            }
+            let key = if owner_handle {
+                "lmstudio-profile"
+            } else {
+                "lmstudio"
+            };
+            let provider = reloaded.providers.get_mut(key).unwrap();
+            provider.models = merge_fetched_models_with_policy(
+                Some("lmstudio"),
+                &provider.models,
+                vec![ModelEntry {
+                    id: "lfm2.5-24b-a2b".into(),
+                    capabilities: cockpit_config::providers::ModelCapabilities {
+                        context_tokens: Some(4096),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                ModelMergePolicy::KeepUnlisted,
+            );
+            let (location, capabilities) = offering_capabilities(&offering, &reloaded);
+            assert_eq!(capabilities.context_tokens, Some(131_072));
+            assert!(hard_requirements_satisfied(&slot, location, &capabilities));
+            assert!(offering_is_compatible(&slot, &offering, &reloaded));
+            let (catalog, installation_id, digest) = catalog(definition.clone());
+            let mut bound = binding(installation_id, digest, &offering.model_id);
+            bound.provider_profile_handle = offering.provider_profile_handle.clone();
+            let profile = resolve_agent_profile(AgentProfileResolutionInput {
+                installation_id,
+                catalog: &catalog,
+                bindings: vec![bound],
+                offerings: vec![offering.clone()],
+                utility_fallbacks: BTreeMap::new(),
+                providers: &reloaded,
+                host_policy: VnextHostPolicy::default(),
+                question_override: ProfileQuestionOverride::Inherit,
+                verification_reductions: BTreeMap::new(),
+            })
+            .expect("persisted manual context makes the primary binding compatible");
+            assert_eq!(
+                profile.slots["primary"].choice.binding.model_id,
+                "lfm2.5-24b-a2b"
+            );
+        }
+    }
+
+    #[test]
     fn agent_profile_resolution_hard_capability_and_locality_unknown_fail_closed() {
         let tool_slot = super::super::ModelSlot {
             purpose: "tools".into(),

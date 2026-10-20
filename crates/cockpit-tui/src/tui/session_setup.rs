@@ -8,8 +8,9 @@
 //! The pane is used as a full-body overlay (`/session-setup`) and as an inline
 //! panel below the banner on a fresh session. Mutations are emitted as
 //! [`SessionSetupOutcome`] values; the app owns daemon RPCs. Errors wrap at
-//! the presentation width: the overlay scrolls visual rows, while inline
-//! errors contribute every wrapped row to the containing chat scroll buffer.
+//! the presentation width: the overlay shows scroll controls only when wrapped
+//! error rows overflow, while inline errors contribute every wrapped row to the
+//! containing chat scroll buffer.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -876,18 +877,34 @@ impl SessionSetupPane {
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
         let title = if self.inline {
             " Session setup (Tab: composer) "
-        } else if matches!(self.status, Status::Error(_)) {
-            " Session setup (↑/↓, PgUp/PgDn: scroll) "
         } else {
             " Session setup "
         };
-        let block = crate::tui::chrome::rounded_block(title, true);
+        let mut block = crate::tui::chrome::rounded_block(title, true);
         let inner = block.inner(area);
-        frame.render_widget(block, area);
 
         if matches!(self.status, Status::Error(_)) {
-            let content = crate::tui::chrome::scrollbar_content(inner);
-            let lines = self.error_lines(content.width);
+            // Match the List's historical highlight-symbol padding. Measure
+            // before reserving a scrollbar so fitting errors keep that layout.
+            let padding = inner.width.min(2);
+            let mut content = Rect {
+                x: inner.x + padding,
+                width: inner.width - padding,
+                ..inner
+            };
+            let mut lines = self.error_lines(content.width);
+            let overflows = lines.len() > usize::from(content.height);
+            if overflows {
+                content = crate::tui::chrome::scrollbar_content(content);
+                lines = self.error_lines(content.width);
+                if !self.inline {
+                    block = crate::tui::chrome::rounded_block(
+                        " Session setup (↑/↓, PgUp/PgDn: scroll) ",
+                        true,
+                    );
+                }
+            }
+            frame.render_widget(block, area);
             let total = lines.len();
             self.error_page = usize::from(content.height).saturating_sub(1).max(1);
             self.error_max_scroll = total.saturating_sub(usize::from(content.height));
@@ -902,15 +919,18 @@ impl SessionSetupPane {
                 ),
                 content,
             );
-            crate::tui::chrome::scrollbar(
-                frame,
-                inner,
-                total,
-                usize::from(content.height),
-                self.error_scroll,
-            );
+            if overflows {
+                crate::tui::chrome::scrollbar(
+                    frame,
+                    inner,
+                    total,
+                    usize::from(content.height),
+                    self.error_scroll,
+                );
+            }
             return;
         }
+        frame.render_widget(block, area);
 
         let mut lines: Vec<Line<'static>> = if !matches!(self.interaction, Interaction::List) {
             self.inline_lines(inner.width.saturating_sub(2))
@@ -2004,6 +2024,89 @@ mod tests {
             .expect("draw");
         terminal.backend().buffer().area().width;
         format!("{:?}", terminal.backend().buffer())
+    }
+
+    fn render_overlay_rows(pane: &mut SessionSetupPane, width: u16, height: u16) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn modes_session_setup_overlay_fitting_states_keep_title_and_padding() {
+        for width in [80, 120] {
+            for color in [false, true] {
+                let mut pane = SessionSetupPane::loading(color);
+                let loading = render_overlay_rows(&mut pane, width, 24);
+                assert!(loading[0].contains(" Session setup "));
+                assert!(!loading[0].contains("scroll"));
+                assert!(loading[1].starts_with("│  Loading session setup…"));
+
+                pane.apply_snapshot(snapshot(vec![]));
+                let ready = render_overlay_rows(&mut pane, width, 24);
+                assert!(ready[0].contains(" Session setup "));
+                assert!(!ready[0].contains("scroll"));
+
+                pane.set_error("Daemon stopped; choose Restart or Quit.");
+                let stopped = render_overlay_rows(&mut pane, width, 24);
+                assert!(stopped[0].contains(" Session setup "));
+                assert!(!stopped[0].contains("scroll"));
+                assert!(stopped[1].starts_with("│  Daemon stopped; choose Restart or Quit."));
+                assert_eq!(pane.error_max_scroll, 0);
+                pane.handle_key(press(KeyCode::End));
+                assert_eq!(render_overlay_rows(&mut pane, width, 24), stopped);
+            }
+        }
+    }
+
+    #[test]
+    fn modes_session_setup_overlay_error_wrap_scroll_chrome_tracks_overflow() {
+        for width in [80, 120] {
+            for color in [false, true] {
+                let mut pane = SessionSetupPane::loading(color);
+                // Exactly one padded row fits, including the last column:
+                // fitting errors must not reserve a scrollbar gutter.
+                let fitting = "e".repeat(usize::from(width - 4));
+                pane.set_error(&fitting);
+                let screen = render_overlay_rows(&mut pane, width, 3);
+                assert!(!screen[0].contains("scroll"));
+                assert_eq!(screen[1], format!("│  {fitting}│"));
+                assert_eq!(pane.error_max_scroll, 0);
+
+                let overflowing = format!("{fitting}e");
+                pane.set_error(&overflowing);
+                let screen = render_overlay_rows(&mut pane, width, 3);
+                assert!(screen[0].contains("Session setup (↑/↓, PgUp/PgDn: scroll)"));
+                assert_eq!(pane.error_max_scroll, 1);
+                pane.handle_key(press(KeyCode::End));
+                let tail = render_overlay_rows(&mut pane, width, 3);
+                assert!(tail[1].starts_with("│  ee"), "{tail:?}");
+                assert_eq!(pane.error_scroll, 1);
+
+                // Ready can itself have more rows than the viewport; Error's
+                // scroll title and old offset must not leak into that state.
+                pane.apply_snapshot(snapshot(vec![]));
+                let ready = render_overlay_rows(&mut pane, width, 3);
+                assert!(!ready[0].contains("scroll"));
+
+                pane.set_error(&overflowing);
+                let screen = render_overlay_rows(&mut pane, width, 3);
+                assert!(screen[0].contains("scroll"));
+                pane.handle_key(press(KeyCode::End));
+                let resized = render_overlay_rows(&mut pane, width, 4);
+                assert!(!resized[0].contains("scroll"));
+                assert_eq!(resized[1], format!("│  {fitting}│"));
+                assert!(resized[2].starts_with("│  e "));
+                assert_eq!(pane.error_scroll, 0);
+                assert_eq!(pane.error_max_scroll, 0);
+            }
+        }
     }
 
     #[test]

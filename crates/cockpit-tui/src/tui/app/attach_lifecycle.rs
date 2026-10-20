@@ -1053,12 +1053,19 @@ mod setup_error_render_tests {
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        // Exclude overlay borders and the permanently reserved scrollbar
-        // column. Inspect the rendered cells, not the pane's source lines.
+        // Exclude overlay borders and the scrollbar column when its thumb
+        // is present. Inspect rendered cells, not the pane's source lines.
         let content = if inline {
             Rect::new(0, 0, width.saturating_sub(1), height)
         } else {
-            Rect::new(1, 1, width.saturating_sub(3), height.saturating_sub(2))
+            let scrollbar = (1..height.saturating_sub(1))
+                .any(|y| buffer[(width.saturating_sub(2), y)].symbol() == "█");
+            Rect::new(
+                1,
+                1,
+                width.saturating_sub(if scrollbar { 3 } else { 2 }),
+                height.saturating_sub(2),
+            )
         };
         let mut text = String::new();
         for y in content.y..content.bottom() {

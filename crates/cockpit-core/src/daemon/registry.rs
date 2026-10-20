@@ -3752,7 +3752,7 @@ impl SessionRegistry {
 
     /// Keep-warm callbacks target the live conversation tip. They must never
     /// spawn a worker on an ended predecessor window.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "extended"))]
     async fn live_keep_warm_handle(
         &self,
         session_id: Uuid,

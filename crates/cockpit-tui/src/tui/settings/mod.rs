@@ -98,6 +98,8 @@ use cockpit_config::extended::ExtendedConfig;
 use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
 
 use providers::initial_list_cursor;
+#[cfg(test)]
+pub(crate) use providers::tests::with_settings_q_fixture;
 
 /// Settings-side operations use the TUI's configured daemon lifetime. Keeping
 /// this tiny helper here makes accidental local vault opens in settings code
@@ -3290,6 +3292,11 @@ pub struct SettingsCx {
     pending_onboarding_validation_commit: Option<PendingOnboardingValidationCommit>,
     completed_provider_add: Option<Result<(String, ProviderEntry, bool), String>>,
     completed_provider_mutation: Option<Result<(), String>>,
+    /// Only Model/Provider Settings q sets this; settlement consumes it once.
+    close_after_provider_save: bool,
+    provider_save_close_ready: bool,
+    #[cfg(test)]
+    defer_test_effects: bool,
     pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
@@ -3754,6 +3761,9 @@ impl SettingsCx {
 
     #[cfg(test)]
     fn flush_request_daemon_effects(&mut self) {
+        if self.defer_test_effects {
+            return;
+        }
         let mut skipped = VecDeque::new();
         while let Some(request) = self.take_daemon_effect() {
             let rpc = match request_from_settings_daemon_work(request.work) {
@@ -7021,6 +7031,15 @@ impl Dialog {
         settings.flush_request_daemon_effects_for_test();
     }
 
+    pub(crate) fn take_settings_save_close(&mut self) -> bool {
+        match self {
+            Dialog::Settings(settings) => {
+                std::mem::take(&mut settings.cx.provider_save_close_ready)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn take_settings_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
         match self {
             Dialog::Settings(settings) => settings.cx.take_daemon_effect(),
@@ -7421,6 +7440,9 @@ impl SettingsDialog {
 
     #[cfg(test)]
     fn settle_test_effects(&mut self) {
+        if self.cx.defer_test_effects {
+            return;
+        }
         for _ in 0..16 {
             let pending_daemon = !self.cx.daemon_effects.is_empty();
             self.flush_request_daemon_effects_for_test();
@@ -7535,6 +7557,9 @@ impl SettingsDialog {
         if let Some(result) = self.cx.completed_provider_mutation.take()
             && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
         {
+            if std::mem::take(&mut self.cx.close_after_provider_save) {
+                self.cx.provider_save_close_ready = result.is_ok();
+            }
             let status = match result {
                 Ok(()) => "saved".to_string(),
                 Err(error) => format!("provider save failed: {error}"),
@@ -8190,6 +8215,10 @@ impl SettingsDialog {
                 pending_onboarding_validation_commit: None,
                 completed_provider_add: None,
                 completed_provider_mutation: None,
+                close_after_provider_save: false,
+                provider_save_close_ready: false,
+                #[cfg(test)]
+                defer_test_effects: false,
                 pending_provider_mutation_navigation: None,
                 completed_provider_mutation_navigation: None,
                 completed_shadow_removal: None,
@@ -8819,7 +8848,7 @@ impl SettingsDialog {
         let close = self.apply_nav(nav);
         #[cfg(test)]
         self.settle_test_effects();
-        close
+        close || std::mem::take(&mut self.cx.provider_save_close_ready)
     }
 
     /// Clear every pointer-derived hover (the position is unknown).

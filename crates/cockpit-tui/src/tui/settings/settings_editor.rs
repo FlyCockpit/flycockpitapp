@@ -48,7 +48,8 @@
 //! transport security cycle in place on `Enter`; backup model is a text edit. A
 //! bottom-of-list `[save changes]` row (and the `s` accelerator) commits to
 //! disk and stays; Back (`Esc`/`h`/`←`) writes the working state into the parent
-//! [`EditState`]'s entry and auto-commits it (no edit is ever dropped).
+//! [`EditState`]'s entry and auto-commits it. `q` saves and closes only after
+//! success; pending saves and rejections retain the owning settings page.
 
 use std::time::{Duration, Instant};
 
@@ -1530,7 +1531,8 @@ impl SettingsEditor {
 
     /// Validate + commit the numeric edit buffer. Percentages clamp to
     /// 0–100; the cache time and the TTFT / idle timeouts accept any
-    /// non-negative integer (seconds). Non-numeric input is rejected inline
+    /// non-negative integer (seconds). Capability token counts must fit u32.
+    /// Non-numeric or out-of-range input is rejected inline
     /// (the field stays open).
     fn commit_numeric_edit(&mut self) -> Result<(), String> {
         let Some(field) = self.editing else {
@@ -1564,10 +1566,14 @@ impl SettingsEditor {
         };
         match field {
             ProviderSettingId::CapabilityContextTokens => {
-                self.capability_context_tokens = u32::try_from(parsed).ok();
+                let tokens =
+                    u32::try_from(parsed).map_err(|_| format!("must be at most {}", u32::MAX))?;
+                self.capability_context_tokens = Some(tokens);
             }
             ProviderSettingId::CapabilityMaxOutputTokens => {
-                self.capability_max_output_tokens = u32::try_from(parsed).ok();
+                let tokens =
+                    u32::try_from(parsed).map_err(|_| format!("must be at most {}", u32::MAX))?;
+                self.capability_max_output_tokens = Some(tokens);
             }
             ProviderSettingId::AutoCompactPct => {
                 self.context.auto_compact_pct = Some(parsed.min(100) as u8);

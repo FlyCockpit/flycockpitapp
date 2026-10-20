@@ -994,6 +994,21 @@ pub(super) struct AddState {
 
 struct FallbackOffer;
 
+/// Whether a provider save has already succeeded or still owns daemon work.
+enum EditCommitOutcome {
+    Saved,
+    Pending,
+}
+
+impl EditCommitOutcome {
+    fn status(&self) -> String {
+        match self {
+            Self::Saved => "saved".into(),
+            Self::Pending => "saving provider…".into(),
+        }
+    }
+}
+
 pub(super) struct EditState {
     pub(super) provider_id: String,
     pub(super) entry: Box<ProviderEntry>,
@@ -2355,11 +2370,36 @@ impl SettingsCx {
 
     /// Commit a staged provider [`EditState`] to disk: insert its entry
     /// into the config map under its id and persist. Returns the `saved`
-    /// (or `save failed: …`) status. This is the single sink every commit
-    /// path — the `[save changes]` row, the `s` accelerator, and
-    /// auto-commit-on-exit — routes through, so no Providers edit is ever
-    /// dropped (no silent data loss).
+    /// (or `save failed: …`) status. All commit paths share the typed
+    /// `try_commit_edit_entry` sink; settings `q` also retains save ownership.
     fn commit_edit_entry(&mut self, s: &EditState) -> Option<String> {
+        Some(match self.try_commit_edit_entry(s) {
+            Ok(outcome) => outcome.status(),
+            Err(error) => format!("save failed: {error}"),
+        })
+    }
+
+    /// Settings `q` owns its draft and queued save until confirmed settlement.
+    fn commit_settings_and_close(&mut self, parent: &mut EditState) -> Nav {
+        match self.try_commit_edit_entry(parent) {
+            Ok(outcome) => {
+                parent.status = Some(outcome.status());
+                match outcome {
+                    EditCommitOutcome::Saved => Nav::Close,
+                    EditCommitOutcome::Pending => {
+                        self.close_after_provider_save = true;
+                        Nav::Stay
+                    }
+                }
+            }
+            Err(error) => {
+                parent.status = Some(format!("save failed: {error}"));
+                Nav::Stay
+            }
+        }
+    }
+
+    fn try_commit_edit_entry(&mut self, s: &EditState) -> Result<EditCommitOutcome, String> {
         // Transactional: keep the prior entry so a failed disk write leaves
         // effective in-memory config unchanged (failed multimodal saves must
         // not publish drafts as authoritative).
@@ -2377,8 +2417,8 @@ impl SettingsCx {
             // pending would leave the Models/Headers sub-pages permanently
             // on "saving provider…" even though their visible state is
             // already authoritative.
-            Ok(()) if provider_is_unchanged => Some("saved".to_string()),
-            Ok(()) => Some("saving provider…".to_string()),
+            Ok(()) if provider_is_unchanged => Ok(EditCommitOutcome::Saved),
+            Ok(()) => Ok(EditCommitOutcome::Pending),
             Err(error) => {
                 match previous {
                     Some(entry) => {
@@ -2388,7 +2428,7 @@ impl SettingsCx {
                         self.config.providers.remove(&s.provider_id);
                     }
                 }
-                Some(format!("save failed: {error}"))
+                Err(error)
             }
         }
     }
@@ -2954,8 +2994,7 @@ impl SettingsCx {
             }
             parent.entry.models = tmp.models;
             self.apply_active_prompt_cache_retention_from_editor(editor);
-            let _ = self.commit_edit_entry(parent);
-            return Nav::Close;
+            return self.commit_settings_and_close(parent);
         }
         // Multimodal recovery / refresh keys that need the live entry.
         if editor.active_text_field().is_none() {
@@ -3209,8 +3248,7 @@ impl SettingsCx {
                 editor.status = Some(format!("save failed: {error}"));
                 return Nav::Stay;
             }
-            let _ = self.commit_edit_entry(parent);
-            return Nav::Close;
+            return self.commit_settings_and_close(parent);
         }
         match editor.handle_key(key) {
             SettingsResult::Stay => Nav::Stay,

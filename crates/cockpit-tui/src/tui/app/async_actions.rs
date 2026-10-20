@@ -1190,6 +1190,9 @@ impl App {
             AsyncActionKind::DaemonRpc("settings.effect") => {
                 if let Ok(AsyncActionPayload::SettingsDaemon(completion)) = result.payload {
                     self.dialog.apply_settings_daemon_completion(completion);
+                    if self.dialog.take_settings_save_close() {
+                        self.close_active_dialog();
+                    }
                 }
             }
             AsyncActionKind::Blocking("settings.blocking-effect" | "settings.path-suggest") => {

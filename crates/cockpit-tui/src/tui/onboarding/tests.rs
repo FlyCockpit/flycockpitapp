@@ -277,18 +277,19 @@ fn welcome_animation_is_tick_driven_and_settles() {
     let mut shell = shell_at(OnboardingStage::Welcome);
     let engine = Dialog::None;
     let frame_zero = render_string(&mut shell, 80, 24, &engine);
+    assert!(!shell.tick(Duration::ZERO));
     // Every intermediate frame reports a change until the fly-in lands.
-    for _ in 0..WELCOME_ANIMATION_FRAMES {
-        assert!(shell.tick());
+    for frame in 1..=WELCOME_ANIMATION_FRAMES {
+        assert!(shell.tick(WELCOME_FRAME_INTERVAL * frame as u32));
     }
     let landed = render_string(&mut shell, 80, 24, &engine);
     assert_ne!(frame_zero, landed);
     assert!(landed.contains("[press any button to continue]"));
     // Landing is not a freeze: the same tick keeps advancing the ambient
     // prop bob and cloud drift past the prompt frame.
-    for _ in 0..4 {
+    for frame in WELCOME_ANIMATION_FRAMES + 1..=WELCOME_ANIMATION_FRAMES + 4 {
         assert!(
-            shell.tick(),
+            shell.tick(WELCOME_FRAME_INTERVAL * frame as u32),
             "ambient motion must keep ticking after landing"
         );
     }
@@ -304,8 +305,9 @@ fn welcome_animation_is_tick_driven_and_settles() {
 fn welcome_animation_keeps_the_animation_tick_alive_until_navigation() {
     let mut shell = shell_at(OnboardingStage::Welcome);
     assert!(shell.welcome_animation_active());
-    for _ in 0..WELCOME_ANIMATION_FRAMES {
-        shell.tick();
+    shell.tick(Duration::ZERO);
+    for frame in 1..=WELCOME_ANIMATION_FRAMES {
+        shell.tick(WELCOME_FRAME_INTERVAL * frame as u32);
     }
     assert!(
         shell.welcome_animation_active(),
@@ -323,10 +325,116 @@ fn reduced_motion_welcome_is_deterministic_and_static() {
     let mut shell = OnboardingShell::new(&snapshot, true);
     let engine = Dialog::None;
     let first = render_string(&mut shell, 80, 24, &engine);
-    assert!(!shell.tick(), "reduced motion must not animate");
+    for millis in [0, 100, 10_000, 10_000] {
+        assert!(
+            !shell.tick(Duration::from_millis(millis)),
+            "reduced motion must not animate"
+        );
+        assert_eq!(shell.frame, 0);
+    }
     let second = render_string(&mut shell, 80, 24, &engine);
     assert_eq!(first, second);
     assert!(first.contains("[press any button to continue]"));
+}
+
+#[test]
+fn welcome_wakes_advance_only_after_a_full_elapsed_interval() {
+    let mut shell = shell_at(OnboardingStage::Welcome);
+    for millis in [0, 0, 1, 50, 99] {
+        assert!(!shell.tick(Duration::from_millis(millis)));
+        assert_eq!(shell.frame, 0);
+    }
+    assert!(shell.tick(Duration::from_millis(100)));
+    assert_eq!(shell.frame, 1);
+    assert!(!shell.tick(Duration::from_millis(100)));
+    assert!(!shell.tick(Duration::from_millis(199)));
+    assert!(shell.tick(Duration::from_millis(201)));
+    assert_eq!(shell.frame, 2);
+    assert!(!shell.tick(Duration::from_millis(299)));
+    assert!(shell.tick(Duration::from_millis(300)));
+    assert_eq!(shell.frame, 3, "partial intervals must carry across wakes");
+}
+
+#[test]
+fn welcome_mouse_bursts_match_idle_time_before_and_after_landing() {
+    let mut idle = shell_at(OnboardingStage::Welcome);
+    let mut busy = shell_at(OnboardingStage::Welcome);
+    idle.set_welcome_cloud_seed_for_golden(42);
+    busy.set_welcome_cloud_seed_for_golden(42);
+    let mut engine = Dialog::None;
+    idle.tick(Duration::ZERO);
+    busy.tick(Duration::ZERO);
+    for frame in 1..=WELCOME_ANIMATION_FRAMES + 12 {
+        let now = WELCOME_FRAME_INTERVAL * frame as u32;
+        assert!(idle.tick(now));
+        assert!(busy.tick(now));
+        for column in 0..80 {
+            let moved = MouseEvent {
+                kind: MouseEventKind::Moved,
+                column,
+                row: 12,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(busy.handle_mouse(moved, &mut engine).action.is_none());
+            assert!(!busy.tick(now), "input cannot create animation time");
+        }
+        assert_eq!(idle.frame, frame);
+        assert_eq!(busy.frame, idle.frame);
+        assert_eq!(
+            render_string(&mut busy, 80, 24, &engine),
+            render_string(&mut idle, 80, 24, &engine)
+        );
+        if frame < WELCOME_ANIMATION_FRAMES {
+            assert!(
+                busy.handle_mouse(click(40, 12), &mut engine)
+                    .action
+                    .is_none()
+            );
+            assert!(busy.handle_key(key(KeyCode::Enter), &mut engine).is_none());
+        }
+    }
+    assert!(matches!(
+        busy.handle_mouse(click(40, 12), &mut engine).action,
+        Some(OnboardingShellAction::Transition(
+            OnboardingTransitionKind::Advance,
+            None
+        ))
+    ));
+}
+
+#[test]
+fn welcome_delayed_wakes_cap_catch_up_without_leaving_animation_debt() {
+    let mut shell = shell_at(OnboardingStage::Welcome);
+    // Startup latency before the first service must not skip the fly-in.
+    assert!(!shell.tick(Duration::from_secs(60)));
+    assert_eq!(shell.frame, 0);
+    assert!(shell.tick(Duration::from_secs(120)));
+    assert_eq!(shell.frame, 3);
+    assert!(shell.welcome_is_flying());
+    assert!(!shell.welcome_prompt_visible());
+    for _ in 0..1_000 {
+        assert!(!shell.tick(Duration::from_secs(120)));
+    }
+    assert!(shell.tick(Duration::from_millis(120_100)));
+    assert_eq!(shell.frame, 4);
+}
+
+#[test]
+fn welcome_clock_resets_on_reentry_but_not_an_unchanged_snapshot() {
+    let mut shell = shell_at(OnboardingStage::Welcome);
+    shell.tick(Duration::ZERO);
+    shell.tick(Duration::from_millis(50));
+    assert!(!shell.sync_snapshot(&snapshot(OnboardingStage::Welcome)));
+    assert!(shell.tick(Duration::from_millis(100)));
+    assert_eq!(shell.frame, 1);
+    assert!(shell.sync_snapshot(&snapshot(OnboardingStage::Profile)));
+    assert!(!shell.tick(Duration::from_secs(30)));
+    assert!(!shell.welcome_animation_active());
+    assert!(shell.sync_snapshot(&snapshot(OnboardingStage::Welcome)));
+    assert!(!shell.tick(Duration::from_secs(60)));
+    assert_eq!(shell.frame, 0);
+    assert!(shell.tick(Duration::from_millis(60_100)));
+    assert_eq!(shell.frame, 1);
 }
 
 #[test]

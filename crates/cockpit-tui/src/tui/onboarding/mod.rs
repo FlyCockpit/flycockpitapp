@@ -14,9 +14,10 @@
 //!   transition RPCs. Escape never silently defers: when work is
 //!   discardable it opens a visible Back / Defer / Cancel choice.
 //!
-//! The welcome fly-in is driven by an explicit frame counter advanced from
-//! the app wake loop (`tick`), never by sleeps; the shell reports the
-//! animation as active so the app keeps its animation tick waking the loop,
+//! The welcome fly-in advances from elapsed monotonic time at a 100 ms
+//! frame cadence, independent of how often the app wake loop calls `tick`.
+//! The shell reports the animation as active so the app keeps its animation
+//! tick waking the loop,
 //! and after landing the counter keeps advancing the ambient prop/cloud
 //! motion instead of freezing at the prompt frame. `NO_COLOR`, `TERM=dumb`,
 //! and the `COCKPIT_REDUCE_MOTION` / `REDUCE_MOTION` controls select the
@@ -46,6 +47,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
+use std::time::Duration;
 
 use crate::tui::settings::Dialog;
 use crate::tui::theme::{BAD, BRASS, FOG, GOOD, HOVER_BG, INK, NIGHT};
@@ -90,6 +92,11 @@ pub use secure_store::SecureStoreSubmission;
 
 /// Frame at which the complete fly-in has landed and its prompt is visible.
 pub(crate) const WELCOME_ANIMATION_FRAMES: usize = welcome::PROMPT_FRAME;
+
+/// Shared with the app's animation wake timer so an idle Welcome keeps moving.
+pub(crate) const WELCOME_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+/// Drop excess catch-up after a stall rather than jumping straight to landed.
+const WELCOME_MAX_CATCH_UP_FRAMES: u32 = 3;
 
 /// Ordered progress chrome. Maps daemon bookkeeping stages onto the five
 /// user-visible checkpoints; `Profile` owns its own slot so a failed
@@ -608,10 +615,12 @@ pub struct OnboardingShell {
     limited_mode: bool,
     bootstrap_state: OnboardingBootstrapState,
     reduced_motion: bool,
-    /// Explicit frame counter for the welcome scene; advanced only by
-    /// [`Self::tick`]. Past [`WELCOME_ANIMATION_FRAMES`] it keeps driving
+    /// Welcome scene frame, advanced from elapsed time by [`Self::tick`].
+    /// Past [`WELCOME_ANIMATION_FRAMES`] it keeps driving
     /// the ambient prop bob and cloud drift while the screen is shown.
     frame: usize,
+    welcome_tick_at: Option<Duration>,
+    welcome_tick_remainder: Duration,
     /// Cloud entropy is chosen once per shell and injectable by golden tests.
     welcome_cloud_seed: u64,
     screen: OnboardingScreen,
@@ -657,6 +666,8 @@ impl OnboardingShell {
             bootstrap_state: snapshot.bootstrap_state,
             reduced_motion,
             frame: 0,
+            welcome_tick_at: None,
+            welcome_tick_remainder: Duration::ZERO,
             welcome_cloud_seed: welcome_cloud_seed(),
             screen,
             escape: None,
@@ -894,6 +905,8 @@ impl OnboardingShell {
         self.stage = snapshot.stage;
         self.escape = None;
         self.frame = 0;
+        self.welcome_tick_at = None;
+        self.welcome_tick_remainder = Duration::ZERO;
         self.screen = Self::native_screen_for(snapshot);
         true
     }
@@ -1329,8 +1342,11 @@ impl OnboardingShell {
         self.welcome_cloud_seed = seed;
     }
 
-    /// Advance the welcome scene exactly one frame. Returns whether the
-    /// frame changed (redraw needed).
+    /// Service the shell at the event loop's monotonic clock reading. Welcome
+    /// advances once per elapsed frame interval, retaining fractional time
+    /// across input wakes. The first wake anchors the clock; later stalls
+    /// catch up by at most three frames and discard excess elapsed time.
+    /// Returns whether a redraw is needed.
     ///
     /// The counter never stops while the Welcome screen is shown: the
     /// fly-in itself settles at [`WELCOME_ANIMATION_FRAMES`] (the prompt
@@ -1338,7 +1354,7 @@ impl OnboardingShell {
     /// ambient prop bob and cloud drift so the landed scene never
     /// freezes. Reduced motion never ticks — its static scene is drawn
     /// landed with the prompt from frame 0.
-    pub(crate) fn tick(&mut self) -> bool {
+    pub(crate) fn tick(&mut self, now: Duration) -> bool {
         if let OnboardingScreen::Authenticate(screen) = &mut self.screen {
             screen.tick();
             return true;
@@ -1350,15 +1366,25 @@ impl OnboardingShell {
         if !self.welcome_animation_active() {
             return false;
         }
-        self.frame = self.frame.saturating_add(1);
+        let Some(previous) = self.welcome_tick_at.replace(now) else {
+            return false;
+        };
+        self.welcome_tick_remainder += now
+            .saturating_sub(previous)
+            .min(WELCOME_FRAME_INTERVAL * WELCOME_MAX_CATCH_UP_FRAMES);
+        let frames =
+            (self.welcome_tick_remainder.as_nanos() / WELCOME_FRAME_INTERVAL.as_nanos()) as u32;
+        if frames == 0 {
+            return false;
+        }
+        self.welcome_tick_remainder -= WELCOME_FRAME_INTERVAL * frames;
+        self.frame = self.frame.saturating_add(frames as usize);
         true
     }
 
     /// True while the Welcome screen is animating — the fly-in or the
     /// post-landing ambient motion — and therefore needs the app's
-    /// animation tick to keep waking the loop. Without that tick the
-    /// frame counter only advances on unrelated wakes and the fly-in
-    /// strands at frame 0.
+    /// animation tick to keep waking the loop even without user input.
     pub(crate) fn welcome_animation_active(&self) -> bool {
         matches!(self.screen, OnboardingScreen::Welcome) && !self.reduced_motion
     }

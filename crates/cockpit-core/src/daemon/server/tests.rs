@@ -48097,6 +48097,154 @@ async fn ux4_final_promotion_rejection_and_fresh_retry_keep_no_saved_rows() {
 }
 
 #[tokio::test]
+async fn ux4_acp_create_replay_catalog_rejection_preserves_saved_identity() {
+    let (_env, _tmp, mut ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    ux4_configure_late_create(&mut ctx, &workspace).await;
+    let Request::CreateCodeRootV1(base) = proto::create_code_root_v1_request(
+        workspace.to_string_lossy().into_owned(),
+        None,
+        false,
+        true,
+        None,
+        None,
+        EnvDriftPolicy::Daemon,
+    ) else {
+        panic!("first-party Code create constructor");
+    };
+    let mut ingress = crate::daemon::acp_catalog_composition::empty_ingress_for_test(
+        "ux4-acp-editor",
+        "ux4-acp-ingress",
+    );
+    ingress
+        .declarations
+        .push(proto::AcpForwardedMcpDeclarationV1 {
+            name: "ux4-docs".into(),
+            transport: proto::AcpForwardedMcpTransportV1::Http {
+                url: "https://127.0.0.1:9/mcp".into(),
+                headers: Vec::new(),
+            },
+        });
+    let create = |ingress| {
+        Request::CreateCodeRootWithAcpIngressV1(proto::CreateCodeRootWithAcpIngressV1Request {
+            base: base.clone(),
+            ingress,
+        })
+    };
+    let Response::CodeRootWithAcpIngressCreated(created) =
+        handle_request(create(ingress.clone()), &mut state, &ctx)
+            .await
+            .expect("save a root with a nonempty forwarded catalog")
+    else {
+        panic!("composed create response");
+    };
+    let id = created.base.root.root_id.0;
+    let before = ctx.db.get_session(id).await.unwrap().unwrap();
+    assert!(!before.ephemeral && before.archived_at_unix_ms.is_none());
+    let slot = state.attached.as_ref().unwrap().handle.forwarded_mcp_slot();
+    let epoch = slot
+        .active()
+        .expect("the successful create bound its catalog");
+
+    // Retire through the real shutdown queue while retaining the connection
+    // and receipt. This also keeps the unrelated test-only 50 ms destructive
+    // stop deadline out of the archival fault's discrimination.
+    ux4_settle_created_workers(&ctx).await;
+    assert!(state.attached.as_ref().unwrap().handle.is_closed());
+
+    // Both an empty ingress and a different nonempty catalog pass validation
+    // but conflict with the saved root's catalog at the real bind boundary.
+    let mut changed = ingress.declarations.clone();
+    changed[0].name = "ux4-other-docs".into();
+    for (index, declarations) in [Vec::new(), changed].into_iter().enumerate() {
+        let mut rejected = ingress.clone();
+        rejected.declarations = declarations;
+        rejected.ingress_request_id =
+            proto::OpaqueAsciiId128V1::new(format!("ux4-acp-rejection-{index}")).unwrap();
+        let error = handle_request(create(rejected), &mut state, &ctx)
+            .await
+            .expect_err("conflicting saved-create replay must be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidIngress, "{error:?}");
+        assert!(
+            error.message.contains("acp_mcp_catalog_conflict"),
+            "{error:?}"
+        );
+        let saved = ctx
+            .db
+            .get_session(id)
+            .await
+            .unwrap()
+            .expect("saved row remains");
+        assert!(
+            !saved.ephemeral,
+            "the original successful create is durable"
+        );
+        assert_eq!(
+            saved.archived_at_unix_ms, before.archived_at_unix_ms,
+            "a rejected create replay must not archive an already-saved identity"
+        );
+        let Response::Sessions { sessions } = handle_request(
+            Request::ListSessions {
+                project_id: None,
+                parent_session_id: None,
+                assistant_id: None,
+                compaction_lineage_root_id: None,
+                include_archived: false,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .unwrap() else {
+            panic!("normal saved-session list response");
+        };
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.session_id)
+                .collect::<Vec<_>>(),
+            [id],
+            "the saved conversation remains in the ordinary session list"
+        );
+        assert!(
+            !epoch.is_released(),
+            "rejection must spare the existing catalog"
+        );
+        assert!(Arc::ptr_eq(&slot.active().unwrap(), &epoch));
+        assert!(state.pending_acp_catalog_composition.is_none());
+    }
+
+    let Response::CodeRootWithAcpIngressCreated(replayed) =
+        handle_request(create(ingress), &mut state, &ctx)
+            .await
+            .expect("matching ingress can still replay the saved create")
+    else {
+        panic!("composed replay response");
+    };
+    assert_eq!(replayed.base.root.root_id, created.base.root.root_id);
+    assert_ne!(
+        replayed.base.attachment.attachment_capability,
+        created.base.attachment.attachment_capability,
+        "successful replay reissues attachment authority"
+    );
+    assert!(
+        crate::sync::lock_or_recover(&ctx.code_root_authority)
+            .authenticate(&replayed.base.attachment.attachment_capability)
+            .is_ok()
+    );
+    assert_eq!(ctx.db.list_sessions(false, 100).await.unwrap().len(), 1);
+    assert!(
+        ctx.db
+            .get_session(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at_unix_ms
+            .is_none()
+    );
+    ux4_settle_created_workers(&ctx).await;
+}
+
+#[tokio::test]
 async fn ux4_cancelled_provisional_create_settles_worker_before_parent_cleanup() {
     let (_env, _tmp, mut ctx, _state, workspace) = fresh_untrusted_workspace().await;
     ux4_configure_late_create(&mut ctx, &workspace).await;

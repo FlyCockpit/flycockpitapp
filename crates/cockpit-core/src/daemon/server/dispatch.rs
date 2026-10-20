@@ -6147,11 +6147,9 @@ async fn dispatch_image_control_read(
     Ok(Response::ImageControlRead(response))
 }
 
-/// Bind the catalog after the base primitive has durably produced its root and
-/// attachment, but before that primitive records its idempotency receipt or
-/// returns the capability.  The receipt is the publication boundary: a
-/// concurrent retry/discovery consumer cannot obtain this attachment before
-/// the root worker has the matching effective catalog.
+/// Bind the catalog before returning the operation's attachment capability.
+/// Fresh creates bind before committing their root and idempotency receipt;
+/// replays bind a reissued capability for an already-saved root.
 fn bind_pending_acp_catalog_before_code_root_publication(
     state: &mut MutableClientState,
     root_id: uuid::Uuid,
@@ -6161,7 +6159,6 @@ fn bind_pending_acp_catalog_before_code_root_publication(
         let Some(pending) = state.pending_acp_catalog_composition.as_mut() else {
             return Ok(());
         };
-        pending.root_id = Some(root_id);
         pending.attachment = Some(attachment.clone());
         (
             pending.service.clone(),
@@ -6182,15 +6179,13 @@ fn bind_pending_acp_catalog_before_code_root_publication(
     service.bind_catalog(root_id, attachment, &cwd, &ingress, slot)
 }
 
-/// Compensation is intentionally outside the base primitive: its binding
-/// failure is observed before the base receipt/response publication, while
-/// the normal close/archive funnels retain ownership of attachment and root
-/// cleanup.  The stored capability is only internal composition state and is
-/// never serialized to the ACP caller on this failure path.
+/// Release only the attachment issued during this composition. A create can
+/// replay a saved root, so the wrapper never owns root cleanup. Fresh roots
+/// remain owned by the base primitive's staging guard through finalization.
+/// The stored capability is never serialized to the ACP caller on failure.
 async fn rollback_acp_catalog_composition_failure(
     error: ErrorPayload,
     pending: PendingAcpCatalogCompositionV1,
-    archive_root: bool,
     request_id: uuid::Uuid,
     state: &mut MutableClientState,
     shared: &Arc<SharedClientState>,
@@ -6215,33 +6210,12 @@ async fn rollback_acp_catalog_composition_failure(
         remote_operation,
     ))
     .await;
-    let root_rollback = if archive_root {
-        match pending.root_id {
-            Some(root_id) => super::sessions::archive_session(ctx, root_id, true)
-                .await
-                .map(|_| ()),
-            None => Ok(()),
-        }
-    } else {
-        Ok(())
-    };
-    match (close, root_rollback) {
-        (Ok(_), Ok(_)) => error,
-        (Err(attachment_error), Ok(_)) => internal(anyhow::anyhow!(
+    match close {
+        Ok(_) => error,
+        Err(attachment_error) => internal(anyhow::anyhow!(
             "ACP catalog composition failed ({}) and attachment rollback failed ({})",
             error.message,
             attachment_error.message,
-        )),
-        (Ok(_), Err(root_error)) => internal(anyhow::anyhow!(
-            "ACP catalog create composition failed ({}) and root rollback failed ({})",
-            error.message,
-            root_error.message,
-        )),
-        (Err(attachment_error), Err(root_error)) => internal(anyhow::anyhow!(
-            "ACP catalog create composition failed ({}) and attachment rollback failed ({}) and root rollback failed ({})",
-            error.message,
-            attachment_error.message,
-            root_error.message,
         )),
     }
 }
@@ -6945,7 +6919,6 @@ async fn handle_serialized_request_inner(
                 service: service.clone(),
                 cwd,
                 ingress: request.ingress.clone(),
-                root_id: None,
                 attachment: None,
             });
             let base_response = Box::pin(handle_serialized_request_inner(
@@ -6969,7 +6942,6 @@ async fn handle_serialized_request_inner(
                     return Err(rollback_acp_catalog_composition_failure(
                         error,
                         pending,
-                        true,
                         request_id,
                         state,
                         shared,
@@ -7020,7 +6992,6 @@ async fn handle_serialized_request_inner(
                 service: service.clone(),
                 cwd,
                 ingress: request.ingress.clone(),
-                root_id: None,
                 attachment: None,
             });
             let base_response = Box::pin(handle_serialized_request_inner(
@@ -7044,7 +7015,6 @@ async fn handle_serialized_request_inner(
                     return Err(rollback_acp_catalog_composition_failure(
                         error,
                         pending,
-                        false,
                         request_id,
                         state,
                         shared,
@@ -7311,11 +7281,10 @@ async fn handle_serialized_request_inner(
                         }
                         crate::sync::lock_or_recover(&ctx.code_root_authority)
                             .forget_unpublished_root(proto::CodeRootIdV1(root_id));
-                        if let Some(pending) = state.pending_acp_catalog_composition.as_mut() {
-                            if let Some(attachment) = pending.attachment.take() {
-                                pending.service.release_catalog(root_id, &attachment);
-                            }
-                            pending.root_id = None;
+                        if let Some(pending) = state.pending_acp_catalog_composition.as_mut()
+                            && let Some(attachment) = pending.attachment.take()
+                        {
+                            pending.service.release_catalog(root_id, &attachment);
                         }
                         if let Err(cleanup) = staging.rollback().await {
                             return Err(internal(anyhow::anyhow!(

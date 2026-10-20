@@ -23,17 +23,15 @@ pub(crate) fn empty_ingress_for_test(
 }
 
 /// Composition-only state carried while a public ACP route delegates to a
-/// base Code-root primitive. The base primitive consumes this immediately
-/// before it records its attachment/idempotency receipt, so neither the
-/// attachment capability nor the response is published without its catalog.
+/// base Code-root primitive. The primitive records its issued capability here
+/// before catalog binding, so the wrapper can close it if composition fails.
 pub(crate) struct PendingAcpCatalogCompositionV1 {
     pub(crate) service: std::sync::Arc<dyn AcpCatalogCompositionServiceV1>,
     pub(crate) cwd: std::path::PathBuf,
     pub(crate) ingress: proto::AcpForwardedMcpIngressV1,
-    /// Set only after base root/attachment persistence has produced the
-    /// capability that the memory-only binding owns. The composed wrapper
-    /// uses these facts to roll back if binding or later publication fails.
-    pub(crate) root_id: Option<uuid::Uuid>,
+    /// The capability issued by this operation. The composed wrapper may
+    /// close it on failure, but owns no root: create may replay a saved root,
+    /// and fresh-root rollback belongs to the base primitive's staging guard.
     pub(crate) attachment: Option<proto::CodeRootAttachmentCapabilityV1>,
 }
 

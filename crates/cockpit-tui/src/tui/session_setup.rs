@@ -7,14 +7,17 @@
 //!
 //! The pane is used as a full-body overlay (`/session-setup`) and as an inline
 //! panel below the banner on a fresh session. Mutations are emitted as
-//! [`SessionSetupOutcome`] values; the app owns daemon RPCs.
+//! [`SessionSetupOutcome`] values; the app owns daemon RPCs. Errors wrap at
+//! the presentation width: the overlay shows scroll controls only when wrapped
+//! error rows overflow, while inline errors contribute every wrapped row to the
+//! containing chat scroll buffer.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use crate::tui::textfield::TextField;
 use cockpit_core::agents::{ToolSurfaceSelection, ToolTier};
@@ -117,6 +120,11 @@ pub(crate) struct SessionSetupPane {
     /// snapshot fills `tool_order`.
     tool_order_agent: Option<String>,
     interaction: Interaction,
+    /// Overlay error viewport, measured in wrapped visual rows. The inline
+    /// presentation uses the containing chat scroll buffer instead.
+    error_scroll: usize,
+    error_max_scroll: usize,
+    error_page: usize,
 }
 
 /// One rendered line, pre-classified so colour is purely supplementary and the
@@ -257,6 +265,9 @@ impl SessionSetupPane {
             tool_order: Vec::new(),
             tool_order_agent: None,
             interaction: Interaction::List,
+            error_scroll: 0,
+            error_max_scroll: 0,
+            error_page: 1,
         }
     }
 
@@ -314,6 +325,9 @@ impl SessionSetupPane {
     /// Record a fixed, daemon-independent error message.
     pub(crate) fn set_error(&mut self, message: impl Into<String>) {
         self.status = Status::Error(message.into());
+        self.interaction = Interaction::List;
+        self.error_scroll = 0;
+        self.error_max_scroll = 0;
     }
 
     pub(crate) fn set_notice(&mut self, message: impl Into<String>) {
@@ -564,6 +578,28 @@ impl SessionSetupPane {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> SessionSetupOutcome {
+        if matches!(self.status, Status::Error(_)) {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => return SessionSetupOutcome::Close,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.error_scroll = self.error_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.error_scroll = self.error_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.error_scroll = self.error_scroll.saturating_sub(self.error_page);
+                }
+                KeyCode::PageDown => {
+                    self.error_scroll = self.error_scroll.saturating_add(self.error_page);
+                }
+                KeyCode::Home => self.error_scroll = 0,
+                KeyCode::End => self.error_scroll = self.error_max_scroll,
+                _ => {}
+            }
+            self.error_scroll = self.error_scroll.min(self.error_max_scroll);
+            return SessionSetupOutcome::Stay;
+        }
         if let Interaction::ConfirmToolChange {
             snapshot,
             override_json,
@@ -844,25 +880,64 @@ impl SessionSetupPane {
         } else {
             " Session setup "
         };
-        let block = crate::tui::chrome::rounded_block(title, true);
+        let mut block = crate::tui::chrome::rounded_block(title, true);
         let inner = block.inner(area);
+
+        if matches!(self.status, Status::Error(_)) {
+            // Match the List's historical highlight-symbol padding. Measure
+            // before reserving a scrollbar so fitting errors keep that layout.
+            let padding = inner.width.min(2);
+            let mut content = Rect {
+                x: inner.x + padding,
+                width: inner.width - padding,
+                ..inner
+            };
+            let mut lines = self.error_lines(content.width);
+            let overflows = lines.len() > usize::from(content.height);
+            if overflows {
+                content = crate::tui::chrome::scrollbar_content(content);
+                lines = self.error_lines(content.width);
+                if !self.inline {
+                    block = crate::tui::chrome::rounded_block(
+                        " Session setup (↑/↓, PgUp/PgDn: scroll) ",
+                        true,
+                    );
+                }
+            }
+            frame.render_widget(block, area);
+            let total = lines.len();
+            self.error_page = usize::from(content.height).saturating_sub(1).max(1);
+            self.error_max_scroll = total.saturating_sub(usize::from(content.height));
+            self.error_scroll = self.error_scroll.min(self.error_max_scroll);
+            frame.render_widget(
+                Paragraph::new(
+                    lines
+                        .into_iter()
+                        .skip(self.error_scroll)
+                        .take(usize::from(content.height))
+                        .collect::<Vec<_>>(),
+                ),
+                content,
+            );
+            if overflows {
+                crate::tui::chrome::scrollbar(
+                    frame,
+                    inner,
+                    total,
+                    usize::from(content.height),
+                    self.error_scroll,
+                );
+            }
+            return;
+        }
         frame.render_widget(block, area);
 
         let mut lines: Vec<Line<'static>> = if !matches!(self.interaction, Interaction::List) {
-            self.inline_lines()
+            self.inline_lines(inner.width.saturating_sub(2))
         } else {
             match &self.status {
                 Status::Loading => vec![Line::from(Span::raw("Loading session setup…"))],
-                Status::Error(message) => message
-                    .lines()
-                    .map(|line| {
-                        Line::from(styled(
-                            line.to_string(),
-                            RowKind::CandidateLocked,
-                            self.color,
-                        ))
-                    })
-                    .collect(),
+                Status::Error(_) => unreachable!("error viewport rendered above"),
                 Status::Ready => self
                     .rows
                     .iter()
@@ -886,13 +961,18 @@ impl SessionSetupPane {
     }
 
     /// Lines for the inline panel (no outer overlay chrome). Used by the
-    /// session-view renderer so the panel sits below the banner box.
-    pub(crate) fn inline_lines(&self) -> Vec<Line<'static>> {
+    /// session-view renderer so the panel sits below the banner box. Errors
+    /// are wrapped here so chat counts and scrolls every visual row.
+    pub(crate) fn inline_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = vec![Line::from(styled(
             "Session setup".to_string(),
             RowKind::CandidateSelected,
             self.color,
         ))];
+        if matches!(self.status, Status::Error(_)) {
+            lines.extend(self.error_lines(width));
+            return lines;
+        }
         if let Some(notice) = &self.notice {
             lines.push(Line::from(styled(
                 notice.clone(),
@@ -902,15 +982,7 @@ impl SessionSetupPane {
         }
         match &self.status {
             Status::Loading => lines.push(Line::from(Span::raw("Loading session setup…"))),
-            Status::Error(message) => {
-                for line in message.lines() {
-                    lines.push(Line::from(styled(
-                        line.to_string(),
-                        RowKind::CandidateLocked,
-                        self.color,
-                    )));
-                }
-            }
+            Status::Error(_) => unreachable!("error rows appended above"),
             Status::Ready => {
                 for row in self.inline_visible_rows() {
                     lines.push(Line::from(styled(row.text.clone(), row.kind, self.color)));
@@ -1029,6 +1101,25 @@ impl SessionSetupPane {
             self.color,
         )));
         lines
+    }
+
+    fn error_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let message = self.error_message().unwrap_or_default();
+        let lines = self
+            .notice
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(message))
+            .flat_map(str::lines)
+            .map(|line| {
+                Line::from(styled(
+                    line.to_string(),
+                    RowKind::CandidateLocked,
+                    self.color,
+                ))
+            })
+            .collect();
+        crate::tui::message_block::wrap_lines_to_width(lines, usize::from(width).max(1)).0
     }
 
     fn inline_visible_rows(&self) -> Vec<&DisplayRow> {
@@ -1835,6 +1926,35 @@ mod tests {
     }
 
     #[test]
+    fn modes_session_setup_error_does_not_activate_stale_rows_and_ready_recovers() {
+        let snap = snapshot(vec![candidate(
+            "authored/reviewer",
+            Global,
+            false,
+            Vec::new(),
+            None,
+        )]);
+        let mut pane = SessionSetupPane::loading(false);
+        pane.apply_snapshot(snap.clone());
+        pane.set_error("Attach failed. Fix the model and retry.");
+        assert_eq!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::Stay
+        );
+        pane.apply_snapshot(snap);
+        assert_eq!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::Stay
+        );
+        assert_eq!(
+            pane.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::SelectAgent {
+                name: "reviewer".into()
+            }
+        );
+    }
+
+    #[test]
     fn modes_session_setup_enter_on_locked_agent_stays_with_notice() {
         let snap = snapshot(vec![candidate(
             "authored/reviewer",
@@ -1883,7 +2003,7 @@ mod tests {
         let inline = SessionSetupPane::loading_inline(false);
         assert!(inline.is_inline());
         assert!(!SessionSetupPane::loading(false).is_inline());
-        let lines = inline.inline_lines();
+        let lines = inline.inline_lines(80);
         assert!(
             lines
                 .iter()
@@ -1897,13 +2017,96 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal
             .draw(|frame| {
-                let lines = pane.inline_lines();
+                let lines = pane.inline_lines(width);
                 let para = ratatui::widgets::Paragraph::new(lines);
                 frame.render_widget(para, frame.area());
             })
             .expect("draw");
         terminal.backend().buffer().area().width;
         format!("{:?}", terminal.backend().buffer())
+    }
+
+    fn render_overlay_rows(pane: &mut SessionSetupPane, width: u16, height: u16) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn modes_session_setup_overlay_fitting_states_keep_title_and_padding() {
+        for width in [80, 120] {
+            for color in [false, true] {
+                let mut pane = SessionSetupPane::loading(color);
+                let loading = render_overlay_rows(&mut pane, width, 24);
+                assert!(loading[0].contains(" Session setup "));
+                assert!(!loading[0].contains("scroll"));
+                assert!(loading[1].starts_with("│  Loading session setup…"));
+
+                pane.apply_snapshot(snapshot(vec![]));
+                let ready = render_overlay_rows(&mut pane, width, 24);
+                assert!(ready[0].contains(" Session setup "));
+                assert!(!ready[0].contains("scroll"));
+
+                pane.set_error("Daemon stopped; choose Restart or Quit.");
+                let stopped = render_overlay_rows(&mut pane, width, 24);
+                assert!(stopped[0].contains(" Session setup "));
+                assert!(!stopped[0].contains("scroll"));
+                assert!(stopped[1].starts_with("│  Daemon stopped; choose Restart or Quit."));
+                assert_eq!(pane.error_max_scroll, 0);
+                pane.handle_key(press(KeyCode::End));
+                assert_eq!(render_overlay_rows(&mut pane, width, 24), stopped);
+            }
+        }
+    }
+
+    #[test]
+    fn modes_session_setup_overlay_error_wrap_scroll_chrome_tracks_overflow() {
+        for width in [80, 120] {
+            for color in [false, true] {
+                let mut pane = SessionSetupPane::loading(color);
+                // Exactly one padded row fits, including the last column:
+                // fitting errors must not reserve a scrollbar gutter.
+                let fitting = "e".repeat(usize::from(width - 4));
+                pane.set_error(&fitting);
+                let screen = render_overlay_rows(&mut pane, width, 3);
+                assert!(!screen[0].contains("scroll"));
+                assert_eq!(screen[1], format!("│  {fitting}│"));
+                assert_eq!(pane.error_max_scroll, 0);
+
+                let overflowing = format!("{fitting}e");
+                pane.set_error(&overflowing);
+                let screen = render_overlay_rows(&mut pane, width, 3);
+                assert!(screen[0].contains("Session setup (↑/↓, PgUp/PgDn: scroll)"));
+                assert_eq!(pane.error_max_scroll, 1);
+                pane.handle_key(press(KeyCode::End));
+                let tail = render_overlay_rows(&mut pane, width, 3);
+                assert!(tail[1].starts_with("│  ee"), "{tail:?}");
+                assert_eq!(pane.error_scroll, 1);
+
+                // Ready can itself have more rows than the viewport; Error's
+                // scroll title and old offset must not leak into that state.
+                pane.apply_snapshot(snapshot(vec![]));
+                let ready = render_overlay_rows(&mut pane, width, 3);
+                assert!(!ready[0].contains("scroll"));
+
+                pane.set_error(&overflowing);
+                let screen = render_overlay_rows(&mut pane, width, 3);
+                assert!(screen[0].contains("scroll"));
+                pane.handle_key(press(KeyCode::End));
+                let resized = render_overlay_rows(&mut pane, width, 4);
+                assert!(!resized[0].contains("scroll"));
+                assert_eq!(resized[1], format!("│  {fitting}│"));
+                assert!(resized[2].starts_with("│  e "));
+                assert_eq!(pane.error_scroll, 0);
+                assert_eq!(pane.error_max_scroll, 0);
+            }
+        }
     }
 
     #[test]
@@ -1940,9 +2143,9 @@ mod tests {
         let mut pane = SessionSetupPane::loading_inline(false);
         pane.apply_snapshot(snap);
         pane.handle_key(press(KeyCode::Down));
-        let before = pane.inline_lines();
+        let before = pane.inline_lines(80);
         // Collapse is presentation-only on App; the pane snapshot stays.
-        let after = pane.inline_lines();
+        let after = pane.inline_lines(80);
         assert_eq!(
             before, after,
             "pending applied snapshot must survive collapse"
@@ -2187,7 +2390,7 @@ mod tests {
             SessionSetupOutcome::Stay
         );
         assert!(
-            pane.inline_lines()
+            pane.inline_lines(80)
                 .iter()
                 .any(|line| line.to_string().contains("will break prompt cache"))
         );
@@ -2258,7 +2461,7 @@ mod tests {
             SessionSetupOutcome::Stay
         );
         assert!(
-            pane.inline_lines()
+            pane.inline_lines(80)
                 .iter()
                 .any(|line| line.to_string().contains("will break prompt cache"))
         );
@@ -2442,7 +2645,7 @@ mod tests {
             }
             other => panic!("expected AddMcp, got {other:?}"),
         }
-        let collapsed = pane.inline_lines();
+        let collapsed = pane.inline_lines(80);
         assert!(
             collapsed
                 .iter()

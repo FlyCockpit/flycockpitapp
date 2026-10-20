@@ -758,7 +758,8 @@ pub fn resolve_agent_profile(
         );
         ensure!(
             offering_is_compatible(slot, &offering, input.providers),
-            "slot `{slot_id}` default binding no longer satisfies hard model requirements"
+            "{}",
+            incompatible_offering_message(slot_id, slot, &offering, input.providers)
         );
         if !slot.models.is_empty() {
             ensure!(
@@ -994,6 +995,14 @@ fn offering_is_compatible(
     offering: &AgentProfileModelOffering,
     providers: &ProvidersConfig,
 ) -> bool {
+    let (location, capabilities) = offering_capabilities(offering, providers);
+    hard_requirements_satisfied(slot, location, &capabilities)
+}
+
+fn offering_capabilities(
+    offering: &AgentProfileModelOffering,
+    providers: &ProvidersConfig,
+) -> (Option<ModelLocation>, EffectiveModelCapabilities) {
     // Older catalog callers carry a provider-id key only, while daemon-owned
     // installation choices carry a credential-owning profile handle as well.
     // Prefer the latter when it is an installed local route; falling back to
@@ -1012,11 +1021,100 @@ fn offering_is_compatible(
         &offering.model_id,
         providers.resolution_generation,
     );
-    hard_requirements_satisfied(
-        slot,
+    (
         providers.resolve_location(capability_key, &offering.model_id),
-        &capabilities,
+        capabilities,
     )
+}
+
+fn incompatible_offering_message(
+    slot_id: &str,
+    slot: &ModelSlot,
+    offering: &AgentProfileModelOffering,
+    providers: &ProvidersConfig,
+) -> String {
+    let (location, capabilities) = offering_capabilities(offering, providers);
+    let mut failures = Vec::new();
+    let required_locality = match slot.locality {
+        ModelLocality::Any => None,
+        ModelLocality::Local if location != Some(ModelLocation::Local) => Some("local"),
+        ModelLocality::Remote
+            if !matches!(
+                location,
+                Some(ModelLocation::Remote | ModelLocation::PrivateRemote)
+            ) =>
+        {
+            Some("remote")
+        }
+        ModelLocality::Local | ModelLocality::Remote => None,
+    };
+    if let Some(required) = required_locality {
+        let actual = match location {
+            None => "unknown",
+            Some(ModelLocation::Local) => "local",
+            Some(ModelLocation::Remote) => "remote",
+            Some(ModelLocation::PrivateRemote) => "private remote",
+        };
+        failures.push(format!("Locality: {actual}; requires {required}"));
+    }
+    match capabilities.context_tokens {
+        None => failures.push(format!(
+            "Context tokens: unknown; requires at least {} (minContextTokens)",
+            slot.min_context_tokens
+        )),
+        Some(actual) if actual < slot.min_context_tokens.try_into().unwrap_or(u32::MAX) => {
+            failures.push(format!(
+                "Context tokens: {actual}; requires at least {} (minContextTokens)",
+                slot.min_context_tokens
+            ));
+        }
+        Some(_) => {}
+    }
+    for required in &slot.required_capabilities {
+        let (label, status) = match required {
+            ModelCapability::TextGeneration => continue,
+            ModelCapability::ToolCalling => ("Tool calling", capabilities.tool_calling),
+            ModelCapability::Vision => ("Vision", capabilities.image_input.status),
+            ModelCapability::JsonSchema => ("JSON schema", capabilities.structured_outputs),
+            ModelCapability::ComputerUse => {
+                if !capabilities
+                    .computer_use
+                    .as_ref()
+                    .is_some_and(|computer_use| computer_use.contract.is_some())
+                {
+                    failures.push("Computer-use: required but no host-issued contract".into());
+                }
+                continue;
+            }
+        };
+        let actual = match status {
+            CapabilityStatus::Supported => continue,
+            CapabilityStatus::Unknown => "unknown",
+            CapabilityStatus::Unsupported => "unsupported",
+            CapabilityStatus::RequiresEntitlement => "requires entitlement",
+        };
+        failures.push(format!("{label}: {actual}; requires Supported"));
+    }
+    let mut message = format!(
+        "slot `{slot_id}` default binding cannot satisfy hard model requirements: {}. \
+         OpenAI-compatible local servers (LM Studio, Ollama) often do not advertise these capabilities. \
+         In /settings → Providers → this model, set Locality, Context tokens, and Tool calling only when they are true. ",
+        failures.join("; ")
+    );
+    if slot.locality == ModelLocality::Remote
+        && slot
+            .required_capabilities
+            .contains(&ModelCapability::ComputerUse)
+    {
+        message.push_str(
+            "Frontier Coding requires remote plus a computer-use contract; \
+             /settings on a local LM Studio model cannot satisfy that. \
+             Switch in /settings → Agents or /agent to a local coding agent that does not require remote or computer-use, \
+             or pick a remote tools-capable model with a host-issued computer-use contract. ",
+        );
+    }
+    message.push_str("Then send again.");
+    message
 }
 
 pub(crate) fn prepared_route_is_compatible(
@@ -2728,6 +2826,170 @@ mod tests {
             !hard_requirements_satisfied(&tool_slot, None, &caps),
             "unknown locality and capability evidence must not satisfy a hard requirement"
         );
+    }
+
+    #[test]
+    fn agent_profile_resolution_hard_requirement_diagnostic_and_compatible_inverse() {
+        let resolve = |locality,
+                       location,
+                       context_tokens,
+                       tool_calling,
+                       computer_use: Option<ComputerUseCapability>| {
+            let mut definition = definition("");
+            let slot = definition
+                .vnext
+                .as_mut()
+                .expect("vNext definition")
+                .model_slots
+                .get_mut("primary")
+                .expect("primary slot");
+            slot.min_context_tokens = 32768;
+            slot.locality = locality;
+            slot.required_capabilities = vec![
+                ModelCapability::ComputerUse,
+                ModelCapability::TextGeneration,
+                ModelCapability::ToolCalling,
+            ];
+            let (catalog, installation_id, digest) = catalog(definition);
+            let mut providers = providers();
+            let model = &mut providers
+                .providers
+                .get_mut("provider")
+                .expect("provider")
+                .models[0];
+            model.context_length = context_tokens;
+            model.location = location;
+            model.capabilities.tool_calling = tool_calling;
+            model.capabilities.computer_use = computer_use.unwrap_or_default();
+            resolve_agent_profile(AgentProfileResolutionInput {
+                installation_id,
+                catalog: &catalog,
+                bindings: vec![binding(installation_id, digest, "model-a")],
+                offerings: vec![offering("model-a")],
+                utility_fallbacks: BTreeMap::new(),
+                providers: &providers,
+                host_policy: VnextHostPolicy::default(),
+                question_override: ProfileQuestionOverride::Inherit,
+                verification_reductions: BTreeMap::new(),
+            })
+        };
+        let contract = Some(ComputerUseCapability {
+            contract: Some(ComputerUseContract::OpenAiResponses),
+            source: None,
+        });
+        let unknown = resolve(
+            ModelLocality::Remote,
+            None,
+            None,
+            CapabilityStatus::Unknown,
+            None,
+        )
+        .expect_err("unknown capabilities must still prevent attach")
+        .to_string();
+        assert_eq!(
+            unknown
+                .split_once(". OpenAI-compatible")
+                .expect("guidance")
+                .0,
+            "slot `primary` default binding cannot satisfy hard model requirements: \
+             Locality: unknown; requires remote; \
+             Context tokens: unknown; requires at least 32768 (minContextTokens); \
+             Computer-use: required but no host-issued contract; \
+             Tool calling: unknown; requires Supported"
+        );
+        for guidance in [
+            "OpenAI-compatible local servers (LM Studio, Ollama) often do not advertise these capabilities",
+            "/settings → Providers → this model, set Locality, Context tokens, and Tool calling only when they are true",
+            "Frontier Coding requires remote plus a computer-use contract",
+            "/settings on a local LM Studio model cannot satisfy that",
+            "/settings → Agents or /agent to a local coding agent that does not require remote or computer-use",
+            "remote tools-capable model with a host-issued computer-use contract",
+        ] {
+            assert!(
+                unknown.contains(guidance),
+                "missing guidance: {guidance}: {unknown}"
+            );
+        }
+        assert!(unknown.ends_with("Then send again."));
+        // The TUI renders this same fixture through both setup-pane surfaces.
+        assert_eq!(
+            include_str!("../../tests/fixtures/attach-hard-requirements.txt").trim_end(),
+            format!(
+                "Could not start a session — attach: daemon error: internal: preparing fresh installed-root launch: {unknown}"
+            )
+        );
+
+        for (required_locality, location, context, tools, computer, expected) in [
+            (
+                ModelLocality::Remote,
+                Some(ModelLocation::Local),
+                Some(16384),
+                CapabilityStatus::Unsupported,
+                Some(ComputerUseCapability::default()),
+                "Locality: local; requires remote; Context tokens: 16384; requires at least 32768 (minContextTokens); Computer-use: required but no host-issued contract; Tool calling: unsupported; requires Supported",
+            ),
+            (
+                ModelLocality::Local,
+                Some(ModelLocation::Remote),
+                Some(32768),
+                CapabilityStatus::Supported,
+                contract.clone(),
+                "Locality: remote; requires local",
+            ),
+            (
+                ModelLocality::Local,
+                Some(ModelLocation::PrivateRemote),
+                Some(32768),
+                CapabilityStatus::Supported,
+                contract.clone(),
+                "Locality: private remote; requires local",
+            ),
+            (
+                ModelLocality::Local,
+                None,
+                Some(32768),
+                CapabilityStatus::Supported,
+                contract.clone(),
+                "Locality: unknown; requires local",
+            ),
+            (
+                ModelLocality::Any,
+                None,
+                Some(32768),
+                CapabilityStatus::RequiresEntitlement,
+                contract.clone(),
+                "Tool calling: requires entitlement; requires Supported",
+            ),
+        ] {
+            let message = resolve(required_locality, location, context, tools, computer)
+                .expect_err("incompatible offering must still prevent attach")
+                .to_string();
+            assert_eq!(
+                message
+                    .split_once(". OpenAI-compatible")
+                    .expect("guidance")
+                    .0,
+                format!(
+                    "slot `primary` default binding cannot satisfy hard model requirements: {expected}"
+                )
+            );
+        }
+        for (required_locality, location) in [
+            (ModelLocality::Any, None),
+            (ModelLocality::Local, Some(ModelLocation::Local)),
+            (ModelLocality::Remote, Some(ModelLocation::Remote)),
+            (ModelLocality::Remote, Some(ModelLocation::PrivateRemote)),
+        ] {
+            let profile = resolve(
+                required_locality,
+                location,
+                Some(32768),
+                CapabilityStatus::Supported,
+                contract.clone(),
+            )
+            .expect("a compatible offering resolves without an incompatibility diagnostic");
+            assert_eq!(profile.slots["primary"].choice.offering.model_id, "model-a");
+        }
     }
 
     #[test]

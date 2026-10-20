@@ -2487,6 +2487,14 @@ impl App {
             self.chat_scroll_anchor = None;
             return;
         }
+        if self.chat_geometry().total_rows() == 0 && banner_rows > 0 {
+            // A fresh session can overflow using only the banner/setup rows.
+            // There is no history entry to anchor to yet; retain the user's
+            // visual-row offset instead of snapping back to the tail.
+            self.chat_scroll_anchor = None;
+            self.chat_scroll_offset = self.chat_scroll_offset.min(total.saturating_sub(visible));
+            return;
+        }
         if self.chat_scroll_anchor.is_none() && self.chat_scroll_offset > 0 {
             self.capture_chat_scroll_anchor_from_current_offset();
         }
@@ -2528,7 +2536,9 @@ impl App {
         let geometry = self.chat_geometry().clone();
         self.chat_scroll_anchor =
             self.anchor_for_visible_top(&geometry, visible_full_start, self.chat_banner_lines);
-        if self.chat_scroll_anchor.is_none() {
+        if self.chat_scroll_anchor.is_none()
+            && !(geometry.total_rows() == 0 && self.chat_banner_lines > 0)
+        {
             self.pin_chat_to_tail();
         } else {
             self.chat_pinned_to_tail = false;
@@ -3136,7 +3146,7 @@ impl App {
                 if !box_lines.is_empty() {
                     box_lines.push(Line::default());
                 }
-                box_lines.extend(pane.inline_lines());
+                box_lines.extend(pane.inline_lines(area.width));
             }
         } else if let Some(hint) = &self.session_setup_collapse_hint {
             box_lines.push(Line::from(Span::styled(

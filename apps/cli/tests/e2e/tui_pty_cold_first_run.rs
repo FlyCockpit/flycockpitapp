@@ -23,6 +23,7 @@ const COLD_WELCOME_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(30);
 const ASYNC_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
 const DAEMON_STABILITY_WINDOW: Duration = Duration::from_secs(5);
+const PROVIDER_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 enum WalkthroughInput {
@@ -36,6 +37,25 @@ struct LoopbackModelsProvider {
     url: String,
     shutdown: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LoopbackModelsProvider {
+    fn connect(&self) -> std::net::TcpStream {
+        let address = self
+            .url
+            .strip_prefix("http://")
+            .unwrap()
+            .strip_suffix("/v1")
+            .unwrap();
+        let socket = std::net::TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        socket
+    }
 }
 
 impl Drop for LoopbackModelsProvider {
@@ -60,6 +80,8 @@ fn has_fixture_authorization(headers: &str) -> bool {
 
 /// No bytes followed by EOF/idle timeout is an unused connection. Once a
 /// request starts, truncated headers/bodies and read errors remain failures.
+/// TCP callers must use blocking mode with a read timeout: only then does
+/// WouldBlock indicate an elapsed timeout rather than pending request bytes.
 fn read_provider_request(socket: &mut impl Read) -> io::Result<Option<String>> {
     const HEADER_LIMIT: usize = 64 * 1024;
     let mut received = Vec::new();
@@ -142,11 +164,17 @@ fn spawn_loopback_models_provider() -> LoopbackModelsProvider {
         while !shutdown_flag.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut socket, _)) => {
+                    // macOS inherits O_NONBLOCK from the listener. SO_RCVTIMEO
+                    // does not clear it; normalize before any request read so
+                    // WouldBlock means the blocking read actually timed out.
                     socket
-                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .set_nonblocking(false)
+                        .expect("make accepted provider socket blocking");
+                    socket
+                        .set_read_timeout(Some(PROVIDER_IO_TIMEOUT))
                         .expect("provider read timeout");
                     socket
-                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .set_write_timeout(Some(PROVIDER_IO_TIMEOUT))
                         .expect("provider write timeout");
                     let request = match read_provider_request(&mut socket) {
                         Ok(Some(request)) => request,
@@ -250,6 +278,92 @@ fn ux4_loopback_provider_survives_unused_connections_and_serves_authenticated_re
         socket.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
         assert!(response.contains(expected), "{response}");
+    }
+}
+
+/// Leave the peer open without sending its next bytes. EOF or a response here
+/// would mean the provider abandoned a pending request or proved a partial one.
+fn delay_provider_request(socket: &mut std::net::TcpStream) {
+    let delay = Duration::from_millis(75);
+    socket.set_read_timeout(Some(delay)).unwrap();
+    let started = Instant::now();
+    let error = socket.read(&mut [0_u8; 1]).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ));
+    assert!(
+        started.elapsed() >= delay,
+        "pending request must wait, not return immediate WouldBlock"
+    );
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+}
+
+fn assert_provider_response(socket: &mut std::net::TcpStream, expected: &str) {
+    let mut response = String::new();
+    socket.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains(expected), "{response}");
+}
+
+#[test]
+fn ux4_loopback_provider_waits_for_delayed_first_request_bytes() {
+    let provider = spawn_loopback_models_provider();
+    let mut socket = provider.connect();
+    delay_provider_request(&mut socket);
+    socket
+        .write_all(b"GET /v1/models HTTP/1.1\r\nAuthorization: Bearer test-key\r\n\r\n")
+        .unwrap();
+    assert_provider_response(&mut socket, "\"object\":\"list\"");
+}
+
+#[test]
+fn ux4_loopback_provider_waits_for_delayed_header_and_body_fragments() {
+    let provider = spawn_loopback_models_provider();
+    let mut socket = provider.connect();
+    socket
+        .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer ")
+        .unwrap();
+    delay_provider_request(&mut socket);
+    socket
+        .write_all(b"test-key\r\nContent-Length: 2\r\n\r\n{")
+        .unwrap();
+    delay_provider_request(&mut socket);
+    socket.write_all(b"}").unwrap();
+    assert_provider_response(&mut socket, "UX4_FIRST_SEND_OK");
+}
+
+#[test]
+fn ux4_loopback_provider_waits_for_elapsed_idle_and_partial_deadlines_then_recovers() {
+    let provider = spawn_loopback_models_provider();
+    for request in [
+        b"".as_slice(),
+        b"GET /v1/models HTTP/1.1\r\nAuthorization: Bearer test-key\r\n",
+        b"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer test-key\r\nContent-Length: 2\r\n\r\n{",
+    ] {
+        let mut abandoned = provider.connect();
+        let started = Instant::now();
+        abandoned.write_all(request).unwrap();
+        // Keep the write half open so EOF cannot masquerade as an idle timeout.
+        let mut rejected = Vec::new();
+        abandoned.read_to_end(&mut rejected).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            rejected.is_empty(),
+            "idle/incomplete authenticated traffic cannot verify a key"
+        );
+        assert!(
+            elapsed >= PROVIDER_IO_TIMEOUT,
+            "provider must wait for its read deadline, not immediate WouldBlock: {elapsed:?}"
+        );
+
+        let mut socket = provider.connect();
+        socket
+            .write_all(b"GET /v1/models HTTP/1.1\r\nAuthorization: Bearer test-key\r\n\r\n")
+            .unwrap();
+        assert_provider_response(&mut socket, "\"object\":\"list\"");
     }
 }
 

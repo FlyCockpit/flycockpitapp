@@ -165,7 +165,7 @@ pub(super) use history_window::HistoryWindow;
 pub(super) use history_window::{HISTORY_PAGE_ENTRIES, HISTORY_WINDOW_TARGET_ENTRIES};
 
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const ANIMATION_TICK: Duration = Duration::from_millis(100);
+const ANIMATION_TICK: Duration = crate::tui::onboarding::WELCOME_FRAME_INTERVAL;
 const SESSION_SWITCH_SPINNER_THRESHOLD: Duration = Duration::from_millis(150);
 const RUN_CAPTURE_MAX_BYTES: usize = 256 * 1024;
 const RUN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -5112,7 +5112,7 @@ impl App {
         changed |= self
             .onboarding_shell
             .as_mut()
-            .is_some_and(|shell| shell.tick());
+            .is_some_and(|shell| shell.tick(terminal_input.now()));
         changed |= self.service_onboarding_shell();
         // Auto-close the embedded pane when its child has exited
         // (GOALS §1i — e.g. `:q`).
@@ -5365,8 +5365,7 @@ impl App {
             // its 30s TTL expires (and clears the screen) even on an idle pane.
             || self.leaks_reveal_active()
             // The welcome fly-in (and its post-landing ambient motion)
-            // advances on this tick; without it the frame counter only
-            // moves on unrelated wakes and the fly-in strands at frame 0.
+            // uses elapsed time; this timer keeps it moving when input is idle.
             || self
                 .onboarding_shell
                 .as_ref()

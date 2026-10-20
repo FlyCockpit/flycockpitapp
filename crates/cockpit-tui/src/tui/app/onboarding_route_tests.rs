@@ -278,6 +278,15 @@ fn welcome_fly_in_drives_the_animation_tick() {
         app.animation_tick_active(),
         "the welcome fly-in must keep the 100ms animation tick alive instead of stranding at frame 0"
     );
+    let shell = app.onboarding_shell.as_mut().unwrap();
+    shell.tick(Duration::ZERO);
+    for frame in 1..=crate::tui::onboarding::WELCOME_ANIMATION_FRAMES + 12 {
+        assert!(shell.tick(ANIMATION_TICK * frame as u32));
+    }
+    assert!(
+        app.animation_tick_active(),
+        "the post-landing ambient motion must keep the animation tick alive"
+    );
     app.onboarding_shell = Some(Box::new(crate::tui::onboarding::OnboardingShell::new(
         &snapshot(cockpit_proto::OnboardingStage::Welcome),
         true,

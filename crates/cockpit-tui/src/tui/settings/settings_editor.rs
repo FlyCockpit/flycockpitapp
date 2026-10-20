@@ -1697,7 +1697,10 @@ impl SettingsEditor {
             // `s` accelerator: commit (only when not on a field that would
             // otherwise consume it — fields here don't take text in browse
             // mode, so `s` is always free as the accelerator).
-            KeyCode::Char('s') => SettingsResult::Save,
+            KeyCode::Char('s') => {
+                self.status = None;
+                SettingsResult::Save
+            }
             // Media capability refresh (generation-keyed; ignored while saving).
             KeyCode::Char('r') if self.multimodal.is_some() => {
                 let _ = self.begin_multimodal_refresh();
@@ -2258,8 +2261,9 @@ impl SettingsEditor {
 
     /// Write the working state back into `entry`, respecting the scope's
     /// override semantics. Called on Back so the parent Edit page carries the
-    /// edits (committed to disk by the caller).
-    pub(super) fn write_into(&self, entry: &mut ProviderEntry) {
+    /// edits (committed through the daemon by the caller). Missing model rows
+    /// return an error so stale editors cannot report a successful no-op.
+    pub(super) fn write_into(&self, entry: &mut ProviderEntry) -> Result<(), String> {
         match &self.scope {
             SettingsScope::Provider => {
                 entry.context = self.context.clone();
@@ -2287,13 +2291,19 @@ impl SettingsEditor {
                 entry.allow_insecure_http = self.allow_insecure_http;
             }
             SettingsScope::Model { model_id } => {
-                // Ensure the row exists (it always should — the editor was
-                // opened from it), then set the Option overrides per group.
-                if let Some(m) = entry.models.iter_mut().find(|m| &m.id == model_id) {
-                    apply_model_overrides(m, self);
-                }
+                // Catalog refresh/removal can invalidate an open editor. A
+                // missing target must never turn an edit into a successful no-op.
+                let model = entry
+                    .models
+                    .iter_mut()
+                    .find(|model| &model.id == model_id)
+                    .ok_or_else(|| {
+                        format!("model `{model_id}` is no longer available; reopen model settings")
+                    })?;
+                apply_model_overrides(model, self);
             }
         }
+        Ok(())
     }
 }
 
@@ -2723,7 +2733,7 @@ mod tests {
         assert_eq!(e.value_str(ProviderSettingId::AllowInsecureHttp), "on");
 
         let mut written = entry.clone();
-        e.write_into(&mut written);
+        e.write_into(&mut written).unwrap();
         assert!(written.allow_insecure_http);
         assert_eq!(written.url, entry.url);
         assert_eq!(written.headers, entry.headers);
@@ -2756,7 +2766,7 @@ mod tests {
         assert!(e.is_overridden(ProviderSettingId::AutoCompactPct));
         // Writeback sets the model override.
         let mut entry2 = entry.clone();
-        e.write_into(&mut entry2);
+        e.write_into(&mut entry2).unwrap();
         let m = entry2.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.context.as_ref().unwrap().auto_compact_pct, Some(70));
     }
@@ -2854,7 +2864,7 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(ProviderSettingId::AutoPruneEnabled), "off");
         let mut entry2 = entry.clone();
-        e.write_into(&mut entry2);
+        e.write_into(&mut entry2).unwrap();
         assert_eq!(entry2.auto_prune, Some(false));
 
         // Model scope: unset shows inherit and is dimmed; cycling to off
@@ -2872,7 +2882,7 @@ mod tests {
         e.handle_key(press(KeyCode::Enter)); // off
         assert!(e.is_overridden(ProviderSettingId::AutoPruneEnabled));
         let mut entry3 = entry.clone();
-        e.write_into(&mut entry3);
+        e.write_into(&mut entry3).unwrap();
         let m = entry3.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.auto_prune, Some(false));
         assert!(m.context.is_none(), "switch must not pin the ctx% group");
@@ -2880,7 +2890,7 @@ mod tests {
         e.handle_key(press(KeyCode::Char('x')));
         assert!(!e.is_overridden(ProviderSettingId::AutoPruneEnabled));
         let mut entry4 = entry.clone();
-        e.write_into(&mut entry4);
+        e.write_into(&mut entry4).unwrap();
         let m = entry4.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.auto_prune, None);
     }
@@ -2916,14 +2926,14 @@ mod tests {
         );
 
         let mut written = entry.clone();
-        e.write_into(&mut written);
+        e.write_into(&mut written).unwrap();
         let m = written.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.system_prompt.as_deref(), Some("model guidance"));
 
         e.handle_key(press(KeyCode::Char('x')));
         assert_eq!(e.value_str(ProviderSettingId::SystemPrompt), "not set");
         let mut cleared = entry.clone();
-        e.write_into(&mut cleared);
+        e.write_into(&mut cleared).unwrap();
         let m = cleared.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.system_prompt, None);
 
@@ -2966,7 +2976,7 @@ mod tests {
         assert_eq!(e.value_str(ProviderSettingId::InlineThink), "leave inline");
         // Writeback pins the explicit opt-out on the model row.
         let mut entry_off = entry.clone();
-        e.write_into(&mut entry_off);
+        e.write_into(&mut entry_off).unwrap();
         let m = entry_off.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.inline_think, Some(false));
 
@@ -2978,7 +2988,7 @@ mod tests {
         );
         assert!(!e.is_overridden(ProviderSettingId::InlineThink));
         let mut entry_default = entry.clone();
-        e.write_into(&mut entry_default);
+        e.write_into(&mut entry_default).unwrap();
         let m = entry_default.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.inline_think, None, "inherit writes None");
     }
@@ -3010,7 +3020,7 @@ mod tests {
             "leave inline"
         );
         let mut entry_off = entry.clone();
-        prov.write_into(&mut entry_off);
+        prov.write_into(&mut entry_off).unwrap();
         assert_eq!(entry_off.inline_think, Some(false));
 
         // Cycle back to inherit → None on writeback.
@@ -3084,7 +3094,7 @@ mod tests {
             "trusted"
         );
         let mut provider_written = entry.clone();
-        provider.write_into(&mut provider_written);
+        provider.write_into(&mut provider_written).unwrap();
         assert_eq!(provider_written.trust, Some(ModelTrust::Trusted));
 
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
@@ -3104,14 +3114,14 @@ mod tests {
         assert!(status.contains("host-mediated capture"), "{status}");
         assert!(status.contains("inference remains redacted"), "{status}");
         let mut entry_off = entry.clone();
-        e.write_into(&mut entry_off);
+        e.write_into(&mut entry_off).unwrap();
         let m = entry_off.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.trust, Some(ModelTrust::Trusted));
 
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(ProviderSettingId::TrustPolicy), "untrusted");
         let mut entry_untrusted = entry.clone();
-        e.write_into(&mut entry_untrusted);
+        e.write_into(&mut entry_untrusted).unwrap();
         let m = entry_untrusted
             .models
             .iter()
@@ -3163,7 +3173,7 @@ mod tests {
             );
 
             let mut written = entry.clone();
-            e.write_into(&mut written);
+            e.write_into(&mut written).unwrap();
             let m = written.models.iter().find(|m| m.id == "m1").unwrap();
             assert_eq!(m.trust, Some(trust), "{trust:?}");
 
@@ -3202,7 +3212,7 @@ mod tests {
             "off"
         );
         let mut entry_off = entry.clone();
-        e.write_into(&mut entry_off);
+        e.write_into(&mut entry_off).unwrap();
         let m = entry_off.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.hint_tool_call_corrections, Some(false));
 
@@ -3213,7 +3223,7 @@ mod tests {
             "inherit"
         );
         let mut entry_default = entry.clone();
-        e.write_into(&mut entry_default);
+        e.write_into(&mut entry_default).unwrap();
         let m = entry_default.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.hint_tool_call_corrections, None, "inherit writes None");
     }
@@ -3237,13 +3247,13 @@ mod tests {
             .unwrap();
         prov.handle_key(press(KeyCode::Enter)); // inherit → on
         let mut entry_on = entry.clone();
-        prov.write_into(&mut entry_on);
+        prov.write_into(&mut entry_on).unwrap();
         assert_eq!(entry_on.hint_tool_call_corrections, Some(true));
 
         prov.handle_key(press(KeyCode::Enter)); // on → off
         prov.handle_key(press(KeyCode::Enter)); // off → inherit
         let mut entry_inherit = entry.clone();
-        prov.write_into(&mut entry_inherit);
+        prov.write_into(&mut entry_inherit).unwrap();
         assert_eq!(entry_inherit.hint_tool_call_corrections, None);
     }
 
@@ -3271,7 +3281,7 @@ mod tests {
         assert!(e.is_overridden(ProviderSettingId::Backup));
         // Writeback pins it onto the provider entry.
         let mut entry_set = entry.clone();
-        e.write_into(&mut entry_set);
+        e.write_into(&mut entry_set).unwrap();
         let b = entry_set.backup.as_ref().unwrap();
         assert_eq!(b.provider, "reliable");
         assert_eq!(b.model, "claude-sonnet-4-6");
@@ -3290,7 +3300,7 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(ProviderSettingId::Backup), "none");
         let mut entry_clear = entry.clone();
-        e.write_into(&mut entry_clear);
+        e.write_into(&mut entry_clear).unwrap();
         assert!(entry_clear.backup.is_none());
     }
 
@@ -3332,7 +3342,7 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
 
         let mut written = entry.clone();
-        e.write_into(&mut written);
+        e.write_into(&mut written).unwrap();
         let capability = &written.capabilities.client_side_tools;
         assert_eq!(capability.status, CapabilityStatus::Supported);
         assert_eq!(capability.source, Some(CapabilitySource::Manual));
@@ -3343,7 +3353,7 @@ mod tests {
 
         e.handle_key(press(KeyCode::Enter));
         let mut cleared = entry.clone();
-        e.write_into(&mut cleared);
+        e.write_into(&mut cleared).unwrap();
         assert!(cleared.capabilities.client_side_tools.is_empty());
     }
 
@@ -3363,7 +3373,7 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
 
         let mut written = entry.clone();
-        e.write_into(&mut written);
+        e.write_into(&mut written).unwrap();
         let capability = &written
             .models
             .iter()
@@ -3376,6 +3386,19 @@ mod tests {
         assert_eq!(
             capability.entitlement.as_deref(),
             Some(XAI_MULTI_AGENT_TOOLS_ENTITLEMENT)
+        );
+    }
+
+    #[test]
+    fn model_writeback_rejects_missing_target_without_changing_siblings() {
+        let entry = provider_with_model();
+        let editor = SettingsEditor::for_model("p", &entry, "missing");
+        let mut written = entry.clone();
+        let error = editor.write_into(&mut written).unwrap_err();
+        assert!(error.contains("model `missing` is no longer available"));
+        assert_eq!(
+            serde_json::to_value(written).unwrap(),
+            serde_json::to_value(entry).unwrap()
         );
     }
 
@@ -3421,7 +3444,7 @@ mod tests {
         e.commit_text(ProviderSettingId::CapabilityContextTokens, "250000")
             .unwrap();
         let mut written = entry.clone();
-        e.write_into(&mut written);
+        e.write_into(&mut written).unwrap();
         assert_eq!(
             written.models[0].capability_overrides.context_tokens,
             Some(250_000)
@@ -3469,7 +3492,7 @@ mod tests {
         assert!(!e.is_overridden(ProviderSettingId::CapabilityAudio));
 
         let mut written = entry.clone();
-        e.write_into(&mut written);
+        e.write_into(&mut written).unwrap();
         assert_eq!(
             written.models[0].capability_overrides.image_input,
             Some(CapabilityStatus::Unsupported)
@@ -3516,7 +3539,7 @@ mod tests {
 
         let provider = SettingsEditor::for_provider("p", &entry);
         let mut provider_written = entry.clone();
-        provider.write_into(&mut provider_written);
+        provider.write_into(&mut provider_written).unwrap();
         assert_eq!(
             provider_written.capabilities.client_side_tools,
             entry.capabilities.client_side_tools
@@ -3524,7 +3547,7 @@ mod tests {
 
         let model = SettingsEditor::for_model("p", &entry, "m1");
         let mut model_written = entry.clone();
-        model.write_into(&mut model_written);
+        model.write_into(&mut model_written).unwrap();
         assert_eq!(
             model_written.models[0].capabilities.client_side_tools,
             entry.models[0].capabilities.client_side_tools
@@ -3554,7 +3577,7 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(ProviderSettingId::WireApi), "completions");
         let mut entry2 = entry.clone();
-        e.write_into(&mut entry2);
+        e.write_into(&mut entry2).unwrap();
         assert_eq!(entry2.wire_api, WireApi::Completions);
     }
 
@@ -3588,13 +3611,13 @@ mod tests {
 
         e.handle_key(press(KeyCode::Enter));
         let mut pinned = entry.clone();
-        e.write_into(&mut pinned);
+        e.write_into(&mut pinned).unwrap();
         let m = pinned.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.wire_api, WireApi::Completions);
 
         e.handle_key(press(KeyCode::Char('x')));
         let mut inherited = entry.clone();
-        e.write_into(&mut inherited);
+        e.write_into(&mut inherited).unwrap();
         let m = inherited.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.wire_api, WireApi::Auto);
     }
@@ -3611,7 +3634,7 @@ mod tests {
             .expect("unrelated model setting commits");
 
         let mut written = entry.clone();
-        editor.write_into(&mut written);
+        editor.write_into(&mut written).unwrap();
         let model = written.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(model.system_prompt.as_deref(), Some("Use concise answers."));
         assert_eq!(model.wire_api, WireApi::Responses);
@@ -3648,7 +3671,7 @@ mod tests {
         e.handle_key(press(KeyCode::Char('x')));
         assert!(!e.is_overridden(ProviderSettingId::AutoCompactPct));
         let mut entry2 = entry.clone();
-        e.write_into(&mut entry2);
+        e.write_into(&mut entry2).unwrap();
         let m = entry2.models.iter().find(|m| m.id == "m1").unwrap();
         assert!(m.context.is_none(), "cleared override writes None");
     }

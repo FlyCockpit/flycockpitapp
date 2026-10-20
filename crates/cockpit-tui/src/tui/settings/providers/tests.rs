@@ -12555,3 +12555,316 @@ fn r17_fetch_all_recovers_typed_observations_after_failed_readbacks() {
 fn r17_single_fetch_recovers_typed_observations_after_failed_readbacks() {
     r17_readback_recovery_preserves_fetch_observations(false);
 }
+
+fn lmstudio_settings_config() -> ProvidersConfig {
+    let mut config = ProvidersConfig::default();
+    config.providers.insert(
+        "lmstudio".into(),
+        ProviderEntry {
+            url: "http://127.0.0.1:1234/v1".into(),
+            template: Some("lmstudio".into()),
+            auth: Some(AuthKind::None),
+            models: vec![model("lfm2.5-24b-a2b", false)],
+            ..Default::default()
+        },
+    );
+    config
+}
+
+fn open_lmstudio_model_settings(dialog: &mut SettingsDialog) {
+    let entry = dialog.config.providers["lmstudio"].clone();
+    dialog.set_test_page(Page::Providers(ProvidersPage::ModelSettings {
+        editor: SettingsEditor::for_model_with_generation(
+            "lmstudio",
+            &entry,
+            "lfm2.5-24b-a2b",
+            dialog.config.resolution_generation.max(1),
+        ),
+        models: Box::new(ModelEditor::new(
+            Some("lmstudio".into()),
+            entry.models.clone(),
+        )),
+        parent: Box::new(EditState::new("lmstudio".into(), entry)),
+    }));
+}
+
+fn edit_model_setting(dialog: &mut SettingsDialog, field: ProviderSettingId) {
+    let Some(ProvidersPage::ModelSettings { editor, .. }) =
+        dialog.page.downcast_mut::<ProvidersPage>()
+    else {
+        panic!("expected model settings");
+    };
+    editor.cursor = editor.fields().iter().position(|id| *id == field).unwrap();
+    dialog.handle_key(press(KeyCode::Enter));
+}
+
+fn minimum_context_slot() -> cockpit_core::agents::ModelSlot {
+    cockpit_core::agents::ModelSlot {
+        purpose: "Primary".into(),
+        min_context_tokens: 1,
+        required_capabilities: vec![cockpit_core::agents::ModelCapability::TextGeneration],
+        locality: cockpit_core::agents::ModelLocality::Any,
+        allow_default_fallback: false,
+        suggested_models: Vec::new(),
+        models: Vec::new(),
+    }
+}
+
+#[test]
+fn model_settings_footer_and_keyboard_save_persist_through_daemon_reopen_and_profile() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
+    use cockpit_config::providers::{CapabilityStatus, ModelLocation};
+    use cockpit_core::agents::{AgentProfileModelOffering, ranked_compatible_offerings};
+
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        for footer in [true, false] {
+            let (tmp, mut dialog) = dialog_with_config(lmstudio_settings_config());
+            let root = tmp.path().display().to_string();
+            let client = runtime
+                .block_on(crate::tui::settings::settings_daemon_client(
+                    &crate::tui::settings::test_lifecycle_client(),
+                ))
+                .unwrap();
+            let initial = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            dialog
+                .adopt_refreshed_provider_snapshot(Ok(initial))
+                .unwrap();
+            let offering = AgentProfileModelOffering {
+                offering_id: "local-lfm".into(),
+                provider_profile_handle: "lmstudio".into(),
+                provider_id: "lmstudio".into(),
+                model_id: "lfm2.5-24b-a2b".into(),
+            };
+            let slot = minimum_context_slot();
+            assert!(
+                ranked_compatible_offerings(&slot, std::slice::from_ref(&offering), &dialog.config)
+                    .is_empty(),
+                "unset context must fail closed before saving"
+            );
+            open_lmstudio_model_settings(&mut dialog);
+            edit_model_setting(&mut dialog, ProviderSettingId::Location);
+            edit_model_setting(&mut dialog, ProviderSettingId::CapabilityTools);
+            edit_model_setting(&mut dialog, ProviderSettingId::CapabilityContextTokens);
+            for ch in "131072".chars() {
+                dialog.handle_key(press(KeyCode::Char(ch)));
+            }
+            if footer {
+                // Click the actual footer while the numeric buffer is still open.
+                let action = SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                    ProviderRowEditorAction::SettingSave,
+                ));
+                let screen = render_provider_rows(&dialog, 80, 24).join("\n");
+                assert!(screen.contains("save changes"));
+                let target = dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .find(|target| {
+                        target.enabled
+                            && target.action
+                                == super::super::shell::SettingsPointerAction::Page(action.clone())
+                    })
+                    .cloned()
+                    .expect("rendered save footer");
+                for kind in [
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                ] {
+                    dialog.handle_pointer(super::super::tests::settings_mouse(
+                        kind,
+                        target.rect.x,
+                        target.rect.y,
+                    ));
+                }
+            } else {
+                dialog.handle_key(press(KeyCode::Enter));
+                dialog.handle_key(press(KeyCode::Char('s')));
+            }
+            dialog.settle_test_effects();
+            assert!(
+                dialog.cx.last_provider_mutation_operation_id.is_some(),
+                "save must cross ApplyProviderMutation"
+            );
+            let current = runtime
+                .block_on(super::super::auth::provider_snapshot(&client, &root))
+                .unwrap();
+            let effective = super::super::providers_config_from_view(&current.config);
+            let caps = effective.resolve_effective_model_capabilities(
+                "lmstudio",
+                "lfm2.5-24b-a2b",
+                current.authority.config_generation,
+            );
+            assert_eq!(caps.context_tokens, Some(131_072));
+            assert!(
+                render_provider_rows(&dialog, 80, 24)
+                    .join("\n")
+                    .contains("saved"),
+                "save outcome must stay visible at the context field"
+            );
+
+            assert_eq!(caps.tool_calling, CapabilityStatus::Supported);
+            assert_eq!(
+                effective.resolve_location("lmstudio", "lfm2.5-24b-a2b"),
+                Some(ModelLocation::Local)
+            );
+            assert_eq!(
+                ranked_compatible_offerings(&slot, std::slice::from_ref(&offering), &effective),
+                vec![offering]
+            );
+
+            let persisted = load_provider(&dialog.config_path, "lmstudio");
+            assert_eq!(
+                persisted.models[0].capability_overrides.context_tokens,
+                Some(131_072)
+            );
+            assert_eq!(
+                persisted.models[0].capability_overrides.tool_calling,
+                Some(CapabilityStatus::Supported)
+            );
+            assert_eq!(persisted.models[0].location, Some(ModelLocation::Local));
+            let merged = merge_fetched_models_with_policy(
+                Some("lmstudio"),
+                &persisted.models,
+                vec![model("lfm2.5-24b-a2b", false)],
+                ModelMergePolicy::KeepUnlisted,
+            );
+            assert_eq!(
+                merged[0].capability_overrides,
+                persisted.models[0].capability_overrides
+            );
+            assert_eq!(merged[0].location, persisted.models[0].location);
+
+            // A new dialog reads the daemon catalog, not the prior editor draft.
+            let mut reopened = SettingsDialog::open_with_config(
+                dialog.config_path.clone(),
+                ProvidersConfig::default(),
+            );
+            reopened.active_project_root = Some(tmp.path().to_path_buf());
+            reopened
+                .adopt_refreshed_provider_snapshot(Ok(current))
+                .unwrap();
+            open_lmstudio_model_settings(&mut reopened);
+            let TestPageRef::Providers(ProvidersPage::ModelSettings { editor, .. }) =
+                reopened.test_page()
+            else {
+                panic!("reopened model settings");
+            };
+            assert_eq!(
+                editor.value_str(ProviderSettingId::CapabilityContextTokens),
+                "131072"
+            );
+            assert_eq!(
+                editor.value_str(ProviderSettingId::CapabilityTools),
+                "supported"
+            );
+            assert_eq!(editor.value_str(ProviderSettingId::Location), "local");
+        }
+    });
+}
+
+#[test]
+fn model_settings_save_status_pending_failure_and_noop_stay_visible() {
+    let (_tmp, mut dialog) = dialog_with_config(lmstudio_settings_config());
+    open_lmstudio_model_settings(&mut dialog);
+    edit_model_setting(&mut dialog, ProviderSettingId::CapabilityContextTokens);
+    for ch in "131072".chars() {
+        dialog.handle_key(press(KeyCode::Char(ch)));
+    }
+    dialog.handle_key(press(KeyCode::Enter));
+    // Drive the reducer and completion separately, as the App does, so the
+    // saving state is rendered before the daemon result is consumed.
+    let nav = dialog
+        .page
+        .handle_key(&mut dialog.cx, press(KeyCode::Char('s')));
+    dialog.apply_nav(nav);
+    assert!(
+        render_provider_rows(&dialog, 80, 24)
+            .join("\n")
+            .contains("saving provider…")
+    );
+    dialog.cx.completed_provider_mutation = Some(Err("daemon rejected the model settings".into()));
+    dialog.apply_pending_provider_completions();
+    assert!(
+        render_provider_rows(&dialog, 80, 24)
+            .join("\n")
+            .contains("daemon rejected the model settings")
+    );
+
+    // Failure from the real save reducer must retain its actionable error.
+    if let Some(ProvidersPage::ModelSettings { editor, .. }) =
+        dialog.page.downcast_mut::<ProvidersPage>()
+    {
+        editor.status = Some("media capabilities refreshed".into());
+    }
+    dialog.provider_edit_authority = None;
+    dialog.handle_key(press(KeyCode::Char('s')));
+    let screen = render_provider_rows(&dialog, 80, 24).join("\n");
+    assert!(screen.contains("save failed:"), "{screen}");
+    assert!(screen.contains("no edit capability"), "{screen}");
+    assert!(!screen.contains("media capabilities refreshed"));
+
+    // Reopen a valid authoritative snapshot: an unchanged save finishes
+    // immediately, without queueing a mutation or leaving a pending status.
+    let (_tmp2, mut unchanged) = dialog_with_config(lmstudio_settings_config());
+    open_lmstudio_model_settings(&mut unchanged);
+    unchanged.handle_key(press(KeyCode::Char('s')));
+    unchanged.settle_test_effects();
+    assert!(
+        render_provider_rows(&unchanged, 80, 24)
+            .join("\n")
+            .contains("saved")
+    );
+    assert!(unchanged.pending_settings.is_empty());
+}
+
+#[test]
+fn model_settings_missing_target_and_invalid_footer_save_fail_without_mutation() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
+    let (_tmp, mut dialog) = dialog_with_config(lmstudio_settings_config());
+    open_lmstudio_model_settings(&mut dialog);
+    edit_model_setting(&mut dialog, ProviderSettingId::CapabilityContextTokens);
+    for ch in "invalid".chars() {
+        dialog.handle_key(press(KeyCode::Char(ch)));
+    }
+    click_rendered_provider_action(
+        &mut dialog,
+        &SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::SettingSave,
+        )),
+    );
+    assert!(
+        render_provider_rows(&dialog, 80, 24)
+            .join("\n")
+            .contains("must be a number")
+    );
+    assert!(dialog.cx.last_provider_mutation_operation_id.is_none());
+    dialog.handle_key(press(KeyCode::Esc));
+    let Some(ProvidersPage::ModelSettings { models, .. }) =
+        dialog.page.downcast_mut::<ProvidersPage>()
+    else {
+        panic!("model settings");
+    };
+    models.rows.clear();
+    for key in [KeyCode::Char('s'), KeyCode::Esc, KeyCode::Char('q')] {
+        dialog.handle_key(press(key));
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Providers(ProvidersPage::ModelSettings { .. })
+        ));
+        assert!(
+            render_provider_rows(&dialog, 80, 24)
+                .join("\n")
+                .contains("no longer available")
+        );
+        assert!(dialog.cx.last_provider_mutation_operation_id.is_none());
+        assert_eq!(
+            load_provider(&dialog.config_path, "lmstudio").models.len(),
+            1
+        );
+    }
+}

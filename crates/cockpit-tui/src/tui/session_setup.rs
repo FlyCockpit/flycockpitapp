@@ -2066,6 +2066,63 @@ mod tests {
     }
 
     #[test]
+    fn modes_session_setup_attach_diagnostic_wraps_whole_words_inline_and_overlay() {
+        let error = "slot `primary` default binding cannot satisfy hard model requirements: Context tokens: unknown; requires at least 1 (minContextTokens). Open Settings → Providers and save the model context override before retrying.";
+        let notice = "Provider settings must be committed before session setup can attach.";
+        let expected_words = format!("{notice} {error}")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for width in [80, 120] {
+            for color in [false, true] {
+                let mut pane = SessionSetupPane::loading_inline(color);
+                pane.set_error(error);
+                pane.set_notice(notice);
+                let lines = pane
+                    .inline_lines(width)
+                    .into_iter()
+                    .skip(1)
+                    .collect::<Vec<_>>();
+                assert!(lines.iter().all(|line| line.width() <= usize::from(width)));
+                assert_eq!(
+                    lines
+                        .iter()
+                        .flat_map(|line| line
+                            .to_string()
+                            .split_whitespace()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>())
+                        .collect::<Vec<_>>(),
+                    expected_words,
+                    "inline wrap must not split Context or Providers"
+                );
+
+                let mut overlay = SessionSetupPane::loading(color);
+                overlay.set_error(error);
+                overlay.set_notice(notice);
+                let rows = render_overlay_rows(&mut overlay, width, 24);
+                assert!(!rows[0].contains("scroll"));
+                let body = rows[1..23]
+                    .iter()
+                    .map(|row| {
+                        row.chars()
+                            .skip(3)
+                            .take(usize::from(width - 4))
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    body.iter()
+                        .flat_map(|row| row.split_whitespace().map(str::to_owned))
+                        .collect::<Vec<_>>(),
+                    expected_words,
+                    "overlay wrap must preserve every diagnostic word"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn modes_session_setup_overlay_error_wrap_scroll_chrome_tracks_overflow() {
         for width in [80, 120] {
             for color in [false, true] {

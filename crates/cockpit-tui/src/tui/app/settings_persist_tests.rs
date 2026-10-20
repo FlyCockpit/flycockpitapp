@@ -302,6 +302,41 @@ fn default_update_id(control: &Control) -> uuid::Uuid {
 }
 
 #[test]
+fn settings_q_app_retention_fixture_reaps_follow_on_work_before_reentry() {
+    for unwind in [false, true] {
+        let mut previous_context = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::tui::settings::with_settings_retention_q_fixture(|root, runtime, dialog| {
+                let daemon = runtime
+                    .block_on(cockpit_core::daemon::boot_test_persistent_daemon())
+                    .unwrap();
+                previous_context = Some(std::sync::Arc::downgrade(daemon.context().unwrap()));
+                let (mut app, _real_tx, _held_rx) = retention_app(root, runtime, dialog);
+                // Adoption starts a real inventory read over the attached
+                // client. Leave its follow-on work to fixture teardown rather
+                // than depending on whether a presentation drain ran first.
+                app.request_inventory_refresh(true);
+                if unwind {
+                    std::panic::panic_any("retention fixture unwind probe");
+                }
+            });
+        }));
+        if unwind {
+            assert_eq!(
+                result.unwrap_err().downcast_ref::<&str>(),
+                Some(&"retention fixture unwind probe")
+            );
+        } else {
+            result.unwrap();
+        }
+        assert!(
+            previous_context.unwrap().upgrade().is_none(),
+            "fixture must reap the exact daemon and its admitted readers before reentry"
+        );
+    }
+}
+
+#[test]
 fn settings_q_app_retention_only_and_combined_wait_for_all_confirmations() {
     use cockpit_client::presentation::TurnEvent;
     use cockpit_proto::DefaultModelStandaloneOutcome;

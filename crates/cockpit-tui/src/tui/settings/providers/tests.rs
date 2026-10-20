@@ -49,6 +49,22 @@ struct ProviderDaemonFixture {
 }
 
 impl ProviderDaemonFixture {
+    fn shutdown(&mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            // The daemon owns an independent runtime. Its completion includes
+            // joining that runtime, so no inventory/setup reader can carry the
+            // process-global authority fence into the next fixture.
+            let result = futures::executor::block_on(daemon.shutdown());
+            if std::thread::panicking() {
+                if let Err(error) = result {
+                    eprintln!("provider fixture shutdown failed during unwind: {error:#}");
+                }
+            } else {
+                result.expect("provider fixture daemon must shut down cleanly");
+            }
+        }
+    }
+
     fn new() -> Self {
         Self::with_config_path(None)
     }
@@ -86,6 +102,9 @@ impl ProviderDaemonFixture {
 
 impl Drop for ProviderDaemonFixture {
     fn drop(&mut self) {
+        // Keep the environment and fixture lock until daemon request handlers
+        // and their follow-on work have actually been destroyed.
+        self.shutdown();
         PROVIDER_DAEMON_FIXTURE_DEPTH.with(|depth| {
             depth.set(depth.get().saturating_sub(1));
         });
@@ -13060,7 +13079,7 @@ pub(crate) fn with_settings_q_fixture(
 pub(crate) fn with_settings_retention_q_fixture(
     test: impl FnOnce(&std::path::Path, &tokio::runtime::Runtime, SettingsDialog),
 ) {
-    let (_fixture, runtime) = provider_daemon_runtime();
+    let (mut fixture, runtime) = provider_daemon_runtime();
     let _runtime_guard = runtime.enter();
     super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
         let mut config = lmstudio_settings_config();
@@ -13110,7 +13129,17 @@ pub(crate) fn with_settings_retention_q_fixture(
         dialog.page = super::super::providers_page(active_model_settings_page(&dialog.config));
         dialog.focus_settings_q_field(ProviderSettingId::PromptCacheRetention);
         dialog.cx.defer_test_effects = true;
-        test(tmp.path(), &runtime, dialog);
+        // App/runner Drop aborts client tasks, but does not join the daemon's
+        // admitted inventory/setup requests. Reap that owner while its project,
+        // key actor, environment and the client runtime are all still alive,
+        // including when a fault probe deliberately panics in the callback.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            test(tmp.path(), &runtime, dialog);
+        }));
+        fixture.shutdown();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     });
 }
 

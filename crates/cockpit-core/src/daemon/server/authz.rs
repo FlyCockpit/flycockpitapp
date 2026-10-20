@@ -318,30 +318,6 @@ pub(super) fn session_access_for_row(
     }
 }
 
-pub(super) fn session_access_for_summary(
-    principal: &ClientPrincipal,
-    summary: &proto::SessionSummary,
-) -> SessionAccess {
-    if principal.has_owner_level_authority() {
-        return SessionAccess::Owner;
-    }
-    let created_by_this_principal = principal
-        .tag()
-        .as_deref()
-        .is_some_and(|tag| summary.created_by_principal.as_deref() == Some(tag));
-    let scoped_to_session = created_by_this_principal || summary.shared_with_collaborators;
-    if !scoped_to_session {
-        return SessionAccess::None;
-    }
-    if principal.can_agent_write_project(&summary.project_root) {
-        SessionAccess::Writer
-    } else if principal.can_agent_read_project(&summary.project_root) {
-        SessionAccess::Readonly
-    } else {
-        SessionAccess::None
-    }
-}
-
 pub(super) async fn attached_session_access(
     principal: &ClientPrincipal,
     state: &MutableClientState,

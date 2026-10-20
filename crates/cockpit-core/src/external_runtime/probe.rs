@@ -359,7 +359,7 @@ fn spawn_bounded_reader(
                 Ok(0) => break,
                 Ok(n) => {
                     let allow = remaining
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                             Some(left.saturating_sub(n.min(left)))
                         })
                         .unwrap_or(0);

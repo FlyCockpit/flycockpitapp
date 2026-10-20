@@ -15,6 +15,7 @@ pub const GENERIC_FILE_GLYPH: &str = "\u{e612}";
 
 /// Whether `tool` is a write/edit variant whose glyph column may be replaced
 /// with a file icon.
+#[cfg(test)]
 pub fn is_file_icon_tool(tool: &str) -> bool {
     matches!(tool, "write" | "edit")
 }

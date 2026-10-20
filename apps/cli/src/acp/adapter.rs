@@ -4,12 +4,15 @@
 //! table, and the outbound permission registry. Imports no proto ingress type
 //! and does not call catalog `Install*` / `Release*` lifecycle methods.
 
+#[cfg(test)]
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 
 use super::AcpTransportCounters;
 use super::classify::{ClassifyError, InboundMessage, classify};
-use super::codec::{AcpFrameError, AcpLineReader, AcpLineWriter, FrameSink, write_diagnostic};
+use super::codec::{AcpFrameError, FrameSink};
+#[cfg(test)]
+use super::codec::{AcpLineReader, AcpLineWriter, write_diagnostic};
 use super::dispatch::{
     DispatchResult, SessionIngress, UnavailableSessionIngress, dispatch_notification,
     dispatch_request, elicitation_is_rejected, is_request_only_session_method, is_session_method,
@@ -60,6 +63,7 @@ where
     R: ResolveCodeRootInterrupt,
     A: ApprovalAck,
 {
+    #[cfg(test)]
     pub fn new(sink: S, resolve: R, ack: A) -> Self {
         Self::new_with_session_ingress(sink, resolve, ack, UnavailableSessionIngress)
     }
@@ -193,6 +197,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub fn run_stdio_peer<In, Out, ErrOut, R, A>(
     stdin: In,
     stdout: Out,
@@ -211,6 +216,7 @@ where
     run_stdio_peer_with_adapter(stdin, stderr, AcpAdapter::new(writer, resolve, ack))
 }
 
+#[cfg(test)]
 pub(crate) fn run_stdio_peer_with_adapter<In, ErrOut, S, R, A, I>(
     stdin: In,
     mut stderr: ErrOut,

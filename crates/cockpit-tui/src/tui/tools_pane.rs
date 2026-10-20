@@ -89,7 +89,6 @@ enum ToolsPending {
         override_json: String,
         cache_break: bool,
         monty_nudge: Option<String>,
-        querying: bool,
     },
 }
 
@@ -356,7 +355,6 @@ impl ToolsPane {
             override_json,
             cache_break,
             monty_nudge,
-            querying: true,
         });
         self.status = Some(format!("{message}; press Enter to query again"));
     }
@@ -374,7 +372,6 @@ impl ToolsPane {
             override_json,
             cache_break,
             monty_nudge,
-            querying: _,
             ..
         }) = self.in_flight.take()
         else {
@@ -407,7 +404,6 @@ impl ToolsPane {
             override_json,
             cache_break,
             monty_nudge,
-            querying: false,
         });
         self.status = Some("retrying the exact durable agent-save mutation".into());
     }
@@ -513,7 +509,6 @@ impl ToolsPane {
                 override_json,
                 cache_break,
                 monty_nudge,
-                querying: _,
                 ..
             } => {
                 if self.agent_name != agent_name
@@ -871,7 +866,6 @@ impl ToolsPane {
             override_json,
             cache_break,
             monty_nudge,
-            querying: false,
         });
         self.status = Some("saving daemon-owned agent tool settings…".to_string());
         Ok(())

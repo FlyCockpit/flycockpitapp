@@ -30,7 +30,6 @@ use crate::config::extended::{
 };
 use crate::db::workspace_trust::WorkspaceTrustMode;
 use crate::embeddings::{Embedder, OpenAiCompatEmbedder};
-use crate::engine::message::Message;
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args};
 use crate::redact::RedactionTable;
 use crate::session::Session;
@@ -314,6 +313,7 @@ impl KnowledgeConcept {
     /// represented in the stable OKF frontmatter rather than as a parallel
     /// in-memory field, so parsed and newly-created concepts have one source
     /// of truth.
+    #[cfg(test)]
     pub(crate) fn dream(
         id: String,
         concept_type: String,
@@ -348,6 +348,7 @@ impl KnowledgeConcept {
     /// Resolve this concept's KB-scoped symbolic references at read time.
     /// Markdown serialization never calls this method, so the source tree and
     /// git only ever receive the symbolic token.
+    #[cfg(test)]
     pub(crate) async fn body_for_reader(
         &self,
         kb_id: &crate::sealed::SealedKnowledgeBaseId,
@@ -1190,6 +1191,7 @@ async fn acquire_process_sidecar_lock(sidecars: &KbSidecars) -> Result<SidecarPr
 /// values makes it impossible for callers to discard the directory capability
 /// that selected the snapshot and later publish into a separately reopened KB
 /// pathname.
+#[cfg(test)]
 async fn snapshot_bundle_with_sidecar_fence(
     sidecars: &KbSidecars,
 ) -> Result<(KnowledgeBundle, SidecarProcessLock)> {
@@ -1513,6 +1515,7 @@ fn acquire_knowledge_write_process_lock_cancellable(
 /// repository that cannot be prepared safely defers *before* model output so
 /// the ledger can rerun the dream against a clean worktree. We never
 /// force-push.
+#[cfg(test)]
 pub(crate) fn apply_knowledge_dream<F>(
     root: &Path,
     merge_policy: KnowledgeBaseMergePolicy,
@@ -3400,6 +3403,7 @@ pub(crate) struct KnowledgeIndex {
 }
 
 impl KnowledgeIndex {
+    #[cfg(test)]
     pub(crate) async fn open(
         root: impl AsRef<Path>,
         embedder: Arc<dyn Embedder>,
@@ -3407,6 +3411,7 @@ impl KnowledgeIndex {
         Self::open_with_query_dimensions(root, embedder, None).await
     }
 
+    #[cfg(test)]
     async fn open_with_query_dimensions(
         root: impl AsRef<Path>,
         embedder: Arc<dyn Embedder>,
@@ -4552,6 +4557,7 @@ fn rrf_merge(
     Ok(out)
 }
 
+#[cfg(test)]
 pub(crate) fn render_injection(
     results: &[SearchResult],
     max_tokens: usize,
@@ -4575,29 +4581,6 @@ pub(crate) fn render_injection(
     Some(token_cap(&scrubbed, max_tokens))
 }
 
-pub(crate) fn retrieval_query_from_turn(history: &[Message], prompt: &Message) -> String {
-    let mut parts = history
-        .iter()
-        .rev()
-        .take(6)
-        .filter_map(message_text)
-        .collect::<Vec<_>>();
-    parts.reverse();
-    if let Some(text) = message_text(prompt) {
-        parts.push(text);
-    }
-    parts.join("\n")
-}
-
-fn message_text(message: &Message) -> Option<String> {
-    let text = match message {
-        Message::User { content } => crate::engine::message::extract_user_text(content),
-        Message::Assistant { content, .. } => crate::engine::message::extract_text(content),
-        Message::System { content } => content.clone(),
-    };
-    let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
 fn citation_label(result: &SearchResult) -> String {
     let citation = result
         .citations
@@ -4763,6 +4746,7 @@ fn safe_search_result(result: &SearchResult) -> String {
     }
 }
 
+#[cfg(test)]
 fn token_cap(body: &str, max_tokens: usize) -> String {
     if crate::tokens::count(body) <= max_tokens {
         return body.to_string();
@@ -4783,84 +4767,6 @@ fn token_cap(body: &str, max_tokens: usize) -> String {
     out
 }
 
-pub(crate) async fn inject_knowledge_for_turn(
-    history: &mut Vec<Message>,
-    session: &Session,
-    cwd: &Path,
-    definition: Option<&crate::agents::AgentDef>,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-    query: &str,
-    redact: Arc<RedactionTable>,
-    executing_model_trusted: bool,
-) {
-    let extended = config.extended();
-    let providers = config.providers();
-    if let Err(error) = validate_dream_models(&extended, &providers) {
-        tracing::warn!(%error, "refusing knowledge injection because dream-model policy is invalid");
-        return;
-    }
-    let attachments = match attached_bundles(
-        session,
-        cwd,
-        definition.and_then(crate::agents::AgentDef::allowed_knowledge_bases),
-        &extended,
-        executing_model_trusted,
-    )
-    .await
-    {
-        Ok(bundles) => bundles,
-        Err(error) => {
-            tracing::warn!(%error, "refusing knowledge injection because knowledge attachment resolution failed");
-            return;
-        }
-    };
-    if attachments.bundles.is_empty() {
-        return;
-    }
-    match production_embedder(&extended, config, redact.clone(), session).await {
-        Ok(Some(embedder)) => {
-            match retrieve_from_knowledge_bases(
-                &attachments.bundles,
-                embedder,
-                query,
-                DEFAULT_SEARCH_LIMIT,
-                Some(&crate::sealed::LocalVaultResolver::new(
-                    session.secret_vault().clone(),
-                )),
-            )
-            .await
-            {
-                Ok(results) => {
-                    if let Some(block) =
-                        render_injection(&results, extended.knowledge_inject_max_tokens, &redact)
-                    {
-                        // The deterministic floor has already fenced any
-                        // flagged result inside `render_injection`; this
-                        // non-persisting utility-model second layer scans
-                        // the floor-clean block before it enters turn
-                        // history (issue #273).
-                        let guard = injection_scan::KbUtilityGuard::new(
-                            &extended,
-                            providers,
-                            redact.clone(),
-                            cwd,
-                        );
-                        let block = injection_scan::fence_knowledge_with_utility_model(
-                            &block, &block, &guard,
-                        )
-                        .await;
-                        history.push(Message::user(block));
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "knowledge retrieval failed"),
-            }
-        }
-        Ok(None) => {
-            tracing::debug!("knowledge bundle attached but no embedding_model is configured")
-        }
-        Err(error) => tracing::warn!(%error, "building knowledge embedder failed"),
-    }
-}
 async fn production_embedder(
     extended: &ExtendedConfig,
     config: &crate::daemon::session_worker::SessionConfigHandle,
@@ -5265,6 +5171,7 @@ pub(crate) async fn sealed_knowledge_base_id_for_tool(
 /// non-secret marker: the Owner is explicitly authorizing a future custody
 /// transfer, and this makes the first copy possible without creating a dummy
 /// vault value merely to learn an ID.
+#[cfg(test)]
 pub(crate) fn sealed_knowledge_base_id_for_owner(
     cwd: &Path,
     extended: &ExtendedConfig,
@@ -6130,26 +6037,6 @@ pub(crate) async fn ensure_local_knowledge_path_access(ctx: &ToolCtx, path: &Pat
                 path.display()
             );
         }
-    }
-    Ok(())
-}
-
-/// Ordinary native filesystem surfaces never write a configured KB. The
-/// explicit human concept route enters through its own narrow sandbox gate;
-/// dreams enter through their provider transaction. Keeping this synchronous
-/// guard here also makes a missing target's lexical path fail closed before a
-/// generic approval can turn it into KB authoring authority.
-pub(crate) fn ensure_no_generic_local_knowledge_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
-    if let Some((entry, _)) = most_specific_local_knowledge_base_for_path(
-        &ctx.config.extended().knowledge_bases,
-        &ctx.cwd,
-        path,
-    )? {
-        bail!(
-            "access denied: `{}` is in local knowledge base `{}`; generic native writes are denied",
-            path.display(),
-            entry.id
-        );
     }
     Ok(())
 }
@@ -7741,7 +7628,7 @@ fn dream_write_cancellation(ctx: &ToolCtx) -> DreamWriteCancellation {
     }
 }
 
-pub(super) fn validate_knowledge_dream_writes(
+fn validate_knowledge_dream_writes(
     mut writes: Vec<KnowledgeDreamWrite>,
 ) -> Result<Vec<KnowledgeDreamWrite>> {
     if writes.is_empty() {
@@ -8586,7 +8473,6 @@ fn render_tool_results(results: &[SearchResult], redact: &RedactionTable) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::tool::Tool as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 

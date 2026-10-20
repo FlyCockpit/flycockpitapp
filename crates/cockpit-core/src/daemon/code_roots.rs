@@ -797,23 +797,6 @@ impl CodeRootAuthorityV1 {
         )
     }
 
-    pub fn replay_ack(
-        &self,
-        logical_client_id: &proto::OpaqueAsciiId128V1,
-        request: &proto::AckCodeRootDeliveriesV1Request,
-    ) -> Result<Option<proto::AckCodeRootDeliveriesV1Result>> {
-        match self.replay(
-            logical_client_id,
-            &request.client_request_id,
-            "ack",
-            request_fingerprint(request)?,
-        )? {
-            Some(IdempotencyResult::Ack(result)) => Ok(Some(result)),
-            Some(_) => bail!("invalid Code-root idempotency receipt"),
-            None => Ok(None),
-        }
-    }
-
     /// Claims the ACK identity before its durable cursor write. The claim is
     /// also counted as a pending receipt, so a successful durable ACK always
     /// has room to record the replay result before releasing its owner.

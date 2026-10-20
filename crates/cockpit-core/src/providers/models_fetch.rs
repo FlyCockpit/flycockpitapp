@@ -409,7 +409,7 @@ async fn resolve_provider_request_async_with_store_refresh(
         }
     };
     let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
-    let mut request = resolve_provider_request_inner_with_sources(
+    let request = resolve_provider_request_inner_with_sources(
         provider_id,
         entry,
         credential,
@@ -418,9 +418,11 @@ async fn resolve_provider_request_async_with_store_refresh(
         &secret_lookup,
     )?;
     #[cfg(not(test))]
-    {
+    let request = {
+        let mut request = request;
         request.command_credential_generation = command_credential_generation;
-    }
+        request
+    };
     Ok(request)
 }
 
@@ -520,13 +522,15 @@ async fn resolve_model_list_request_async_with_store(
             (None, _) => None,
         }
     };
-    let mut request = registry
+    let request = registry
         .provider_for(provider_id, entry)
         .model_list_request(provider_id, entry, resolved, credential, env_lookup)?;
     #[cfg(not(test))]
-    {
+    let request = {
+        let mut request = request;
         request.command_credential_generation = command_credential_generation;
-    }
+        request
+    };
     Ok(request)
 }
 

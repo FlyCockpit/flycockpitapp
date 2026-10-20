@@ -321,11 +321,13 @@ impl PasteRegistry {
         &self.blocks
     }
 
+    #[cfg(test)]
     pub(crate) fn contains_image_bytes(&self, png: &[u8]) -> bool {
         let hash = hash_bytes(png);
         self.contains_image_bytes_at_hash(png, hash)
     }
 
+    #[cfg(test)]
     fn contains_image_bytes_at_hash(&self, png: &[u8], hash: u64) -> bool {
         self.blocks.iter().any(|block| {
             matches!(&block.kind, PasteKind::Image { png: retained, hash: retained_hash, .. }
@@ -569,6 +571,7 @@ impl PasteRegistry {
             .map(|(_, placeholder)| placeholder)
     }
 
+    #[cfg(test)]
     pub(super) fn register_image_with_id(
         &mut self,
         at: usize,
@@ -1027,6 +1030,7 @@ impl PasteRegistry {
     /// Drop the block whose range is exactly `[start, end)` (used after a
     /// whole-block delete the caller performed on the buffer). Also
     /// shifts the trailing blocks left by the removed length.
+    #[cfg(test)]
     pub(super) fn remove_range(&mut self, start: usize, end: usize) {
         self.shift_for_edit(start, -((end - start) as isize));
     }
@@ -1132,6 +1136,7 @@ impl PasteRegistry {
     /// no transcript or wire markers. Returns `None` when any image block is
     /// present because a text-only consumer must choose an explicit image
     /// attachment contract rather than leaking a placeholder literal.
+    #[cfg(test)]
     pub(super) fn expand_plain_payload(&self, buffer: &str) -> Option<String> {
         if self.blocks.iter().any(|block| {
             matches!(
@@ -1256,10 +1261,11 @@ impl PasteRegistry {
     /// registry. Well-formed `<user_paste id="...">...</user_paste id="...">`
     /// regions become condensed text blocks. Surviving image placeholders
     /// are rebuilt from `retained_images`; unknown image numbers remain text.
+    #[cfg(test)]
     pub(super) fn rebuild_from_editor(
         editor_text: &str,
         retained_images: &BTreeMap<u32, RetainedImage>,
-        mut count_text: impl FnMut(&str) -> usize,
+        count_text: impl FnMut(&str) -> usize,
     ) -> EditorPasteRebuild {
         let snapshot = EditorPasteSnapshot {
             images: retained_images.clone(),

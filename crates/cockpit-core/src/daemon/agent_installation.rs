@@ -387,6 +387,7 @@ impl AuthorizedWorkspaceRoot {
         canonical_workspace_id(&self.canonical_path)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_regular_file_relative(&self, components: &[&str]) -> Result<Vec<u8>> {
         self.held_directory.read_regular_file_relative(components)
     }
@@ -477,8 +478,11 @@ pub(crate) struct WorkerWorkspaceConfigAuthority {
 struct WorkspaceConfigLayerAuthority {
     config_directory: AuthorizedWorkspaceRoot,
     config_leaf: OsString,
+    #[cfg(test)]
     effective_default_journal_leaf: OsString,
+    #[cfg(test)]
     effective_default_backup_leaf: OsString,
+    #[cfg(test)]
     config_dir_kind: Option<crate::config::dirs::ConfigDirKind>,
     trust_location: RetainedLayerTrustLocation,
 }
@@ -1385,11 +1389,15 @@ impl WorkerWorkspaceConfigAuthority {
                     .file_name()
                     .context("effective-default journal has no file name")?
                     .to_os_string();
+            #[cfg(not(test))]
+            let _ = &effective_default_journal_leaf;
             let effective_default_backup_leaf =
                 crate::config::effective_default::backup_path_for_layer(&config_path)
                     .file_name()
                     .context("effective-default backup has no file name")?
                     .to_os_string();
+            #[cfg(not(test))]
+            let _ = &effective_default_backup_leaf;
             let config_directory = AuthorizedWorkspaceRoot::capture(config_directory)?;
             let trust_location = RetainedLayerTrustLocation::capture(
                 &config_path,
@@ -1400,8 +1408,11 @@ impl WorkerWorkspaceConfigAuthority {
                 config_directory,
                 trust_location,
                 config_leaf,
+                #[cfg(test)]
                 effective_default_journal_leaf,
+                #[cfg(test)]
                 effective_default_backup_leaf,
+                #[cfg(test)]
                 config_dir_kind: if exclusive_config_override {
                     None
                 } else {
@@ -1439,6 +1450,7 @@ impl WorkerWorkspaceConfigAuthority {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn capture_workspace_config_layers(
         &self,
     ) -> Result<cockpit_config::config::WorkspaceConfigLayerSnapshotChain> {
@@ -1473,6 +1485,7 @@ impl WorkerWorkspaceConfigAuthority {
     /// files themselves remain live for the ordinary config refresh path, but
     /// a later `COCKPIT_CONFIG` override cannot redirect this worker to an
     /// unrelated source tree.
+    #[cfg(test)]
     pub(crate) fn resolve_hooks(
         &self,
     ) -> Result<cockpit_config::config::extended::hooks::HookRegistry> {
@@ -1919,33 +1932,6 @@ impl WorkerWorkspaceConfigAuthority {
                 Ok(())
             }))
         })
-    }
-
-    /// Resolve the effective provider view after applying an update to the
-    /// retained write target, entirely from the directories selected at
-    /// attachment.  This is used before a clear is journaled: recording
-    /// `None` would make a later crash-recovery receipt lie whenever a lower
-    /// layer provides the inherited default.
-    pub(crate) fn projected_effective_default_after_retained_update(
-        &self,
-        requested: Option<&cockpit_config::config::providers::ActiveModelRef>,
-    ) -> Result<cockpit_config::config::providers::ProvidersConfig> {
-        let mut snapshots = self.capture_retained_effective_default_layer_snapshots()?;
-        let Some(target) = snapshots.last_mut() else {
-            anyhow::bail!("no retained cockpit config layer applies to this attached session");
-        };
-        let bytes =
-            cockpit_config::config::effective_default::projected_config_bytes_for_default_update(
-                target.config_json.as_deref().unwrap_or(b"{}"),
-                requested,
-            )?;
-        *target = cockpit_config::config::workspace_config_layer_snapshot_with_config_json(
-            target,
-            Some(bytes),
-        );
-        cockpit_config::config::providers::ConfigDoc::providers_from_workspace_layer_snapshots(
-            &snapshots,
-        )
     }
 
     /// Policy-scoped counterpart used by attached default-model mutations.

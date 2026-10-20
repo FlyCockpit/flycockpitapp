@@ -965,7 +965,9 @@ struct CurrentIdentity {
     epoch: u64,
     immutable: String,
     location: ImageLocationClass,
+    #[cfg(feature = "extended")]
     adapter_kind: ImageAdapterKind,
+    #[cfg(feature = "extended")]
     allow_insecure_transport: bool,
     enabled: bool,
     refresh_authority: Option<RefreshAuthority>,
@@ -1026,6 +1028,7 @@ pub struct ImageRuntimeRegistry {
 /// `destination.adapter_kind` field produced by the dispatch authority. Used
 /// for discovery projections so the model sees the same adapter vocabulary it
 /// passes to `generate_image`.
+#[cfg(feature = "extended")]
 pub(crate) fn adapter_kind_str(kind: ImageAdapterKind) -> &'static str {
     match kind {
         ImageAdapterKind::OpenaiImages => "openai_images",
@@ -1319,7 +1322,9 @@ impl ImageRuntimeRegistry {
             epoch,
             immutable: endpoint.immutable_identity(),
             location: endpoint.location,
+            #[cfg(feature = "extended")]
             adapter_kind: endpoint.adapter,
+            #[cfg(feature = "extended")]
             allow_insecure_transport: endpoint.allow_insecure_transport,
             enabled: endpoint.enabled,
             refresh_authority: None,

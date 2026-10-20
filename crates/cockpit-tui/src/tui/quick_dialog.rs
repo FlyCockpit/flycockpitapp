@@ -941,7 +941,7 @@ mod tests {
 
     #[test]
     fn recursion_options_have_no_zero() {
-        let mut dialog = QuickDialog::open(current(), vec![model("p/a")]);
+        let dialog = QuickDialog::open(current(), vec![model("p/a")]);
         let snapshot = dialog.snapshot();
         assert!(snapshot.contains("off"));
         for depth in 1..=6 {

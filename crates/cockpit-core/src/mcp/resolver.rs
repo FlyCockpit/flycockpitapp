@@ -138,6 +138,7 @@ impl CatalogEntry {
         &self.name
     }
 
+    #[cfg(test)]
     fn persistent_server_mut(&mut self) -> Option<&mut ServerConfig> {
         match &mut self.origin {
             CatalogOrigin::Builtin => None,

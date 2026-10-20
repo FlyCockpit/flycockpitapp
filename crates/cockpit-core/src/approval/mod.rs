@@ -111,6 +111,7 @@ fn normalize_selected_id_for_offered_prompt<'a>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_host_approval_response(
     response: &ResolveResponse,
     offered: &InterruptQuestionSet,

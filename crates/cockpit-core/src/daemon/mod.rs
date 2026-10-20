@@ -387,6 +387,7 @@ pub fn daemon_error_exit_code(error: &anyhow::Error) -> u8 {
 /// `current_exe()`; test builds require the `cockpit-daemon-spawn-harness`
 /// binary discovered via [`discover_daemon_spawn_harness_executable`].
 pub(crate) const DAEMON_SPAWN_EXECUTABLE_ENV: &str = "COCKPIT_DAEMON_SPAWN_EXECUTABLE";
+#[cfg(test)]
 const DAEMON_SPAWN_HARNESS_BIN: &str = "cockpit-daemon-spawn-harness";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2174,10 +2175,6 @@ fn submit_supervisor_reap(
     }
 }
 
-pub(crate) fn reap_daemon_owner_thread(supervisor: std::thread::JoinHandle<()>) {
-    submit_supervisor_to_reaper(supervisor, None);
-}
-
 impl InProcessDaemonGuard {
     pub async fn shutdown(mut self) -> Result<()> {
         self.begin_shutdown();
@@ -2206,10 +2203,6 @@ impl InProcessDaemonGuard {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-    }
-
-    pub(crate) fn shutdown_force_handle(&self) -> shutdown::ShutdownSignal {
-        self.force.clone()
     }
 }
 
@@ -2362,6 +2355,7 @@ async fn shutdown_in_process_context(
     result
 }
 
+#[cfg(test)]
 fn spawn_in_process_shutdown_supervisor(
     ctx: std::sync::Arc<server::DaemonContext>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -2393,11 +2387,6 @@ fn spawn_in_process_shutdown_supervisor(
     })
 }
 
-struct InProcessBootReady {
-    endpoint: cockpit_client::InProcessEndpoint,
-    force: shutdown::ShutdownSignal,
-}
-
 struct PendingInProcessBoot {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     supervisor: Option<std::thread::JoinHandle<()>>,
@@ -2412,150 +2401,6 @@ impl Drop for PendingInProcessBoot {
             submit_supervisor_to_reaper(supervisor, None);
         }
     }
-}
-
-fn spawn_owned_in_process_daemon(
-    paths: DaemonPaths,
-    terminal_factory: terminal::TerminalHostFactory,
-) -> Result<(
-    tokio::sync::oneshot::Receiver<Result<InProcessBootReady>>,
-    tokio::sync::oneshot::Sender<()>,
-    tokio::sync::oneshot::Receiver<Result<()>>,
-    std::thread::JoinHandle<()>,
-)> {
-    let (booted, boot) = tokio::sync::oneshot::channel();
-    let (shutdown, mut shutdown_request) = tokio::sync::oneshot::channel();
-    let (completion, completed) = tokio::sync::oneshot::channel();
-    let supervisor = std::thread::Builder::new()
-        .name("cockpit-in-process-daemon".to_string())
-        .spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("building in-process daemon runtime")
-                .and_then(|runtime| {
-                    runtime.block_on(async move {
-                        let services = match server::boot(paths, terminal_factory).await {
-                            Ok(services) => services,
-                            Err(error) => {
-                                let _ = booted.send(Err(error));
-                                return Ok(());
-                            }
-                        };
-                        let services = match server::in_process_boot_services(services).await {
-                            Ok(services) => services,
-                            Err(error) => {
-                                let _ = booted.send(Err(error));
-                                return Ok(());
-                            }
-                        };
-                        let ctx = match services {
-                            server::BootServices::Ready(ctx) => {
-                                let endpoint = server::register_in_process_context(ctx.clone());
-                                let force = ctx.shutdown_signal().clone();
-                                if booted
-                                    .send(Ok(InProcessBootReady { endpoint, force }))
-                                    .is_err()
-                                {
-                                    return shutdown_in_process_context(ctx, Vec::new()).await;
-                                }
-                                ctx
-                            }
-                            server::BootServices::Locked(locked) => {
-                                let (endpoint, mut ready) =
-                                    server::locked_in_process_endpoint(locked);
-                                let force = shutdown::ShutdownSignal::new();
-                                if booted
-                                    .send(Ok(InProcessBootReady {
-                                        endpoint,
-                                        force: force.clone(),
-                                    }))
-                                    .is_err()
-                                {
-                                    return Ok(());
-                                }
-                                let ctx = loop {
-                                    tokio::select! {
-                                        _ = &mut shutdown_request => return Ok(()),
-                                        changed = ready.changed() => {
-                                            changed.context("locked in-process ready authority stopped")?;
-                                            if let Some(ctx) = ready.borrow().clone() {
-                                                break ctx;
-                                            }
-                                        }
-                                    }
-                                };
-                                // The locked bootstrap handed off to its
-                                // ready context: publish it through the
-                                // in-process registry so discover/connect
-                                // reconnects observe the running daemon
-                                // instead of re-entering a spawn path.
-                                let _ = server::register_in_process_context(ctx.clone());
-                                ctx
-                            }
-                        };
-                        #[cfg(not(test))]
-                        let tasks = {
-                            let mut tasks = Vec::new();
-                            tasks.push(server::spawn_lock_sweeper(ctx.clone()));
-                            tasks.push(
-                                guidance_maintenance::spawn_guidance_maintenance(ctx.clone()),
-                            );
-                            if let Some(handle) =
-                                crate::updater::maybe_spawn_background(ctx.clone())
-                            {
-                                tasks.push(handle);
-                            }
-                            #[cfg(feature = "remote")]
-                            tasks.push(org_sync::spawn_background(ctx.clone()));
-                            #[cfg(feature = "remote")]
-                            tasks.push(remote_audit_upload::spawn_background(ctx.clone()));
-                            #[cfg(feature = "remote")]
-                            tasks.push(connector::spawn_background(ctx.clone()));
-                            #[cfg(feature = "remote")]
-                            tasks.push(remote_outbox_worker::spawn_background(ctx.clone()));
-                            tasks
-                        };
-                        #[cfg(test)]
-                        let tasks = Vec::new();
-                        let _ = shutdown_request.await;
-                        shutdown_in_process_context(ctx, tasks).await
-                    })
-                });
-            let _ = completion.send(result);
-        })
-        .context("spawning in-process daemon owner thread")?;
-    Ok((boot, shutdown, completed, supervisor))
-}
-
-pub(crate) async fn boot_in_process(
-    paths: DaemonPaths,
-    terminal_factory: terminal::TerminalHostFactory,
-) -> Result<(
-    cockpit_client::InProcessEndpoint,
-    Option<InProcessDaemonGuard>,
-)> {
-    if let Some(endpoint) = server::registered_in_process_endpoint(&paths.socket) {
-        return Ok((endpoint, None));
-    }
-    let (boot, shutdown, completion, supervisor) =
-        spawn_owned_in_process_daemon(paths, terminal_factory)?;
-    let mut pending = PendingInProcessBoot {
-        shutdown: Some(shutdown),
-        supervisor: Some(supervisor),
-    };
-    let ready = boot
-        .await
-        .context("in-process daemon owner stopped during boot")??;
-    Ok((
-        ready.endpoint,
-        Some(InProcessDaemonGuard {
-            shutdown: pending.shutdown.take(),
-            force: ready.force,
-            completion: Some(completion),
-            supervisor: pending.supervisor.take(),
-        }),
-    ))
 }
 
 /// Isolated persistent daemon for tests. Holds the owner thread so the
@@ -4269,31 +4114,6 @@ fn wait_for_supervisor_admin_stop(
             }
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-pub(crate) fn stop_exact(paths: &DaemonPaths, expected: &DaemonPidReceipt) -> Result<bool> {
-    let current = read_daemon_pid_record(&paths.pid_file);
-    if current != Some(expected.clone()) {
-        anyhow::bail!(
-            "daemon PID receipt changed; refusing to signal or clean a replacement incarnation"
-        );
-    }
-    #[cfg(target_os = "linux")]
-    return stop_linux(paths, expected.clone(), restart_release_timeout(None));
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    return stop_kqueue_unix(paths, expected.clone(), restart_release_timeout(None));
-    #[cfg(all(
-        unix,
-        not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
-    ))]
-    return stop_unix_without_stable_handle(paths, expected.clone());
-    #[cfg(windows)]
-    return stop_windows(paths, expected.clone(), restart_release_timeout(None));
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (paths, expected);
-        anyhow::bail!("exact daemon process teardown is unsupported on this platform")
     }
 }
 

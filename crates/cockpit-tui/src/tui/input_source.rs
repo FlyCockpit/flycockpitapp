@@ -367,7 +367,7 @@ impl TerminalInput {
 
 fn next_generation() -> u64 {
     NEXT_TERMINAL_GENERATION
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .expect("terminal input generation exhausted")

@@ -645,6 +645,7 @@ pub async fn write_bundle_zip(
 /// as the redacted path. It starts no secure-key actor and rehydrates nothing.
 /// The stderr "raw secrets" warning is emitted by the CLI command surface, not
 /// here.
+#[cfg(test)]
 pub(crate) async fn write_bundle_zip_raw_local(
     db: &Db,
     target: &SessionRow,

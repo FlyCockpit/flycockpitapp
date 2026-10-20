@@ -859,7 +859,7 @@ pub(crate) async fn execute_settings_daemon_work(
                     client_operation_id,
                     flow_id,
                     input: input
-                        .map(|mut input| cockpit_proto::SensitiveWirePayload::new(input.take())),
+                        .map(|input| cockpit_proto::SensitiveWirePayload::new(input.take())),
                 })
                 .await
                 .map_err(|error| error.to_string())?
@@ -8725,7 +8725,10 @@ impl SettingsDialog {
             }
             Nav::Back => {
                 let current = std::mem::replace(&mut self.page, root_page(0));
+                #[cfg(feature = "extended")]
                 let mut parent = self.stack.pop().unwrap_or_else(|| root_page(0));
+                #[cfg(not(feature = "extended"))]
+                let parent = self.stack.pop().unwrap_or_else(|| root_page(0));
                 // Sidecar pages are intentionally split into navigable
                 // surfaces. Their reducer session is authoritative state, not
                 // page-local presentation: return the child session to its
@@ -8739,6 +8742,7 @@ impl SettingsDialog {
                     parent_sidecar.session = child.session.clone();
                 }
                 self.page = parent;
+                drop(current);
                 false
             }
             Nav::Close => true,

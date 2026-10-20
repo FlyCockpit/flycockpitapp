@@ -24,6 +24,7 @@ pub fn budget_to_ledger(budget: VerificationBudget) -> LedgerVerificationBudget 
     }
 }
 
+#[cfg(test)]
 pub fn ledger_to_budget(ledger: LedgerVerificationBudget) -> VerificationBudget {
     VerificationBudget {
         max_candidates: u16::try_from(ledger.candidate_count.max(0)).unwrap_or(u16::MAX),

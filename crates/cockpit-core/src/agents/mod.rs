@@ -293,6 +293,7 @@ impl PostureResolution {
     /// seam for a model-override def (the governing def's grants, slot
     /// substituted) and the test fixture seam. Production resolution paths
     /// use [`Self::from_def`].
+    #[cfg(test)]
     pub(crate) fn from_grants(grants: BTreeSet<AgentCapability>) -> Self {
         Self { grants }
     }
@@ -2386,6 +2387,7 @@ pub(crate) fn parse_package_sidecar_file(bytes: &[u8]) -> Result<AgentPackageSid
 /// Package sidecar.json is the runtime sidecar authority for an authored
 /// agent. `None` means inherit the global selection (no package, or no
 /// sidecar.json). `Some` is the exclusive declaration list from the package.
+#[cfg(test)]
 pub(crate) fn package_sidecar_authority(def: &AgentDef) -> Option<Vec<AgentPackageSidecarEntry>> {
     let bytes = def.package_files.as_ref()?.get(PACKAGE_SIDECAR_FILE)?;
     parse_package_sidecar_file(bytes)

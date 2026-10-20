@@ -8,8 +8,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::db::Db;
+#[cfg(test)]
+use crate::db::workspace_lease_artifacts::TaskArtifactState;
 use crate::db::workspace_lease_artifacts::{
-    NewWorkspaceLease, TaskArtifactState, WorkspaceDigest, WorkspaceLeaseKind, WorkspaceLeaseRow,
+    NewWorkspaceLease, WorkspaceDigest, WorkspaceLeaseKind, WorkspaceLeaseRow,
 };
 use crate::db::write_scope_leases::WriteScopeLeaseRow;
 use crate::git;
@@ -683,6 +685,7 @@ impl WorktreeOrchestrator {
     }
 }
 
+#[cfg(test)]
 pub fn no_user_visible_commit(before: u64, after: u64) -> Result<()> {
     if before != after {
         bail!("orchestration created a user-visible commit ({before} -> {after})");
@@ -690,6 +693,7 @@ pub fn no_user_visible_commit(before: u64, after: u64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn assert_not_force_removing(source: &str) -> Result<()> {
     let forced = concat!("git::worktree", "_remove(");
     let force_flag = concat!("--", "force");
@@ -699,6 +703,7 @@ pub fn assert_not_force_removing(source: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn artifact_is_terminal(state: TaskArtifactState) -> bool {
     state.is_terminal()
 }

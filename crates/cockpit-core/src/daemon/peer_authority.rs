@@ -38,15 +38,6 @@ pub fn proto_local_role(role: LocalClientRole) -> cockpit_proto::LocalClientRole
     }
 }
 
-pub fn principal_local_role(role: cockpit_proto::LocalClientRole) -> LocalClientRole {
-    match role {
-        cockpit_proto::LocalClientRole::Tui => LocalClientRole::Tui,
-        cockpit_proto::LocalClientRole::Cli => LocalClientRole::Cli,
-        cockpit_proto::LocalClientRole::Acp => LocalClientRole::Acp,
-        cockpit_proto::LocalClientRole::AgentChild => LocalClientRole::AgentChild,
-    }
-}
-
 /// How long a peer credential stays valid without renewal. PIDs are
 /// recycled; keep this short enough that a stale binding cannot outlive the
 /// originating peer.

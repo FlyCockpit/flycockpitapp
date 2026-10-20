@@ -425,7 +425,6 @@ enum DispatchVerificationOutcome {
     },
     Block {
         message: String,
-        operation_id: Option<uuid::Uuid>,
     },
     Revise {
         args: serde_json::Value,
@@ -1626,7 +1625,6 @@ async fn execute_ordinary_call_unscoped(
             crate::engine::verification::InterceptInput {
                 session: env.session,
                 agent: env.agent,
-                model: env.model,
                 ctx: env.ctx,
                 history,
                 resolved_name,
@@ -1690,7 +1688,6 @@ async fn execute_ordinary_call_unscoped(
                         permission_denied_kind = Some("blocked_verification");
                         DispatchVerificationOutcome::Block {
                             message: "verification could not safely project this action for automatic approval and the user declined to run it manually; revise and re-emit".into(),
-                            operation_id: Some(operation_id),
                         }
                     }
                 }
@@ -1703,10 +1700,9 @@ async fn execute_ordinary_call_unscoped(
             }
             crate::engine::verification::VerificationOutcome::Block {
                 message,
-                operation_id,
+                operation_id: _,
             } => DispatchVerificationOutcome::Block {
                 message,
-                operation_id,
             },
             crate::engine::verification::VerificationOutcome::Revise {
                 args,
@@ -1721,7 +1717,6 @@ async fn execute_ordinary_call_unscoped(
         match verification {
             DispatchVerificationOutcome::Block {
                 message,
-                operation_id: _,
             } => {
                 // A verification Block is a deterministic refusal, not an
                 // approval boundary: it raises no interrupt and parks no

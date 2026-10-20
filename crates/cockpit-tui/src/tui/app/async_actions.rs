@@ -515,6 +515,7 @@ fn oauth_request_hash<T: serde::Serialize>(value: &T) -> Result<String, String> 
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "remote"))]
 struct StartupDisclosureIdentity<'a> {
     project_root: &'a str,
     generation: u64,
@@ -523,6 +524,7 @@ struct StartupDisclosureIdentity<'a> {
     attachment: Option<(uuid::Uuid, u64)>,
 }
 
+#[cfg(any(test, feature = "remote"))]
 fn startup_disclosure_completion_is_current(
     current: StartupDisclosureIdentity<'_>,
     completed: StartupDisclosureIdentity<'_>,

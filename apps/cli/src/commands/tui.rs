@@ -56,26 +56,6 @@ fn combine_app_and_lifecycle(app: Result<()>, lifecycle: Result<()>) -> Result<(
     }
 }
 
-pub async fn run(
-    project: Option<&Path>,
-    no_sandbox: bool,
-    launch_start: Option<Instant>,
-) -> Result<()> {
-    run_mode(
-        project,
-        no_sandbox,
-        SessionMode::Code,
-        launch_start,
-        false,
-        false,
-        false,
-        None,
-        None,
-        None,
-    )
-    .await
-}
-
 /// Start every interactive mode through the sole TUI/session construction
 /// path. The mode is intentionally not translated into `SetAgent` or any
 /// other broad existing control: those controls lack the
@@ -120,6 +100,8 @@ pub async fn run_mode(
     combine_app_and_lifecycle(result, lifecycle_result)
 }
 
+// Retained as a process-boundary construction hook inspected by integration tests.
+#[allow(dead_code)]
 pub async fn run_with_session(
     project: Option<&Path>,
     no_sandbox: bool,

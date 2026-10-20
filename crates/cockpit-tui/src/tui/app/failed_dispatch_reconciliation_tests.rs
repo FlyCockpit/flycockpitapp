@@ -162,7 +162,6 @@ fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
     SideConversation {
         endpoint: cockpit_client::ClientEndpoint::Wire(tmp.join("daemon.sock")),
         side_session_id: uuid::Uuid::new_v4(),
-        socket: tmp.join("missing-daemon.sock"),
         saved_runner: None,
         saved_history: vec![HistoryEntry::Plain {
             line: "main history".to_string(),

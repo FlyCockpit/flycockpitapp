@@ -4,13 +4,14 @@
 //! It only decides whether one bounded idle-window refresh is worthwhile;
 //! callers retain the normal request, redaction, and cancellation boundaries.
 
+#[cfg(any(test, feature = "extended"))]
 use base64::Engine as _;
+#[cfg(any(test, feature = "extended"))]
 use uuid::Uuid;
 
-use crate::{
-    config::providers::{CacheRetentionProfile, KeepWarmMode},
-    session::InferenceSendIdentity,
-};
+use crate::config::providers::{CacheRetentionProfile, KeepWarmMode};
+#[cfg(any(test, feature = "extended"))]
+use crate::session::InferenceSendIdentity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeepWarmSkipReason {
@@ -98,6 +99,7 @@ pub fn decide(
 /// for the scheduler's 96-byte generic id contract without relaxing that
 /// contract for all job types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "extended"))]
 pub(crate) struct KeepWarmJobId {
     pub session_id: Uuid,
     pub cache_send_identity: InferenceSendIdentity,
@@ -108,6 +110,7 @@ pub(crate) struct KeepWarmJobId {
 /// Mint the deterministic, idempotent id for one cache-producing send.
 /// `send_id` is unique per inference send, so the session/send/schedule tuple
 /// provides scheduling uniqueness without spending 22 more bytes on a nonce.
+#[cfg(any(test, feature = "extended"))]
 pub(crate) fn format_job_id(
     session_id: Uuid,
     cache_send_identity: InferenceSendIdentity,
@@ -126,6 +129,7 @@ pub(crate) fn format_job_id(
 
 /// Parse a locally minted keep-warm id strictly. Reject non-canonical forms so
 /// a malformed durable row cannot alias a different callback identity.
+#[cfg(any(test, feature = "extended"))]
 pub(crate) fn parse_job_id(id: &str) -> anyhow::Result<KeepWarmJobId> {
     let mut parts = id.split('.');
     anyhow::ensure!(
@@ -153,6 +157,7 @@ pub(crate) fn parse_job_id(id: &str) -> anyhow::Result<KeepWarmJobId> {
     })
 }
 
+#[cfg(any(test, feature = "extended"))]
 fn next_job_id_part<'a>(
     parts: &mut impl Iterator<Item = &'a str>,
     label: &str,
@@ -163,10 +168,12 @@ fn next_job_id_part<'a>(
         .ok_or_else(|| anyhow::anyhow!("keep-warm callback is missing a {label}"))
 }
 
+#[cfg(any(test, feature = "extended"))]
 fn encode_uuid(id: Uuid) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id.as_bytes())
 }
 
+#[cfg(any(test, feature = "extended"))]
 fn decode_uuid(raw: &str) -> anyhow::Result<Uuid> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(raw)
@@ -182,6 +189,7 @@ fn decode_uuid(raw: &str) -> anyhow::Result<Uuid> {
     Uuid::from_slice(&bytes).map_err(Into::into)
 }
 
+#[cfg(any(test, feature = "extended"))]
 fn encode_i64_base36(value: i64) -> String {
     if value < 0 {
         format!("n{}", encode_u64_base36(value.unsigned_abs()))
@@ -190,6 +198,7 @@ fn encode_i64_base36(value: i64) -> String {
     }
 }
 
+#[cfg(any(test, feature = "extended"))]
 fn decode_i64_base36(raw: &str) -> anyhow::Result<i64> {
     let (negative, magnitude) = raw
         .strip_prefix('n')
@@ -212,6 +221,7 @@ fn decode_i64_base36(raw: &str) -> anyhow::Result<i64> {
     }
 }
 
+#[cfg(any(test, feature = "extended"))]
 fn encode_u64_base36(mut value: u64) -> String {
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     if value == 0 {
@@ -229,6 +239,7 @@ fn encode_u64_base36(mut value: u64) -> String {
         .to_string()
 }
 
+#[cfg(any(test, feature = "extended"))]
 fn decode_u64_base36(raw: &str) -> anyhow::Result<u64> {
     anyhow::ensure!(
         !raw.is_empty() && (raw == "0" || !raw.starts_with('0')),

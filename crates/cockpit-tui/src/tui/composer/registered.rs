@@ -191,6 +191,7 @@ impl RegisteredComposer {
         self.paste_registry.expand_display(self.composer.text())
     }
 
+    #[cfg(test)]
     pub(crate) fn plain_payload(&self) -> Option<String> {
         self.paste_registry
             .expand_plain_payload(self.composer.text())
@@ -588,6 +589,7 @@ impl RegisteredComposer {
         true
     }
 
+    #[cfg(test)]
     fn can_insert_image(&self, png: &[u8]) -> bool {
         let byte_length = png.len() as u64;
         if self.paste_registry.contains_image_bytes(png) {
@@ -596,6 +598,7 @@ impl RegisteredComposer {
         self.can_insert_distinct_image(byte_length)
     }
 
+    #[cfg(test)]
     fn can_insert_distinct_image(&self, byte_length: u64) -> bool {
         let retained = self.paste_registry.image_payloads_by_number();
         let total = retained.values().try_fold(byte_length, |sum, image| {
@@ -640,6 +643,7 @@ impl RegisteredComposer {
             && retained.len() < cockpit_proto::send_user_message::MAX_MESSAGE_ATTACHMENTS
     }
 
+    #[cfg(test)]
     pub(crate) fn try_insert_image(&mut self, png: Vec<u8>) -> bool {
         if !self.can_insert_image(&png) {
             return false;

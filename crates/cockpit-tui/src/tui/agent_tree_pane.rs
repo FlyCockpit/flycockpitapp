@@ -757,6 +757,7 @@ fn build_override_rows(snapshot: &AgentEffectiveSettingsV1) -> Vec<OverrideRow> 
 /// re-validates compatibility on apply). A slot with a daemon-owned unavailable
 /// reason is shown read-only. Current/default markers join the setup row to the
 /// focused control by its opaque route identity, never by display labels.
+#[cfg(test)]
 fn build_model_rows(slots: &[SessionSetupModelSlotV1], terminal: bool) -> Vec<OverrideRow> {
     build_model_rows_with_control(slots, terminal, None)
 }

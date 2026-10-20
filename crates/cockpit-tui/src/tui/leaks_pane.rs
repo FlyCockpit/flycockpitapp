@@ -229,7 +229,6 @@ pub enum LeaksOutcome {
 
 /// A metadata-only leaks RPC. Never carries or returns plaintext.
 pub struct LeaksRpcAction {
-    daemon_socket: PathBuf,
     kind: LeaksRpcKind,
 }
 
@@ -371,8 +370,8 @@ impl LeaksPane {
     /// The initial (first-page) list action, or `None` if the daemon socket is
     /// unknown (detached).
     pub fn initial_load_action(&self) -> Option<LeaksRpcAction> {
+        self.daemon_socket.as_ref()?;
         Some(LeaksRpcAction {
-            daemon_socket: self.daemon_socket.clone()?,
             kind: LeaksRpcKind::List {
                 cursor: None,
                 rotation: self.rotation_filter,
@@ -531,9 +530,8 @@ impl LeaksPane {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     self.confirm_delete = None;
-                    if let Some(socket) = self.daemon_socket.clone() {
+                    if self.daemon_socket.is_some() {
                         return LeaksOutcome::Rpc(LeaksRpcAction {
-                            daemon_socket: socket,
                             kind: LeaksRpcKind::Delete { report_id },
                         });
                     }
@@ -557,11 +555,10 @@ impl LeaksPane {
                     self.selected += 1;
                 } else if self.has_more {
                     // Page at end: fetch the next page with the MAC cursor.
-                    if let (Some(socket), Some(cursor)) =
+                    if let (Some(_), Some(cursor)) =
                         (self.daemon_socket.clone(), self.next_cursor.clone())
                     {
                         return LeaksOutcome::Rpc(LeaksRpcAction {
-                            daemon_socket: socket,
                             kind: LeaksRpcKind::List {
                                 cursor: Some(cursor),
                                 rotation: self.rotation_filter,
@@ -597,11 +594,9 @@ impl LeaksPane {
     }
 
     fn rotate(&mut self, rotation: LeakRotationDisposition) -> LeaksOutcome {
-        if let (Some(socket), Some(report_id)) =
-            (self.daemon_socket.clone(), self.selected_report_id())
+        if let (Some(_), Some(report_id)) = (self.daemon_socket.clone(), self.selected_report_id())
         {
             LeaksOutcome::Rpc(LeaksRpcAction {
-                daemon_socket: socket,
                 kind: LeaksRpcKind::Rotate {
                     report_id,
                     rotation,

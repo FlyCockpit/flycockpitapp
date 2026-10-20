@@ -464,6 +464,7 @@ impl CredentialStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn get_loaded_owned(&self, provider_id: &str) -> Option<Value> {
         if let Some(records) = &self.transient_records {
             return records
@@ -942,6 +943,7 @@ impl CredentialStore {
     }
 
     /// Reload this store from its backing vault or leftover import file.
+    #[cfg(test)]
     pub(crate) fn reopen(&self) -> Result<Self> {
         match &self.backend {
             CredentialBackend::Vault(vault) => Self::from_vault(vault.clone()),

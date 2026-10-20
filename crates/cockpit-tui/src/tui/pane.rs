@@ -51,10 +51,6 @@ impl ScrollList {
         self.scroll = 0;
     }
 
-    pub(crate) fn clamp_cursor(&mut self, len: usize) {
-        self.cursor = self.cursor.min(len.saturating_sub(1));
-    }
-
     pub(crate) fn move_by(&mut self, delta: isize, len: usize) {
         if delta == 0 {
             return;
@@ -67,15 +63,6 @@ impl ScrollList {
                 crate::tui::nav::wrap_next(self.cursor, len)
             };
         }
-    }
-
-    pub(crate) fn move_clamped(&mut self, delta: isize, len: usize) {
-        if len == 0 {
-            self.cursor = 0;
-            return;
-        }
-        let next = self.cursor as isize + delta;
-        self.cursor = next.clamp(0, len as isize - 1) as usize;
     }
 
     pub(crate) fn clamp_windowed(&mut self, len: usize, viewport: usize) {
@@ -100,6 +87,7 @@ impl ScrollList {
         .min(max_scroll);
     }
 
+    #[cfg(test)]
     pub(crate) fn clamp_visible_span(
         &mut self,
         viewport_rows: usize,

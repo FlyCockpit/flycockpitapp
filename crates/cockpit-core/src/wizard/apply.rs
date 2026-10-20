@@ -75,7 +75,6 @@ fn lifetime_setup_wizard_descriptor() -> WizardDescriptor {
         description: "Choose what happens after the last Cockpit window closes",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
-        onboarding_agent_models: std::collections::BTreeMap::new(),
         onboarding_catalog_revision: None,
         steps: vec![
             crate::wizard::StepDescriptor {

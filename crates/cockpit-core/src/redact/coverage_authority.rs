@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::Result;
+#[cfg(test)]
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -48,6 +49,7 @@ pub(crate) enum CoverageOwnerMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct CoverageLimits {
     pub workers: usize,
     pub queued: usize,
@@ -60,6 +62,7 @@ pub(crate) struct CoverageLimits {
     pub artifact_bytes_total: usize,
 }
 
+#[cfg(test)]
 pub(crate) const COVERAGE_LIMITS: CoverageLimits = CoverageLimits {
     workers: COVERAGE_WORKERS,
     queued: COVERAGE_QUEUE,
@@ -84,6 +87,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub(crate) struct CoverageBinding([u8; 16]);
 
 impl CoverageBinding {
+    #[cfg(test)]
     pub(crate) const fn from_daemon_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
@@ -127,7 +131,11 @@ pub(crate) enum CoverageScope {
     AutoTitle,
     InputPrediction,
     TagInline,
+    // Reserved for future redaction coverage wire consumers.
+    #[allow(dead_code)]
     McpSandboxProjection,
+    // Reserved for future redaction coverage wire consumers.
+    #[allow(dead_code)]
     ApprovalPreview,
     DebugContext,
     RedactionOverride,
@@ -757,6 +765,7 @@ struct Inner {
     state: Mutex<State>,
     workers: Arc<Semaphore>,
     flight_completed: Notify,
+    #[cfg(test)]
     owner_mode: CoverageOwnerMode,
 }
 
@@ -775,7 +784,7 @@ impl Default for RedactionCoverageAuthority {
 }
 
 impl RedactionCoverageAuthority {
-    pub(crate) fn new(owner_mode: CoverageOwnerMode) -> Self {
+    pub(crate) fn new(_owner_mode: CoverageOwnerMode) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
@@ -795,15 +804,18 @@ impl RedactionCoverageAuthority {
                 }),
                 workers: Arc::new(Semaphore::new(COVERAGE_WORKERS)),
                 flight_completed: Notify::new(),
-                owner_mode,
+                #[cfg(test)]
+                owner_mode: _owner_mode,
             }),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn owner_mode(&self) -> CoverageOwnerMode {
         self.inner.owner_mode
     }
 
+    #[cfg(test)]
     pub(crate) const fn limits(&self) -> CoverageLimits {
         COVERAGE_LIMITS
     }
@@ -1147,7 +1159,7 @@ impl RedactionCoverageAuthority {
         &self,
         state: &mut State,
         generation: Arc<RedactionCoverageGeneration>,
-        purpose: CoverageScope,
+        _purpose: CoverageScope,
     ) -> std::result::Result<CoverageAdmission, CoverageError> {
         let resident_matches = state
             .residents
@@ -1177,7 +1189,8 @@ impl RedactionCoverageAuthority {
         Ok(CoverageAdmission {
             inner: Arc::downgrade(&self.inner),
             generation,
-            purpose,
+            #[cfg(test)]
+            purpose: _purpose,
             released: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -1258,6 +1271,7 @@ impl RedactionCoverageAuthority {
 
     /// Rebind is intentionally stronger than invalidation: old waiters wake
     /// with a sanitized refusal and no old result can publish.
+    #[cfg(test)]
     pub(crate) fn rebind(&self) {
         self.invalidate();
     }
@@ -1344,12 +1358,14 @@ impl Drop for WaiterLease {
 pub(crate) struct CoverageAdmission {
     inner: Weak<Inner>,
     generation: Arc<RedactionCoverageGeneration>,
+    #[cfg(test)]
     purpose: CoverageScope,
     released: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg(test)]
 pub(crate) enum UnsupportedSourceDetailClass {
     UnsupportedFormat,
     Unreadable,
@@ -1357,12 +1373,14 @@ pub(crate) enum UnsupportedSourceDetailClass {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[cfg(test)]
 pub(crate) struct OwnerUnsupportedSourceDiagnostic {
     pub display_path: String,
     pub detail: UnsupportedSourceDetailClass,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[cfg(test)]
 pub(crate) struct RedactionCoverageStatusProjection {
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1371,8 +1389,10 @@ pub(crate) struct RedactionCoverageStatusProjection {
 
 /// Proof that daemon dispatch completed the owner authorization check. The
 /// field is private so a generic egress caller cannot forge the disposition.
+#[cfg(test)]
 pub(crate) struct OwnerAuthorization(());
 
+#[cfg(test)]
 impl OwnerAuthorization {
     pub(crate) fn after_principal_check(is_owner: bool) -> Option<Self> {
         is_owner.then_some(Self(()))
@@ -1511,10 +1531,12 @@ impl CoverageAdmission {
         Ok(result)
     }
 
+    #[cfg(test)]
     pub(crate) fn purpose(&self) -> CoverageScope {
         self.purpose
     }
 
+    #[cfg(test)]
     pub(crate) fn unsupported_source_projection(
         self,
         authorization: Option<OwnerAuthorization>,

@@ -584,7 +584,6 @@ mod tests {
     use super::super::receipt::ToolMediaSubjectReceiptV1;
     use super::super::seal;
     use super::*;
-    use std::sync::Mutex;
 
     struct FakeKeyResolver {
         key: [u8; 32],

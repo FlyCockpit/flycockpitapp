@@ -480,38 +480,6 @@ impl WorkspaceCaptureBoundary for WorkspaceCoverageInputs<'_> {
     }
 }
 
-pub(crate) async fn snapshot_session_capture_inputs<'a>(
-    session: &'a crate::session::Session,
-    principal: &'a ClientPrincipal,
-    owner_authorization_revision: i64,
-    workspace_root: &'a Path,
-    environment: &'a EnvSnapshot,
-    command_cache: &'a crate::secret_command::CommandSecretCache,
-    policy_digest: &'a str,
-    override_revision: u64,
-    redact_config: &'a RedactConfig,
-) -> anyhow::Result<SessionCoverageInputs<'a>> {
-    let vault_revision = session
-        .secret_vault()
-        .current_inventory_generation()
-        .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
-    let sealed_records = session.db.machine_scoped_sealed_redaction_records().await?;
-    let sealed = sealed_records_binding(&sealed_records);
-    Ok(SessionCoverageInputs {
-        principal,
-        owner_authorization_revision,
-        session_id: session.id,
-        workspace_root,
-        environment,
-        vault_revision,
-        command_cache: &command_cache,
-        policy_digest,
-        sealed,
-        override_revision,
-        redact_config,
-    })
-}
-
 impl DaemonGlobalCoverageInputs<'_> {
     pub(crate) fn coverage_key(&self) -> anyhow::Result<RedactionCoverageKey> {
         Ok(RedactionCoverageKey::daemon_global(

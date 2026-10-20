@@ -39,7 +39,6 @@ pub struct ImageProfile {
     pub png_compression: CompressionType,
     pub png_filter: FilterType,
     pub resize_filter: ResizeFilter,
-    pub jpeg_quality: u8,
 }
 
 /// Maximum single RGBA allocation accepted by screenshot decode and resize
@@ -63,7 +62,6 @@ impl ImageProfile {
             png_compression: CompressionType::Default,
             png_filter: FilterType::Adaptive,
             resize_filter: ResizeFilter::Lanczos3,
-            jpeg_quality: 90,
         }
     }
 
@@ -81,7 +79,6 @@ impl ImageProfile {
             png_compression: CompressionType::Level(6),
             png_filter: FilterType::Paeth,
             resize_filter: ResizeFilter::Triangle,
-            jpeg_quality: 90,
         }
     }
 
@@ -99,7 +96,6 @@ impl ImageProfile {
             png_compression: CompressionType::Default,
             png_filter: FilterType::Adaptive,
             resize_filter: ResizeFilter::Nearest,
-            jpeg_quality: 90,
         }
     }
 
@@ -118,7 +114,6 @@ impl ImageProfile {
             png_compression: CompressionType::Level(6),
             png_filter: FilterType::Paeth,
             resize_filter: ResizeFilter::Triangle,
-            jpeg_quality: 90,
         }
     }
 }
@@ -340,14 +335,6 @@ pub fn encode_png_rgba(image: &image::RgbaImage, profile: &ImageProfile) -> Resu
         ExtendedColorType::Rgba8,
     )?;
     check_output(bytes, profile)
-}
-
-/// Decode, nearest-scale, and PNG-encode a screenshot.
-pub fn scale_png_nearest(png: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-    let profile = ImageProfile::screenshot();
-    let decoded = decode_and_orient(png, &profile)?;
-    let scaled = scale(decoded, width, height, &profile);
-    encode_png(&scaled, &profile)
 }
 
 /// True when `input` is a multi-frame GIF (additional frames will be ignored).
@@ -790,10 +777,6 @@ pub(crate) mod test_hooks {
             });
             (barrier, continue_tx, enter_rx)
         }
-
-        pub fn has_entered(&self) -> bool {
-            self.entered.1.load(Ordering::SeqCst)
-        }
     }
 
     #[derive(Debug, Default)]
@@ -875,11 +858,6 @@ pub(crate) mod test_hooks {
         out.extend_from_slice(&[0x49, 0x49]); // truncated TIFF
         out.extend_from_slice(&jpeg[2..]);
         out
-    }
-
-    /// JPEG with EXIF orientation tag 9 (out of range).
-    pub fn jpeg_out_of_range_exif_fixture() -> Vec<u8> {
-        jpeg_with_exif_orientation(pattern_image(4, 4), 9)
     }
 
     pub fn pattern_image(width: u32, height: u32) -> DynamicImage {
@@ -969,7 +947,6 @@ pub(crate) mod test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::GenericImage;
     use image::codecs::png::{CompressionType, FilterType};
     use image::imageops::FilterType as ResizeFilter;
 

@@ -85,6 +85,7 @@ impl Session {
 
     /// Best-effort rollback for the sole latest-message ledger retraction.
     /// A concurrent manual rename wins the SQL predicate and is never clobbered.
+    #[cfg(test)]
     pub(crate) async fn restore_title_progress_after_retract(
         &self,
         snapshot: TitleProgressSnapshot,
@@ -439,7 +440,7 @@ impl Session {
     /// session. It is the mutually exclusive alternative to
     /// [`Self::note_user_content`], so it consumes the shared durable slot
     /// itself rather than racing the utility-title path.
-    pub fn note_user_content_for_metadata(&self, text: &str) -> Option<MetadataWork> {
+    pub(crate) fn note_user_content_for_metadata(&self, text: &str) -> Option<MetadataWork> {
         let increment = crate::auto_title::estimate_tokens(text);
         if increment == 0 {
             return None;

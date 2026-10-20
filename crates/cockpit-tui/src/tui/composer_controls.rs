@@ -18,6 +18,7 @@ use crate::tui::button::{bracketed_label, display_width};
 
 /// Chat widths at which placement/order fixtures run. Planning is
 /// width-driven and continuous; these anchor the tests.
+#[cfg(test)]
 pub const COMPOSER_CONTROL_PROBE_WIDTHS: [u16; 3] = [120, 80, 40];
 
 /// One column of separation between pills, and between the last pill and
@@ -347,12 +348,14 @@ fn place_pills_truncated(
 
 /// Current-feature → replacement surface → parity proof. A `proof` must
 /// be a declared `#[test]` in `tui/app/composer_controls_tests.rs`.
+#[cfg(test)]
 pub struct ComposerParityRow {
     pub control: &'static str,
     pub surface: &'static str,
     pub proof: &'static str,
 }
 
+#[cfg(test)]
 pub fn capability_parity_table() -> &'static [ComposerParityRow] {
     &[
         ComposerParityRow {

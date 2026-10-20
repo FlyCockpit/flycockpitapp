@@ -26,9 +26,8 @@ use super::revalidator::{
 };
 use super::seal;
 use super::session_authority::{
-    AdmissionDenial, AdmittedAttachment, AdmittedLocalHandle, AdmittedRetainedSource,
-    AttachmentResolver, LocalPathPolicy, READ_IMAGE_MAX_INPUT_BYTES, RetainedHttpsPolicy,
-    SessionMediaAuthority,
+    AdmissionDenial, AdmittedAttachment, AdmittedRetainedSource, AttachmentResolver,
+    LocalPathPolicy, READ_IMAGE_MAX_INPUT_BYTES, RetainedHttpsPolicy, SessionMediaAuthority,
 };
 
 // ---------------------------------------------------------------------------

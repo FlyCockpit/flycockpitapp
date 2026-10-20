@@ -4290,7 +4290,7 @@ mod tests {
             self.reads.fetch_add(1, Ordering::SeqCst);
             let failed = self
                 .failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     left.checked_sub(1)
                 })
                 .is_ok();

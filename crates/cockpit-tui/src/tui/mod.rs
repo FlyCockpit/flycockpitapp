@@ -16,7 +16,7 @@ pub mod agent_attention;
 pub mod agent_runner;
 pub mod agent_tree_pane;
 pub mod app;
-pub mod async_action;
+pub(crate) mod async_action;
 pub mod attention;
 pub mod auth_failure;
 pub mod banner_box;

@@ -125,6 +125,7 @@ pub enum JsonRpcId {
 }
 
 impl JsonRpcId {
+    #[cfg(test)]
     pub fn to_json(&self) -> String {
         match self {
             Self::Null => "null".to_string(),

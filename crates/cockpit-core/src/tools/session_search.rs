@@ -73,6 +73,7 @@ enum HistorySearchScope {
 }
 
 impl HistorySearchScope {
+    #[cfg(test)]
     fn parse(args: &Value) -> Result<Self> {
         Self::parse_with_default(args, "lineage")
     }

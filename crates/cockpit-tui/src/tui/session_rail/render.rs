@@ -319,11 +319,9 @@ impl SessionRail {
                 let role = last.map(|message| match message.role {
                     cockpit_proto::MessageRole::User => MessageBlockRole {
                         label: crate::tui::history::user_display_label().to_string(),
-                        style: Style::default().fg(crate::tui::history::user_message_color()),
                     },
                     cockpit_proto::MessageRole::Agent => MessageBlockRole {
                         label: "agent".to_string(),
-                        style: muted,
                     },
                 });
                 let label = role

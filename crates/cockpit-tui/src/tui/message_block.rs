@@ -33,14 +33,13 @@ struct WrappedMarkdown {
 #[derive(Debug, Clone)]
 pub(crate) struct MessageBlockRole {
     pub(crate) label: String,
-    pub(crate) style: Style,
 }
 
 /// Build one static Markdown message block. This is the single shared
 /// Markdown-message assembly site consumed by both the transcript and compact
 /// read-only surfaces. Callers may compose their own live chrome around the
 /// returned block, or add the compact role/timestamp header with
-/// [`MessageBlock::with_header`].
+/// the preview surface.
 pub(crate) fn render_markdown_message_block(
     text: &str,
     max_width: usize,
@@ -165,26 +164,6 @@ fn wrap_rendered_markdown(
         copy_cells: out_cells,
         copy_newlines_before: out_newlines,
         copy_incomplete: out_incomplete,
-    }
-}
-
-impl MessageBlock {
-    /// Add the compact header used by preview surfaces. Keeping this on the
-    /// shared block prevents compact views from growing a parallel Markdown
-    /// assembly path while letting the transcript retain its live chrome.
-    pub(crate) fn with_header(
-        self,
-        role: MessageBlockRole,
-        timestamp: String,
-    ) -> Vec<Line<'static>> {
-        let header_style = role.style.add_modifier(ratatui::style::Modifier::BOLD);
-        let mut lines = Vec::with_capacity(self.lines.len() + 1);
-        lines.push(Line::from(vec![
-            Span::styled(role.label, header_style),
-            Span::styled(format!(" · {timestamp}"), header_style),
-        ]));
-        lines.extend(self.lines);
-        lines
     }
 }
 

@@ -1680,6 +1680,7 @@ fn retry_recovery_submission(text: String) -> UserSubmission {
     submission
 }
 
+#[cfg(test)]
 fn auto_continue_submission(
     text: String,
     images: Vec<crate::engine::message::SubmissionImage>,
@@ -5073,6 +5074,8 @@ impl Driver {
         Ok(())
     }
 
+    // Retained as a production-path inspection hook for the agent-tree integration test.
+    #[allow(dead_code)]
     async fn terminalize_agent_tree_executor(
         &self,
         agent_instance_id: uuid::Uuid,

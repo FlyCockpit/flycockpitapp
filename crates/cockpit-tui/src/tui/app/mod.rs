@@ -1687,9 +1687,6 @@ pub(super) struct ScrollAnchor {
 pub(super) struct SideConversation {
     /// The ephemeral fork's session id — the row to discard on exit.
     pub(super) side_session_id: uuid::Uuid,
-    /// The daemon socket the side fork lives on (the same one the parent
-    /// runner is attached to), so the discard RPC reaches the right daemon.
-    pub(super) socket: std::path::PathBuf,
     pub(super) endpoint: cockpit_client::ClientEndpoint,
     /// Saved main-session view, restored on exit.
     saved_runner: Option<Result<AgentRunner, String>>,
@@ -3963,6 +3960,7 @@ impl App {
         let (connections, _) = tokio::sync::mpsc::channel(1);
         let (sensitive, _) = tokio::sync::mpsc::channel(1);
         crate::tui::agent_runner::SelectedLifecycle {
+            socket: PathBuf::from("test.sock"),
             endpoint: cockpit_client::ClientEndpoint::InProcess(
                 cockpit_client::InProcessEndpoint::new(connections, sensitive),
             ),
@@ -3970,7 +3968,6 @@ impl App {
             lifetime_client: None,
             owns_daemon: true,
             ephemeral_owner: false,
-            socket: PathBuf::from("test.sock"),
             startup_notice: None,
             promoted_from_ephemeral: false,
         }

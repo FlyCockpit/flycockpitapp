@@ -617,7 +617,7 @@ pub async fn execute_before_first_inference(
     execute_declared_seed_calls(&env, history, calls).await
 }
 
-pub async fn execute_declared_seed_calls(
+pub(crate) async fn execute_declared_seed_calls(
     env: &crate::engine::agent::tool_dispatch::DispatchEnv<'_>,
     history: &mut Vec<Message>,
     calls: Vec<crate::engine::message::ToolCall>,

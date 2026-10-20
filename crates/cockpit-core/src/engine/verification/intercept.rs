@@ -35,7 +35,7 @@ use crate::{
             VerificationDigest, VerificationSurrogateKind, VerificationSynthesisTerminal,
         },
     },
-    engine::{agent::Agent, model::Model, tool::ToolCtx},
+    engine::{agent::Agent, tool::ToolCtx},
     session::Session,
 };
 
@@ -96,7 +96,6 @@ pub(crate) struct VerificationDispatchPlan {
 pub(crate) struct InterceptInput<'a> {
     pub session: &'a Session,
     pub agent: &'a Agent,
-    pub model: &'a Model,
     pub ctx: &'a ToolCtx,
     pub history: &'a [crate::engine::message::Message],
     pub resolved_name: &'a str,
@@ -1229,11 +1228,10 @@ mod tests {
     use super::*;
     use crate::{
         agents::{
-            EffectiveVnextGrant, ExecutionKind, GeneratorSpec, GoalSkepticsPolicy, ModelCapability,
-            ModelLocality, ModelSlot, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate,
-            ToolClass, VerificationAction, VerificationMode, VerificationPolicy,
-            VerificationRecipe, VerificationRule, VerificationSelector, VnextAgentDef,
-            VnextHostPolicy,
+            EffectiveVnextGrant, GeneratorSpec, GoalSkepticsPolicy, ModelCapability, ModelLocality,
+            ModelSlot, OnAdjudicationFailure, OnBudgetExceeded, SelectorPredicate, ToolClass,
+            VerificationAction, VerificationMode, VerificationPolicy, VerificationRecipe,
+            VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
         },
         db::{
             agent_tree_decisions::NewAgentInstance,
@@ -1784,7 +1782,6 @@ mod tests {
         }));
         let agent = test_agent(tools, Some(verify_grant_inheriting_cost()));
         let (session, instance_id) = prepared_session(tmp.path()).await;
-        let model = test_model();
         let (tx, _rx) = mpsc::channel(8);
         let ctx = tool_ctx(session.clone(), tmp.path(), &tx, instance_id);
         let args = serde_json::json!({
@@ -1796,7 +1793,6 @@ mod tests {
             InterceptInput {
                 session: &session,
                 agent: &agent,
-                model: &model,
                 ctx: &ctx,
                 history: &[],
                 resolved_name: "plan_write",

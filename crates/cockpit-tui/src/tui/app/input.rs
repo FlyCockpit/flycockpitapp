@@ -4291,25 +4291,6 @@ impl App {
         self.composer.apply_paste_token_count(block_id, tokens)
     }
 
-    /// Insert a pasted image as a `[Pasted image #N]` block. On a
-    /// non-vision model, also toast that it'll be sent as a text note —
-    /// the bytes are retained either way and re-evaluated at send time.
-    pub(super) fn insert_image_block(&mut self, png: Vec<u8>) {
-        if !self.composer.try_insert_image(png) {
-            self.show_toast("Paste unavailable", super::ToastKind::Error);
-            return;
-        }
-        self.refresh_at_dismiss();
-        self.reset_at_window();
-        self.reset_slash_window();
-        if !self.active_model_supports_images() {
-            self.show_toast(
-                "Current model has no image support — this image will be sent as a text note.",
-                super::ToastKind::Info,
-            );
-        }
-    }
-
     pub(super) fn insert_image_handle_block(
         &mut self,
         admission: crate::tui::async_action::DaemonImagePathAdmission,

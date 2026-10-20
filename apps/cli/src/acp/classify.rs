@@ -30,19 +30,6 @@ pub enum ClassifyError {
     },
 }
 
-impl ClassifyError {
-    pub fn request_id(&self) -> Option<&JsonRpcId> {
-        match self {
-            Self::DuplicateMember { request_id, .. }
-            | Self::InvalidJson { request_id }
-            | Self::InvalidJsonrpc { request_id }
-            | Self::InvalidParams { request_id }
-            | Self::MissingMethod { request_id }
-            | Self::BothRequestAndResponse { request_id } => request_id.as_ref(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundMessage {
     Request(InboundRequest),

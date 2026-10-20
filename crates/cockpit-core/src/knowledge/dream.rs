@@ -1,40 +1,44 @@
-//! Governed knowledge synthesis over explicitly attached sessions.
+//! Knowledge Dream model selection, per-root fences, and prompt construction.
 //!
-//! The model-facing orchestrator may fan out one layer of read-only workers,
-//! but its only durable product is a provider-neutral [`DreamChangeSet`]. This
-//! module owns selection, target-union redaction, human provenance protection,
-//! sink dispatch, and completion-ledger ordering.
+//! Focused change-set validation fixtures also exercise redaction and human
+//! provenance protection alongside the live knowledge-write path.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail, ensure};
-use async_trait::async_trait;
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
-use tokio_util::sync::CancellationToken;
+#[cfg(test)]
 use uuid::Uuid;
 
+#[cfg(test)]
 use super::{
-    Citation, KnowledgeCommitOrigin, KnowledgeConcept, KnowledgeDreamCommit,
-    KnowledgeDreamGitOutcome, KnowledgeDreamWrite, KnowledgeMutationRoot,
-    apply_knowledge_dream_writes, apply_registered_knowledge_dream,
-    validate_knowledge_dream_writes,
+    Citation, KnowledgeConcept, KnowledgeDreamWrite, KnowledgeMutationRoot,
+    apply_knowledge_dream_writes, validate_knowledge_dream_writes,
 };
-use crate::config::extended::{ExtendedConfig, KnowledgeBaseRegistryEntry, KnowledgeBaseSource};
+#[cfg(test)]
+use crate::config::extended::KnowledgeBaseSource;
+use crate::config::extended::{ExtendedConfig, KnowledgeBaseRegistryEntry};
 use crate::config::providers::{ModelTrust, ProvidersConfig};
-use crate::db::knowledge_dreams::DreamSessionSource;
 use crate::db::session_search::HistoryCallerTrust;
+#[cfg(test)]
 use crate::redact::RedactionTable;
-use crate::session::Session;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg(test)]
 pub enum ConceptProvenance {
     Human,
     Dream,
 }
 
+#[cfg(test)]
 impl ConceptProvenance {
     pub(super) fn as_str(self) -> &'static str {
         match self {
@@ -45,6 +49,7 @@ impl ConceptProvenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(test)]
 pub struct ConceptUpsert {
     pub id: String,
     #[serde(rename = "type")]
@@ -57,6 +62,7 @@ pub struct ConceptUpsert {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(test)]
 pub struct DreamChangeSet {
     pub knowledge_base_id: String,
     pub source_session_ids: Vec<Uuid>,
@@ -125,94 +131,7 @@ pub fn resolve_dream_model(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DreamRunOutcome {
-    NothingToDream,
-    Applied {
-        sessions_dreamed: usize,
-        concepts_written: usize,
-        sink: KnowledgeDreamGitOutcome,
-    },
-    Deferred {
-        sessions_pending: usize,
-        sink: KnowledgeDreamGitOutcome,
-    },
-}
-
-#[async_trait]
-pub trait DreamSink: Send + Sync {
-    async fn apply(
-        &self,
-        model: &ResolvedDreamModel,
-        change_set: &DreamChangeSet,
-        cancel: CancellationToken,
-    ) -> Result<KnowledgeDreamGitOutcome>;
-}
-
-/// The only launch sink. Git/fencing remains encapsulated in the existing KB
-/// provider transaction; the engine sees only this interface and its outcome.
-pub struct LocalGitSink {
-    session: Arc<Session>,
-    cwd: PathBuf,
-    allowed_knowledge_bases: Option<BTreeSet<String>>,
-    config: ExtendedConfig,
-    knowledge_access_trusted: bool,
-}
-
-/// TODO(hosted dream service): add `RemoteSink` when hosted KB writes can
-/// submit authenticated change sets to the server. It deliberately has no
-/// launch implementation; `LocalGitSink` is the sole current sink.
-pub struct RemoteSink;
-
-impl LocalGitSink {
-    pub fn new(
-        session: Arc<Session>,
-        cwd: PathBuf,
-        allowed_knowledge_bases: Option<BTreeSet<String>>,
-        config: ExtendedConfig,
-        knowledge_access_trusted: bool,
-    ) -> Self {
-        Self {
-            session,
-            cwd,
-            allowed_knowledge_bases,
-            config,
-            knowledge_access_trusted,
-        }
-    }
-}
-
-#[async_trait]
-impl DreamSink for LocalGitSink {
-    async fn apply(
-        &self,
-        model: &ResolvedDreamModel,
-        change_set: &DreamChangeSet,
-        cancel: CancellationToken,
-    ) -> Result<KnowledgeDreamGitOutcome> {
-        let change_set = change_set.clone();
-        let commit = KnowledgeDreamCommit {
-            knowledge_base_id: change_set.knowledge_base_id.clone(),
-            origin: KnowledgeCommitOrigin::Dream,
-            model: model.reference(),
-            sessions_dreamed: change_set.source_session_ids.len(),
-            concepts_written: change_set.upserts.len(),
-            data_files_written: 0,
-        };
-        apply_registered_knowledge_dream(
-            &self.session,
-            &self.cwd,
-            self.allowed_knowledge_bases.as_ref(),
-            &self.config,
-            self.knowledge_access_trusted,
-            &commit,
-            cancel,
-            move |root| apply_change_set_to_local_bundle(root, &change_set),
-        )
-        .await
-    }
-}
-
+#[cfg(test)]
 fn apply_change_set_to_local_bundle(
     root: &KnowledgeMutationRoot,
     change_set: &DreamChangeSet,
@@ -281,10 +200,6 @@ fn apply_change_set_to_local_bundle(
     apply_knowledge_dream_writes(root, &writes)
 }
 
-pub struct DreamEngine {
-    session: Arc<Session>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CanonicalDreamProjectRoot(String);
 
@@ -350,155 +265,6 @@ impl CanonicalDreamProjectRoot {
     }
 }
 
-impl DreamEngine {
-    pub fn new(session: Arc<Session>) -> Self {
-        Self { session }
-    }
-
-    /// Validate and apply the final merge produced by the orchestrator. The
-    /// orchestrator and its one worker layer never receive a write capability.
-    pub(crate) async fn apply_orchestrated_change_set(
-        &self,
-        _run_fence: crate::session::DreamRunFence,
-        knowledge_base: &KnowledgeBaseRegistryEntry,
-        config: &ExtendedConfig,
-        providers: &ProvidersConfig,
-        executing_model: &str,
-        reader_redaction: &RedactionTable,
-        change_set: DreamChangeSet,
-        sink: &dyn DreamSink,
-        cancel: CancellationToken,
-    ) -> Result<DreamRunOutcome> {
-        // `_run_fence` is the exact per-KB boundary acquired before source
-        // selection and transferred here by the apply owner. LocalGitSink
-        // additionally holds #138's cross-process/root fence around the
-        // filesystem transaction.
-        let project_root =
-            CanonicalDreamProjectRoot::from_session_path(&self.session.project_root)?;
-        ensure!(
-            matches!(&knowledge_base.source, KnowledgeBaseSource::Local { .. }),
-            "remote dream submission is hosted and not implemented"
-        );
-        let model = resolve_dream_model(knowledge_base, config, providers)?;
-        ensure!(
-            model.reference() == executing_model,
-            "knowledge base `{}` must dream with `{}`, not `{executing_model}`",
-            knowledge_base.id,
-            model.reference()
-        );
-        ensure!(
-            change_set.knowledge_base_id == knowledge_base.id,
-            "dream change set targets the wrong knowledge base"
-        );
-
-        let consumer = self.session.db.ensure_installation_identity().await?;
-        let sources = self
-            .session
-            .db
-            .undreamed_sessions_for_knowledge_base(
-                &knowledge_base.id,
-                project_root.as_str(),
-                consumer.as_hex(),
-                history_caller_trust(&model, providers),
-            )
-            .await?;
-        if sources.is_empty() {
-            ensure!(
-                change_set.source_session_ids.is_empty() && change_set.upserts.is_empty(),
-                "knowledge base `{}` has no undreamed attached sessions",
-                knowledge_base.id
-            );
-            return Ok(DreamRunOutcome::NothingToDream);
-        }
-        validate_exact_source_set(&sources, &change_set.source_session_ids)?;
-
-        // Reuse #130's target-union seam: reader + machine-scoped sealed
-        // literals once, then each attached source session's persisted table.
-        let mut redaction = self
-            .session
-            .with_machine_scoped_sealed_redactions(reader_redaction)
-            .await?;
-        for source in &sources {
-            redaction = self
-                .session
-                .recall_redaction_table_from_base(&redaction, source.session_id)?;
-        }
-        let mut redacted = redact_and_validate_change_set(change_set, &redaction)?;
-        // Utility-model second layer over model-authored orchestrated dream
-        // output (issue #273): the same quarantine the interactive
-        // `knowledgeDreamApply` tool applies, at the single funnel every
-        // dream sink receives its change set through, so no sink (local or
-        // future hosted) can bypass it. The bound and the scan coincide —
-        // every upsert is scanned, and the count is capped first — so no
-        // write position predictably escapes the second layer. A
-        // floor-flagged upsert short-circuits (the shared write validation
-        // in the sink neutralizes it); the marker is retained in the body so
-        // the persisted file re-fences on every later read. A missing or
-        // unavailable model degrades to that floor.
-        ensure!(
-            redacted.upserts.len() <= super::MAX_KNOWLEDGE_DREAM_WRITES,
-            "orchestrated dream change set exceeds the per-apply write bound"
-        );
-        let guard = super::KbUtilityGuard::new(
-            config,
-            providers.clone(),
-            Arc::new(redaction),
-            &self.session.project_root,
-        );
-        for upsert in &mut redacted.upserts {
-            // Scan the exact serialized OKF document the sink will write
-            // (frontmatter included), then retain the quarantine marker in
-            // the body it serializes from.
-            let concept = KnowledgeConcept::dream(
-                upsert.id.clone(),
-                upsert.concept_type.clone(),
-                upsert.title.clone(),
-                upsert.body.clone(),
-                upsert.citations.clone(),
-            );
-            let serialized = super::serialize_concept(&concept);
-            if super::utility_quarantine_finding_for_dream_write(&serialized, &guard)
-                .await
-                .is_some()
-            {
-                tracing::warn!(
-                    concept_id = %upsert.id,
-                    "quarantining orchestrated dream concept flagged by the utility-model injection guard"
-                );
-                upsert.body.push_str("\n\n");
-                upsert
-                    .body
-                    .push_str(super::DREAM_INJECTION_NEUTRALIZED_MARKER);
-            }
-        }
-        let sink_outcome = sink.apply(&model, &redacted, cancel).await?;
-        if matches!(sink_outcome, KnowledgeDreamGitOutcome::Deferred { .. }) {
-            return Ok(DreamRunOutcome::Deferred {
-                sessions_pending: sources.len(),
-                sink: sink_outcome,
-            });
-        }
-        let source_ids = sources
-            .iter()
-            .map(|source| source.session_id)
-            .collect::<Vec<_>>();
-        self.session
-            .db
-            .record_knowledge_dream_completion(
-                &knowledge_base.id,
-                project_root.as_str(),
-                consumer.as_hex(),
-                &source_ids,
-            )
-            .await?;
-        Ok(DreamRunOutcome::Applied {
-            sessions_dreamed: source_ids.len(),
-            concepts_written: redacted.upserts.len(),
-            sink: sink_outcome,
-        })
-    }
-}
-
 pub(crate) fn knowledge_dream_lock_for_root(
     project_root: &CanonicalDreamProjectRoot,
     kb_id: &str,
@@ -545,24 +311,7 @@ pub fn build_dream_prompt(knowledge_base_id: &str) -> String {
     )
 }
 
-fn validate_exact_source_set(expected: &[DreamSessionSource], submitted: &[Uuid]) -> Result<()> {
-    let expected = expected
-        .iter()
-        .map(|source| source.session_id)
-        .collect::<BTreeSet<_>>();
-    let submitted_count = submitted.len();
-    let submitted = submitted.iter().copied().collect::<BTreeSet<_>>();
-    ensure!(
-        submitted.len() == submitted_count,
-        "dream source session ids contain duplicates"
-    );
-    ensure!(
-        expected == submitted,
-        "dream source set changed; rerun against the current attached, undreamed sessions"
-    );
-    Ok(())
-}
-
+#[cfg(test)]
 fn redact_and_validate_change_set(
     mut change_set: DreamChangeSet,
     redaction: &RedactionTable,
@@ -592,6 +341,7 @@ fn redact_and_validate_change_set(
     Ok(change_set)
 }
 
+#[cfg(test)]
 fn valid_concept_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128

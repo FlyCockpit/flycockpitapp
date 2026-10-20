@@ -293,23 +293,6 @@ impl TranscriptionHttpTransport {
         Self::vetted_header_map(origin, headers, dns, body_limit, None)
     }
 
-    pub(crate) fn vetted_headers_default_limit(
-        origin: &str,
-        headers: &[crate::providers::models_fetch::ResolvedHeader],
-        dns: Arc<dyn DnsResolver>,
-    ) -> Result<Self, ProviderTransportConfigError> {
-        let mut resolved = HeaderMap::new();
-        for header in headers {
-            let name = HeaderName::from_bytes(header.name.as_bytes())
-                .map_err(|_| ProviderTransportConfigError::InvalidCredential)?;
-            let mut value = HeaderValue::from_str(&header.value)
-                .map_err(|_| ProviderTransportConfigError::InvalidCredential)?;
-            value.set_sensitive(true);
-            resolved.insert(name, value);
-        }
-        Self::vetted_header_map(origin, resolved, dns, MAX_RESPONSE_BODY_BYTES, None)
-    }
-
     fn vetted_headers_default_limit_with_refresh(
         origin: &str,
         headers: &[crate::providers::models_fetch::ResolvedHeader],

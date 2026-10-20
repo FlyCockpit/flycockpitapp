@@ -2572,7 +2572,7 @@ impl Session {
     /// Record a real cache hit against the concrete endpoint that dispatched
     /// the request. Fallback attempts call this with their own target, rather
     /// than the session's mutable active selection.
-    pub fn note_cache_hit_for_endpoint(
+    pub(crate) fn note_cache_hit_for_endpoint(
         &self,
         endpoint: crate::engine::model::CacheEndpointIdentity,
         usage: crate::tokens::TokenUsage,
@@ -2588,7 +2588,7 @@ impl Session {
     /// Whether this exact configured endpoint has observed a real cache hit
     /// during the current live session. Estimates and utility bookkeeping do
     /// not establish this gate.
-    pub fn has_observed_cache_hit_for_endpoint(
+    pub(crate) fn has_observed_cache_hit_for_endpoint(
         &self,
         endpoint: &crate::engine::model::CacheEndpointIdentity,
     ) -> bool {

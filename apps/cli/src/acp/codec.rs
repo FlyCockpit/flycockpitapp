@@ -65,6 +65,7 @@ pub struct AcpFrame {
 }
 
 impl AcpFrame {
+    #[cfg(test)]
     pub fn byte_len(&self) -> usize {
         self.json.len()
     }
@@ -180,14 +181,6 @@ impl<W> AcpLineWriter<W> {
             bytes_written: 0,
         }
     }
-
-    pub fn bytes_written(&self) -> usize {
-        self.bytes_written
-    }
-
-    pub fn into_inner(self) -> W {
-        self.inner
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +212,7 @@ impl<W: Write> FrameSink for AcpLineWriter<W> {
 
 /// In-memory sink used by the permission registry and hermetic transcripts.
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct MemoryFrameSink {
     pub frames: Vec<String>,
     pub fail_next: bool,
@@ -226,6 +220,7 @@ pub struct MemoryFrameSink {
     pub closed: bool,
 }
 
+#[cfg(test)]
 impl FrameSink for MemoryFrameSink {
     fn write_json_value(
         &mut self,

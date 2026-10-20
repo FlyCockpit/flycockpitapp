@@ -815,7 +815,7 @@ const HIDDEN_SLASH_ALIASES: &[HiddenSlashAlias] = &[HiddenSlashAlias {
     canonical: "help",
 }];
 
-pub(crate) fn slash_command_by_name(name: &str) -> Option<&'static SlashCommand> {
+pub(super) fn slash_command_by_name(name: &str) -> Option<&'static SlashCommand> {
     SLASH_COMMANDS.iter().find(|c| c.name == name)
 }
 
@@ -2831,24 +2831,6 @@ impl App {
                     .await
             },
         );
-    }
-
-    /// Exit/interrupt teardown for an open `/sealed` overlay. If a WRITE is
-    /// pending, zeroize its typed buffer and send a best-effort
-    /// `CancelSealedOwnerOperation` over the still-live attached binding BEFORE
-    /// the runner/daemon is torn down — otherwise a Ctrl-C×2 exit would leave the
-    /// minted capability live until its server-side expiry. Fail-safe: with no
-    /// session/binding it just drops (the buffer is already zeroized) and never
-    /// blocks exit. A recover reveal needs no cancel; its plaintext lives only in
-    /// the alt-screen buffer (never in history/exit-tail) and is scrubbed on drop.
-    pub(super) fn teardown_sealed_overlay(&mut self) {
-        let Overlay::Sealed(mut overlay) = std::mem::take(&mut self.overlay) else {
-            return;
-        };
-        if let Some(capability_id) = overlay.take_pending_write_capability() {
-            self.cancel_sealed_capability(&capability_id);
-        }
-        // `overlay` drops here, zeroizing any reveal/input buffer.
     }
 
     /// Exit settlement for every capability whose id is already known. Uses

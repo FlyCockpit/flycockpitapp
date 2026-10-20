@@ -4,11 +4,14 @@
 //! control-plane paths via sandbox deny lists. Socket admission (issue #337)
 //! uses peer-bound credentials from `SO_PEERCRED` attestation, not this file.
 
+#[cfg(test)]
 use std::path::Path;
 
+#[cfg(test)]
 use anyhow::{Context, Result};
 use rand::RngExt as _;
 
+#[cfg(test)]
 use super::DaemonPaths;
 
 /// In-memory owner capability minted once per daemon boot.
@@ -36,6 +39,7 @@ impl OwnerCapability {
         constant_time_eq(self.token.as_bytes(), presented.as_bytes())
     }
 
+    #[cfg(test)]
     pub(crate) fn token(&self) -> &str {
         &self.token
     }
@@ -43,6 +47,7 @@ impl OwnerCapability {
     /// Write the token to the 0600 file next to the control socket for
     /// sandbox deny-path tests and fixtures. Socket peers must not use this
     /// file for owner admission (issue #337).
+    #[cfg(test)]
     pub fn publish(&self, socket: &Path) -> Result<()> {
         let path = DaemonPaths::owner_capability_path_for_socket(socket);
         if let Some(parent) = path.parent() {

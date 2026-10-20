@@ -343,6 +343,7 @@ async fn pin_rpc_parity_with_direct_db_calls() {
     assert!(matches!(response, Response::PinChanged { changed: true }));
 }
 
+#[cfg(feature = "remote")]
 fn sealed_owner_channel_requests() -> Vec<Request> {
     vec![
         Request::BeginSealedOwnerOperation {
@@ -8670,6 +8671,7 @@ async fn mint_mcp_edit_authority(
     }
 }
 
+#[cfg(feature = "remote")]
 fn test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
@@ -20685,17 +20687,12 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_redaction"
         | "set_tandem_models"
         | "refresh_config"
-        | "refresh_host_capabilities"
         | "cancel_schedule"
         | "prune"
         | "compact"
         | "resume_from_compaction"
         | "pin"
         | "promote_conversation_rule" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
-        // Discard is deliberately idempotent. The owner reaches the handler,
-        // and an unknown/already-removed ephemeral lineage acknowledges
-        // without inventing state.
-        "discard_session" => AuthzAllowedOutcome::Response,
         // `recover_security_blocked_media` validates the owner-principal binding
         // first, then short-circuits on the missing storage authority before the
         // attach check, so a detached owner reaches the `Internal` "media storage
@@ -20826,7 +20823,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "list_failed_tool_calls"
         | "get_assistant"
         | "get_session_compactions"
-        | "list_media_egress_verdicts"
         | "diagnose_media_reservation"
         | "get_doctor_snapshot"
         | "get_agent_inventory"
@@ -25791,7 +25787,6 @@ async fn assert_worker_delivery_happy(kind: &str) {
         },
         "prune" => Request::Prune,
         "compact" => Request::Compact,
-        "resume_from_compaction" => Request::ResumeFromCompaction,
         "pin" => Request::Pin {
             text: "remember this".into(),
         },
@@ -32416,24 +32411,6 @@ fn sample_png() -> Vec<u8> {
     out
 }
 
-fn assert_same_png_pixels(got: &crate::engine::message::SubmissionImage, want: &[u8]) {
-    let crate::engine::message::SubmissionImage::Png { bytes: got } = got else {
-        panic!("dispatcher must resolve retained references to PNG bytes");
-    };
-    let got = image::load_from_memory(got)
-        .expect("got png")
-        .to_rgba8()
-        .into_raw();
-    let want = image::load_from_memory(want)
-        .expect("want png")
-        .to_rgba8()
-        .into_raw();
-    assert_eq!(
-        got, want,
-        "durable storage may re-encode PNG; pixels must match"
-    );
-}
-
 fn assert_same_durable_png_pixels(got: &crate::engine::message::SubmissionMedia, want: &[u8]) {
     let crate::engine::message::SubmissionMedia::Image { bytes: got, .. } = got else {
         panic!("dispatcher must resolve retained image media to normalized bytes");
@@ -38823,6 +38800,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         approved_client_executable: base.approved_client_executable.clone(),
         peer_credential_registry: base.peer_credential_registry.clone(),
         canonical_cwd: base.canonical_cwd.clone(),
+        #[cfg(feature = "remote")]
         fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
         started_at: base.started_at,
         caffeinate: base.caffeinate.clone(),
@@ -38860,7 +38838,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         agent_installation_fixture: base.agent_installation_fixture.clone(),
         secure_key: None,
         secret_store_path: base.secret_store_path.clone(),
-        container_manager: base.container_manager.clone(),
+        _container_manager: base._container_manager.clone(),
         _secure_key_actor: None,
         external_journal: None,
         media_storage_recovery: None,
@@ -38937,6 +38915,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         approved_client_executable: base.approved_client_executable.clone(),
         peer_credential_registry: base.peer_credential_registry.clone(),
         canonical_cwd: base.canonical_cwd.clone(),
+        #[cfg(feature = "remote")]
         fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
         started_at: base.started_at,
         caffeinate: base.caffeinate.clone(),
@@ -38974,7 +38953,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         agent_installation_fixture: base.agent_installation_fixture.clone(),
         secure_key: None,
         secret_store_path: base.secret_store_path.clone(),
-        container_manager: base.container_manager.clone(),
+        _container_manager: base._container_manager.clone(),
         _secure_key_actor: None,
         external_journal: None,
         media_storage_recovery: None,

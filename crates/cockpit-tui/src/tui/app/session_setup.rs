@@ -147,14 +147,6 @@ impl App {
                 }
                 self.submit_session_setup_add_mcp(scope, name, transport, endpoint, command, auth);
             }
-            SessionSetupOutcome::Notice { message } => {
-                pane.set_notice(message);
-                if as_overlay {
-                    self.overlay = Overlay::SessionSetup(pane);
-                } else {
-                    self.session_setup_inline = Some(pane);
-                }
-            }
         }
     }
 

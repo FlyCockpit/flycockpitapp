@@ -6,6 +6,7 @@
 //! the existing private media-storage policy; consumers receive held/immutable
 //! sources, never a model-controlled re-open authority.
 
+#[cfg(test)]
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -416,11 +417,13 @@ impl AttachmentResolver for PersistedAttachmentResolver {
             }
             Some(super::session_authority::AdmittedHandle::RetainedHttps(
                 AdmittedRetainedSource {
+                    #[cfg(test)]
                     canonical_url: format!(
                         "attachment:{}",
                         Uuid::from_bytes(attachment.attachment_id)
                     ),
                     content,
+                    #[cfg(test)]
                     content_type: "application/octet-stream".to_owned(),
                 },
             ))
@@ -488,6 +491,7 @@ impl LocalPathPolicy for HeldLocalPathPolicy {
         Ok((file, evidence))
     }
 
+    #[cfg(test)]
     fn admit(
         &self,
         _session_id: &str,
@@ -655,6 +659,7 @@ impl RetainedHttpsPolicy for MediaStorageRetainedHttpsPolicy {
         // against an in-memory sink before any private reservation.
         let media_storage = self.media_storage.clone();
         let url = url.to_owned();
+        #[cfg(test)]
         let canonical_url = url.clone();
         let result = std::thread::scope(|scope| {
             scope
@@ -680,8 +685,10 @@ impl RetainedHttpsPolicy for MediaStorageRetainedHttpsPolicy {
             return Err(AdmissionDenial::HttpsDenied);
         }
         Ok(AdmittedRetainedSource {
+            #[cfg(test)]
             canonical_url,
             content: result,
+            #[cfg(test)]
             content_type: "application/octet-stream".to_owned(),
         })
     }

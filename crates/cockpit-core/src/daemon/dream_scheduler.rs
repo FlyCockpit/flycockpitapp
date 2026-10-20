@@ -5,18 +5,27 @@
 //! configured knowledge base on this installation and consumes its complete
 //! per-consumer ledger snapshot in one headless Dream turn.
 
+#[cfg(test)]
 use std::collections::HashSet;
+#[cfg(test)]
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use chrono::{Datelike, Local, TimeZone, Utc};
+use chrono::Utc;
+#[cfg(test)]
+use chrono::{Datelike, Local, TimeZone};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, oneshot};
+#[cfg(test)]
+use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 
 use crate::config::extended::{KnowledgeBaseRegistryEntry, KnowledgeBaseSource};
 use crate::config::providers::ActiveModelRef;
+#[cfg(test)]
 use crate::daemon::config_source::ConfigSource;
 use crate::daemon::proto::{EnvSnapshotSource, QueueDeliveryClass};
 use crate::daemon::registry::SessionRegistry;
@@ -24,13 +33,12 @@ use crate::daemon::session_worker::{CancelOrigin, SessionWork, TurnOutcome};
 use crate::db::Db;
 use crate::db::session_search::HistoryCallerTrust;
 use crate::env_snapshot::EnvSnapshot;
+use crate::knowledge::dream::CanonicalDreamProjectRoot;
 #[cfg(test)]
 use crate::knowledge::dream::knowledge_dream_run_lock_for_root;
-use crate::knowledge::dream::{
-    CanonicalDreamProjectRoot, history_caller_trust, resolve_dream_model,
-};
+#[cfg(test)]
+use crate::knowledge::dream::{history_caller_trust, resolve_dream_model};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const DREAM_TURN_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// Cancellation is cooperative, but the dedicated Dream worker must not own
 /// the per-KB execution fence indefinitely when it fails to publish a terminal
@@ -39,12 +47,14 @@ const DREAM_TURN_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DREAM_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const DREAM_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_millis(10);
+#[cfg(test)]
 const DEFAULT_JITTER_SECONDS: i64 = 60 * 60;
 
 pub(crate) const REMOTE_KNOWLEDGE_DREAM_UNAVAILABLE_MESSAGE: &str =
     "remote knowledge-base dream submission is hosted and not implemented";
 
 #[derive(Clone)]
+#[cfg(test)]
 pub(crate) struct DreamScheduler {
     db: Db,
     registry: SessionRegistry,
@@ -52,43 +62,8 @@ pub(crate) struct DreamScheduler {
     in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
+#[cfg(test)]
 impl DreamScheduler {
-    pub(crate) fn spawn(
-        db: Db,
-        registry: SessionRegistry,
-        config_source: ConfigSource,
-        _workspace_root: PathBuf,
-        shutdown: crate::daemon::shutdown::ShutdownSignal,
-    ) -> tokio::task::JoinHandle<()> {
-        let scheduler = Self {
-            db,
-            registry,
-            config_source,
-            in_flight: Arc::new(Mutex::new(HashSet::new())),
-        };
-        tokio::spawn(async move { scheduler.run(shutdown).await })
-    }
-
-    async fn run(self, shutdown: crate::daemon::shutdown::ShutdownSignal) {
-        let mut shutdown_rx = shutdown.subscribe();
-        loop {
-            if shutdown.is_draining() {
-                return;
-            }
-            if let Err(error) = self.run_due_once().await {
-                tracing::warn!(error = %error, "knowledge dream scheduler pass failed");
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(POLL_INTERVAL) => {}
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || shutdown.is_draining() {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
     async fn run_due_once(&self) -> Result<()> {
         let consumer_id = self
             .db
@@ -487,6 +462,7 @@ fn local_knowledge_dream_head(
         .filter(|commit| !commit.is_empty())
 }
 
+#[cfg(test)]
 impl DreamScheduler {
     async fn claim_in_flight(&self, project_root: &CanonicalDreamProjectRoot, kb_id: &str) -> bool {
         self.in_flight
@@ -503,6 +479,7 @@ impl DreamScheduler {
     }
 }
 
+#[cfg(test)]
 fn is_due(
     schedule: Option<&str>,
     last_scheduled_at_unix_ms: Option<i64>,
@@ -549,6 +526,7 @@ fn is_due(
     }
 }
 
+#[cfg(test)]
 fn default_daily_is_due(last_scheduled_at: i64, now: i64, kb_id: &str, consumer_id: &str) -> bool {
     let Some(now_local) = Local.timestamp_opt(now, 0).single() else {
         return false;
@@ -594,6 +572,7 @@ fn default_daily_is_due(last_scheduled_at: i64, now: i64, kb_id: &str, consumer_
             .saturating_add(default_jitter_seconds(kb_id, consumer_id))
 }
 
+#[cfg(test)]
 fn default_jitter_seconds(kb_id: &str, consumer_id: &str) -> i64 {
     let mut hash = Sha256::new();
     hash.update(b"flycockpit-knowledge-dream-midnight-jitter-v1\0");

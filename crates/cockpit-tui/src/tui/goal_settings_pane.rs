@@ -225,7 +225,6 @@ enum GoalSettingsPending {
         patch: cockpit_proto::GoalSupervisionPatch,
         prior_goal_json: Option<String>,
         override_json: Option<String>,
-        querying: bool,
     },
 }
 
@@ -340,7 +339,6 @@ impl GoalSettingsPane {
             patch,
             prior_goal_json,
             override_json,
-            querying: true,
         });
         self.status = Some(format!("{message}; press Enter to query again"));
     }
@@ -356,7 +354,6 @@ impl GoalSettingsPane {
             patch,
             prior_goal_json,
             override_json,
-            querying: _,
             ..
         }) = self.in_flight.take()
         else {
@@ -387,7 +384,6 @@ impl GoalSettingsPane {
             patch,
             prior_goal_json,
             override_json,
-            querying: false,
         });
         self.status = Some("retrying the exact durable goal-settings mutation".into());
     }
@@ -486,7 +482,6 @@ impl GoalSettingsPane {
                 patch,
                 prior_goal_json,
                 override_json,
-                querying: _,
                 ..
             } => {
                 if self.agent_name != agent_name
@@ -881,7 +876,6 @@ impl GoalSettingsPane {
                 patch: goal_patch,
                 prior_goal_json,
                 override_json,
-                querying: false,
             });
             self.status = Some("saving agent goal settings…".to_string());
             return Ok(GoalSettingsOutcome::Pending);

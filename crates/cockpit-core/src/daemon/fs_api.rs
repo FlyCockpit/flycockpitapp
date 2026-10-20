@@ -2351,8 +2351,10 @@ pub(crate) fn canonical_project_root(project_root: &str) -> Result<PathBuf, Erro
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthorizedCanonicalPathMode {
+    #[cfg(any(test, feature = "remote"))]
     Existing,
     WriteTarget,
+    #[cfg(any(test, feature = "remote"))]
     RenameSource,
 }
 
@@ -2365,12 +2367,15 @@ pub(crate) fn resolve_authorized_canonical_path(
 ) -> Result<PathBuf, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
     match mode {
+        #[cfg(any(test, feature = "remote"))]
         AuthorizedCanonicalPathMode::Existing => resolve_existing_path(&root, path),
         AuthorizedCanonicalPathMode::WriteTarget => resolve_existing_or_parent_path(&root, path),
+        #[cfg(any(test, feature = "remote"))]
         AuthorizedCanonicalPathMode::RenameSource => resolve_rename_source(&root, path),
     }
 }
 
+#[cfg(any(test, feature = "remote"))]
 fn resolve_rename_source(root: &Path, path: &str) -> Result<PathBuf, ErrorPayload> {
     let rel = clean_relative_path(path)?;
     let name = rel

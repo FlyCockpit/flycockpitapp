@@ -85,10 +85,3 @@ pub fn repository_id(dir: &Path) -> Result<String> {
         .as_str()
         .to_string())
 }
-
-pub fn canonical_root(dir: &Path) -> Result<String> {
-    let root = git::find_worktree_root(dir)
-        .ok_or_else(|| anyhow::anyhow!("`{}` is not inside a git worktree", dir.display()))?;
-    let root = git::resolve_git_path(&root)?;
-    Ok(root.to_string_lossy().into_owned())
-}

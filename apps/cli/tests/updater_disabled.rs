@@ -13,10 +13,9 @@ use cockpit_core::updater::{
     ActiveUpdater, BinaryReplacer, FakeFixtureEvidence, InstallationAuthorization,
     InstallationPaths, InstallationPolicy, ManualUpdateOutcome, MetadataRepository,
     PlatformBinaryReplacer, SupervisorMaintenanceClient, SupervisorMaintenanceRequest,
-    TargetFetcher, TrustRoot, UntrustedRepositoryMetadata, UpdateApplyReceipt,
-    UpdateApplyReceiptState, UpdateCheckResult, UpdateLockRecord, UpdateLockStore,
-    UpdateStatusSnapshot, UpdateTargetDescriptor, Updater, UpdaterError,
-    VerifiedRepositoryMetadata,
+    TargetFetcher, TrustRoot, UntrustedRepositoryMetadata, UpdateApplyReceipt, UpdateCheckResult,
+    UpdateLockRecord, UpdateLockStore, UpdateStatusSnapshot, UpdateTargetDescriptor, Updater,
+    UpdaterError, VerifiedRepositoryMetadata,
 };
 use sha2::{Digest, Sha256};
 

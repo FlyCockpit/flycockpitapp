@@ -18,15 +18,6 @@ pub(crate) mod raw_json;
 pub(crate) mod registry;
 pub(crate) mod server;
 
-pub(crate) use codec::{
-    ACP_FORWARDED_MCP_VECTOR_MAX_BYTES_V1, ACP_JSON_FRAME_MAX_BYTES_V1, AcpFrame, AcpFrameError,
-    AcpLineReader, AcpLineWriter,
-};
-pub(crate) use registry::{
-    ACP_OUTBOUND_PERMISSION_MAX_CHARGED_BYTES_V1, ACP_OUTBOUND_PERMISSION_MAX_ENTRIES_V1,
-    OutboundPermissionRegistry,
-};
-
 /// ACP host acquisition seam. The settings owner supplies the current
 /// background-agents value; acquisition itself uses the discoverable wire owner
 /// (Unix socket or Windows named-pipe identity).
@@ -51,6 +42,7 @@ pub(crate) struct AcpTransportCounters {
 }
 
 impl AcpTransportCounters {
+    #[cfg(test)]
     pub(crate) fn zero_side_effects(&self) -> bool {
         self.daemon_mutations == 0
             && self.bridge_conversions == 0

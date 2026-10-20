@@ -3402,13 +3402,11 @@ async fn run_foreground_inner_with_boot_db_impl(
     #[cfg(feature = "remote")]
     let mut org_sync_task = ForegroundTask::new(org_sync::spawn_background(ctx.clone()));
     #[cfg(feature = "remote")]
-    let mut remote_audit_upload_task =
-        ForegroundTask::new(remote_audit_upload::spawn_background(ctx.clone()));
+    let mut audit_task = ForegroundTask::new(remote_audit_upload::spawn_background(ctx.clone()));
     #[cfg(feature = "remote")]
     let mut connector_task = ForegroundTask::new(connector::spawn_background(ctx.clone()));
     #[cfg(feature = "remote")]
-    let mut remote_outbox_task =
-        ForegroundTask::new(remote_outbox_worker::spawn_background(ctx.clone()));
+    let mut outbox_task = ForegroundTask::new(remote_outbox_worker::spawn_background(ctx.clone()));
 
     // Dedicated Unix peer-authenticated leak-reveal socket (sibling of the
     // control socket; path a pure function of it). Carries only the closed
@@ -3536,7 +3534,7 @@ async fn run_foreground_inner_with_boot_db_impl(
     }
     #[cfg(feature = "remote")]
     {
-        remote_audit_upload_task.abort_and_join().await;
+        audit_task.abort_and_join().await;
     }
     #[cfg(feature = "remote")]
     {
@@ -3544,7 +3542,7 @@ async fn run_foreground_inner_with_boot_db_impl(
     }
     #[cfg(feature = "remote")]
     {
-        remote_outbox_task.abort_and_join().await;
+        outbox_task.abort_and_join().await;
     }
     #[cfg(any(unix, windows))]
     leak_reveal_task.abort_and_join().await;

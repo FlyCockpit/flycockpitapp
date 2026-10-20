@@ -56,6 +56,27 @@ fn combine_app_and_lifecycle(app: Result<()>, lifecycle: Result<()>) -> Result<(
     }
 }
 
+#[allow(dead_code, reason = "CLI TUI process-boundary inspector entrypoint")]
+pub async fn run(
+    project: Option<&Path>,
+    no_sandbox: bool,
+    launch_start: Option<Instant>,
+) -> Result<()> {
+    run_mode(
+        project,
+        no_sandbox,
+        SessionMode::Code,
+        launch_start,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
 /// Start every interactive mode through the sole TUI/session construction
 /// path. The mode is intentionally not translated into `SetAgent` or any
 /// other broad existing control: those controls lack the

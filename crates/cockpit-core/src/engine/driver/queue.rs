@@ -1,24 +1,5 @@
 use super::*;
 
-/// Drain queued user submissions from the channel without blocking.
-/// Stops at the [`MAX_FOLD`] batch cap; anything beyond stays queued.
-pub(super) async fn drain_queue(
-    rx: &crate::engine::message::UserSubmissionQueue,
-    into: &mut Vec<UserSubmission>,
-    target_id: &str,
-) {
-    drain_queue_limit(rx, into, target_id, MAX_FOLD).await;
-}
-
-pub(super) async fn drain_queue_limit(
-    rx: &crate::engine::message::UserSubmissionQueue,
-    into: &mut Vec<UserSubmission>,
-    target_id: &str,
-    max: usize,
-) {
-    rx.drain_into_for(into, max, Some(target_id)).await;
-}
-
 pub(super) async fn drain_effective_top_queue(
     rx: &crate::engine::message::UserSubmissionQueue,
     into: &mut Vec<UserSubmission>,
@@ -47,7 +28,7 @@ pub(super) async fn drain_group_order_queue(
 }
 
 /// Discard *all* currently-queued user submissions from the channel
-/// (no [`MAX_FOLD`] cap, unlike [`drain_queue`]) and report how many were
+/// (without the ordinary [`MAX_FOLD`] batching cap) and report how many were
 /// dropped. Used on the ctrl+c cancel-unwind so messages the user queued
 /// during the cancelled span never auto-start a fresh turn — the cancel
 /// returns the session to idle rather than silently rolling into the next

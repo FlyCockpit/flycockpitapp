@@ -188,7 +188,7 @@ impl App {
         &mut self,
         parent_session_id: uuid::Uuid,
         endpoint: cockpit_client::ClientEndpoint,
-        socket: std::path::PathBuf,
+        _socket: std::path::PathBuf,
         side_session_id: uuid::Uuid,
         side_short_id: String,
     ) {
@@ -245,7 +245,6 @@ impl App {
             let side = SideConversation {
                 side_session_id,
                 endpoint,
-                socket,
                 saved_runner: None,
                 saved_history: self.history.clone(),
                 saved_history_render_versions: self.history_render_versions.clone(),

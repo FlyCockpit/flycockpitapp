@@ -1126,6 +1126,7 @@ impl UserSubmissionQueue {
         });
     }
 
+    #[cfg(test)]
     pub(crate) async fn has_send_now_for(&self, target_id: Option<&str>) -> bool {
         self.first_send_now_for(target_id).await.is_some()
     }
@@ -1169,6 +1170,7 @@ impl UserSubmissionQueue {
         }
     }
 
+    #[cfg(test)]
     async fn first_send_now_for(&self, target_id: Option<&str>) -> Option<Uuid> {
         let state = self.inner.lock().await;
         match target_id {
@@ -1446,11 +1448,6 @@ impl UserSubmissionQueue {
             .await;
         self.drain_into_for_filtered(into, max, target_id, QueueDrainFilter::Held)
             .await;
-    }
-
-    async fn peek_front_is_run_invocation(&self, target_id: Option<&str>) -> bool {
-        self.peek_front_is_run_invocation_filtered(target_id, QueueDrainFilter::Any)
-            .await
     }
 
     async fn peek_front_is_run_invocation_filtered(

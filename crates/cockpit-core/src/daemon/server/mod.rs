@@ -41,8 +41,10 @@ use crate::daemon::registry::SessionRegistry;
 #[cfg(feature = "extended")]
 use crate::daemon::scheduler::DaemonSchedulerHandle;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
+#[cfg(test)]
+use crate::daemon::set_current_redaction;
 use crate::daemon::shutdown::ShutdownPhase;
-use crate::daemon::{EventEnvelope, EventReceiver, EventSender, send_event, set_current_redaction};
+use crate::daemon::{EventEnvelope, EventReceiver, EventSender};
 #[cfg(test)]
 use crate::daemon::{SharedRedactionTable, current_redaction};
 use crate::db::Db;
@@ -2931,7 +2933,7 @@ pub struct DaemonContext {
     /// Canonical process cwd captured once at daemon construction. Remote
     /// operation resources never trust a caller-supplied fallback cwd.
     pub canonical_cwd: PathBuf,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "remote"))]
     pub(crate) fcor_resolver_calls: std::sync::atomic::AtomicUsize,
     pub started_at: Instant,
     /// Caffeination authority (`/caffeinate`, GOALS §1a chrome glyph).
@@ -3048,7 +3050,7 @@ pub struct DaemonContext {
     /// Context-owned container runtime authority. The DB-keyed weak registry
     /// lets tool/session siblings locate this exact manager without making a
     /// process-global first-writer selection authoritative.
-    pub(crate) container_manager: Arc<crate::container::ContainerManager>,
+    pub(crate) _container_manager: Arc<crate::container::ContainerManager>,
     /// Owns the actor thread; kept so Drop drains before unset_default_store.
     _secure_key_actor: Option<crate::secure_key::SecureKeyActor>,
     /// Shared production protected redaction-history key resolver, built from
@@ -3218,7 +3220,7 @@ impl DaemonContext {
         *crate::sync::lock_or_recover(&self.exit_guard_reservation) = Weak::new();
     }
 
-    pub(crate) fn release_exit_guard_reservation(&self, client_state: &mut MutableClientState) {
+    fn release_exit_guard_reservation(&self, client_state: &mut MutableClientState) {
         let _decision = crate::sync::lock_or_recover(&self.restart_decision);
         self.clear_exit_guard_reservation(client_state.exit_guard_reservation.as_ref());
         client_state.exit_guard_reservation = None;
@@ -3364,6 +3366,7 @@ impl DaemonContext {
     /// writes the endpoint before activation, so the fallible path never
     /// installs this bundle; the inverse remains for an idempotent rollback
     /// of a never-published owner.
+    #[cfg(test)]
     fn deactivate_persistent_services(&self) {
         self.registry.set_resource_scheduler(None);
         #[cfg(feature = "extended")]
@@ -3802,7 +3805,7 @@ impl DaemonContext {
                 .expect("resolving approved local client executable"),
             peer_credential_registry,
             canonical_cwd: canonical_cwd.clone(),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "remote"))]
             fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
             started_at,
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
@@ -3842,7 +3845,7 @@ impl DaemonContext {
             agent_installation_fixture,
             secure_key: None,
             secret_store_path: None,
-            container_manager: container,
+            _container_manager: container,
             _secure_key_actor: None,
             redaction_key_resolver,
             external_journal: None,
@@ -8484,7 +8487,7 @@ async fn run_retention_tick_at(ctx: &DaemonContext, cfg: RetentionConfig, now_un
     }
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(test)]
 async fn run_retention_tick_db(db: Db, cfg: RetentionConfig) {
     let now_secs = chrono::Utc::now().timestamp();
     run_retention_pass(db, cfg, now_secs).await;
@@ -9294,7 +9297,7 @@ where
     handle_client_transport_as(stream, ctx, principal, client_instance_id, false, None).await
 }
 
-#[cfg(any(unix, test))]
+#[cfg(test)]
 async fn handle_client_transport<S>(stream: S, ctx: Arc<DaemonContext>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -9586,6 +9589,7 @@ enum ClientEventCommand {
         rendered_interrupts: Arc<StdMutex<HashSet<Uuid>>>,
     },
     Detach,
+    #[cfg(test)]
     Barrier(oneshot::Sender<()>),
 }
 
@@ -9802,6 +9806,7 @@ async fn run_client_event_forwarder(
                         session_event_rx = None;
                         rendered_interrupts = None;
                     }
+                    #[cfg(test)]
                     Some(ClientEventCommand::Barrier(done)) => {
                         let _ = done.send(());
                     }

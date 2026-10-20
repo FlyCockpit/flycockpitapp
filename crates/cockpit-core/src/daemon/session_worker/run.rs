@@ -5808,6 +5808,7 @@ impl StartupWorkInbox {
         self.pending.push_back(work);
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -6885,7 +6886,7 @@ pub(super) async fn run_worker(
                 }
                 proto::Event::ScheduleCompleted { .. } => {
                     // Saturating: never underflow if a completion is ever seen without its start.
-                    let _ = live_for_forward.active_schedules.fetch_update(
+                    let _ = live_for_forward.active_schedules.try_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |n| Some(n.saturating_sub(1)),
@@ -6897,7 +6898,7 @@ pub(super) async fn run_worker(
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 proto::Event::ToolEnd { .. } | proto::Event::ToolError { .. } => {
-                    let _ = live_for_forward.tool_running.fetch_update(
+                    let _ = live_for_forward.tool_running.try_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |n| Some(n.saturating_sub(1)),

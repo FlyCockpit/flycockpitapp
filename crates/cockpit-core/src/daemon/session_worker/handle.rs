@@ -29,6 +29,7 @@ pub struct SessionWorkerHandle {
     work_tx: mpsc::Sender<SessionWork>,
     /// Live per-thread activity epoch shared directly with the driver's
     /// schedule authority. Dispatch publishes only after durable acceptance.
+    #[cfg(any(test, feature = "extended"))]
     idle_activity_tx: tokio::sync::watch::Sender<tokio::time::Instant>,
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
@@ -174,6 +175,7 @@ impl TurnCompletions {
     }
 
     #[cfg(test)]
+    #[cfg(feature = "extended")]
     fn has_pending(&self, turn_id: &str) -> bool {
         self.pending
             .get(turn_id)
@@ -405,13 +407,13 @@ pub(crate) struct HostCapabilityRefreshRuntime {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct HostCapabilitiesRefreshCompletion {
+pub struct HostCapabilitiesRefreshCompletion {
     pub snapshot: cockpit_proto::HostCapabilitySnapshot,
     pub published: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HostCapabilitiesRefreshError {
+pub enum HostCapabilitiesRefreshError {
     Declined,
     Internal(String),
 }
@@ -885,6 +887,7 @@ impl ReplaceConfigSnapshotAck {
     }
 }
 
+#[cfg(test)]
 pub(super) fn replace_config_snapshot(
     config_snapshot: &Arc<RwLock<SessionConfigSnapshot>>,
     replacement: SessionConfigSnapshot,
@@ -1306,6 +1309,7 @@ impl SessionWorkerHandle {
                 .expect("test workspace authority"),
             ),
             work_tx,
+            #[cfg(any(test, feature = "extended"))]
             idle_activity_tx,
             event_tx,
             turn_completions: Arc::new(Mutex::new(TurnCompletions::default())),
@@ -1685,7 +1689,7 @@ impl Drop for InteractiveClientGuard {
         // the count before this drop, so the count is now `prev - 1`.
         let prev = self
             .counter
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |n| Some(n.saturating_sub(1)),
@@ -1808,6 +1812,7 @@ impl SessionWorkerHandle {
     /// Install a new policy only after the caller has published the matching
     /// retained config snapshot.  The shared task-local used by the driver
     /// observes this same cell on its next policy read.
+    #[cfg(test)]
     pub(crate) fn replace_trust_policy(&self, policy: crate::config::trust::WorkspaceTrustPolicy) {
         crate::config::trust::replace_shared_workspace_trust_policy(&self.trust_policy, policy);
     }
@@ -1849,6 +1854,7 @@ impl SessionWorkerHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn record_user_activity(&self) {
         let _ = self.idle_activity_tx.send(tokio::time::Instant::now());
     }
@@ -1901,6 +1907,7 @@ impl SessionWorkerHandle {
     }
 
     #[cfg(test)]
+    #[cfg(feature = "extended")]
     pub(crate) fn has_pending_turn_for_test(&self, turn_id: &str) -> bool {
         self.turn_completions
             .lock()
@@ -1909,6 +1916,7 @@ impl SessionWorkerHandle {
     }
 
     #[cfg(test)]
+    #[cfg(feature = "extended")]
     pub(crate) fn broadcast_notice_for_test(&self, text: String) {
         send_current_event(
             &self.event_tx,
@@ -3182,6 +3190,7 @@ pub(crate) fn spawn(
         trust_transition_pending: trust_transition_pending.clone(),
         workspace_root_authority: workspace_root_authority.clone(),
         work_tx,
+        #[cfg(any(test, feature = "extended"))]
         idle_activity_tx: idle_activity_tx.clone(),
         event_tx: event_tx.clone(),
         turn_completions: turn_completions.clone(),

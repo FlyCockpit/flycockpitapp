@@ -2105,9 +2105,9 @@ impl ToolCtx {
         self.media_authority.as_deref()
     }
 
-    /// Attach a media authority to this context. Production-only; the
-    /// daemon/session-worker composition calls this on the direct-native
-    /// dispatch path. Test-only constructors may use fakes.
+    /// Attach a media authority to a test context. Production composition
+    /// installs the authority while constructing the direct-native context.
+    #[cfg(test)]
     pub(crate) fn with_media_authority(
         mut self,
         authority: Arc<crate::tool_media_authority::SessionMediaAuthority>,
@@ -2182,14 +2182,6 @@ impl CallerModel {
 
     pub(crate) fn from_model(model: &crate::engine::model::Model) -> Self {
         Self::new(model.provider_id(), model.model_id_ref())
-    }
-
-    pub(crate) fn provider_id(&self) -> &str {
-        &self.provider_id
-    }
-
-    pub(crate) fn model_id(&self) -> &str {
-        &self.model_id
     }
 }
 
@@ -2573,34 +2565,6 @@ impl ToolBox {
         self
     }
 
-    /// Keep only built-in operations whose declared effect is read-only.
-    ///
-    /// This is a capability boundary, not a scheduling hint: an unregistered
-    /// or user-authored tool is excluded even when it claims `ReadOnly`, since
-    /// a custom shell template can make that claim while executing arbitrary
-    /// code. Callers that need a constrained non-read-only escape hatch must
-    /// add that tool back explicitly and own its effect accounting.
-    pub(crate) fn registered_read_only_operations(mut self) -> Self {
-        let is_safe = |tool: &Arc<dyn Tool>| {
-            tool.is_registered_ordinary_operation() && tool.effect() == ToolEffect::ReadOnly
-        };
-        self.tools.retain(|_, tool| is_safe(tool));
-        self.dormant_direct_native_media
-            .retain(|_, tool| is_safe(tool));
-        self.mcp_builtin_tools
-            .retain(|_, entry| is_safe(&entry.tool));
-        self.overrides
-            .retain(|name, _| self.tools.contains_key(name));
-        self.capability_unavailable
-            .retain(|name, _| self.tools.contains_key(name));
-        self.capability_description_suffixes
-            .retain(|name, _| self.tools.contains_key(name));
-        self.direct_native_media_unavailable
-            .retain(|name, _| self.dormant_direct_native_media.contains_key(name));
-        self.definition_cache.lock().unwrap().clear();
-        self
-    }
-
     /// Wrap every non-read-only callable operation on this toolbox.
     ///
     /// Background fork callers use this to retain the parent capability
@@ -2765,6 +2729,7 @@ impl ToolBox {
         has_available_operation
     }
 
+    #[cfg(test)]
     pub(crate) fn discoverable_mcp_tool_names(&self) -> Vec<String> {
         self.mcp_builtin_tools
             .iter()
@@ -2775,6 +2740,7 @@ impl ToolBox {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn mcp_native_tool_names(&self) -> Vec<String> {
         self.mcp_builtin_tools.keys().cloned().collect()
     }

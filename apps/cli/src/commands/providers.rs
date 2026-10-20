@@ -383,9 +383,9 @@ fn render_provider_usage_wire(
 mod tests {
     use std::collections::BTreeMap;
 
-    use serde_json::json;
-
     use super::*;
+    #[cfg(feature = "grok-subscription")]
+    use serde_json::json;
 
     fn oauth_provider(credential_ref: &str) -> ProviderEntry {
         ProviderEntry {

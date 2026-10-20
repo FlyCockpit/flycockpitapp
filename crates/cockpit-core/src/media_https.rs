@@ -5,7 +5,9 @@
 //! the HTTP stack could resolve a second time.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(test)]
 use std::pin::Pin;
+#[cfg(test)]
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
@@ -101,19 +103,18 @@ pub(crate) trait HttpsMediaFetcher: Send + Sync {
 /// In-memory HTTPS body sink. Tool admission fetches here first so a DNS,
 /// redirect, timeout, or non-success denial cannot reserve private storage.
 #[derive(Default)]
+#[cfg(test)]
 pub(crate) struct MemoryHttpsSink(Vec<u8>);
 
+#[cfg(test)]
 impl MemoryHttpsSink {
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.0
-    }
-
     #[cfg(test)]
     pub(crate) fn as_slice(&self) -> &[u8] {
         &self.0
     }
 }
 
+#[cfg(test)]
 impl AsyncWrite for MemoryHttpsSink {
     fn poll_write(
         self: Pin<&mut Self>,

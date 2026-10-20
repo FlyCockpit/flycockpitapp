@@ -181,6 +181,7 @@ mod imp {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg(any(test, feature = "remote"))]
     pub struct HeldEntryIdentity {
         pub filesystem_id: u64,
         pub object_id: u128,
@@ -192,6 +193,7 @@ mod imp {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg(any(test, feature = "remote"))]
     pub enum HeldRenameEffect {
         Applied(HeldEntryIdentity),
         AppliedIdentityMismatch {
@@ -200,6 +202,7 @@ mod imp {
         },
     }
 
+    #[cfg(any(test, feature = "remote"))]
     fn identity(metadata: &std::fs::Metadata) -> Result<HeldEntryIdentity, ExternalJournalError> {
         let kind = if metadata.is_file() {
             1
@@ -347,6 +350,7 @@ mod imp {
             &self.path
         }
 
+        #[cfg(any(test, feature = "remote"))]
         pub fn held_identity(&self) -> Result<HeldEntryIdentity, ExternalJournalError> {
             identity(
                 &self
@@ -356,6 +360,7 @@ mod imp {
             )
         }
 
+        #[cfg(any(test, feature = "remote"))]
         pub fn open_entry_identity(
             &self,
             name: &str,
@@ -375,6 +380,7 @@ mod imp {
             )
         }
 
+        #[cfg(feature = "remote")]
         pub fn require_entry_absent(&self, name: &str) -> Result<(), ExternalJournalError> {
             check_component(name)?;
             let name = cstring(name)?;
@@ -387,6 +393,7 @@ mod imp {
             }
         }
 
+        #[cfg(any(test, feature = "remote"))]
         pub fn require_same_filesystem(
             &self,
             other: &DirGuard,
@@ -399,6 +406,7 @@ mod imp {
             Ok(())
         }
 
+        #[cfg(any(test, feature = "remote"))]
         pub fn rename_entry_noreplace_atomic(
             &self,
             name: &str,
@@ -415,6 +423,7 @@ mod imp {
             )
         }
 
+        #[cfg(any(test, feature = "remote"))]
         pub(crate) fn rename_entry_noreplace_atomic_with_hook(
             &self,
             name: &str,

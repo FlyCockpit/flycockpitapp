@@ -152,7 +152,6 @@ pub struct WizardDescriptor {
     /// model choices are a function of the agent chosen on the preceding
     /// screen. Keeping that relationship in the descriptor makes it apply to
     /// both renderers and authoritative answer replay.
-    pub(crate) onboarding_agent_models: BTreeMap<String, Vec<SelectOption>>,
     /// Immutable catalog identity carried with the rendered picker.  It is
     /// encoded with the answers so authoritative replay fetches this exact
     /// catalog revision instead of resolving `main` a second time.
@@ -636,7 +635,6 @@ pub fn onboarding_profile_descriptor() -> WizardDescriptor {
         description: "Set an optional display name",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
-        onboarding_agent_models: BTreeMap::new(),
         onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
@@ -708,7 +706,6 @@ fn model_descriptor_with_selection_mode(
         description: "Set trust, capabilities, limits, thinking, delegation, and default model",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: Some(model_context),
-        onboarding_agent_models: BTreeMap::new(),
         onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
@@ -1105,7 +1102,6 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
         description: "Configure an inference provider and its authentication",
         write_policy: WritePolicy::PerStep,
         model_context: None,
-        onboarding_agent_models: BTreeMap::new(),
         onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
@@ -1342,7 +1338,6 @@ pub fn security_descriptor_for_config_with_caps(
         description: "Review sandboxing, approvals, redaction, and workspace trust",
         write_policy: WritePolicy::CommitAtEnd,
         model_context: None,
-        onboarding_agent_models: BTreeMap::new(),
         onboarding_catalog_revision: None,
         steps: vec![
             StepDescriptor {
@@ -2625,7 +2620,6 @@ mod tests {
             description: "Test wizard",
             write_policy: policy,
             model_context: None,
-            onboarding_agent_models: BTreeMap::new(),
             onboarding_catalog_revision: None,
             steps: vec![
                 StepDescriptor {
@@ -2730,7 +2724,6 @@ mod tests {
             description: "Prefill test",
             write_policy: WritePolicy::CommitAtEnd,
             model_context: None,
-            onboarding_agent_models: BTreeMap::new(),
             onboarding_catalog_revision: None,
             steps: vec![
                 StepDescriptor {

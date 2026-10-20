@@ -1,7 +1,9 @@
 //! Test/test-support session constructors. They open a vault for the given
 //! `Db` so existing fixtures keep a four-argument `Session::create` shape.
 
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -11,6 +13,7 @@ use super::lifecycle::RedactionKeyResolverArc;
 use crate::db::Db;
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub(crate) struct TestSessionRowOptions {
     model_selection: TestModelSelectionFields,
     session_entry_mode: Option<crate::daemon::proto::SessionEntryMode>,
@@ -18,6 +21,7 @@ pub(crate) struct TestSessionRowOptions {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 enum TestModelSelectionFields {
     #[default]
     None,
@@ -30,10 +34,12 @@ enum TestModelSelectionFields {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct TestAssistantFields {
     name: String,
 }
 
+#[cfg(test)]
 impl TestSessionRowOptions {
     pub(crate) fn with_model_selection(
         mut self,
@@ -123,6 +129,7 @@ impl Session {
         Ok(self)
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_redaction_coverage_for_test(&self) {
         *self.redaction_coverage.lock().unwrap() = None;
     }
@@ -130,6 +137,7 @@ impl Session {
     /// Build and insert a durable row that can be consumed by
     /// [`Session::resume_for_test`]. Raw-row fixtures use this boundary so the
     /// writer and resume validation share one synthetic project identity.
+    #[cfg(test)]
     pub(crate) async fn insert_row_for_test(
         db: &Db,
         project_root: &Path,

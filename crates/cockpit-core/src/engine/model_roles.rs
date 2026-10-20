@@ -2772,13 +2772,6 @@ mod tests {
         providers
     }
 
-    fn extended_mode() -> ExtendedConfig {
-        ExtendedConfig {
-            agent_chooses_subagent_model: true,
-            ..ExtendedConfig::default()
-        }
-    }
-
     /// AC5. A trusted child resolved to a `Remote` location must fail closed:
     /// no capture grant is minted. Fails against pre-gate code, where a Remote
     /// trusted child mints a grant.

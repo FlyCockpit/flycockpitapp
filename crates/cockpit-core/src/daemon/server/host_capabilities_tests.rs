@@ -456,7 +456,7 @@ async fn host_capabilities_container_rows_reuse_one_detect_call() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut probes = injected_probes(&tmp, Arc::new(AtomicUsize::new(0)));
     let ctx = test_ctx();
-    probes.container = ContainerProbeSource::ReuseSnapshot(ctx.container_manager.availability());
+    probes.container = ContainerProbeSource::ReuseSnapshot(ctx._container_manager.availability());
     let before = crate::container::detect_runtime_call_count();
     let collected = collect_shared_host_probes(&probes, false).await;
     let after = crate::container::detect_runtime_call_count();

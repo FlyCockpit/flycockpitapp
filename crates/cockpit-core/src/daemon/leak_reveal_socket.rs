@@ -314,28 +314,6 @@ where
     Some(())
 }
 
-/// Read exactly one fixed-length (67-byte) request frame. The request is a
-/// closed fixed-size frame, so we read EXACTLY that many bytes — never wait for
-/// EOF (the client keeps the connection open to read the response, and byte-mode
-/// named pipes produce no write-side EOF until the handle fully closes).
-/// Trailing bytes already sitting in the buffer are a protocol violation and
-/// fail closed; we do not wait for them. Returns `None` on a short read,
-/// connection error, extra buffered byte, or malformed frame.
-async fn read_request_frame<S>(stream: &mut S) -> Option<LeakRevealSocketRequest>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut buf = [0u8; LEAK_REVEAL_REQUEST_FRAME_LEN];
-    stream.read_exact(&mut buf).await.ok()?;
-    // Reject extra bytes that are already readable. Do not wait for EOF or for
-    // a later byte: Unix half-close is not expressible on named pipes, and the
-    // client must keep the duplex handle open to read the response.
-    if consume_buffered_trailing_byte(stream).await {
-        return None;
-    }
-    crate::daemon::leak_reveal_frame::decode_request(&buf).ok()
-}
-
 /// Connect to a daemon's dedicated reveal socket, present `capability`, and
 /// return the revealed secret or a content-free denial. Used by the socket-
 /// attached TUI. A malformed capability (not 64 hex chars) fails closed as

@@ -4502,8 +4502,14 @@ pub(crate) enum HostEffectClass {
     Authorization,
     Destructive,
     ExternalAction,
+    // Reserved for future host-effect wire operations; must stay fail-closed.
+    #[allow(dead_code)]
     Publish,
+    // Reserved for future host-effect wire operations; must stay fail-closed.
+    #[allow(dead_code)]
     Purchase,
+    // Reserved for future host-effect wire operations; must stay fail-closed.
+    #[allow(dead_code)]
     Production,
 }
 
@@ -5425,23 +5431,6 @@ impl AgentTreeRuntime {
         Ok(settlement)
     }
 
-    /// Reconcile requests created by a live executor after worker startup.
-    /// Question and approval tools persist through the lifecycle directly so
-    /// their worker-owned timer and resolver hand-off must not wait for a
-    /// process restart to become active.  Only `pending` requests are started
-    /// here; a persisted `resolving` request is a recovery concern and must
-    /// never be claimed again through an illegal resolving-to-resolving CAS.
-    pub(crate) async fn reconcile_pending_requests(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<TerminalDeadlineSettlement>> {
-        self.reconcile_pending_requests_limited(
-            session_id,
-            crate::db::agent_tree_decisions::MAX_AGENT_TREE_PAGE_SIZE,
-        )
-        .await
-    }
-
     /// Bounded worker-maintenance variant. Durable requests are sorted by the
     /// DB recovery query, so repeated calls make deterministic forward
     /// progress without letting a large attention backlog starve client work
@@ -6000,6 +5989,7 @@ pub(crate) enum PrivateDecisionContinuationAnswer {
 }
 
 impl PrivateDecisionContinuationAnswer {
+    #[cfg(test)]
     pub(crate) fn option(id: impl Into<String>) -> Self {
         Self::Option { id: id.into() }
     }

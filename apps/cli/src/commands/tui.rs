@@ -56,6 +56,7 @@ fn combine_app_and_lifecycle(app: Result<()>, lifecycle: Result<()>) -> Result<(
     }
 }
 
+#[allow(dead_code, reason = "CLI TUI process-boundary inspector entrypoint")]
 pub async fn run(
     project: Option<&Path>,
     no_sandbox: bool,
@@ -120,6 +121,8 @@ pub async fn run_mode(
     combine_app_and_lifecycle(result, lifecycle_result)
 }
 
+// Retained as a process-boundary construction hook inspected by integration tests.
+#[allow(dead_code)]
 pub async fn run_with_session(
     project: Option<&Path>,
     no_sandbox: bool,

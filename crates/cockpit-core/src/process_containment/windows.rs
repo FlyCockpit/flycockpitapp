@@ -432,6 +432,7 @@ impl WindowsJobAdapter {
     }
 
     #[cfg(test)]
+    #[cfg(target_os = "windows")]
     fn live_job_count(&self) -> usize {
         self.jobs.lock().unwrap().len()
     }

@@ -176,7 +176,7 @@ pub struct GuidanceReviewPane {
 }
 
 impl GuidanceReviewPane {
-    pub fn open(
+    pub(crate) fn open(
         attached: Option<crate::tui::agent_runner::AttachedRequestBinding>,
         redraw: Arc<tokio::sync::Notify>,
     ) -> Self {
@@ -334,7 +334,7 @@ impl GuidanceReviewPane {
 }
 
 impl DaemonGuidanceReviewDispatcher {
-    pub fn new(attached: crate::tui::agent_runner::AttachedRequestBinding) -> Self {
+    pub(crate) fn new(attached: crate::tui::agent_runner::AttachedRequestBinding) -> Self {
         Self { attached }
     }
 

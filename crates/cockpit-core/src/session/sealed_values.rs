@@ -359,18 +359,6 @@ impl Session {
         Ok(())
     }
 
-    /// Build the enforced redaction union for text recalled from `target`.
-    /// The target table is read directly from the encrypted vault because a
-    /// recalled session need not have a live [`Session`] object.
-    pub(crate) async fn recall_redaction_table(
-        &self,
-        reader: &crate::redact::RedactionTable,
-        target: uuid::Uuid,
-    ) -> Result<crate::redact::RedactionTable> {
-        let base = self.with_machine_scoped_sealed_redactions(reader).await?;
-        self.recall_redaction_table_from_base(&base, target)
-    }
-
     /// Add one target session's persisted table to a reader/machine base.
     /// Search callers reuse the base across hits so machine compartments are
     /// opened only once per recall operation.

@@ -325,6 +325,7 @@ fn consistency_check_load(raw_params: &str) -> Result<(), DtoError> {
 }
 
 impl SessionAdmissionDto {
+    #[cfg(test)]
     pub(crate) fn mcp_servers(&self) -> &[McpServerDto] {
         match self {
             Self::New(dto) => &dto.mcp_servers,

@@ -10,8 +10,6 @@ use crate::config::dirs::global_config_dir;
 #[cfg(test)]
 use crate::config::dirs::global_config_file;
 #[cfg(test)]
-use crate::config::dirs::most_specific_config_write_target;
-#[cfg(test)]
 use crate::config::providers::ConfigDoc;
 use crate::config::providers::HeaderSpec;
 use crate::daemon::client::ensure_persistent_daemon;

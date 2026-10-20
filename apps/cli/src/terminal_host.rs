@@ -1913,6 +1913,7 @@ fn ingress_conflict() -> ErrorPayload {
         message: "terminal ingress metadata conflict".to_string(),
     }
 }
+#[cfg(test)]
 fn ingress_path_unavailable() -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::IngressPathUnavailable,
@@ -2050,6 +2051,7 @@ fn validate_image(
     }
 }
 
+#[cfg(test)]
 fn validate_path_text(path: &str) -> std::result::Result<(), ErrorPayload> {
     if path
         .bytes()
@@ -2065,11 +2067,13 @@ fn validate_path_text(path: &str) -> std::result::Result<(), ErrorPayload> {
 }
 
 #[cfg(any(not(windows), test))]
+#[cfg(test)]
 fn posix_literal(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum IngressShellDialect {
     #[cfg(any(not(windows), test))]
     Posix,
@@ -2079,6 +2083,7 @@ enum IngressShellDialect {
     Cmd,
 }
 
+#[cfg(test)]
 fn shell_path_literal(
     path: &str,
     dialect: IngressShellDialect,
@@ -2098,22 +2103,6 @@ fn shell_path_literal(
                 Ok(format!("\"{}\"", path.replace('"', "\"\"")))
             }
         }
-    }
-}
-
-fn host_shell_dialect() -> IngressShellDialect {
-    #[cfg(windows)]
-    {
-        let shell = default_shell().to_ascii_lowercase();
-        if shell.ends_with("powershell.exe") || shell.ends_with("pwsh.exe") {
-            IngressShellDialect::PowerShell
-        } else {
-            IngressShellDialect::Cmd
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        IngressShellDialect::Posix
     }
 }
 

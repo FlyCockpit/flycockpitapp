@@ -47,10 +47,6 @@ impl ProtectedPaths {
         self.paths.clone()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.paths.is_empty()
-    }
-
     pub(crate) fn measured_retained_bytes(&self) -> usize {
         self.paths
             .capacity()

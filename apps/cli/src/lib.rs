@@ -28,23 +28,22 @@ pub mod test_env {
 pub(crate) mod daemon {
     pub(crate) use cockpit_core::daemon::supervisor;
     pub(crate) use cockpit_core::daemon::{
-        DaemonPaths, DaemonProbe, DaemonStatus, EventSender, SharedRedactionTable, caffeinate,
-        capture_restart_release, daemon_pid, derive_restart_no_sandbox, discover, global_coverage,
-        proto, restart_release_timeout, run_foreground, run_foreground_with_resume,
-        send_current_event, server, session_worker, spawn_detached_with_resume_async,
-        stop_with_timeout, terminal, unrecognized_pid_metadata_error, wait_for_restart_release,
+        DaemonPaths, DaemonProbe, DaemonStatus, EventSender, caffeinate, capture_restart_release,
+        daemon_pid, derive_restart_no_sandbox, discover, global_coverage, proto,
+        restart_release_timeout, run_foreground, run_foreground_with_resume, server,
+        session_worker, spawn_detached_with_resume_async, stop_with_timeout, terminal,
+        unrecognized_pid_metadata_error, wait_for_restart_release,
     };
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{
             OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient, acquire_acp_socket_daemon,
-            ensure_persistent_daemon, promote_attached_owner_in_place, run_assistant_daemon,
-            run_one_shot_daemon, run_owned_daemon, set_spawn_disabled,
+            ensure_persistent_daemon, run_assistant_daemon, run_owned_daemon, set_spawn_disabled,
         };
     }
     #[cfg(test)]
-    pub(crate) use cockpit_core::daemon::{
-        boot_test_persistent_daemon, enable_in_process_auto_promote,
-    };
+    pub(crate) use cockpit_core::daemon::boot_test_persistent_daemon;
+    #[cfg(all(test, feature = "remote"))]
+    pub(crate) use cockpit_core::daemon::enable_in_process_auto_promote;
 }
 pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
@@ -70,8 +69,8 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
+use crate::cli::Command;
 pub use crate::cli::public_v0_1_command;
-use crate::cli::{Cli, Command};
 
 pub mod manpages {
     use std::fs;

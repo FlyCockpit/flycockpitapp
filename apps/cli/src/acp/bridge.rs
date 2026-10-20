@@ -11,10 +11,12 @@ use cockpit_proto::{
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
+#[cfg(test)]
 use super::AcpTransportCounters;
 use super::dto::{McpServerDto, NameValueDto, SessionAdmissionDto, SessionLoadDto, SessionNewDto};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct SessionAdmissionReceipt {
     pub method: SessionAdmissionMethod,
     pub server_count: usize,
@@ -22,6 +24,7 @@ pub(crate) struct SessionAdmissionReceipt {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum SessionAdmissionMethod {
     New,
     Load,
@@ -42,6 +45,7 @@ impl std::error::Error for BridgeError {}
 pub(crate) struct BridgeFacade;
 
 impl BridgeFacade {
+    #[cfg(test)]
     pub(crate) fn admit(
         &self,
         dto: &SessionAdmissionDto,

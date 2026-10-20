@@ -1279,7 +1279,7 @@ impl ParkCommit {
         let _ = self
             .inner
             .registered
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 Some(n.saturating_sub(1))
             });
     }
@@ -1917,25 +1917,10 @@ impl InterruptHub {
         }
     }
 
-    /// Subscribe before starting a waiter producer. The receiver observes the
-    /// exact UUID registered, so multiple registrations cannot collapse or
-    /// release a consumer for a sibling waiter.
-    pub(crate) fn subscribe_registered(&self) -> tokio::sync::mpsc::UnboundedReceiver<Uuid> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut subscriber = lock_or_recover(&self.registered_interrupts);
-        assert!(
-            subscriber
-                .as_ref()
-                .is_none_or(|current| current.is_closed()),
-            "interrupt registration readiness has exactly one consuming owner"
-        );
-        *subscriber = Some(tx);
-        rx
-    }
-
     /// Subscribe before starting an interrupt producer. Each received item is
     /// the exact UUID whose raise path reached publication; unlike a bare
     /// notification permit, items cannot collapse or release the wrong waiter.
+    #[cfg(test)]
     pub(crate) fn subscribe_raised(&self) -> tokio::sync::mpsc::UnboundedReceiver<Uuid> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut subscriber = lock_or_recover(&self.raised_interrupts);

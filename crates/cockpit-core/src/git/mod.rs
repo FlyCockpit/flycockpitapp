@@ -1216,7 +1216,7 @@ pub(crate) fn byte_identical_receipt(dir: &Path) -> Result<ByteIdenticalReceipt>
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ByteIdenticalReceipt {
+pub struct ByteIdenticalReceipt {
     pub head: String,
     pub git_ref: String,
     pub index: String,

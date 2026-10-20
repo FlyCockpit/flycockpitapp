@@ -56,7 +56,7 @@ mod recording;
 pub mod sealed_values;
 #[cfg(any(test, feature = "test-support"))]
 mod test_constructors;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) use test_constructors::TestSessionRowOptions;
 /// The trusted-child sealed-value capture authority + pending-record registry
 /// (leak-report AC7/AC8, sub-increment 2c-2). Exercised end-to-end by its own
@@ -2087,6 +2087,7 @@ impl Session {
     /// Snapshot the latest inference send's durable identity. The timestamp
     /// is only for the daemon job deadline; elapsed-time policy continues to
     /// use [`Self::seconds_since_last_send`] while the session is live.
+    #[cfg(any(test, feature = "extended"))]
     pub(crate) fn last_send_identity(&self) -> Option<InferenceSendIdentity> {
         self.last_send_at.lock().unwrap().map(|t| t.identity)
     }

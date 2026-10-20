@@ -49,7 +49,7 @@ fn next_notes_pane_instance() -> u64 {
 
 fn claim_next_notes_pane_instance(counter: &AtomicU64) -> u64 {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             if current == 0 {
                 None
             } else {

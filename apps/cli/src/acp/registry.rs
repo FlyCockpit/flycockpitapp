@@ -60,6 +60,7 @@ pub enum PermissionStateName {
 /// These values are connection-local identifiers and accounting metadata, not
 /// an externally exposed ACP response.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct PermissionEntryDiagnostics {
     pub request_id: String,
     pub attention_id: String,
@@ -211,6 +212,7 @@ pub trait ApprovalAck {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct RecordingResolve {
     pub calls: Vec<ResolveCodeRootInterruptV1>,
     pub cancelled_attachments: Vec<cockpit_proto::CodeRootAttachmentCapabilityV1>,
@@ -218,6 +220,7 @@ pub struct RecordingResolve {
     pub next: Option<ResolveCodeRootInterruptResultV1>,
 }
 
+#[cfg(test)]
 impl ResolveCodeRootInterrupt for RecordingResolve {
     fn resolve(&mut self, request: ResolveCodeRootInterruptV1) -> ResolveCodeRootInterruptResultV1 {
         self.calls.push(request);
@@ -235,10 +238,12 @@ impl ResolveCodeRootInterrupt for RecordingResolve {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct RecordingAck {
     pub ids: Vec<String>,
 }
 
+#[cfg(test)]
 impl ApprovalAck for RecordingAck {
     fn ack_approval_delivery(&mut self, delivery_id: &str) {
         self.ids.push(delivery_id.to_string());
@@ -264,18 +269,22 @@ impl OutboundPermissionRegistry {
         }
     }
 
+    #[cfg(test)]
     pub fn charged_entries(&self) -> usize {
         self.inner.lock().expect("registry").charged_entries
     }
 
+    #[cfg(test)]
     pub fn charged_bytes(&self) -> usize {
         self.inner.lock().expect("registry").charged_bytes
     }
 
+    #[cfg(test)]
     pub fn charge_releases(&self) -> u64 {
         self.inner.lock().expect("registry").charge_releases
     }
 
+    #[cfg(test)]
     pub fn daemon_outcome_of(&self, request_id: &str) -> Option<ResolveCodeRootInterruptResultV1> {
         self.inner
             .lock()
@@ -285,15 +294,7 @@ impl OutboundPermissionRegistry {
             .and_then(|entry| entry.daemon_outcome)
     }
 
-    pub fn resolve_request_id_of(&self, request_id: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .expect("registry")
-            .entries
-            .get(request_id)
-            .and_then(|entry| entry.resolve_request_id.clone())
-    }
-
+    #[cfg(test)]
     pub fn state_of(&self, request_id: &str) -> Option<PermissionStateName> {
         self.inner
             .lock()
@@ -303,6 +304,7 @@ impl OutboundPermissionRegistry {
             .map(|entry| entry.state)
     }
 
+    #[cfg(test)]
     pub(crate) fn diagnostics_of(&self, request_id: &str) -> Option<PermissionEntryDiagnostics> {
         self.inner
             .lock()
@@ -606,6 +608,7 @@ impl OutboundPermissionRegistry {
         let _ = counters;
     }
 
+    #[cfg(test)]
     pub fn on_daemon_terminal(
         &self,
         sink: &mut dyn FrameSink,
@@ -658,6 +661,7 @@ impl OutboundPermissionRegistry {
         }
     }
 
+    #[cfg(test)]
     pub fn on_local_cancel(
         &self,
         request_id: &str,

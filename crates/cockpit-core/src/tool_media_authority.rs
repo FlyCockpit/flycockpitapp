@@ -121,6 +121,3 @@ pub fn binding_consumer_id(session_id: &str, client_submission_hex: &str) -> Str
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-pub(crate) mod secure_key_consumer_test_helpers;

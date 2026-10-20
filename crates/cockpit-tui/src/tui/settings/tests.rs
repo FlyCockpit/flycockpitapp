@@ -4013,7 +4013,7 @@ fn render_all_non_provider_pointer_surface_variants() {
         }
     }
 
-    let mut page_fixtures = vec![
+    let page_fixtures = vec![
         (
             instructions_page(InstructionsPage::new()),
             SettingsPointerSurfaceKind::Instructions,
@@ -4023,6 +4023,8 @@ fn render_all_non_provider_pointer_surface_variants() {
             SettingsPointerSurfaceKind::RedactPatterns,
         ),
     ];
+    #[cfg(feature = "extended")]
+    let mut page_fixtures = page_fixtures;
     #[cfg(feature = "extended")]
     page_fixtures.extend([
         (

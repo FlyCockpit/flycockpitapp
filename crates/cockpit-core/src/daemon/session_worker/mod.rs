@@ -409,7 +409,7 @@ enum RedactionRefreshOutcome {
     Refused(String),
 }
 
-pub(super) fn worker_coverage_publish_owners(
+fn worker_coverage_publish_owners(
     session: &std::sync::Arc<Session>,
     env_overlay: &std::sync::Arc<std::sync::RwLock<HashMap<String, String>>>,
     config_snapshot: &std::sync::Arc<std::sync::RwLock<handle::SessionConfigSnapshot>>,

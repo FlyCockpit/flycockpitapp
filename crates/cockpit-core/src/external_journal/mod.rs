@@ -37,6 +37,7 @@ pub mod projection;
 pub mod spool;
 
 #[cfg(any(unix, test))]
+#[cfg(any(test, feature = "remote"))]
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -53,8 +54,10 @@ use cockpit_db::external_journal::{
     ExternalPrepareOutcome, ExternalTransitionOutcome, PrepareExternalOperation,
 };
 #[cfg(any(unix, test))]
+#[cfg(any(test, feature = "remote"))]
 use cockpit_db::filesystem_identity::FilesystemIdentityV1;
 
+#[cfg(any(test, feature = "remote"))]
 pub(crate) use fsguard::DirGuard;
 #[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 pub(crate) use fsguard::{HeldEntryIdentity, HeldRenameEffect};
@@ -573,6 +576,7 @@ impl ExternalJournal {
     }
     /// Open the owner-private namespace used by remote operation recovery.
     /// Callers receive a held no-follow directory authority, never its path.
+    #[cfg(any(test, feature = "remote"))]
     pub(crate) fn remote_operation_artifact_dir(&self) -> Result<DirGuard, ExternalJournalError> {
         if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return Err(ExternalJournalError::Containment(
@@ -589,6 +593,7 @@ impl ExternalJournal {
     }
 
     #[cfg(any(unix, test))]
+    #[cfg(any(test, feature = "remote"))]
     pub(crate) fn write_remote_rename_artifact(
         &self,
         artifact_id: Uuid,
@@ -609,6 +614,7 @@ impl ExternalJournal {
     }
 
     #[cfg(any(unix, test))]
+    #[cfg(any(test, feature = "remote"))]
     pub(crate) fn read_remote_rename_artifact(
         &self,
         artifact_id: Uuid,
@@ -624,6 +630,7 @@ impl ExternalJournal {
         RemoteRenameArtifactV1::decode(&bytes)
     }
 
+    #[cfg(any(test, feature = "remote"))]
     pub(crate) fn remove_all_remote_rename_artifacts(
         &self,
         artifact_id: Uuid,
@@ -682,12 +689,14 @@ impl ExternalJournal {
     }
 
     #[cfg(test)]
+    #[cfg(feature = "remote")]
     pub(crate) fn fail_next_remote_rename_cleanup_sync(&self) {
         self.fail_remote_rename_cleanup_sync
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
+    #[cfg(feature = "remote")]
     pub(crate) fn fail_next_remote_rename_cleanup_unlink(&self) {
         self.fail_remote_rename_cleanup_unlink
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2124,6 +2133,7 @@ impl ExternalJournal {
 
 #[cfg(any(unix, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "remote"))]
 pub(crate) struct RemoteRenameArtifactV1 {
     pub logical_attachment_id: Uuid,
     pub operation_id: Uuid,
@@ -2136,11 +2146,13 @@ pub(crate) struct RemoteRenameArtifactV1 {
 }
 
 #[cfg(any(unix, test))]
+#[cfg(any(test, feature = "remote"))]
 fn remote_rename_artifact_name(artifact_id: Uuid, generation: u64) -> String {
     format!("{artifact_id}.{generation}.rr1")
 }
 
 #[cfg(any(unix, test))]
+#[cfg(any(test, feature = "remote"))]
 impl RemoteRenameArtifactV1 {
     const FIXED: usize = 4 + 16 + 16 + 8 + 57 * 3 + 2 + 2;
 

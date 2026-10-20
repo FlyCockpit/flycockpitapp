@@ -68,7 +68,7 @@ pub(crate) enum Phase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubagentPhase {
+pub(crate) enum SubagentPhase {
     Identity,
     ModelGrants,
     ModelTrust,
@@ -122,7 +122,6 @@ struct ArmedConfirmation {
 struct SubagentStackFrame {
     parent: AgentAuthoringDraft,
     child_path: Vec<usize>,
-    phase: SubagentPhase,
 }
 
 /// The nested agent authoring reducer.
@@ -281,7 +280,6 @@ impl AgentAuthoringScreen {
             .review_policy_revision
             .as_deref()
             .is_some_and(|revision| revision != projection.policy.policy_revision);
-        let phase = self.phase;
         self.projection = projection;
         self.draft = fresh_authoring_draft(&self.projection);
         self.enter_draft_context();
@@ -2012,7 +2010,6 @@ impl AgentAuthoringScreen {
         self.subagent_stack.push(SubagentStackFrame {
             parent: parent_snapshot.clone(),
             child_path: child_path.clone(),
-            phase: SubagentPhase::Identity,
         });
         self.draft = parent_snapshot;
         let child = prepared_child_draft(&self.projection);
@@ -2047,7 +2044,6 @@ impl AgentAuthoringScreen {
         self.subagent_stack.push(SubagentStackFrame {
             parent: self.draft.clone(),
             child_path,
-            phase: SubagentPhase::Identity,
         });
         self.editing_child = child;
         self.enter_draft_context();
@@ -2065,7 +2061,6 @@ impl AgentAuthoringScreen {
         self.subagent_stack.push(SubagentStackFrame {
             parent: self.draft.clone(),
             child_path,
-            phase: SubagentPhase::Identity,
         });
         self.draft.children.push(child);
         self.editing_child = self.draft.children.last().cloned();
@@ -2088,7 +2083,6 @@ impl AgentAuthoringScreen {
         self.subagent_stack.push(SubagentStackFrame {
             parent: self.draft.clone(),
             child_path: vec![index],
-            phase: SubagentPhase::Identity,
         });
         self.editing_child = child;
         self.enter_draft_context();

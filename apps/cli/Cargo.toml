@@ -26,6 +26,8 @@ workspace = true
 # internal/remote builds; they are absent from the default help and dispatch
 # surface.
 default = []
+# Validation marker; the CI check uses the same local product feature set.
+ci = []
 extended = [
     "cockpit-client/extended",
     "cockpit-config/extended",

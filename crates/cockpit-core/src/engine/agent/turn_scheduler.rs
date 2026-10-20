@@ -51,6 +51,7 @@ impl CallClassification {
         matches!(self, Self::ParallelLane { .. })
     }
 
+    #[cfg(test)]
     pub fn is_serial_barrier(&self) -> bool {
         matches!(self, Self::SerialBarrier { .. })
     }
@@ -135,6 +136,7 @@ impl ScheduledCall {
         self.classification.is_parallel_lane()
     }
 
+    #[cfg(test)]
     pub fn is_serial_barrier(&self) -> bool {
         self.classification.is_serial_barrier()
     }
@@ -255,6 +257,7 @@ pub(crate) fn terminal_event_payload(
 ///
 /// Delegate calls are only syntax-classified here.  Real child resolution and
 /// admission belong to the Driver at the attempt boundary.
+#[cfg(test)]
 pub(crate) fn build_plan(
     calls: &[crate::engine::message::ToolCall],
     resolved_names: &[String],

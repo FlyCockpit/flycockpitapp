@@ -896,6 +896,7 @@ impl AgentRunner {
             .take()
     }
 
+    #[cfg(feature = "remote")]
     pub(crate) fn has_attached_client(&self) -> bool {
         self.current_client.is_some()
     }
@@ -1604,7 +1605,7 @@ async fn lock_current_client_epoch(
 fn advance_attachment_epoch(context: &AttachRequestContext) -> u64 {
     let previous = context
         .attachment_epoch
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
             Some(epoch.saturating_add(1))
         })
         .expect("attachment epoch update is infallible");
@@ -4034,12 +4035,16 @@ fn daemon_request_blocking(
 /// Code and Computer session work uses the configured default lifetime; an
 /// Assistant is durable background work and therefore promotes an idle
 /// ephemeral owner before its session row is opened or created.
+// Retained for the concrete adapter inspected by the blocking-call ownership test.
+#[allow(dead_code)]
 pub(crate) struct AssistantSessionResolution {
     pub(crate) response: Response,
     pub(crate) startup_notice: Option<String>,
     pub(crate) promoted_from_ephemeral: bool,
 }
 
+// Retained for the concrete adapter inspected by the blocking-call ownership test.
+#[allow(dead_code)]
 pub(crate) fn resolve_assistant_session_blocking(
     lifecycle: cockpit_client::LifecycleClient,
     request: Request,

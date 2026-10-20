@@ -492,6 +492,7 @@ pub fn cron_referenced_skills_from_jobs(jobs: Vec<ScheduledJobRow>) -> Result<Ha
     Ok(out)
 }
 
+#[cfg(feature = "extended")]
 fn collect_skill_references(value: &serde_json::Value, out: &mut HashSet<String>) {
     match value {
         serde_json::Value::String(s) => {
@@ -686,6 +687,7 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use super::*;
+    #[cfg(feature = "extended")]
     use crate::db::skill_usage::SkillUsageSeed;
 
     #[derive(Debug)]

@@ -2587,13 +2587,6 @@ impl OAuthFlowStore {
         Some((ready, cancelled))
     }
 
-    async fn restore_provider(&self, id: &str, owner: &str, flow: ProviderOAuthReady) {
-        let mut flows = self.provider.lock().await;
-        if let Some(stored) = flows.get_mut(id).filter(|flow| flow.owner == owner) {
-            stored.flow = ProviderOAuthFlow::Ready(flow);
-        }
-    }
-
     async fn resolve_provider_id(
         &self,
         id: Option<&str>,
@@ -30812,15 +30805,6 @@ pub(super) fn explicit_config_refresh_error(
             },
         }.into(),
     }
-}
-
-pub(super) async fn attached_trust_policy_shared(
-    ctx: &DaemonContext,
-    att: &SharedAttachedSession,
-) -> std::result::Result<crate::config::trust::WorkspaceTrustPolicy, ErrorPayload> {
-    crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &att.project_root)
-        .await
-        .map_err(internal)
 }
 
 pub(super) async fn get_inventory_bundle_shared(

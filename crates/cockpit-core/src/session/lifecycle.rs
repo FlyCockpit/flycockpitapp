@@ -381,6 +381,7 @@ pub(crate) async fn persist_session_with_redaction_custody(
 }
 
 /// Create a new assistant session row and empty redaction-table custody together.
+#[cfg(any(test, feature = "extended"))]
 pub(crate) async fn persist_assistant_session_with_redaction_custody(
     db: &crate::db::Db,
     vault: Arc<crate::secure_key::SecretVault>,

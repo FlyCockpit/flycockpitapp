@@ -25,6 +25,7 @@ fn jsonrpsee_raw_params_as_str<'a, 'p>(params: &'a Params<'p>) -> Option<&'a str
 const JSONRPSEE_RAW_PARAMS_API: for<'a, 'p> fn(&'a Params<'p>) -> Option<&'a str> =
     jsonrpsee_raw_params_as_str;
 
+#[cfg(test)]
 const INBOUND_METHODS: &[&str] = &[
     "initialize",
     "session/list",
@@ -127,10 +128,12 @@ pub struct DispatchContext<I: SessionIngress> {
     raw_params: Option<String>,
 }
 
+#[cfg(test)]
 pub fn build_rpc_module() -> RpcModule<DispatchContext<UnavailableSessionIngress>> {
     build_rpc_module_with_ingress(Arc::new(Mutex::new(UnavailableSessionIngress)))
 }
 
+#[cfg(test)]
 pub fn build_rpc_module_with_ingress<I: SessionIngress + 'static>(
     session_ingress: Arc<Mutex<I>>,
 ) -> RpcModule<DispatchContext<I>> {
@@ -267,6 +270,7 @@ fn ingress_error(error: SessionIngressError) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(-32601, error.message(), None::<()>)
 }
 
+#[cfg(test)]
 pub fn registered_method_names() -> Vec<&'static str> {
     INBOUND_METHODS.to_vec()
 }

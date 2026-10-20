@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
+#[cfg(any(not(target_os = "macos"), test))]
 use std::process::Stdio;
 use std::sync::OnceLock;
 
@@ -718,6 +719,7 @@ enum GitGuard {
     /// Both the Git working directory and the destination pathspec are
     /// derived from the retained parent.  A diagnostic spelling captured at
     /// approval must never become an operational Git authority.
+    #[cfg(any(not(target_os = "macos"), test))]
     Inspect {
         repo_parent: PathBuf,
         destination_name: String,
@@ -927,79 +929,81 @@ fn write_private_file(
 }
 
 async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
-    let GitGuard::Inspect {
-        repo_parent: parent,
-        destination_name,
-    } = &resolved.git_guard
-    else {
-        return Ok(());
-    };
-    let mut inside_command = tokio::process::Command::new("git");
-    inside_command
-        .arg("-C")
-        .arg(parent)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        // Make the one status we classify below stable. All other Git errors,
-        // including corrupt repository/configuration failures, remain
-        // fail-closed and their text is never surfaced.
-        .env_clear()
-        .env("LC_ALL", "C")
-        .env("LANGUAGE", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", "/dev/null")
-        .env("XDG_CONFIG_HOME", "/dev/null")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let inside = inside_command
-        .output()
-        .await
-        .context("running sealed file git worktree inspection")?;
-    if !inside.status.success() {
-        // A directory outside Git cannot contain a tracked or ignored
-        // destination, so it needs no Git guard. Do not treat exit status 128
-        // alone as that state: Git also uses it for broken repositories and
-        // configuration errors, which must remain fail-closed.
-        if inside.status.code() == Some(128) && repository_metadata_absent(parent)? {
-            return Ok(());
+    match &resolved.git_guard {
+        GitGuard::Skip => Ok(()),
+        #[cfg(any(not(target_os = "macos"), test))]
+        GitGuard::Inspect {
+            repo_parent: parent,
+            destination_name,
+        } => {
+            let mut inside_command = tokio::process::Command::new("git");
+            inside_command
+                .arg("-C")
+                .arg(parent)
+                .args(["rev-parse", "--is-inside-work-tree"])
+                // Make the one status we classify below stable. All other Git errors,
+                // including corrupt repository/configuration failures, remain
+                // fail-closed and their text is never surfaced.
+                .env_clear()
+                .env("LC_ALL", "C")
+                .env("LANGUAGE", "C")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", "/dev/null")
+                .env("XDG_CONFIG_HOME", "/dev/null")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let inside = inside_command
+                .output()
+                .await
+                .context("running sealed file git worktree inspection")?;
+            if !inside.status.success() {
+                // A directory outside Git cannot contain a tracked or ignored
+                // destination, so it needs no Git guard. Do not treat exit status 128
+                // alone as that state: Git also uses it for broken repositories and
+                // configuration errors, which must remain fail-closed.
+                if inside.status.code() == Some(128) && repository_metadata_absent(parent)? {
+                    return Ok(());
+                }
+                bail!("cannot establish sealed file git-guard state for destination");
+            }
+            if inside.stdout.as_slice() != b"true\n" {
+                // A successful `false` result (for example a bare repository) is not
+                // a working tree and therefore has no tracked worktree destination.
+                // Any other successful response is malformed and must not disable the
+                // leak guard.
+                if inside.stdout.as_slice() == b"false\n" {
+                    return Ok(());
+                }
+                bail!("sealed file git worktree inspection returned an invalid result");
+            }
+            // `parent` is descriptor-backed for pinned Unix destinations, and this
+            // relative pathspec is therefore evaluated inside that same retained
+            // directory. Never pass the approval-time pathname to Git: it may have
+            // been rebound after the parent was opened.
+            let tracked = git_query_status(
+                parent,
+                &[
+                    "ls-files",
+                    "--error-unmatch",
+                    "--",
+                    destination_name.as_str(),
+                ],
+            )
+            .await?;
+            let ignored = git_query_status(
+                parent,
+                &["check-ignore", "-q", "--", destination_name.as_str()],
+            )
+            .await?;
+            if tracked != GitQueryStatus::Negative || ignored != GitQueryStatus::Positive {
+                bail!(
+                    "sealed file destination is tracked or not ignored; add the pinned path to .gitignore before approving materialization"
+                );
+            }
+            Ok(())
         }
-        bail!("cannot establish sealed file git-guard state for destination");
     }
-    if inside.stdout.as_slice() != b"true\n" {
-        // A successful `false` result (for example a bare repository) is not
-        // a working tree and therefore has no tracked worktree destination.
-        // Any other successful response is malformed and must not disable the
-        // leak guard.
-        if inside.stdout.as_slice() == b"false\n" {
-            return Ok(());
-        }
-        bail!("sealed file git worktree inspection returned an invalid result");
-    }
-    // `parent` is descriptor-backed for pinned Unix destinations, and this
-    // relative pathspec is therefore evaluated inside that same retained
-    // directory. Never pass the approval-time pathname to Git: it may have
-    // been rebound after the parent was opened.
-    let tracked = git_query_status(
-        parent,
-        &[
-            "ls-files",
-            "--error-unmatch",
-            "--",
-            destination_name.as_str(),
-        ],
-    )
-    .await?;
-    let ignored = git_query_status(
-        parent,
-        &["check-ignore", "-q", "--", destination_name.as_str()],
-    )
-    .await?;
-    if tracked != GitQueryStatus::Negative || ignored != GitQueryStatus::Positive {
-        bail!(
-            "sealed file destination is tracked or not ignored; add the pinned path to .gitignore before approving materialization"
-        );
-    }
-    Ok(())
 }
 
 /// Prove an explicit non-repository state without interpreting Git's error
@@ -1007,6 +1011,7 @@ async fn git_leak_guard(resolved: &ResolvedDestination) -> Result<()> {
 /// object) means repository state exists and a failed Git inspection remains
 /// fail-closed. Metadata lookup errors likewise propagate rather than disable
 /// the leak guard.
+#[cfg(any(not(target_os = "macos"), test))]
 fn repository_metadata_absent(start: &Path) -> Result<bool> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if start.starts_with("/proc/self/fd") {
@@ -1042,6 +1047,7 @@ fn metadata_absent_from_retained_directory(start: &Path) -> Result<bool> {
     bail!("Git metadata ancestor inspection exceeded its safety bound")
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn metadata_absent_in_ancestors(start: &Path) -> Result<bool> {
     for ancestor in start.ancestors() {
         match std::fs::symlink_metadata(ancestor.join(".git")) {
@@ -1054,11 +1060,13 @@ fn metadata_absent_in_ancestors(start: &Path) -> Result<bool> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(not(target_os = "macos"), test))]
 enum GitQueryStatus {
     Positive,
     Negative,
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 async fn git_query_status(parent: &Path, args: &[&str]) -> Result<GitQueryStatus> {
     let status = tokio::process::Command::new("git")
         .arg("-C")

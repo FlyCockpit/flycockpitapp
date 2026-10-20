@@ -6,8 +6,7 @@
 use super::classify::JSON_RPC_VERSION;
 use super::raw_json::JsonRpcId;
 use jsonrpsee_types::error::{
-    INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, METHOD_NOT_FOUND_CODE,
-    PARSE_ERROR_CODE,
+    INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, METHOD_NOT_FOUND_CODE, PARSE_ERROR_CODE,
 };
 use serde_json::{Value, json};
 
@@ -55,10 +54,6 @@ pub fn invalid_params(id: &JsonRpcId, message: &str) -> String {
     error_response(Some(id), INVALID_PARAMS_CODE, message).expect("request id is present")
 }
 
-pub fn internal_error(id: &JsonRpcId, message: &str) -> String {
-    error_response(Some(id), INTERNAL_ERROR_CODE, message).expect("request id is present")
-}
-
 pub fn notification(method: &str, params: Value) -> String {
     json!({
         "jsonrpc": JSON_RPC_VERSION,
@@ -90,8 +85,4 @@ fn id_value(id: &JsonRpcId) -> Value {
         }
         JsonRpcId::String(s) => Value::from(s.clone()),
     }
-}
-
-pub fn assert_jsonrpc_2_0(frame: &str) -> bool {
-    frame.contains("\"jsonrpc\":\"2.0\"")
 }

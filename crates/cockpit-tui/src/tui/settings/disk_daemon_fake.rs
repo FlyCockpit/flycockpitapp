@@ -1928,7 +1928,6 @@ fn mutate_agent(
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<AgentMutationResult, String> {
-    let agent_name = cockpit_proto::agent_mutation_name(&mutation).map(str::to_owned);
     let consumed_revision = expected_revision.clone();
     let generation_before = current_config_generation();
     let resets_inventory = matches!(&mutation, AgentMutation::ResetAllBuiltins);

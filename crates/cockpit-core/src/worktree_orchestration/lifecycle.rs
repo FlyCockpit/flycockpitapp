@@ -53,6 +53,7 @@ pub async fn pin_managed_worktree(
 }
 
 /// Grace-retain: leave the path in place. Never force-deletes.
+#[cfg(test)]
 pub fn retain_managed_worktree(lease: &WorkspaceLeaseRow) {
     tracing::debug!(
         lease = %lease.workspace_lease_id,

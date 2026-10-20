@@ -107,6 +107,7 @@ pub(crate) fn validate_https_origin(origin: &str) -> Result<Url, ProviderTranspo
 /// address class is still vetted by [`VettedHttpClient`] against the endpoint's
 /// declared location, so allowing `http` here does not widen the egress target
 /// set.
+#[cfg(any(test, feature = "extended"))]
 pub(crate) fn validate_http_or_https_origin(
     origin: &str,
 ) -> Result<Url, ProviderTransportConfigError> {

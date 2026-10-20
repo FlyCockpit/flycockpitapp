@@ -55,8 +55,10 @@ use crate::{
 
 /// Ties the scheduler callback future's lifetime to the delivered refresh.
 /// Dropping a timed-out callback must cancel the driver-owned provider call.
+#[cfg(feature = "extended")]
 struct KeepWarmCallbackGuard(tokio_util::sync::CancellationToken);
 
+#[cfg(feature = "extended")]
 impl Drop for KeepWarmCallbackGuard {
     fn drop(&mut self) {
         self.0.cancel();
@@ -1279,6 +1281,7 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.external_journal).clone()
     }
 
+    #[cfg(feature = "remote")]
     pub(crate) fn external_journal_handle(
         &self,
     ) -> Option<Arc<crate::external_journal::ExternalJournal>> {
@@ -1294,6 +1297,7 @@ impl SessionRegistry {
             Some((storage, ledger));
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_message_media_authority(&self) {
         *crate::sync::lock_or_recover(&self.inner.message_media_authority) = None;
     }
@@ -1314,6 +1318,7 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = Some(runtime);
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_tool_media_runtime(&self) {
         *crate::sync::lock_or_recover(&self.inner.tool_media_runtime) = None;
     }
@@ -1383,10 +1388,6 @@ impl SessionRegistry {
     /// lookups never execute).
     pub(crate) fn command_secret_cache(&self) -> Arc<crate::secret_command::CommandSecretCache> {
         crate::sync::lock_or_recover(&self.inner.command_secret_cache).clone()
-    }
-
-    pub(crate) fn config_source(&self) -> &crate::daemon::config_source::ConfigSource {
-        &self.inner.config_source
     }
 
     /// Pre-resolve (execute-once) every command-backed secret referenced by
@@ -3751,6 +3752,7 @@ impl SessionRegistry {
 
     /// Keep-warm callbacks target the live conversation tip. They must never
     /// spawn a worker on an ended predecessor window.
+    #[cfg(any(test, feature = "extended"))]
     async fn live_keep_warm_handle(
         &self,
         session_id: Uuid,

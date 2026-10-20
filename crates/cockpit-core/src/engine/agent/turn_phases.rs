@@ -3828,7 +3828,6 @@ mod metadata_fork_tests {
 
         // A request-preparation error drops this local work. A later root turn
         // must not be able to claim it.
-        drop(held_for_this_turn);
         assert!(session.take_metadata_fork().is_none());
     }
 }

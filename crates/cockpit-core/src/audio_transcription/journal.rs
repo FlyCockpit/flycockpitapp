@@ -455,49 +455,8 @@ impl TranscriptionDispatchService {
         &self.journal
     }
 
-    #[cfg(test)]
-    pub(crate) fn transport(&self) -> &dyn TranscriptionEgressTransport {
-        self.transport.as_ref()
-    }
-
     pub fn identity(&self) -> &TranscriptionDestinationIdentity {
         &self.identity
-    }
-
-    /// Prepare, dispatch, and finish one transcription through the journal.
-    #[cfg(test)]
-    pub(crate) async fn dispatch(
-        &self,
-        owner_session_id: &SafeToken,
-        idempotency_key: &SafeToken,
-        source_digest: Digest,
-        duration_ms: u64,
-        now_wall_ms: i64,
-        audio: &[u8],
-        boundaries: &mut (dyn Iterator<Item = u128> + Send),
-        build: impl Fn(&str) -> Result<PlannedMultipart>,
-        cancel: &CancellationToken,
-    ) -> Result<TranscriptionHandoff, ExternalJournalError> {
-        let prepared = prepare_transcription(
-            &self.journal,
-            owner_session_id,
-            idempotency_key,
-            source_digest,
-            duration_ms,
-            now_wall_ms,
-        )
-        .await?;
-        dispatch_prepared(
-            &self.journal,
-            &prepared,
-            now_wall_ms,
-            audio,
-            boundaries,
-            build,
-            self.transport.as_ref(),
-            cancel,
-        )
-        .await
     }
 
     /// Dispatch with durable media-budget admission. The ledger's atomic

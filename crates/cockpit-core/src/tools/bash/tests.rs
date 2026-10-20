@@ -1699,18 +1699,6 @@ fn resolve_next_interrupt_with_escalation(
     })
 }
 
-async fn approve_next_path_prompt(ctx: &ToolCtx) {
-    resolve_next_interrupt(
-        ctx.session.db.clone(),
-        ctx.session.id,
-        ctx.interrupts.clone(),
-        ID_APPROVE_SESSION,
-        None,
-    )
-    .await
-    .unwrap();
-}
-
 async fn deny_next_path_prompt(ctx: &ToolCtx) {
     spawn_resolve_next_interrupt_with_response(
         ctx.session.db.clone(),

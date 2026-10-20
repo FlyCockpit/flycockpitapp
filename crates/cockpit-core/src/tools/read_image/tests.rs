@@ -20,7 +20,7 @@
 
 use super::*;
 use crate::engine::tool::Tool;
-use image::{GenericImage, ImageBuffer, Rgba};
+use image::{ImageBuffer, Rgba};
 
 // ---------------------------------------------------------------------------
 // Fixtures

@@ -222,6 +222,7 @@ fn spawn_wire_owner_server(
     });
     let state_for_task = Arc::clone(&state);
     let server = tokio::spawn(async move {
+        #[cfg(windows)]
         let mut listener = listener;
         loop {
             #[cfg(unix)]

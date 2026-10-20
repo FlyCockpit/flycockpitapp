@@ -2367,7 +2367,7 @@ impl AgentsPage {
         else {
             return;
         };
-        let Some(agent) = self
+        let Some(_) = self
             .pending_external_edit
             .as_ref()
             .filter(|request| request.id == id && request.agent == agent)

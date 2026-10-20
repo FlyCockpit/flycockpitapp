@@ -324,6 +324,7 @@ fn params_with_direct_computer(args: &SpawnArgs, model: &Model) -> ModelParams {
 /// path may not omit custody. The class is the candidate's own configured trust
 /// class — host-authorized, because enabling `computer_use` on a model is a
 /// host configuration decision and no model-authored selector reaches here.
+#[cfg(test)]
 pub(crate) fn computer_use_custody_route(
     providers: &crate::config::providers::ProvidersConfig,
     provider_id: &str,
@@ -342,6 +343,7 @@ pub(crate) fn computer_use_custody_route(
 
 /// The shared selection criteria for a computer-use route, so the candidate
 /// scan and the worker construction site cannot drift apart.
+#[cfg(test)]
 pub(crate) fn computer_use_criteria(
     selector: &str,
 ) -> crate::config::providers::ModelPolicyCriteria<'_> {

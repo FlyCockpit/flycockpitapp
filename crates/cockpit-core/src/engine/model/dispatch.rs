@@ -1494,20 +1494,6 @@ impl Model {
         matches!(self, Model::Anthropic { .. })
     }
 
-    fn definitions_for_initial_wire<'a>(
-        &self,
-        tools: &'a [ToolDefinition],
-    ) -> std::borrow::Cow<'a, [ToolDefinition]> {
-        let wire = match self {
-            Model::OpenAi { client, .. } => {
-                self.resolve_live_wire_api_for_base_url(client.base_url())
-            }
-            Model::ChatGpt { .. } => crate::config::providers::WireApi::Responses,
-            Model::Anthropic { .. } => crate::config::providers::WireApi::Completions,
-        };
-        wire_schema::definitions_for_wire(wire, tools)
-    }
-
     /// Map a fail-closed [`UnrenderableWireField`] into the typed pre-network
     /// [`InferenceFailure`] (phase `prep`,
     /// [`InferenceErrorClass::UnrenderableWireField`]) the prep entry points

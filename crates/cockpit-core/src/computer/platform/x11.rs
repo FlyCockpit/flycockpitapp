@@ -1134,7 +1134,6 @@ pub fn authorized_atspi_present() -> bool {
 #[cfg(test)]
 mod opaque_window_tests {
     use super::{opaque_x11_window_id, x11_window_from_opaque};
-    use crate::computer::target::OpaqueWindowId;
 
     #[test]
     fn x11_window_id_round_trips_and_rejects_incomplete_identities() {

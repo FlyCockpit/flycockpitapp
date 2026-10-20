@@ -130,7 +130,11 @@ pub const RESERVATION_LEGAL_EDGES: &[(&str, &str)] = &[
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaExternalHandoffOutcome {
+    // Reserved for future external-handoff wire outcomes.
+    #[allow(dead_code)]
     Accepted,
+    // Reserved for future external-handoff wire outcomes.
+    #[allow(dead_code)]
     DefinitivelyRejected,
     SubmissionUnknown,
 }
@@ -1371,7 +1375,7 @@ impl MediaReservationLedger {
     /// Move a reservation off `dispatching_external` for a non-terminal
     /// journal outcome. `submission_unknown` / `accepted` keep the outbound
     /// charge held (`external_pending`); a definitive rejection may settle.
-    pub async fn finish_external_handoff(
+    pub(crate) async fn finish_external_handoff(
         &self,
         id: &str,
         expected_version: u64,
@@ -2081,6 +2085,7 @@ pub(crate) fn finish_external_handoff_conn(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "extended"))]
 pub(crate) fn definitive_rejection_retry_conn(
     conn: &rusqlite::Connection,
     id: &str,
@@ -2263,6 +2268,7 @@ pub(crate) fn definitive_rejection_retry_conn(
     })
 }
 
+#[cfg(any(test, feature = "extended"))]
 fn load_reservation_plan_facts(
     conn: &rusqlite::Connection,
     id: &str,
@@ -2281,6 +2287,7 @@ fn load_reservation_plan_facts(
     Ok(plans)
 }
 
+#[cfg(any(test, feature = "extended"))]
 pub(crate) fn allocate_media_queue_sequence(conn: &rusqlite::Connection) -> Result<u64> {
     let from_counter = conn.query_row(
         "UPDATE media_queue_sequence SET next_value=next_value+1 WHERE singleton=1 RETURNING next_value-1",

@@ -7,6 +7,7 @@
 //! [`crate::agents::VerificationEstimate::UnknownPrice`], which still routes
 //! to `onBudgetExceeded`.
 
+#[cfg(test)]
 use crate::agents::{VerificationBudget, VerificationEstimate};
 use crate::tokens::{TokenizerStrategy, count_with};
 
@@ -73,6 +74,7 @@ pub struct PreCollectionEstimate {
 }
 
 impl PreCollectionEstimate {
+    #[cfg(test)]
     pub fn to_verification_estimate(self) -> VerificationEstimate {
         match self.cost_microusd {
             Some(cost) => VerificationEstimate::Known(VerificationBudget {
@@ -242,9 +244,9 @@ pub fn encoding_for_model_id(model_id: &str) -> Option<TokenizerStrategy> {
 mod tests {
     use super::*;
     use crate::agents::{
-        ExecutionKind, GoalSkepticsPolicy, ModelCapability, ModelLocality, ModelSlot,
-        OnBudgetExceeded, SelectorPredicate, ToolClass, VerificationAction, VerificationDispatch,
-        VerificationPolicy, VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
+        GoalSkepticsPolicy, ModelCapability, ModelLocality, ModelSlot, OnBudgetExceeded,
+        SelectorPredicate, ToolClass, VerificationAction, VerificationDispatch, VerificationPolicy,
+        VerificationRule, VerificationSelector, VnextAgentDef, VnextHostPolicy,
     };
     use std::collections::{BTreeMap, BTreeSet};
 

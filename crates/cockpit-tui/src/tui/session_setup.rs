@@ -61,9 +61,6 @@ pub(crate) enum SessionSetupOutcome {
         command: Option<String>,
         auth: String,
     },
-    Notice {
-        message: String,
-    },
 }
 
 /// MCP write target chosen in the Add-MCP dialog.
@@ -271,6 +268,7 @@ impl SessionSetupPane {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_inline(&self) -> bool {
         self.inline
     }
@@ -289,6 +287,7 @@ impl SessionSetupPane {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn frozen_tool_order(&self) -> &[String] {
         &self.tool_order
     }
@@ -334,6 +333,7 @@ impl SessionSetupPane {
         self.notice = Some(message.into());
     }
 
+    #[cfg(test)]
     pub(crate) fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }

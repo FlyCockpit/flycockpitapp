@@ -2332,15 +2332,6 @@ fn install_test_provider_config(
     );
 }
 
-fn edit_test_provider_config(
-    driver: &mut Driver,
-    edit: impl FnOnce(&mut crate::config::providers::ProvidersConfig),
-) {
-    let mut providers = driver.config.providers();
-    edit(&mut providers);
-    install_test_provider_config(driver, providers);
-}
-
 /// Replace a fixture provider endpoint through the real generation-pinned
 /// configuration dependency used by foreground and nested drivers.
 fn set_test_provider_url(driver: &mut Driver, url: String) {

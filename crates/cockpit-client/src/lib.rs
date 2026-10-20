@@ -2283,7 +2283,7 @@ pub fn owner_capability_path(control_socket: &Path) -> PathBuf {
     }
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(all(test, any(unix, windows)))]
 fn load_owner_capability(socket: &Path) -> Option<proto::OwnerCapabilityToken> {
     let path = owner_capability_path(socket);
     let bytes = std::fs::read(&path).ok()?;

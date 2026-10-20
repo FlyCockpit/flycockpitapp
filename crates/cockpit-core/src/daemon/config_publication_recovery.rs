@@ -19,7 +19,8 @@ use anyhow::{Context, Result, bail};
 const PRE_SOCKET_CONFIG_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PreSocketConfigPublication {
+// Opaque parameter of public recovery APIs; only daemon boot can mint it.
+pub struct PreSocketConfigPublication {
     deadline: Instant,
 }
 

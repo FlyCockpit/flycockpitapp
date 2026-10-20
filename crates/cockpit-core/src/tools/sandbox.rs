@@ -1799,7 +1799,7 @@ mod tests {
         std::fs::write(cwd.join(".env"), "SECRET=x").unwrap();
         std::fs::create_dir_all(cwd.join("src")).unwrap();
         std::fs::write(cwd.join("src/main.rs"), "fn main() {}").unwrap();
-        let (env, mut ctx) = sandboxed_ctx(cwd).await;
+        let (env, ctx) = sandboxed_ctx(cwd).await;
         ctx.session.set_sandbox_enabled(false);
         (env, ctx)
     }

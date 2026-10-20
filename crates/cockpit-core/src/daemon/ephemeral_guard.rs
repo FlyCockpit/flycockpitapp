@@ -584,6 +584,7 @@ impl EphemeralDaemonGuard {
     /// Request shutdown and synchronously join its shared result. Idempotent:
     /// the first caller performs teardown and every concurrent/later caller
     /// observes the same completion.
+    #[cfg(test)]
     pub(crate) fn shutdown(&self) -> anyhow::Result<()> {
         shutdown_shared(&self.cleanup_state, &self.socket, self.process.clone())
     }

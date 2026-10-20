@@ -9238,7 +9238,6 @@ mod render_history_spacing_tests {
         let saved_main = SideConversation {
             side_session_id: uuid::Uuid::new_v4(),
             endpoint: cockpit_client::ClientEndpoint::Wire(tmp.path().join("missing-daemon.sock")),
-            socket: tmp.path().join("missing-daemon.sock"),
             saved_runner: None,
             saved_history: app.history.clone(),
             saved_history_render_versions: app.history_render_versions.clone(),

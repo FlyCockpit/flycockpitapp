@@ -2605,6 +2605,7 @@ impl RedactionTable {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn coverage_binding(&self) -> Option<&coverage_authority::CoverageTableBinding> {
         self.coverage_binding.as_ref()
     }
@@ -3142,6 +3143,7 @@ pub(crate) struct RedactionSourceUnreadableError {
 
 /// True when [`RedactionTable::build`] (and siblings) refused so a later
 /// consumer cannot proceed with a table that would miss secrets.
+#[cfg(test)]
 pub(crate) fn build_would_miss_secrets(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<EnvFileOverLimitError>().is_some()

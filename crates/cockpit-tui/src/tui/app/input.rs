@@ -614,6 +614,13 @@ impl App {
         }
     }
 
+    pub(super) fn send_pending_settings_request(&mut self) {
+        if let Some(req) = self.dialog.take_daemon_request() {
+            let _ = self.dialog.take_pending_default_model_update_id();
+            self.send_daemon_request("/settings", req, ControlApplied::None);
+        }
+    }
+
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
         if let Some(exit) = self.route_key_through_layer_stack(key) {
@@ -1121,11 +1128,8 @@ impl App {
         if self.dialog.is_active() {
             if self.dialog.handle_key(key) {
                 self.close_active_dialog();
-            } else if let Some(req) = self.dialog.take_daemon_request() {
-                // The send boundary binds the id carried by SetDefaultModel
-                // and retires it on non-delivery or a failed receipt.
-                let _ = self.dialog.take_pending_default_model_update_id();
-                self.send_daemon_request("/settings", req, ControlApplied::None);
+            } else {
+                self.send_pending_settings_request();
             }
             self.drain_oauth_actions();
             // Provider editors can persist credentials without closing the

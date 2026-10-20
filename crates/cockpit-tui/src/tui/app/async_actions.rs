@@ -1192,6 +1192,8 @@ impl App {
                     self.dialog.apply_settings_daemon_completion(completion);
                     if self.dialog.take_settings_save_close() {
                         self.close_active_dialog();
+                    } else {
+                        self.send_pending_settings_request();
                     }
                 }
             }

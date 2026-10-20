@@ -13054,3 +13054,190 @@ pub(crate) fn with_settings_q_fixture(
         test(tmp.path(), &runtime, dialog);
     });
 }
+
+/// Active-model fixture with a real supported retention capability on disk.
+/// Runtime selection is attached by App; config-only defaults start unset.
+pub(crate) fn with_settings_retention_q_fixture(
+    test: impl FnOnce(&std::path::Path, &tokio::runtime::Runtime, SettingsDialog),
+) {
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let mut config = lmstudio_settings_config();
+        // This fixture's identity is local to the test. Resolve it as an
+        // explicit custom OpenAI-compatible endpoint, without a template id.
+        let provider = config.providers.get_mut("lmstudio").unwrap();
+        provider.template = None;
+        provider.wire_api = cockpit_config::providers::WireApi::Completions;
+        let model = &mut config.providers.get_mut("lmstudio").unwrap().models[0];
+        model.capability_overrides.context_tokens = Some(8192);
+        model.capabilities.prompt_cache_retention =
+            cockpit_config::providers::CapabilityStatus::Supported;
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let client = runtime
+            .block_on(super::super::settings_daemon_client(
+                &super::super::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(
+                &client,
+                &tmp.path().display().to_string(),
+            ))
+            .unwrap();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        // Reuse the already-promoted production-config context and install
+        // the existing fake secure-key actor seam required for real attaches.
+        // No OS keyring or production secret values participate.
+        let daemon = runtime
+            .block_on(cockpit_core::daemon::boot_test_persistent_daemon())
+            .unwrap();
+        let context = daemon.context().unwrap();
+        let (_key_actor, resolver) =
+            cockpit_core::redact::start_fake_redaction_key_resolver(&context.db).unwrap();
+        context.registry.set_redaction_key_resolver(resolver);
+        let active = cockpit_config::providers::ActiveModelRef {
+            provider: "lmstudio".into(),
+            model: "lfm2.5-24b-a2b".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+        dialog.config.active_model = Some(active.clone());
+        dialog.original_config.active_model = Some(active);
+        dialog.page = super::super::providers_page(active_model_settings_page(&dialog.config));
+        dialog.focus_settings_q_field(ProviderSettingId::PromptCacheRetention);
+        dialog.cx.defer_test_effects = true;
+        test(tmp.path(), &runtime, dialog);
+    });
+}
+
+impl SettingsDialog {
+    pub(crate) fn focus_settings_q_context(&mut self) {
+        self.focus_settings_q_field(ProviderSettingId::CapabilityContextTokens);
+    }
+
+    fn focus_settings_q_field(&mut self, field: ProviderSettingId) {
+        let Some(ProvidersPage::ModelSettings { editor, .. }) =
+            self.page.downcast_mut::<ProvidersPage>()
+        else {
+            panic!("model settings");
+        };
+        editor.cursor = editor.fields().iter().position(|id| *id == field).unwrap();
+    }
+}
+
+#[test]
+fn settings_q_provider_completion_identity_cannot_close_another_save() {
+    with_settings_q_fixture(false, false, |_root, runtime, mut dialog| {
+        dialog.handle_key(press(KeyCode::Enter));
+        for ch in "131072".chars() {
+            dialog.handle_key(press(KeyCode::Char(ch)));
+        }
+        dialog.handle_key(press(KeyCode::Enter));
+        assert!(!dialog.handle_key(press(KeyCode::Char('q'))));
+        let effect = dialog.cx.daemon_effects.front().unwrap();
+        let good = super::super::SettingsDaemonEffectCompletion {
+            dialog_id: effect.dialog_id,
+            operation_id: effect.operation_id,
+            target: effect.target.clone(),
+            response: Ok(cockpit_proto::Response::Ack),
+            authoritative_rejection: false,
+            committed_refresh_needed: None,
+        };
+        let mut wrapper = super::super::Dialog::Settings(Box::new(dialog));
+        for mismatch in 0..3 {
+            let mut stale = super::super::SettingsDaemonEffectCompletion {
+                dialog_id: good.dialog_id,
+                operation_id: good.operation_id,
+                target: good.target.clone(),
+                response: good.response.clone(),
+                authoritative_rejection: good.authoritative_rejection,
+                committed_refresh_needed: good.committed_refresh_needed.clone(),
+            };
+            match mismatch {
+                0 => stale.dialog_id = uuid::Uuid::new_v4(),
+                1 => stale.operation_id = uuid::Uuid::new_v4(),
+                2 => stale.target.owner.push_str("-wrong"),
+                _ => unreachable!(),
+            }
+            wrapper.apply_settings_daemon_completion(stale);
+            assert!(!wrapper.take_settings_save_close());
+            assert!(!wrapper.handle_key(press(KeyCode::Esc)));
+        }
+        // Use the same execution/error projection as App: an ambiguous
+        // result must settle through its queued same-operation query.
+        while let Some(effect) = wrapper.take_settings_daemon_effect() {
+            let (response, authoritative_rejection, committed_refresh_needed) = match runtime
+                .block_on(super::super::execute_settings_daemon_work(
+                    effect.work,
+                    super::super::test_lifecycle_client(),
+                )) {
+                Ok(outcome) => (
+                    outcome.response,
+                    outcome.authoritative_rejection,
+                    outcome.committed_refresh_needed,
+                ),
+                Err(error) => (Err(error), false, None),
+            };
+            wrapper.apply_settings_daemon_completion(
+                super::super::SettingsDaemonEffectCompletion {
+                    dialog_id: effect.dialog_id,
+                    operation_id: effect.operation_id,
+                    target: effect.target,
+                    response,
+                    authoritative_rejection,
+                    committed_refresh_needed,
+                },
+            );
+        }
+        assert!(wrapper.take_settings_save_close());
+        assert!(!wrapper.take_settings_save_close());
+    });
+}
+
+#[test]
+fn settings_q_noop_classification_uses_the_whole_provider_plan() {
+    for provider_scope in [false, true] {
+        for metadata in [false, true] {
+            with_settings_q_fixture(provider_scope, false, |_root, runtime, mut dialog| {
+                if metadata {
+                    dialog.config.on_unlisted_models_fetch = Some(OnUnlistedModelsFetch::Remove);
+                } else {
+                    let sibling = dialog.config.providers["lmstudio"].clone();
+                    dialog.config.providers.insert("sibling".into(), sibling);
+                }
+                assert!(
+                    !dialog.handle_key(press(KeyCode::Char('q'))),
+                    "unchanged current provider does not imply an empty whole-config plan"
+                );
+                let effect = dialog.cx.take_daemon_effect().unwrap();
+                let outcome = runtime
+                    .block_on(super::super::execute_settings_daemon_work(
+                        effect.work,
+                        super::super::test_lifecycle_client(),
+                    ))
+                    .unwrap();
+                dialog.apply_daemon_completion(super::super::SettingsDaemonEffectCompletion {
+                    dialog_id: effect.dialog_id,
+                    operation_id: effect.operation_id,
+                    target: effect.target,
+                    response: outcome.response,
+                    authoritative_rejection: outcome.authoritative_rejection,
+                    committed_refresh_needed: outcome.committed_refresh_needed,
+                });
+                assert!(dialog.cx.settings_save_close_ready);
+                if metadata {
+                    assert_eq!(
+                        dialog.original_config.on_unlisted_models_fetch,
+                        Some(OnUnlistedModelsFetch::Remove)
+                    );
+                } else {
+                    assert!(dialog.original_config.providers.contains_key("sibling"));
+                }
+            });
+        }
+    }
+}

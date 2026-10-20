@@ -54,7 +54,6 @@ use ratatui::widgets::{Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use super::auth::FetchOutcome;
-use crate::tui::settings::provider_entries_equal;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, INK, INK_INDEX, resolve_color};
 use cockpit_config::providers::{
@@ -994,7 +993,7 @@ pub(super) struct AddState {
 
 struct FallbackOffer;
 
-/// Whether a provider save has already succeeded or still owns daemon work.
+/// Whether the complete settings save has succeeded or still owns daemon work.
 enum EditCommitOutcome {
     Saved,
     Pending,
@@ -2387,7 +2386,7 @@ impl SettingsCx {
                 match outcome {
                     EditCommitOutcome::Saved => Nav::Close,
                     EditCommitOutcome::Pending => {
-                        self.close_after_provider_save = true;
+                        self.close_after_settings_save = true;
                         Nav::Stay
                     }
                 }
@@ -2407,18 +2406,17 @@ impl SettingsCx {
         self.config
             .providers
             .insert(s.provider_id.clone(), (*s.entry).clone());
-        let provider_is_unchanged = self
-            .original_config
-            .providers
-            .get(&s.provider_id)
-            .is_some_and(|original| provider_entries_equal(original, s.entry.as_ref()));
         match self.save_config() {
-            // A no-op save has no daemon effect to settle. Reporting it as
-            // pending would leave the Models/Headers sub-pages permanently
-            // on "saving provider…" even though their visible state is
-            // already authoritative.
-            Ok(()) if provider_is_unchanged => Ok(EditCommitOutcome::Saved),
-            Ok(()) => Ok(EditCommitOutcome::Pending),
+            // Classify the actual whole-config plan, including metadata,
+            // other providers and the separately staged default-model save.
+            Ok(())
+                if self.provider_save_pending()
+                    || self.completed_provider_mutation.is_some()
+                    || self.settings_default_model_save.is_some() =>
+            {
+                Ok(EditCommitOutcome::Pending)
+            }
+            Ok(()) => Ok(EditCommitOutcome::Saved),
             Err(error) => {
                 match previous {
                     Some(entry) => {

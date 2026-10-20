@@ -99,7 +99,7 @@ use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersC
 
 use providers::initial_list_cursor;
 #[cfg(test)]
-pub(crate) use providers::tests::with_settings_q_fixture;
+pub(crate) use providers::tests::{with_settings_q_fixture, with_settings_retention_q_fixture};
 
 /// Settings-side operations use the TUI's configured daemon lifetime. Keeping
 /// this tiny helper here makes accidental local vault opens in settings code
@@ -1413,6 +1413,11 @@ pub(super) enum SettingsSaveOutcome {
     CommittedRefreshNeeded(String),
 }
 
+struct SettingsDefaultModelSave {
+    update_id: uuid::Uuid,
+    selection: Option<cockpit_config::providers::ActiveModelRef>,
+}
+
 enum PendingSettingsOperation {
     GuidanceTrace,
     ExtendedLoad {
@@ -1516,6 +1521,16 @@ enum PendingSettingsOperation {
 }
 
 impl PendingSettingsOperation {
+    fn is_provider_mutation(&self) -> bool {
+        match self {
+            Self::ProviderMutation { .. } => true,
+            Self::SettlementQuery { original, .. } | Self::SettlementUnknown { original, .. } => {
+                original.is_provider_mutation()
+            }
+            _ => false,
+        }
+    }
+
     fn blocks_navigation(&self) -> bool {
         match self {
             Self::GuidanceTrace
@@ -3292,9 +3307,10 @@ pub struct SettingsCx {
     pending_onboarding_validation_commit: Option<PendingOnboardingValidationCommit>,
     completed_provider_add: Option<Result<(String, ProviderEntry, bool), String>>,
     completed_provider_mutation: Option<Result<(), String>>,
-    /// Only Model/Provider Settings q sets this; settlement consumes it once.
-    close_after_provider_save: bool,
-    provider_save_close_ready: bool,
+    /// Only Model/Provider Settings q arms close; every save channel must settle.
+    close_after_settings_save: bool,
+    settings_default_model_save: Option<SettingsDefaultModelSave>,
+    settings_save_close_ready: bool,
     #[cfg(test)]
     defer_test_effects: bool,
     pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
@@ -3493,6 +3509,23 @@ impl SettingsCx {
             .values()
             .any(PendingSettingsOperation::blocks_navigation)
             || !self.blocking_effects.is_empty()
+            || self.settings_default_model_save.is_some()
+    }
+
+    fn provider_save_pending(&self) -> bool {
+        self.pending_settings
+            .values()
+            .any(PendingSettingsOperation::is_provider_mutation)
+    }
+
+    fn finish_settings_save_if_ready(&mut self) {
+        if self.close_after_settings_save
+            && !self.provider_save_pending()
+            && self.settings_default_model_save.is_none()
+        {
+            self.close_after_settings_save = false;
+            self.settings_save_close_ready = true;
+        }
     }
 
     fn enqueue_daemon_effect(
@@ -7018,7 +7051,14 @@ impl Dialog {
 
     pub fn take_daemon_request(&mut self) -> Option<Request> {
         match self {
-            Dialog::Settings(s) => s.pending_daemon_request.take(),
+            Dialog::Settings(s) => {
+                // A combined save publishes providers first. Its revision-bound
+                // provider plan must not race the default-model config update.
+                if s.settings_default_model_save.is_some() && s.provider_save_pending() {
+                    return None;
+                }
+                s.pending_daemon_request.take()
+            }
             _ => None,
         }
     }
@@ -7034,9 +7074,70 @@ impl Dialog {
     pub(crate) fn take_settings_save_close(&mut self) -> bool {
         match self {
             Dialog::Settings(settings) => {
-                std::mem::take(&mut settings.cx.provider_save_close_ready)
+                std::mem::take(&mut settings.cx.settings_save_close_ready)
             }
             _ => false,
+        }
+    }
+
+    /// Only the exact staged operation and selection can settle this page's
+    /// default-model save. Ack is transport delivery, never save success.
+    pub(crate) fn apply_settings_default_model_result(
+        &mut self,
+        update_id: uuid::Uuid,
+        outcome: &cockpit_proto::DefaultModelStandaloneOutcome,
+    ) -> bool {
+        let Dialog::Settings(settings) = self else {
+            return true;
+        };
+        let Some(pending) = &settings.cx.settings_default_model_save else {
+            return true;
+        };
+        if pending.update_id != update_id {
+            return false;
+        }
+        let result = match outcome {
+            cockpit_proto::DefaultModelStandaloneOutcome::Applied { selection, .. } => {
+                let target = |active: &cockpit_config::providers::ActiveModelRef| {
+                    (
+                        active.provider.clone(),
+                        active.model.clone(),
+                        active
+                            .reasoning_effort
+                            .as_ref()
+                            .map(|effort| effort.value.clone()),
+                        active.thinking_mode,
+                        active.prompt_cache_retention,
+                    )
+                };
+                if selection.as_ref().map(target) != pending.selection.as_ref().map(target) {
+                    return false;
+                }
+                settings.cx.config.active_model = selection.clone();
+                settings.cx.original_config.active_model = selection.clone();
+                Ok(())
+            }
+            cockpit_proto::DefaultModelStandaloneOutcome::Rejected { user_message, .. } => {
+                Err(user_message.clone())
+            }
+        };
+        settings.finish_default_model_save(result);
+        true
+    }
+
+    pub(crate) fn fail_settings_default_model_save(
+        &mut self,
+        update_id: uuid::Uuid,
+        message: String,
+    ) {
+        if let Dialog::Settings(settings) = self
+            && settings
+                .cx
+                .settings_default_model_save
+                .as_ref()
+                .is_some_and(|pending| pending.update_id == update_id)
+        {
+            settings.finish_default_model_save(Err(message));
         }
     }
 
@@ -7521,6 +7622,25 @@ impl SettingsDialog {
         }
     }
 
+    fn finish_default_model_save(&mut self, result: Result<(), String>) {
+        self.cx.settings_default_model_save = None;
+        let status = match result {
+            Ok(()) => "saved".to_string(),
+            Err(error) => {
+                self.cx.close_after_settings_save = false;
+                format!("default model save failed: {error}")
+            }
+        };
+        if let Some(
+            ProvidersPage::ModelSettings { parent, .. }
+            | ProvidersPage::ProviderSettings { parent, .. },
+        ) = self.page.downcast_mut::<ProvidersPage>()
+        {
+            parent.status = Some(status);
+        }
+        self.cx.finish_settings_save_if_ready();
+    }
+
     fn apply_pending_provider_completions(&mut self) {
         if let Some(completion) = self.cx.completed_provider_auth.take()
             && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
@@ -7557,10 +7677,20 @@ impl SettingsDialog {
         if let Some(result) = self.cx.completed_provider_mutation.take()
             && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
         {
-            if std::mem::take(&mut self.cx.close_after_provider_save) {
-                self.cx.provider_save_close_ready = result.is_ok();
+            if result.is_err() {
+                self.cx.close_after_settings_save = false;
+                // This request has not been sent: take_daemon_request fences
+                // it behind provider settlement. Keep the editor's draft.
+                if self.cx.settings_default_model_save.take().is_some() {
+                    self.cx.pending_daemon_request = None;
+                    self.cx.pending_default_model_update_id = None;
+                }
             }
+            self.cx.finish_settings_save_if_ready();
             let status = match result {
+                Ok(()) if self.cx.settings_default_model_save.is_some() => {
+                    "saving default model…".to_string()
+                }
                 Ok(()) => "saved".to_string(),
                 Err(error) => format!("provider save failed: {error}"),
             };
@@ -8215,8 +8345,9 @@ impl SettingsDialog {
                 pending_onboarding_validation_commit: None,
                 completed_provider_add: None,
                 completed_provider_mutation: None,
-                close_after_provider_save: false,
-                provider_save_close_ready: false,
+                close_after_settings_save: false,
+                settings_default_model_save: None,
+                settings_save_close_ready: false,
                 #[cfg(test)]
                 defer_test_effects: false,
                 pending_provider_mutation_navigation: None,
@@ -8848,7 +8979,7 @@ impl SettingsDialog {
         let close = self.apply_nav(nav);
         #[cfg(test)]
         self.settle_test_effects();
-        close || std::mem::take(&mut self.cx.provider_save_close_ready)
+        close || std::mem::take(&mut self.cx.settings_save_close_ready)
     }
 
     /// Clear every pointer-derived hover (the position is unknown).
@@ -9815,6 +9946,10 @@ impl SettingsCx {
                 clear: true,
             },
         };
+        self.settings_default_model_save = Some(SettingsDefaultModelSave {
+            update_id: default_update_id,
+            selection: self.config.active_model.clone(),
+        });
         self.pending_default_model_update_id = Some(default_update_id);
         self.pending_daemon_request = Some(request);
         // The staged value is only an intent until the daemon returns the
@@ -10087,9 +10222,16 @@ impl SettingsCx {
         // The layer-wide default is never part of this file write; it goes to
         // the daemon's authoritative effective-default operation, and the
         // dialog only shows the new value once that verified result arrives.
-        self.stage_default_model_change();
+        let desired_default = self.config.active_model.clone();
+        let staged_default = self.stage_default_model_change();
         let result = self
             .upsert_provider_config_via_daemon(&mut merged, notice.map(|notice| notice.render()));
+        if result.is_err() && staged_default {
+            self.settings_default_model_save = None;
+            self.pending_daemon_request = None;
+            self.pending_default_model_update_id = None;
+            self.config.active_model = desired_default;
+        }
         // Once queued, leave no second plaintext owner in the live dialog.
         for entry in self.config.providers.values_mut() {
             for header in &mut entry.headers {

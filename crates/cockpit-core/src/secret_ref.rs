@@ -82,6 +82,48 @@ pub fn provider_named_secret_references_for(
         .collect()
 }
 
+/// A global credential can follow its inherited authentication envelope,
+/// never an arbitrary project reference to a known vault name. Reject a name
+/// shared with any changed/foreign envelope because the resolution store is
+/// shared by all providers in the effective snapshot.
+pub(crate) fn inherited_global_provider_references(
+    effective: &ProvidersConfig,
+    source: &cockpit_config::providers::GlobalProviderCredentialSource,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut names = std::collections::BTreeSet::new();
+    let mut records = std::collections::BTreeSet::new();
+    let mut denied_names = std::collections::BTreeSet::new();
+    let mut denied_records = std::collections::BTreeSet::new();
+    for (id, entry) in &effective.providers {
+        let inherited = source.providers.get(id).is_some_and(|global| {
+            entry.url == global.url
+                && entry.headers == global.headers
+                && entry.auth_command == global.auth_command
+                && entry.credential_ref == global.credential_ref
+                && entry.oauth == global.oauth
+        });
+        let referenced = provider_named_secret_references_for(effective, id);
+        let record = entry
+            .credential_ref
+            .iter()
+            .filter(|id| !crate::auth::descriptor::is_credential_record_id(id))
+            .cloned();
+        if inherited {
+            names.extend(referenced);
+            records.extend(record);
+        } else {
+            denied_names.extend(referenced);
+            denied_records.extend(record);
+        }
+    }
+    names.retain(|name| !denied_names.contains(name));
+    records.retain(|id| !denied_records.contains(id));
+    (names, records)
+}
+
 fn provider_reference_strings(entry: &ProviderEntry) -> impl Iterator<Item = &str> {
     entry
         .headers
@@ -944,5 +986,60 @@ mod tests {
             "the config must NOT be rewritten to reference a foreign-owned name: {raw}"
         );
         assert!(!raw.contains("$secret:openai"), "{raw}");
+    }
+}
+
+#[cfg(test)]
+mod ux4_tests {
+    use super::*;
+    use crate::config::providers::HeaderSpec;
+
+    #[test]
+    fn ux4_global_credential_authority_cannot_be_supplied_by_json_or_a_changed_destination() {
+        let entry = ProviderEntry {
+            url: "https://global.example/v1".into(),
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: "$secret:global-key".into(),
+            }],
+            ..Default::default()
+        };
+        let source = cockpit_config::providers::GlobalProviderCredentialSource {
+            owner_root: "/global".into(),
+            providers: BTreeMap::from([("p".into(), entry.clone())]),
+        };
+        let mut effective = ProvidersConfig {
+            providers: source.providers.clone(),
+            ..Default::default()
+        };
+        assert!(
+            inherited_global_provider_references(&effective, &source)
+                .0
+                .contains("global-key")
+        );
+        effective.providers.get_mut("p").unwrap().url = "https://attacker.example/v1".into();
+        assert!(
+            inherited_global_provider_references(&effective, &source)
+                .0
+                .is_empty()
+        );
+        effective.providers = source.providers.clone();
+        effective.providers.insert("foreign".into(), entry);
+        assert!(
+            inherited_global_provider_references(&effective, &source)
+                .0
+                .is_empty(),
+            "a sibling cannot borrow the global name from a shared store"
+        );
+        let supplied = serde_json::json!({"global_credential_source": {"owner_root":"/global","providers":{}}});
+        let parsed: ProvidersConfig = serde_json::from_value(supplied).unwrap();
+        assert!(parsed.global_credential_source.is_none());
+        effective.global_credential_source = Some(std::sync::Arc::new(source));
+        assert!(
+            serde_json::to_value(effective)
+                .unwrap()
+                .get("global_credential_source")
+                .is_none()
+        );
     }
 }

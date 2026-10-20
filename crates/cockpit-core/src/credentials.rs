@@ -326,6 +326,35 @@ impl CredentialStore {
         })
     }
 
+    /// Add only explicitly authorized inherited global references. The caller
+    /// proves each reference's complete authentication envelope against the
+    /// retained global source; the vault still enforces the exact owner claim.
+    pub(crate) fn extend_provider_references(
+        &mut self,
+        source: Self,
+        names: &BTreeSet<String>,
+        records: &BTreeSet<String>,
+    ) {
+        self.secrets.extend(
+            source
+                .secrets
+                .into_iter()
+                .filter(|(name, _)| names.contains(name)),
+        );
+        self.command_specs.extend(
+            source
+                .command_specs
+                .into_iter()
+                .filter(|(name, _)| names.contains(name)),
+        );
+        self.records.extend(
+            source
+                .records
+                .into_iter()
+                .filter(|(id, _)| records.contains(id)),
+        );
+    }
+
     /// Import-only / test fixtures. Production login, refresh, logout, MCP,
     /// provider-header, `ask`, and setup paths must use [`Self::from_vault`]
     /// or [`Self::open_default`].

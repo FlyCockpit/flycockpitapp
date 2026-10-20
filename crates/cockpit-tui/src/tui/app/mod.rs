@@ -2168,6 +2168,7 @@ fn providers_from_view(
         // non-zero generation only when the daemon snapshot is applied via
         // with_resolution_generation on the live path.
         resolution_generation: 0,
+        global_credential_source: None,
     }
 }
 

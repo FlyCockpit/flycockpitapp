@@ -6147,11 +6147,9 @@ async fn dispatch_image_control_read(
     Ok(Response::ImageControlRead(response))
 }
 
-/// Bind the catalog after the base primitive has durably produced its root and
-/// attachment, but before that primitive records its idempotency receipt or
-/// returns the capability.  The receipt is the publication boundary: a
-/// concurrent retry/discovery consumer cannot obtain this attachment before
-/// the root worker has the matching effective catalog.
+/// Bind the catalog before returning the operation's attachment capability.
+/// Fresh creates bind before committing their root and idempotency receipt;
+/// replays bind a reissued capability for an already-saved root.
 fn bind_pending_acp_catalog_before_code_root_publication(
     state: &mut MutableClientState,
     root_id: uuid::Uuid,
@@ -6161,7 +6159,6 @@ fn bind_pending_acp_catalog_before_code_root_publication(
         let Some(pending) = state.pending_acp_catalog_composition.as_mut() else {
             return Ok(());
         };
-        pending.root_id = Some(root_id);
         pending.attachment = Some(attachment.clone());
         (
             pending.service.clone(),
@@ -6182,15 +6179,13 @@ fn bind_pending_acp_catalog_before_code_root_publication(
     service.bind_catalog(root_id, attachment, &cwd, &ingress, slot)
 }
 
-/// Compensation is intentionally outside the base primitive: its binding
-/// failure is observed before the base receipt/response publication, while
-/// the normal close/archive funnels retain ownership of attachment and root
-/// cleanup.  The stored capability is only internal composition state and is
-/// never serialized to the ACP caller on this failure path.
+/// Release only the attachment issued during this composition. A create can
+/// replay a saved root, so the wrapper never owns root cleanup. Fresh roots
+/// remain owned by the base primitive's staging guard through finalization.
+/// The stored capability is never serialized to the ACP caller on failure.
 async fn rollback_acp_catalog_composition_failure(
     error: ErrorPayload,
     pending: PendingAcpCatalogCompositionV1,
-    archive_root: bool,
     request_id: uuid::Uuid,
     state: &mut MutableClientState,
     shared: &Arc<SharedClientState>,
@@ -6215,33 +6210,12 @@ async fn rollback_acp_catalog_composition_failure(
         remote_operation,
     ))
     .await;
-    let root_rollback = if archive_root {
-        match pending.root_id {
-            Some(root_id) => super::sessions::archive_session(ctx, root_id, true)
-                .await
-                .map(|_| ()),
-            None => Ok(()),
-        }
-    } else {
-        Ok(())
-    };
-    match (close, root_rollback) {
-        (Ok(_), Ok(_)) => error,
-        (Err(attachment_error), Ok(_)) => internal(anyhow::anyhow!(
+    match close {
+        Ok(_) => error,
+        Err(attachment_error) => internal(anyhow::anyhow!(
             "ACP catalog composition failed ({}) and attachment rollback failed ({})",
             error.message,
             attachment_error.message,
-        )),
-        (Ok(_), Err(root_error)) => internal(anyhow::anyhow!(
-            "ACP catalog create composition failed ({}) and root rollback failed ({})",
-            error.message,
-            root_error.message,
-        )),
-        (Err(attachment_error), Err(root_error)) => internal(anyhow::anyhow!(
-            "ACP catalog create composition failed ({}) and attachment rollback failed ({}) and root rollback failed ({})",
-            error.message,
-            attachment_error.message,
-            root_error.message,
         )),
     }
 }
@@ -6945,7 +6919,6 @@ async fn handle_serialized_request_inner(
                 service: service.clone(),
                 cwd,
                 ingress: request.ingress.clone(),
-                root_id: None,
                 attachment: None,
             });
             let base_response = Box::pin(handle_serialized_request_inner(
@@ -6969,7 +6942,6 @@ async fn handle_serialized_request_inner(
                     return Err(rollback_acp_catalog_composition_failure(
                         error,
                         pending,
-                        true,
                         request_id,
                         state,
                         shared,
@@ -7020,7 +6992,6 @@ async fn handle_serialized_request_inner(
                 service: service.clone(),
                 cwd,
                 ingress: request.ingress.clone(),
-                root_id: None,
                 attachment: None,
             });
             let base_response = Box::pin(handle_serialized_request_inner(
@@ -7044,7 +7015,6 @@ async fn handle_serialized_request_inner(
                     return Err(rollback_acp_catalog_composition_failure(
                         error,
                         pending,
-                        false,
                         request_id,
                         state,
                         shared,
@@ -7170,13 +7140,7 @@ async fn handle_serialized_request_inner(
             );
             let canonical =
                 crate::daemon::fs_api::canonical_project_root(&request.workspace_selector.path)?;
-            let create_identity =
-                recovering_root_id
-                    .is_none()
-                    .then(|| CodeRootCreateRequestIdentity {
-                        logical_client_id: request.logical_client_id.clone(),
-                        client_request_id: request.client_request_id.clone(),
-                    });
+            let mut staging = None;
             // Reserve attachment capacity before any async session or
             // durable-projection work. The request fence already reserves
             // idempotency-receipt capacity, so concurrent clients cannot all
@@ -7190,100 +7154,148 @@ async fn handle_serialized_request_inner(
             );
             let options = request.options.clone();
             let principal = state.principal.clone();
-            let attached = match Box::pin(attach(
-                state,
-                ctx,
-                create_identity.as_ref(),
-                recovering_root_id.map(|root_id| root_id.0),
-                None,
-                recovering_root_id
-                    .is_none()
-                    .then(|| canonical.to_string_lossy().into_owned()),
-                options.initial_model,
-                options.no_sandbox,
-                options.interactive,
-                Some(proto::SessionEntryMode::Code),
-                options.model_override,
-                options.env_snapshot,
-                options.env_policy,
-                &principal,
-                effects,
-            ))
-            .await
-            {
-                Ok(attached) => attached,
-                Err(error) => {
-                    crate::sync::lock_or_recover(&ctx.code_root_authority)
-                        .release_attachment_reservation(&reservation);
-                    return Err(error);
-                }
-            };
-            let root = match code_root_read_from_attached_response(ctx, attached).await {
-                Ok(root) => root,
-                Err(error) => {
-                    crate::sync::lock_or_recover(&ctx.code_root_authority)
-                        .release_attachment_reservation(&reservation);
-                    return Err(error);
-                }
-            };
-            if let Some(attached) = state.attached.as_ref() {
-                if let Err(error) = attached.handle.persist_if_needed() {
-                    crate::sync::lock_or_recover(&ctx.code_root_authority)
-                        .release_attachment_reservation(&reservation);
-                    return Err(internal(error));
-                }
-            }
-            let writer =
-                crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
-            let initial_source_key = crate::sync::lock_or_recover(&ctx.code_root_authority)
-                .initial_delivery_source_key("create", &request)
-                .map_err(code_root_contract_error)?;
-            let initial = match writer
-                .write_initial_root_state_changed(root.root_id, initial_source_key)
+            let finalized = async {
+                let attached = match Box::pin(attach(
+                    state,
+                    ctx,
+                    recovering_root_id.is_none().then_some(&mut staging),
+                    recovering_root_id.map(|root_id| root_id.0),
+                    None,
+                    recovering_root_id
+                        .is_none()
+                        .then(|| canonical.to_string_lossy().into_owned()),
+                    options.initial_model,
+                    options.no_sandbox,
+                    options.interactive,
+                    Some(proto::SessionEntryMode::Code),
+                    options.model_override,
+                    options.env_snapshot,
+                    options.env_policy,
+                    &principal,
+                    effects,
+                ))
                 .await
-            {
-                Ok(initial) => initial,
+                {
+                    Ok(attached) => attached,
+                    Err(error) => {
+                        crate::sync::lock_or_recover(&ctx.code_root_authority)
+                            .release_attachment_reservation(&reservation);
+                        return Err(error);
+                    }
+                };
+                let root = match code_root_read_from_attached_response(ctx, attached).await {
+                    Ok(root) => root,
+                    Err(error) => {
+                        crate::sync::lock_or_recover(&ctx.code_root_authority)
+                            .release_attachment_reservation(&reservation);
+                        return Err(error);
+                    }
+                };
+                if let Some(attached) = state.attached.as_ref() {
+                    if let Err(error) = attached.handle.persist_if_needed() {
+                        crate::sync::lock_or_recover(&ctx.code_root_authority)
+                            .release_attachment_reservation(&reservation);
+                        return Err(internal(error));
+                    }
+                }
+                let writer = crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(
+                    ctx.db.clone(),
+                );
+                let initial_source_key = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                    .initial_delivery_source_key("create", &request)
+                    .map_err(code_root_contract_error)?;
+                let initial = match writer
+                    .write_initial_root_state_changed(root.root_id, initial_source_key)
+                    .await
+                {
+                    Ok(initial) => initial,
+                    Err(error) => {
+                        crate::sync::lock_or_recover(&ctx.code_root_authority)
+                            .release_attachment_reservation(&reservation);
+                        return Err(internal(error));
+                    }
+                };
+                let attachment = {
+                    let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
+                    let capture_generation = authority.capture_generation_for(root.root_id);
+                    authority
+                        .mint_attachment(
+                            root.root_id,
+                            request.logical_client_id.clone(),
+                            capture_generation,
+                            initial.cursor,
+                            &reservation,
+                        )
+                        .map_err(code_root_contract_error)?
+                };
+                bind_pending_acp_catalog_before_code_root_publication(
+                    state,
+                    root.root_id.0,
+                    &attachment.attachment_capability,
+                )?;
+                let result = {
+                    let result = proto::CreateCodeRootV1Result { attachment, root };
+                    let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
+                    authority
+                        .bind_created_root(
+                            &request.logical_client_id,
+                            &request.client_request_id,
+                            result.root.root_id,
+                        )
+                        .map_err(code_root_contract_error)?;
+                    authority
+                        .record_create_with_commit(&request, result.clone(), || {
+                            if let Some(staging) = staging.as_mut() {
+                                staging.commit()?;
+                            }
+                            Ok(())
+                        })
+                        .map_err(code_root_contract_error)?;
+                    authority.finish_code_root_request(
+                        &request.logical_client_id,
+                        &request.client_request_id,
+                        "create",
+                    );
+                    result
+                };
+                if let Some(attached) = state.attached.as_mut() {
+                    attached.code_root_capability =
+                        Some(result.attachment.attachment_capability.clone());
+                }
+                Ok(result)
+            }
+            .await;
+            let result = match finalized {
+                Ok(result) => result,
                 Err(error) => {
-                    crate::sync::lock_or_recover(&ctx.code_root_authority)
-                        .release_attachment_reservation(&reservation);
-                    return Err(internal(error));
+                    if let Some(staging) = staging.take() {
+                        let root_id = staging.session_id();
+                        if state
+                            .attached
+                            .as_ref()
+                            .is_some_and(|attached| attached.handle.owns_session_id(root_id))
+                        {
+                            state.attached = None;
+                            state.pending_replay.clear();
+                            effects.session_event_rx = None;
+                        }
+                        crate::sync::lock_or_recover(&ctx.code_root_authority)
+                            .forget_unpublished_root(proto::CodeRootIdV1(root_id));
+                        if let Some(pending) = state.pending_acp_catalog_composition.as_mut()
+                            && let Some(attachment) = pending.attachment.take()
+                        {
+                            pending.service.release_catalog(root_id, &attachment);
+                        }
+                        if let Err(cleanup) = staging.rollback().await {
+                            return Err(internal(anyhow::anyhow!(
+                                "Code create failed ({}) and provisional cleanup failed ({cleanup})",
+                                error.message,
+                            )));
+                        }
+                    }
+                    return Err(error);
                 }
             };
-            let attachment = {
-                let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
-                let capture_generation = authority.capture_generation_for(root.root_id);
-                authority
-                    .mint_attachment(
-                        root.root_id,
-                        request.logical_client_id.clone(),
-                        capture_generation,
-                        initial.cursor,
-                        &reservation,
-                    )
-                    .map_err(code_root_contract_error)?
-            };
-            bind_pending_acp_catalog_before_code_root_publication(
-                state,
-                root.root_id.0,
-                &attachment.attachment_capability,
-            )?;
-            let result = {
-                let result = proto::CreateCodeRootV1Result { attachment, root };
-                let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
-                authority
-                    .record_create(&request, result.clone())
-                    .map_err(code_root_contract_error)?;
-                authority.finish_code_root_request(
-                    &request.logical_client_id,
-                    &request.client_request_id,
-                    "create",
-                );
-                result
-            };
-            if let Some(attached) = state.attached.as_mut() {
-                attached.code_root_capability =
-                    Some(result.attachment.attachment_capability.clone());
-            }
             Ok(Response::CodeRootCreated(result))
         }
 
@@ -31325,20 +31337,14 @@ impl Drop for CodeRootAttachmentReservationGuard<'_> {
 }
 
 /// Owns a create, attach, or ACK idempotency fence while its dispatch future
-/// may still own side effects. Once create has bound a newly-created root,
-/// cancellation deliberately retains a bounded recovery association so an
-/// exact retry resumes that root; a successful receipt explicitly finishes
-/// it. The fence is separate from attachment capacity.
+/// may still own side effects. Fresh creates keep provisional cleanup ownership
+/// until finalization; only the synchronous receipt boundary binds the root.
+/// The fence is separate from attachment capacity.
 struct CodeRootRequestGuard<'a> {
     authority: &'a std::sync::Arc<std::sync::Mutex<crate::daemon::code_roots::CodeRootAuthorityV1>>,
     logical_client_id: proto::OpaqueAsciiId128V1,
     client_request_id: proto::OpaqueAsciiId128V1,
     route: &'static str,
-}
-
-struct CodeRootCreateRequestIdentity {
-    logical_client_id: proto::OpaqueAsciiId128V1,
-    client_request_id: proto::OpaqueAsciiId128V1,
 }
 
 impl<'a> CodeRootRequestGuard<'a> {
@@ -31647,7 +31653,7 @@ pub(super) fn replay_attach_hydration_events(
 pub(super) async fn attach(
     state: &mut MutableClientState,
     ctx: &DaemonContext,
-    code_root_create: Option<&CodeRootCreateRequestIdentity>,
+    code_root_create: Option<&mut Option<crate::daemon::registry::CodeAttachStaging>>,
     session_id: Option<Uuid>,
     since_seq: Option<i64>,
     project_root: Option<String>,
@@ -31857,55 +31863,55 @@ pub(super) async fn attach(
         };
         handle
     } else {
-        ctx.registry
-            .attach(
-                session_id,
-                project_root,
-                initial_model,
-                client_no_sandbox,
-                model_override.as_ref(),
-                session_env,
-                session_entry_mode,
-            )
-            .await
-            .map_err(|error| {
-                if error
-                    .downcast_ref::<crate::daemon::registry::SessionEntryModeConflict>()
-                    .is_some()
-                {
-                    ErrorPayload {
-                        code: ErrorCode::BadRequest,
-                        message: error.to_string(),
-                    }
-                } else if error
-                    .downcast_ref::<crate::daemon::registry::SessionAttachRetry>()
-                    .is_some()
-                    || error
-                        .downcast_ref::<crate::daemon::registry::SessionTerminalCleanupRetry>()
-                        .is_some()
-                {
-                    ErrorPayload {
-                        code: ErrorCode::Conflict,
-                        message: error.to_string(),
-                    }
-                } else {
-                    workspace_trust_error(error)
+        let result = if let Some(staging) = code_root_create {
+            ctx.registry
+                .attach_provisional_code_root(
+                    project_root,
+                    initial_model,
+                    client_no_sandbox,
+                    model_override.as_ref(),
+                    session_env,
+                    staging,
+                )
+                .await
+        } else {
+            ctx.registry
+                .attach(
+                    session_id,
+                    project_root,
+                    initial_model,
+                    client_no_sandbox,
+                    model_override.as_ref(),
+                    session_env,
+                    session_entry_mode,
+                )
+                .await
+        };
+        result.map_err(|error| {
+            if error
+                .downcast_ref::<crate::daemon::registry::SessionEntryModeConflict>()
+                .is_some()
+            {
+                ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: error.to_string(),
                 }
-            })?
+            } else if error
+                .downcast_ref::<crate::daemon::registry::SessionAttachRetry>()
+                .is_some()
+                || error
+                    .downcast_ref::<crate::daemon::registry::SessionTerminalCleanupRetry>()
+                    .is_some()
+            {
+                ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: error.to_string(),
+                }
+            } else {
+                workspace_trust_error(error)
+            }
+        })?
     };
-    // Bind a newly-created Code root to its request identity as soon as the
-    // worker exists.  Everything below this point may hydrate projections or
-    // be cancelled by the transport, but an exact retry can now resume this
-    // root instead of creating another one.
-    if let Some(pending) = code_root_create {
-        crate::sync::lock_or_recover(&ctx.code_root_authority)
-            .bind_created_root(
-                &pending.logical_client_id,
-                &pending.client_request_id,
-                proto::CodeRootIdV1(handle.session_id()),
-            )
-            .map_err(code_root_contract_error)?;
-    }
     // Attach-only projections use the policy snapshot of the handle that the
     // registry actually returned. This is safe for both branches: live
     // workers retain their original policy, while newly-started workers have

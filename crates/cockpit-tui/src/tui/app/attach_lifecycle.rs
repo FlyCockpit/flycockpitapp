@@ -261,7 +261,7 @@ impl App {
                 self.show_toast("Send a message to save this draft first", ToastKind::Info);
                 return;
             }
-            self.local_session_draft = false;
+            // Keep the visible draft identity until attach commits successfully.
             if let Some(runner) = self
                 .draft_return_view
                 .as_mut()
@@ -270,7 +270,7 @@ impl App {
                 self.agent_runner = Some(Ok(runner));
                 self.pending_session_materialization = true;
                 if let Err(error) = self.maybe_open_local_session_draft_with_clear(|| Ok(())) {
-                    self.restore_durable_view_after_draft_failure(&error.to_string());
+                    self.retain_local_draft_after_attach_failure(&error.to_string());
                 }
                 return;
             }
@@ -490,18 +490,10 @@ impl App {
         continuations: &[RunnerAttachContinuation],
         error: &str,
     ) {
-        if self.draft_return_view.is_some() {
-            self.restore_durable_view_after_draft_failure(&format!(
-                "Could not create session: {error}; saved conversation restored. Send again or /new to retry."
-            ));
-        } else if self.startup_session_resolved && self.launch.session_id.is_none() {
-            self.local_session_draft = true;
-            self.startup_retained_submission_id = None;
-            self.session_setup_inline = None;
-            self.history.push(HistoryEntry::CommandError {
-                line: format!("Could not create session: {error}; send to retry"),
-            });
-            self.agent_runner = None;
+        if self.local_session_draft
+            || (self.startup_session_resolved && self.launch.session_id.is_none())
+        {
+            self.retain_local_draft_after_attach_failure(error);
         }
         for continuation in continuations {
             match continuation {

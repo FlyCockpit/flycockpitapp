@@ -702,24 +702,29 @@ fn acp_catalog_binding_precedes_base_code_root_publication() {
         );
     }
 
-    for (base_route, receipt) in [
+    for (base_route, next_route, receipt) in [
         (
             "Request::CreateCodeRootV1(request) =>",
-            ".record_create(&request",
+            "Request::AttachExistingCodeRootV1(request) =>",
+            ".record_create_with_commit(&request",
         ),
         (
             "Request::AttachExistingCodeRootV1(request) =>",
+            "Request::CloseCodeRootAttachmentV1(request) =>",
             ".record_attach(&request",
         ),
     ] {
         let base = dispatch
             .split(base_route)
             .nth(1)
-            .and_then(|tail| {
-                tail.split("Request::CloseCodeRootAttachmentV1(request) =>")
-                    .next()
-            })
+            .and_then(|tail| tail.split(next_route).next())
             .expect("base Code-root route");
+        // Replay has a separate binding call. Check the binding for the newly
+        // minted attachment, so replay cannot mask publication ordered too early.
+        let base = base
+            .split("let attachment = {")
+            .nth(1)
+            .expect("new attachment finalization");
         let binding = base
             .find("bind_pending_acp_catalog_before_code_root_publication")
             .expect("catalog composition gate");

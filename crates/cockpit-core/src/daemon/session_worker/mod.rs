@@ -775,7 +775,9 @@ pub use handle::{
     SessionConfigHandle, SessionConfigSnapshot, SessionWork, SessionWorkTrustReconciling,
     SessionWorkerHandle, TurnOutcome, UserMessageProbeResult,
 };
-pub(crate) use handle::{HostCapabilitiesRefreshError, HostCapabilityRefreshRuntime};
+pub(crate) use handle::{
+    HostCapabilitiesRefreshError, HostCapabilityRefreshRuntime, WorkerStartPermit,
+};
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 pub(crate) use helpers::daemon_no_sandbox;
 #[allow(unused_imports)]

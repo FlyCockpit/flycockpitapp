@@ -47543,3 +47543,767 @@ async fn setup_settings_cockpit_config_override_requires_its_write_policy() {
         );
     }
 }
+
+/// Exercise the same global owner used by native onboarding, then the Code
+/// root create boundary used by the first composer submit in another root.
+fn ux4_seed_global_default(path: &Path, selection: &crate::config::providers::ActiveModelRef) {
+    // Fixture only: ConfigDoc::write deliberately leaves daemon-owned default
+    // metadata alone. Production onboarding uses its coordinated default RPC.
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({ "active_model": selection })).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::config::providers::ConfigDoc::load(path)
+            .unwrap()
+            .providers()
+            .active_model
+            .as_ref(),
+        Some(selection)
+    );
+}
+
+async fn ux4_onboarding_secret_first_attach(environment: bool) {
+    use crate::config::providers::{ActiveModelRef, ConfigDoc, ModelEntry};
+    let (_env, _tmp, mut ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    install_test_redaction_key_resolver(Arc::get_mut(&mut ctx).unwrap());
+    let global = cockpit_config::dirs::ensure_global_config_dir().unwrap();
+    const KEY: &str = "ux4-fake-provider-key-for-regression-only";
+    *ctx.env_baseline.write().unwrap() = EnvSnapshot::new(
+        proto::EnvSnapshotSource::DaemonStart,
+        HashMap::from([("OPENROUTER_API_KEY".into(), KEY.into())]),
+    );
+    let catalog = take_onboarding_catalog(&ctx, &mut state, &global, "ux4-onboard").await;
+    let template = crate::providers::template_by_id("openrouter").unwrap();
+    let entry = crate::wizard::provider_entry_for_template(
+        template,
+        template.url.into(),
+        crate::providers::headers_for_pasted_key(template, ""),
+    );
+    let secret = if environment {
+        proto::ProviderSecretValue::detected_environment(
+            "openrouter".into(),
+            "OPENROUTER_API_KEY".into(),
+        )
+    } else {
+        proto::ProviderSecretValue::new(format!("Bearer {KEY}"))
+    };
+    let header_secrets = entry
+        .headers
+        .iter()
+        .map(|header| {
+            header
+                .name
+                .eq_ignore_ascii_case("Authorization")
+                .then(|| secret.clone())
+        })
+        .collect();
+    apply_onboarding_mutation(
+        &ctx,
+        &mut state,
+        &catalog,
+        "ux4-onboard",
+        proto::ProviderMutationBatch {
+            upserts: vec![proto::ProviderMutationUpsert {
+                model_patch: None,
+                provider_id: "openrouter".into(),
+                entry,
+                header_secrets,
+            }],
+            deletes: vec![],
+            metadata: None,
+        },
+    )
+    .await;
+    let path = cockpit_config::dirs::global_config_file().unwrap();
+    let mut doc = ConfigDoc::load(&path).unwrap();
+    let mut providers = doc.providers();
+    providers.providers.get_mut("openrouter").unwrap().models = vec![ModelEntry {
+        id: "ux4-model".into(),
+        ..Default::default()
+    }];
+    let active = ActiveModelRef {
+        provider: "openrouter".into(),
+        model: "ux4-model".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    providers.active_model = Some(active.clone());
+    doc.write(&providers).unwrap();
+    ux4_seed_global_default(&path, &active);
+    let bytes = std::fs::read(global_provider_path("openrouter")).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains("$secret:provider-openrouter-"));
+    assert!(
+        !text.contains(KEY),
+        "provider files must contain references only"
+    );
+    let name = providers.providers["openrouter"].headers[0]
+        .value
+        .strip_prefix("$secret:")
+        .unwrap()
+        .to_owned();
+    assert!(
+        ctx.secret_vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                &name
+            )
+            .is_ok()
+    );
+    let inventory = handle_request(
+        Request::ListSecretInventory {
+            cursor: None,
+            limit: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(!serde_json::to_string(&inventory).unwrap().contains(KEY));
+    set_workspace_trust_mode(
+        &ctx,
+        &workspace,
+        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+    )
+    .await;
+    let create = proto::create_code_root_v1_request(
+        workspace.to_string_lossy().into_owned(),
+        None,
+        false,
+        true,
+        None,
+        None,
+        EnvDriftPolicy::Daemon,
+    );
+    let project_providers = workspace.join(".cockpit/providers");
+    std::fs::create_dir_all(&project_providers).unwrap();
+    std::fs::write(workspace.join(".cockpit/config.json"), "{}").unwrap();
+    std::fs::write(
+        project_providers.join("foreign.json"),
+        serde_json::json!({
+            "url": "https://attacker.example/v1",
+            "headers": [{"name": "Authorization", "value": format!("$secret:{name}")}],
+            "models": [{"id": "ux4-model"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let response = handle_request(create.clone(), &mut state, &ctx)
+        .await
+        .expect("the verified global key must resolve on first send");
+    let Response::CodeRootCreated(created) = response else {
+        panic!("expected Code root");
+    };
+    assert!(
+        !state
+            .attached
+            .as_ref()
+            .unwrap()
+            .handle
+            .config_snapshot()
+            .providers
+            .providers
+            .contains_key("foreign"),
+        "IgnoreConfig cannot import a project's credential reference"
+    );
+    assert_eq!(ctx.db.list_sessions(false, 100).await.unwrap().len(), 1);
+    let replay = handle_request(create, &mut state, &ctx).await.unwrap();
+    let Response::CodeRootCreated(replayed) = replay else {
+        panic!("expected replayed Code root");
+    };
+    assert_eq!(created.root.root_id, replayed.root.root_id);
+    assert_eq!(
+        ctx.db.list_sessions(false, 100).await.unwrap().len(),
+        1,
+        "retry must not duplicate a successful first attach"
+    );
+    // A second project inherits the same owner-authored global provider.
+    let second = workspace.parent().unwrap().join("second-workspace");
+    std::fs::create_dir_all(&second).unwrap();
+    set_workspace_trust_mode(
+        &ctx,
+        &second,
+        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+    )
+    .await;
+    handle_request(
+        proto::create_code_root_v1_request(
+            second.to_string_lossy().into_owned(),
+            None,
+            false,
+            true,
+            None,
+            None,
+            EnvDriftPolicy::Daemon,
+        ),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("global key must work in another project");
+    ctx.registry.drain_all(Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn ux4_onboarding_paste_secret_first_attach() {
+    ux4_onboarding_secret_first_attach(false).await;
+}
+
+#[tokio::test]
+async fn ux4_onboarding_environment_secret_first_attach() {
+    ux4_onboarding_secret_first_attach(true).await;
+}
+
+#[tokio::test]
+async fn ux4_failed_first_attach_retry_has_no_saved_rows() {
+    use crate::config::providers::{
+        ActiveModelRef, ConfigDoc, HeaderSpec, ModelEntry, ProviderEntry, ProvidersConfig,
+    };
+    let (_env, _tmp, mut ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    install_test_redaction_key_resolver(Arc::get_mut(&mut ctx).unwrap());
+    let path = cockpit_config::dirs::ensure_global_config_dir()
+        .unwrap()
+        .join("config.json");
+    let mut providers = ProvidersConfig::default();
+    providers.providers.insert(
+        "openrouter".into(),
+        ProviderEntry {
+            url: "https://openrouter.ai/api/v1".into(),
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: "$secret:ux4-missing".into(),
+            }],
+            models: vec![ModelEntry {
+                id: "ux4-model".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    providers.active_model = Some(ActiveModelRef {
+        provider: "openrouter".into(),
+        model: "ux4-model".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    ConfigDoc::load(&path).unwrap().write(&providers).unwrap();
+    ux4_seed_global_default(&path, providers.active_model.as_ref().unwrap());
+    set_workspace_trust_mode(
+        &ctx,
+        &workspace,
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    )
+    .await;
+    let create = proto::create_code_root_v1_request(
+        workspace.to_string_lossy().into_owned(),
+        None,
+        false,
+        true,
+        None,
+        None,
+        EnvDriftPolicy::Daemon,
+    );
+    for _ in 0..2 {
+        let error = handle_request(create.clone(), &mut state, &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains("ux4-missing"),
+            "must reach missing credential rejection"
+        );
+        assert!(
+            ctx.db.list_sessions(false, 100).await.unwrap().is_empty(),
+            "failed attach must leave zero saved rows"
+        );
+    }
+    let global = cockpit_config::dirs::global_config_dir().unwrap();
+    ctx.secret_vault
+        .mutate_owner_named_secret_guarded(
+            "ux4-missing",
+            b"Bearer ux4-repaired-fake-key",
+            "provider",
+            &crate::secret_ownership::canonical_owner_root(&global.to_string_lossy()),
+        )
+        .unwrap();
+    let response = handle_request(create.clone(), &mut state, &ctx)
+        .await
+        .expect("same draft can attach after credential repair");
+    let Response::CodeRootCreated(created) = response else {
+        panic!("expected Code root");
+    };
+    let response = handle_request(create, &mut state, &ctx).await.unwrap();
+    let Response::CodeRootCreated(replayed) = response else {
+        panic!("expected Code root replay");
+    };
+    assert_eq!(created.root.root_id, replayed.root.root_id);
+    assert_eq!(
+        ctx.db.list_sessions(false, 100).await.unwrap().len(),
+        1,
+        "successful repair creates exactly one saved row"
+    );
+    ctx.registry.drain_all(Duration::from_secs(5)).await;
+}
+
+/// Teardown uses the real worker shutdown queue and observes registry retirement.
+/// The 50 ms destructive-stop test deadline is unrelated to create semantics.
+async fn ux4_settle_created_workers(ctx: &DaemonContext) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for id in ctx.registry.active_session_ids() {
+            if let Some(handle) = ctx.registry.live_handle(id) {
+                let _ = handle
+                    .send_work(crate::daemon::session_worker::SessionWork::Shutdown {
+                        pause_for_resume: true,
+                    })
+                    .await;
+            }
+        }
+        while !ctx.registry.active_session_ids().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("created workers retire before teardown or leak assertions");
+}
+
+/// Real config, owner vault and worker construction shared by late-create
+/// failure cases. The injected faults below are SQLite triggers, not mocks of
+/// the handler, credential resolver, registry or persistence layer.
+async fn ux4_configure_late_create(ctx: &mut Arc<DaemonContext>, workspace: &Path) {
+    use crate::config::providers::{
+        ActiveModelRef, ConfigDoc, HeaderSpec, ModelEntry, ProviderEntry, ProvidersConfig,
+    };
+    install_test_redaction_key_resolver(Arc::get_mut(ctx).unwrap());
+    let global = cockpit_config::dirs::ensure_global_config_dir().unwrap();
+    let path = global.join("config.json");
+    let mut providers = ProvidersConfig::default();
+    providers.providers.insert(
+        "openrouter".into(),
+        ProviderEntry {
+            url: "https://openrouter.ai/api/v1".into(),
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: "$secret:ux4-late-create-key".into(),
+            }],
+            models: vec![ModelEntry {
+                id: "ux4-model".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    providers.active_model = Some(ActiveModelRef {
+        provider: "openrouter".into(),
+        model: "ux4-model".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    ConfigDoc::load(&path).unwrap().write(&providers).unwrap();
+    ux4_seed_global_default(&path, providers.active_model.as_ref().unwrap());
+    ctx.secret_vault
+        .mutate_owner_named_secret_guarded(
+            "ux4-late-create-key",
+            b"Bearer ux4-late-create-fake-key",
+            "provider",
+            &crate::secret_ownership::canonical_owner_root(&global.to_string_lossy()),
+        )
+        .unwrap();
+    set_workspace_trust_mode(
+        ctx,
+        workspace,
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    )
+    .await;
+}
+
+async fn ux4_late_create_rejection_and_retry(promotion: bool) {
+    let (_env, _tmp, mut ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    ux4_configure_late_create(&mut ctx, &workspace).await;
+    ctx.db
+        .write(move |conn| {
+            conn.execute_batch(if promotion {
+            "CREATE TRIGGER ux4_late_create_failure BEFORE UPDATE OF ephemeral ON sessions
+             WHEN OLD.ephemeral = 1 AND NEW.ephemeral = 0
+             BEGIN SELECT RAISE(ABORT, 'ux4-late-create-rejected'); END;"
+        } else {
+            "CREATE TRIGGER ux4_late_create_failure BEFORE INSERT ON code_root_projection_deliveries
+             WHEN NEW.source_key LIKE 'initial:%'
+             BEGIN SELECT RAISE(ABORT, 'ux4-late-create-rejected'); END;"
+        })?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let fresh_request = || {
+        proto::create_code_root_v1_request(
+            workspace.to_string_lossy().into_owned(),
+            None,
+            false,
+            true,
+            None,
+            None,
+            EnvDriftPolicy::Daemon,
+        )
+    };
+    let first = fresh_request();
+    let retry = fresh_request();
+    let (Request::CreateCodeRootV1(first_identity), Request::CreateCodeRootV1(retry_identity)) =
+        (&first, &retry)
+    else {
+        panic!("first-party create helper must use the closed Code route");
+    };
+    assert_ne!(
+        first_identity.logical_client_id,
+        retry_identity.logical_client_id
+    );
+    assert_ne!(
+        first_identity.client_request_id,
+        retry_identity.client_request_id
+    );
+    let mut saved_counts = Vec::new();
+    let mut parent_counts = Vec::new();
+    let mut registry_counts = Vec::new();
+    let mut attached_after_error = Vec::new();
+    for request in [first.clone(), retry, first] {
+        let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
+        assert!(
+            error.message.contains("ux4-late-create-rejected"),
+            "must reach late rejection: {}",
+            error.message
+        );
+        saved_counts.push(ctx.db.list_sessions(false, 100).await.unwrap().len());
+        parent_counts.push(
+            ctx.db
+                .blocking_read_for_sync_ui(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT count(*) FROM sessions WHERE session_entry_mode = 'code'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                })
+                .unwrap(),
+        );
+        registry_counts.push(ctx.registry.active_session_ids().len());
+        attached_after_error.push(state.attached.is_some());
+    }
+    // Settle workers even on the historical/fault implementation before any
+    // assertion deliberately discriminates its leaked rows.
+    ux4_settle_created_workers(&ctx).await;
+    assert_eq!(
+        saved_counts,
+        [0, 0, 0],
+        "a rejected create and fresh/exact retries must remain unsaved"
+    );
+    assert_eq!(
+        parent_counts,
+        [0, 0, 0],
+        "rollback removes provisional parents and FK dependents"
+    );
+    assert_eq!(
+        registry_counts,
+        [0, 0, 0],
+        "rejected creates publish no workers"
+    );
+    assert_eq!(
+        attached_after_error,
+        [false, false, false],
+        "rejected attachment cannot remain usable"
+    );
+    ctx.db
+        .write(|conn| {
+            conn.execute_batch("DROP TRIGGER ux4_late_create_failure;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let request = fresh_request();
+    let Response::CodeRootCreated(created) = handle_request(request.clone(), &mut state, &ctx)
+        .await
+        .unwrap()
+    else {
+        panic!("expected successful repair");
+    };
+    let Response::CodeRootCreated(replayed) =
+        handle_request(request, &mut state, &ctx).await.unwrap()
+    else {
+        panic!("expected exact successful replay");
+    };
+    assert_eq!(created.root.root_id, replayed.root.root_id);
+    assert_eq!(
+        ctx.db.list_sessions(false, 100).await.unwrap().len(),
+        1,
+        "successful create promotes once"
+    );
+    assert_eq!(ctx.registry.active_session_ids(), [created.root.root_id.0]);
+    ux4_settle_created_workers(&ctx).await;
+
+    // Inverse: an explicit saved-session resume failing at the same late
+    // projection boundary must retain its durable row.
+    state.attached = None;
+    ctx.db.write(|conn| {
+        conn.execute_batch("CREATE TRIGGER ux4_saved_resume_failure BEFORE INSERT ON code_root_projection_deliveries
+            WHEN NEW.source_key LIKE 'initial:%'
+            BEGIN SELECT RAISE(ABORT, 'ux4-saved-resume-rejected'); END;")?;
+        Ok(())
+    }).await.unwrap();
+    let error = handle_request(
+        proto::attach_existing_code_root_v1_request(
+            created.root.root_id.0,
+            None,
+            None,
+            false,
+            true,
+            None,
+            None,
+            EnvDriftPolicy::Daemon,
+        ),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    ctx.registry.drain_all(Duration::from_secs(5)).await;
+    assert!(
+        error.message.contains("ux4-saved-resume-rejected"),
+        "must reject saved resume at projection: {}",
+        error.message
+    );
+    let saved = ctx
+        .db
+        .get_session(created.root.root_id.0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !saved.ephemeral,
+        "saved resume must never acquire provisional deletion ownership"
+    );
+    assert_eq!(ctx.db.list_sessions(false, 100).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn ux4_post_worker_projection_rejection_and_fresh_retry_keep_no_saved_rows() {
+    ux4_late_create_rejection_and_retry(false).await;
+}
+
+#[tokio::test]
+async fn ux4_final_promotion_rejection_and_fresh_retry_keep_no_saved_rows() {
+    ux4_late_create_rejection_and_retry(true).await;
+}
+
+#[tokio::test]
+async fn ux4_acp_create_replay_catalog_rejection_preserves_saved_identity() {
+    let (_env, _tmp, mut ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    ux4_configure_late_create(&mut ctx, &workspace).await;
+    let Request::CreateCodeRootV1(base) = proto::create_code_root_v1_request(
+        workspace.to_string_lossy().into_owned(),
+        None,
+        false,
+        true,
+        None,
+        None,
+        EnvDriftPolicy::Daemon,
+    ) else {
+        panic!("first-party Code create constructor");
+    };
+    let mut ingress = crate::daemon::acp_catalog_composition::empty_ingress_for_test(
+        "ux4-acp-editor",
+        "ux4-acp-ingress",
+    );
+    ingress
+        .declarations
+        .push(proto::AcpForwardedMcpDeclarationV1 {
+            name: "ux4-docs".into(),
+            transport: proto::AcpForwardedMcpTransportV1::Http {
+                url: "https://127.0.0.1:9/mcp".into(),
+                headers: Vec::new(),
+            },
+        });
+    let create = |ingress| {
+        Request::CreateCodeRootWithAcpIngressV1(proto::CreateCodeRootWithAcpIngressV1Request {
+            base: base.clone(),
+            ingress,
+        })
+    };
+    let Response::CodeRootWithAcpIngressCreated(created) =
+        handle_request(create(ingress.clone()), &mut state, &ctx)
+            .await
+            .expect("save a root with a nonempty forwarded catalog")
+    else {
+        panic!("composed create response");
+    };
+    let id = created.base.root.root_id.0;
+    let before = ctx.db.get_session(id).await.unwrap().unwrap();
+    assert!(!before.ephemeral && before.archived_at_unix_ms.is_none());
+    let slot = state.attached.as_ref().unwrap().handle.forwarded_mcp_slot();
+    let epoch = slot
+        .active()
+        .expect("the successful create bound its catalog");
+
+    // Retire through the real shutdown queue while retaining the connection
+    // and receipt. This also keeps the unrelated test-only 50 ms destructive
+    // stop deadline out of the archival fault's discrimination.
+    ux4_settle_created_workers(&ctx).await;
+    assert!(state.attached.as_ref().unwrap().handle.is_closed());
+
+    // Both an empty ingress and a different nonempty catalog pass validation
+    // but conflict with the saved root's catalog at the real bind boundary.
+    let mut changed = ingress.declarations.clone();
+    changed[0].name = "ux4-other-docs".into();
+    for (index, declarations) in [Vec::new(), changed].into_iter().enumerate() {
+        let mut rejected = ingress.clone();
+        rejected.declarations = declarations;
+        rejected.ingress_request_id =
+            proto::OpaqueAsciiId128V1::new(format!("ux4-acp-rejection-{index}")).unwrap();
+        let error = handle_request(create(rejected), &mut state, &ctx)
+            .await
+            .expect_err("conflicting saved-create replay must be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidIngress, "{error:?}");
+        assert!(
+            error.message.contains("acp_mcp_catalog_conflict"),
+            "{error:?}"
+        );
+        let saved = ctx
+            .db
+            .get_session(id)
+            .await
+            .unwrap()
+            .expect("saved row remains");
+        assert!(
+            !saved.ephemeral,
+            "the original successful create is durable"
+        );
+        assert_eq!(
+            saved.archived_at_unix_ms, before.archived_at_unix_ms,
+            "a rejected create replay must not archive an already-saved identity"
+        );
+        let Response::Sessions { sessions } = handle_request(
+            Request::ListSessions {
+                project_id: None,
+                parent_session_id: None,
+                assistant_id: None,
+                compaction_lineage_root_id: None,
+                include_archived: false,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .unwrap() else {
+            panic!("normal saved-session list response");
+        };
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.session_id)
+                .collect::<Vec<_>>(),
+            [id],
+            "the saved conversation remains in the ordinary session list"
+        );
+        assert!(
+            !epoch.is_released(),
+            "rejection must spare the existing catalog"
+        );
+        assert!(Arc::ptr_eq(&slot.active().unwrap(), &epoch));
+        assert!(state.pending_acp_catalog_composition.is_none());
+    }
+
+    let Response::CodeRootWithAcpIngressCreated(replayed) =
+        handle_request(create(ingress), &mut state, &ctx)
+            .await
+            .expect("matching ingress can still replay the saved create")
+    else {
+        panic!("composed replay response");
+    };
+    assert_eq!(replayed.base.root.root_id, created.base.root.root_id);
+    assert_ne!(
+        replayed.base.attachment.attachment_capability,
+        created.base.attachment.attachment_capability,
+        "successful replay reissues attachment authority"
+    );
+    assert!(
+        crate::sync::lock_or_recover(&ctx.code_root_authority)
+            .authenticate(&replayed.base.attachment.attachment_capability)
+            .is_ok()
+    );
+    assert_eq!(ctx.db.list_sessions(false, 100).await.unwrap().len(), 1);
+    assert!(
+        ctx.db
+            .get_session(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at_unix_ms
+            .is_none()
+    );
+    ux4_settle_created_workers(&ctx).await;
+}
+
+#[tokio::test]
+async fn ux4_cancelled_provisional_create_settles_worker_before_parent_cleanup() {
+    let (_env, _tmp, mut ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    ux4_configure_late_create(&mut ctx, &workspace).await;
+    let mut staging = None;
+    let env = ctx.env_baseline.read().unwrap().clone();
+    let handle = ctx
+        .registry
+        .attach_provisional_code_root(Some(workspace), None, false, None, env, &mut staging)
+        .await
+        .unwrap();
+    handle.persist_if_needed().unwrap();
+    let id = handle.session_id();
+    let staging = staging.expect("fresh Code creation transfers cleanup ownership");
+    assert!(ctx.db.get_session(id).await.unwrap().unwrap().ephemeral);
+    assert!(ctx.db.list_sessions(false, 100).await.unwrap().is_empty());
+    assert!(ctx.registry.active_session_ids().is_empty());
+    assert!(!handle.is_closed(), "the worker is alive but parked");
+    // Cancellation/Drop must retain the publication fence through cleanup.
+    // A subsequent publication owner cannot observe an unsettled predecessor.
+    drop(staging);
+    let _publication = tokio::time::timeout(
+        Duration::from_secs(5),
+        ctx.registry.lock_worker_publication(),
+    )
+    .await
+    .expect("cancelled create releases its publication fence after cleanup");
+    assert!(
+        handle.is_closed(),
+        "the parked worker is settled before parent deletion"
+    );
+    assert!(ctx.db.get_session(id).await.unwrap().is_none());
+    assert!(ctx.registry.active_session_ids().is_empty());
+}
+
+#[tokio::test]
+async fn ux4_drain_during_provisional_create_rejects_promotion_and_settles_worker() {
+    let (_env, _tmp, mut ctx, _state, workspace) = fresh_untrusted_workspace().await;
+    ux4_configure_late_create(&mut ctx, &workspace).await;
+    let mut staging = None;
+    let env = ctx.env_baseline.read().unwrap().clone();
+    let handle = ctx
+        .registry
+        .attach_provisional_code_root(Some(workspace), None, false, None, env, &mut staging)
+        .await
+        .unwrap();
+    handle.persist_if_needed().unwrap();
+    let id = handle.session_id();
+    let mut staging = staging.unwrap();
+    assert!(ctx.shutdown.begin_drain());
+    let error = staging.commit().unwrap_err();
+    assert!(error.to_string().contains("shutting down"));
+    assert!(ctx.db.get_session(id).await.unwrap().unwrap().ephemeral);
+    assert!(ctx.registry.active_session_ids().is_empty());
+    staging.rollback().await.unwrap();
+    assert!(
+        handle.is_closed(),
+        "drain rejection settles the parked worker"
+    );
+    assert!(ctx.db.get_session(id).await.unwrap().is_none());
+    assert!(ctx.db.list_sessions(false, 100).await.unwrap().is_empty());
+    assert!(ctx.registry.active_session_ids().is_empty());
+}

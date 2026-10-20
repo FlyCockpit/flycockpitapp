@@ -292,6 +292,7 @@ pub struct SessionRail {
     toggle_area: Option<Rect>,
     new_session_area: Option<Rect>,
     local_draft: bool,
+    attached_session_id: Option<Uuid>,
     counts: RailRequestCounts,
 }
 
@@ -353,6 +354,7 @@ impl SessionRail {
             toggle_area: None,
             new_session_area: None,
             local_draft: false,
+            attached_session_id: None,
             counts: RailRequestCounts::default(),
         }
     }
@@ -746,6 +748,18 @@ impl SessionRail {
         true
     }
 
+    pub(crate) fn set_attachment(&mut self, draft: bool, session_id: Option<Uuid>) {
+        self.local_draft = draft;
+        if self.attached_session_id != session_id {
+            self.attached_session_id = session_id;
+            if !self.focused {
+                self.current_mut().selected_session_id = session_id;
+                self.preview = None;
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_local_draft(&mut self, draft: bool) {
         self.local_draft = draft;
     }

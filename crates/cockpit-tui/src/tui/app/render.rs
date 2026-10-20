@@ -1263,6 +1263,8 @@ impl App {
         self.divider = None;
         self.pane_body = None;
         self.find_bar_rect = None;
+        self.session_rail
+            .set_attachment(self.local_session_draft, self.launch.session_id);
         self.session_rail.set_pointer_capture(self.mouse_capture);
         self.session_rail.begin_frame();
         let rects = geom.layout(frame.area());

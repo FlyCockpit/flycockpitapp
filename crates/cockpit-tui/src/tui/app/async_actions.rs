@@ -2249,7 +2249,9 @@ impl App {
                 }
                 if label == "session.switch" && self.draft_return_view.is_some() {
                     if self.provisional_new_session {
-                        self.restore_durable_view_after_draft_failure("Could not create session; saved conversation restored. Send again or /new to retry.");
+                        self.retain_local_draft_after_attach_failure(
+                            "Could not create session; send to retry",
+                        );
                     } else {
                         self.draft_return_view = None;
                         self.maybe_submit_startup_retained_message();

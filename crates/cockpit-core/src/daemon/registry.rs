@@ -125,7 +125,7 @@ type WorkerGeneration = u64;
 /// private capability so a future start path cannot bypass trust inventory
 /// capture merely by calling the low-level constructor.
 struct WorkerPublicationPermit<'a> {
-    _guard: &'a tokio::sync::MutexGuard<'a, ()>,
+    _guard: &'a tokio::sync::OwnedMutexGuard<()>,
 }
 
 /// Outcome of [`SessionRegistry::drain_all`]. Splits the two independent
@@ -222,6 +222,203 @@ pub(crate) async fn require_startup_reconciled(
                 "session startup interrupt reconciliation did not complete before its deadline"
             )
         }
+    }
+}
+
+/// Owns a fresh Code identity through create finalization. The worker remains
+/// parked and outside the registry until commit. Cleanup closes its start
+/// channel and joins it before removing the ephemeral FK parent.
+pub(crate) struct CodeAttachStaging {
+    db: Db,
+    session_id: Uuid,
+    committed: bool,
+    worker: Option<PreparedSessionWorker>,
+    publication_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+struct PreparedSessionWorker {
+    registry: SessionRegistry,
+    handle: SessionWorkerHandle,
+    join: JoinHandle<()>,
+    start_permit: session_worker::WorkerStartPermit,
+    generation: WorkerGeneration,
+    terminal_lock_cleanup_gate: Arc<AsyncMutex<()>>,
+    terminal_closing: Arc<AtomicBool>,
+    terminal_cleanup_complete: Arc<AtomicBool>,
+    config_watch_paths: crate::daemon::config_source::ConfigWatchPaths,
+}
+
+impl CodeAttachStaging {
+    pub(crate) fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    /// No await separates durable promotion, registry publication and receipt
+    /// insertion by the caller. The publication gate remains owned throughout.
+    pub(crate) fn commit(&mut self) -> Result<()> {
+        if self.committed {
+            return Ok(());
+        }
+        let worker = self
+            .worker
+            .as_ref()
+            .context("Code create has no prepared worker")?;
+        anyhow::ensure!(
+            !worker.registry.inner.shutdown.is_draining()
+                && !super::supervisor::worker_handover_active(),
+            "daemon is shutting down; not publishing Code root"
+        );
+        worker.handle.session().commit_new_code_attach()?;
+        self.committed = true;
+        self.worker.take().expect("prepared worker").publish();
+        Ok(())
+    }
+
+    fn delete_parent(db: &Db, id: Uuid) -> Result<()> {
+        db.blocking_write_for_sync_maintenance(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            if crate::db::Db::get_session_conn(&tx, id)?.is_some_and(|row| row.ephemeral) {
+                crate::db::sessions::delete_session_conn(&tx, id)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn start_cleanup(&mut self) -> Option<JoinHandle<Result<()>>> {
+        let worker = self.worker.take()?;
+        let db = self.db.clone();
+        let id = self.session_id;
+        let publication_guard = self.publication_guard.take();
+        // This task owns cleanup even if the request is cancelled while
+        // awaiting rollback. It never starts the driver to shut it down.
+        self.committed = true;
+        Some(tokio::spawn(async move {
+            let _publication_guard = publication_guard;
+            drop(worker.start_permit);
+            let result = async {
+                worker
+                    .join
+                    .await
+                    .context("settling provisional Code worker")?;
+                Self::delete_parent(&db, id)
+            }
+            .await;
+            if let Err(error) = &result {
+                tracing::warn!(session_id = %id, %error, "Code create cleanup remains pending for boot sweep");
+            }
+            result
+        }))
+    }
+
+    pub(crate) async fn rollback(mut self) -> Result<()> {
+        if let Some(cleanup) = self.start_cleanup() {
+            cleanup.await.context("joining Code create rollback")??;
+        } else {
+            Self::delete_parent(&self.db, self.session_id)?;
+            self.committed = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CodeAttachStaging {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let id = self.session_id;
+        if let Some(cleanup) = self.start_cleanup() {
+            drop(cleanup);
+        } else if let Err(error) = Self::delete_parent(&self.db, id) {
+            tracing::warn!(session_id = %id, %error, "failed Code preparation cleanup remains pending for boot sweep");
+        }
+    }
+}
+
+impl PreparedSessionWorker {
+    fn publish(self) {
+        let Self {
+            registry,
+            handle,
+            join,
+            start_permit,
+            generation,
+            terminal_lock_cleanup_gate,
+            terminal_closing,
+            terminal_cleanup_complete,
+            config_watch_paths,
+        } = self;
+        let session_id = handle.session_id();
+        crate::sync::lock_or_recover(&registry.inner.workers)
+            .live
+            .insert(
+                session_id,
+                WorkerEntry {
+                    generation,
+                    handle: handle.clone(),
+                    activation_leases: 0,
+                    terminal_lock_cleanup_gate,
+                    terminal_closing,
+                    terminal_cleanup_complete,
+                },
+            );
+        let hook_registry = registry.clone();
+        handle
+            .session()
+            .set_compaction_successor_begin_hook(Arc::new({
+                let registry = registry.clone();
+                move |from, to| registry.begin_compaction_rekey(from, to)
+            }));
+        handle
+            .session()
+            .set_compaction_successor_abort_hook(Arc::new({
+                let registry = registry.clone();
+                move |from, to| registry.abort_compaction_rekey(from, to)
+            }));
+        handle.session().set_compaction_successor_hook(Arc::new(move |from, to| {
+            if let Err(error) = hook_registry.rekey_live_worker(from, to) {
+                tracing::warn!(
+                    error = %error,
+                    %from,
+                    %to,
+                    "compaction successor rekey failed; live worker may be unreachable under the new session id"
+                );
+            }
+            #[cfg(feature = "extended")]
+            if let (Some(scheduler), Ok(runtime)) =
+                (hook_registry.scheduler(), tokio::runtime::Handle::try_current())
+            {
+                runtime.spawn(async move {
+                    if let Err(error) = scheduler.cancel_keep_warm_jobs_for_session(from).await {
+                        tracing::warn!(
+                            error = %error,
+                            %from,
+                            "cancelling predecessor keep-warm jobs after compaction failed"
+                        );
+                    }
+                });
+            }
+        }));
+        let config_watcher = crate::daemon::config_watch::spawn_config_watcher(
+            registry.inner.db.clone(),
+            registry.inner.config_source.clone(),
+            handle.clone(),
+            config_watch_paths,
+            registry.coverage_authority().clone(),
+        );
+        crate::sync::lock_or_recover(&registry.inner.worker_joins).insert(
+            session_id,
+            WorkerJoin {
+                generation,
+                join,
+                _config_watcher: config_watcher.map(ConfigWatcherJoin),
+            },
+        );
+
+        // Release only after every cleanup target exists. From this point an
+        // immediate worker exit can atomically retire the exact generation.
+        start_permit.release();
     }
 }
 
@@ -1412,6 +1609,34 @@ impl SessionRegistry {
             env_snapshot,
             session_entry_mode,
             false,
+            None,
+        )
+        .await
+    }
+
+    /// A fresh Code-root request owns its provisional worker until all of its
+    /// fallible finalization has completed. Ordinary attach/resume callers
+    /// retain the registry-level completion boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn attach_provisional_code_root(
+        &self,
+        project_root: Option<PathBuf>,
+        initial_model: Option<ActiveModelRef>,
+        client_no_sandbox: bool,
+        model_override: Option<&ActiveModelRef>,
+        env_snapshot: EnvSnapshot,
+        staging: &mut Option<CodeAttachStaging>,
+    ) -> Result<SessionWorkerHandle> {
+        self.attach_with_creation_flags(
+            None,
+            project_root,
+            initial_model,
+            client_no_sandbox,
+            model_override,
+            env_snapshot,
+            crate::daemon::proto::SessionEntryMode::Code,
+            false,
+            Some(staging),
         )
         .await
     }
@@ -1436,6 +1661,7 @@ impl SessionRegistry {
             env_snapshot,
             crate::daemon::proto::SessionEntryMode::Code,
             true,
+            None,
         )
         .await
     }
@@ -1451,13 +1677,14 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
         session_entry_mode: crate::daemon::proto::SessionEntryMode,
         is_dream_session: bool,
+        mut staging: Option<&mut Option<CodeAttachStaging>>,
     ) -> Result<SessionWorkerHandle> {
         // This is deliberately daemon-wide rather than keyed by session id:
         // trust transitions select workers by durable workspace root, while a
         // cold attach does not know that root until it has resolved authority.
         // Holding the gate through insertion also makes the attach-time trust
         // sample the committed one when a transition wins first.
-        let worker_publication = self.inner.worker_publication.lock().await;
+        let worker_publication = self.inner.worker_publication.clone().lock_owned().await;
         let worker_publication_permit = WorkerPublicationPermit {
             _guard: &worker_publication,
         };
@@ -1571,7 +1798,7 @@ impl SessionRegistry {
         // allocates that state instead of inflating the enclosing `attach`
         // future (which the resume path above already keeps small), so the whole
         // future stays comfortably within the worker stack.
-        Box::pin(self.attach_create_session(
+        let handle = Box::pin(self.attach_create_session(
             project_root,
             initial_model,
             client_no_sandbox,
@@ -1580,8 +1807,13 @@ impl SessionRegistry {
             session_entry_mode,
             is_dream_session,
             &worker_publication_permit,
+            staging.as_deref_mut(),
         ))
-        .await
+        .await?;
+        if let Some(Some(staging)) = staging {
+            staging.publication_guard = Some(worker_publication);
+        }
+        Ok(handle)
     }
 
     /// Exclude worker start/publication while a caller captures and commits a
@@ -1788,6 +2020,7 @@ impl SessionRegistry {
         session_entry_mode: crate::daemon::proto::SessionEntryMode,
         is_dream_session: bool,
         worker_publication: &WorkerPublicationPermit<'_>,
+        staging: Option<&mut Option<CodeAttachStaging>>,
     ) -> Result<SessionWorkerHandle> {
         // Linearize the full preflight/start handoff with trust decisions and
         // config publication. Command-secret preparation below awaits; without
@@ -1886,11 +2119,9 @@ impl SessionRegistry {
             } else {
                 None
             };
-        // Lazy persistence (session-id-display-and-lazy-persist): hold the
-        // new session in memory with its id assigned but its `sessions` row
-        // un-written until `start_worker` flushes it, immediately before
-        // durable lifecycle rows (agent-tree, write-scope) that foreign-key
-        // to `sessions`.
+        // Allocate identity in memory. Code preparation may need an ephemeral
+        // parent for profile/lifecycle FKs. The owning operation promotes it
+        // only after its complete fallible finalization.
         let mut session = match assistant_identity_name {
             Some(name) => Session::create_assistant_deferred(
                 self.inner.db.clone(),
@@ -1910,6 +2141,20 @@ impl SessionRegistry {
         }
         .context("creating session")?;
         session.set_deferred_entry_mode(session_entry_mode)?;
+        let mut code_staging = if session_entry_mode == crate::daemon::proto::SessionEntryMode::Code
+        {
+            session.stage_new_code_attach()?;
+            Some(CodeAttachStaging {
+                db: self.inner.db.clone(),
+                session_id: session.id,
+                committed: false,
+                worker: None,
+                publication_guard: None,
+            })
+        } else {
+            None
+        };
+
         if is_dream_session {
             session.set_deferred_dream_session()?;
         }
@@ -1972,25 +2217,35 @@ impl SessionRegistry {
             }
         }
         debug_assert!(trust_revision > 0);
-        self.start_worker(
-            worker_publication,
-            session,
-            &providers_cfg,
-            &extended_cfg,
-            client_no_sandbox,
-            worker_model_override.as_ref(),
-            preserve_root_model_override,
-            None,
-            trust_policy,
-            trust_revision,
-            workspace_root_authority,
-            workspace_layer,
-            hooks,
-            config_watch_paths,
-            env_snapshot,
-            generation,
-        )
-        .await
+        let result = self
+            .start_worker(
+                worker_publication,
+                session,
+                &providers_cfg,
+                &extended_cfg,
+                client_no_sandbox,
+                worker_model_override.as_ref(),
+                preserve_root_model_override,
+                None,
+                trust_policy,
+                trust_revision,
+                workspace_root_authority,
+                workspace_layer,
+                hooks,
+                config_watch_paths,
+                env_snapshot,
+                generation,
+                code_staging.as_mut(),
+            )
+            .await?;
+        if let Some(mut code_staging) = code_staging {
+            if let Some(staging) = staging {
+                *staging = Some(code_staging);
+            } else {
+                code_staging.commit()?;
+            }
+        }
+        Ok(result)
     }
 
     /// Create a new assistant session through the normal daemon worker path,
@@ -2007,7 +2262,7 @@ impl SessionRegistry {
         // Assistant creation is a worker-start path too. Acquire in the same
         // global order as attach (worker publication before config
         // publication), and retain it through the live/join insertion.
-        let worker_publication_guard = self.inner.worker_publication.lock().await;
+        let worker_publication_guard = self.inner.worker_publication.clone().lock_owned().await;
         let worker_publication = WorkerPublicationPermit {
             _guard: &worker_publication_guard,
         };
@@ -2116,6 +2371,7 @@ impl SessionRegistry {
             config_watch_paths,
             env_snapshot,
             generation,
+            None,
         )
         .await
     }
@@ -2216,6 +2472,7 @@ impl SessionRegistry {
             config_watch_paths,
             env_snapshot,
             generation,
+            None,
         )
         .await
     }
@@ -2443,6 +2700,7 @@ impl SessionRegistry {
         config_watch_paths: crate::daemon::config_source::ConfigWatchPaths,
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
+        staging: Option<&mut CodeAttachStaging>,
     ) -> Result<SessionWorkerHandle> {
         if self.inner.shutdown.is_draining() || super::supervisor::worker_handover_active() {
             bail!("daemon is shutting down; not starting session workers");
@@ -2813,76 +3071,22 @@ impl SessionRegistry {
         )
         .context("starting session worker")?;
 
-        crate::sync::lock_or_recover(&self.inner.workers)
-            .live
-            .insert(
-                session_id,
-                WorkerEntry {
-                    generation,
-                    handle: handle.clone(),
-                    activation_leases: 0,
-                    terminal_lock_cleanup_gate,
-                    terminal_closing,
-                    terminal_cleanup_complete,
-                },
-            );
-        let registry = self.clone();
-        handle
-            .session()
-            .set_compaction_successor_begin_hook(Arc::new({
-                let registry = registry.clone();
-                move |from, to| registry.begin_compaction_rekey(from, to)
-            }));
-        handle
-            .session()
-            .set_compaction_successor_abort_hook(Arc::new({
-                let registry = registry.clone();
-                move |from, to| registry.abort_compaction_rekey(from, to)
-            }));
-        handle.session().set_compaction_successor_hook(Arc::new(move |from, to| {
-            if let Err(error) = registry.rekey_live_worker(from, to) {
-                tracing::warn!(
-                    error = %error,
-                    %from,
-                    %to,
-                    "compaction successor rekey failed; live worker may be unreachable under the new session id"
-                );
-            }
-            #[cfg(feature = "extended")]
-            if let (Some(scheduler), Ok(runtime)) =
-                (registry.scheduler(), tokio::runtime::Handle::try_current())
-            {
-                runtime.spawn(async move {
-                    if let Err(error) = scheduler.cancel_keep_warm_jobs_for_session(from).await {
-                        tracing::warn!(
-                            error = %error,
-                            %from,
-                            "cancelling predecessor keep-warm jobs after compaction failed"
-                        );
-                    }
-                });
-            }
-        }));
-        let config_watcher = crate::daemon::config_watch::spawn_config_watcher(
-            self.inner.db.clone(),
-            self.inner.config_source.clone(),
-            handle.clone(),
+        let worker = PreparedSessionWorker {
+            registry: self.clone(),
+            handle: handle.clone(),
+            join,
+            start_permit,
+            generation,
+            terminal_lock_cleanup_gate,
+            terminal_closing,
+            terminal_cleanup_complete,
             config_watch_paths,
-            self.coverage_authority().clone(),
-        );
-        crate::sync::lock_or_recover(&self.inner.worker_joins).insert(
-            session_id,
-            WorkerJoin {
-                generation,
-                join,
-                _config_watcher: config_watcher.map(ConfigWatcherJoin),
-            },
-        );
-
-        // Release only after every cleanup target exists. From this point an
-        // immediate worker exit can atomically retire the exact generation.
-        start_permit.release();
-
+        };
+        if let Some(staging) = staging {
+            staging.worker = Some(worker);
+        } else {
+            worker.publish();
+        }
         Ok(handle)
     }
 
@@ -4017,6 +4221,58 @@ mod tests {
         reg.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
         reg.set_secret_vault(vault);
         reg
+    }
+
+    #[tokio::test]
+    async fn ux4_code_attach_staging_is_hidden_and_cleans_failed_preparation() {
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+        let reg = test_registry();
+        let failed = test_session(&reg);
+        failed.stage_new_code_attach().unwrap();
+        let guard = CodeAttachStaging {
+            db: reg.inner.db.clone(),
+            session_id: failed.id,
+            committed: false,
+            worker: None,
+            publication_guard: None,
+        };
+        failed.persist_if_needed().unwrap();
+        assert!(
+            reg.inner
+                .db
+                .list_sessions(false, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reg.inner
+                .db
+                .get_session(failed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .ephemeral
+        );
+        drop(guard);
+        assert!(reg.inner.db.get_session(failed.id).await.unwrap().is_none());
+        let success = test_session(&reg);
+        success.stage_new_code_attach().unwrap();
+        success.persist_if_needed().unwrap();
+        success.commit_new_code_attach().unwrap();
+        assert_eq!(
+            reg.inner.db.list_sessions(false, 100).await.unwrap().len(),
+            1
+        );
+        assert!(
+            !reg.inner
+                .db
+                .get_session(success.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .ephemeral
+        );
     }
 
     fn test_session(reg: &SessionRegistry) -> Arc<Session> {
@@ -5395,7 +5651,7 @@ mod tests {
             )
             .expect("capture test workspace authority"),
         );
-        let worker_publication_guard = reg.inner.worker_publication.lock().await;
+        let worker_publication_guard = reg.inner.worker_publication.clone().lock_owned().await;
         let worker_publication = WorkerPublicationPermit {
             _guard: &worker_publication_guard,
         };
@@ -5419,6 +5675,7 @@ mod tests {
                 crate::daemon::config_source::ConfigWatchPaths::default(),
                 env,
                 1,
+                None,
             )
             .await
         {
@@ -5506,7 +5763,7 @@ mod tests {
             AttachClaim::Starting(slot) => slot,
             _ => panic!("second concurrent resume must wait on the shared start"),
         };
-        let worker_publication_guard = reg.inner.worker_publication.lock().await;
+        let worker_publication_guard = reg.inner.worker_publication.clone().lock_owned().await;
         let worker_publication = WorkerPublicationPermit {
             _guard: &worker_publication_guard,
         };

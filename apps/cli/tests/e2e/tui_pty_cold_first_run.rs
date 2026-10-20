@@ -7,7 +7,7 @@
 //! Profile stage with a single keystroke — the exact path that used to
 //! wedge silently at step 1.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -23,6 +23,7 @@ const COLD_WELCOME_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(30);
 const ASYNC_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
 const DAEMON_STABILITY_WINDOW: Duration = Duration::from_secs(5);
+const PROVIDER_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 enum WalkthroughInput {
@@ -30,7 +31,127 @@ enum WalkthroughInput {
     Mouse,
 }
 
-fn spawn_loopback_models_provider() -> (String, Arc<AtomicBool>) {
+/// Own the listener thread on success and panic paths. In particular, a
+/// detached mock panic must not masquerade as a missing-secret product error.
+struct LoopbackModelsProvider {
+    url: String,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LoopbackModelsProvider {
+    fn connect(&self) -> std::net::TcpStream {
+        let address = self
+            .url
+            .strip_prefix("http://")
+            .unwrap()
+            .strip_suffix("/v1")
+            .unwrap();
+        let socket = std::net::TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        socket
+    }
+}
+
+impl Drop for LoopbackModelsProvider {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let result = worker.join();
+            if !std::thread::panicking() {
+                result.expect("loopback provider thread");
+            }
+        }
+    }
+}
+
+fn has_fixture_authorization(headers: &str) -> bool {
+    headers.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value.trim() == "Bearer test-key"
+        })
+    })
+}
+
+/// No bytes followed by EOF/idle timeout is an unused connection. Once a
+/// request starts, truncated headers/bodies and read errors remain failures.
+/// TCP callers must use blocking mode with a read timeout: only then does
+/// WouldBlock indicate an elapsed timeout rather than pending request bytes.
+fn read_provider_request(socket: &mut impl Read) -> io::Result<Option<String>> {
+    const HEADER_LIMIT: usize = 64 * 1024;
+    let mut received = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let header_end = loop {
+        if let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            let end = end + 4;
+            if end <= HEADER_LIMIT {
+                break end;
+            }
+        }
+        if received.len() >= HEADER_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bounded provider request headers",
+            ));
+        }
+        match socket.read(&mut chunk) {
+            Ok(0) if received.is_empty() => return Ok(None),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete provider request headers",
+                ));
+            }
+            Ok(read) => received.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if received.is_empty()
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let headers = std::str::from_utf8(&received[..header_end])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        .to_owned();
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>())
+        })
+        .transpose()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        .unwrap_or(0);
+    if length >= 4 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bounded provider request body",
+        ));
+    }
+    let remaining = (header_end + length).saturating_sub(received.len());
+    socket.take(remaining as u64).read_to_end(&mut received)?;
+    if received.len() < header_end + length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "incomplete provider request body",
+        ));
+    }
+    Ok(Some(headers))
+}
+
+fn spawn_loopback_models_provider() -> LoopbackModelsProvider {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
     listener
         .set_nonblocking(true)
@@ -38,29 +159,248 @@ fn spawn_loopback_models_provider() -> (String, Arc<AtomicBool>) {
     let provider_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_flag = Arc::clone(&shutdown);
-    std::thread::spawn(move || {
-        let body = r#"{"data":[{"id":"scripted","object":"model"},{"id":"fallback","object":"model"}],"object":"list"}"#;
+    let worker = std::thread::spawn(move || {
+        let body = r#"{"data":[{"id":"scripted","object":"model","context_length":131072,"max_output_tokens":8192,"supported_parameters":["tools"]},{"id":"fallback","object":"model","context_length":131072,"max_output_tokens":8192,"supported_parameters":["tools"]}],"object":"list"}"#;
         while !shutdown_flag.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut socket, _)) => {
-                    socket.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                    let mut request = [0_u8; 4096];
-                    let _ = socket.read(&mut request);
+                    // macOS inherits O_NONBLOCK from the listener. SO_RCVTIMEO
+                    // does not clear it; normalize before any request read so
+                    // WouldBlock means the blocking read actually timed out.
+                    socket
+                        .set_nonblocking(false)
+                        .expect("make accepted provider socket blocking");
+                    socket
+                        .set_read_timeout(Some(PROVIDER_IO_TIMEOUT))
+                        .expect("provider read timeout");
+                    socket
+                        .set_write_timeout(Some(PROVIDER_IO_TIMEOUT))
+                        .expect("provider write timeout");
+                    let request = match read_provider_request(&mut socket) {
+                        Ok(Some(request)) => request,
+                        // A preflight or cancelled connection never establishes
+                        // credential proof. Reject it and keep serving clients.
+                        Ok(None) => continue,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::UnexpectedEof
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::BrokenPipe
+                                    | io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            eprintln!("abandoned provider request: {error}");
+                            continue;
+                        }
+                        Err(error) => panic!("invalid provider request: {error}"),
+                    };
+                    let (content_type, response) = if request.starts_with("GET ") {
+                        assert!(
+                            has_fixture_authorization(&request),
+                            "provider verification must authenticate with the onboarded key"
+                        );
+                        ("application/json", body.to_owned())
+                    } else {
+                        assert!(
+                            has_fixture_authorization(&request),
+                            "first inference must authenticate with the onboarded key"
+                        );
+                        ("text/event-stream", concat!(
+                            "data: {\"id\":\"ux4\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"scripted\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"UX4_FIRST_SEND_OK\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"ux4\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"scripted\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                            "data: [DONE]\n\n",
+                        ).to_owned())
+                    };
                     let _ = write!(
                         socket,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(),
+                        response
                     );
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Err(_) => break,
+                Err(error) => panic!("accept provider connection: {error}"),
             }
         }
     });
-    (provider_url, shutdown)
+    LoopbackModelsProvider {
+        url: provider_url,
+        shutdown,
+        worker: Some(worker),
+    }
+}
+
+#[test]
+fn ux4_loopback_provider_survives_unused_connections_and_serves_authenticated_requests() {
+    let provider = spawn_loopback_models_provider();
+    let address = provider
+        .url
+        .strip_prefix("http://")
+        .unwrap()
+        .strip_suffix("/v1")
+        .unwrap();
+    drop(std::net::TcpStream::connect(address).unwrap());
+    let mut abandoned = std::net::TcpStream::connect(address).unwrap();
+    abandoned.write_all(b"GET /v1/models HTTP/1.1\r\n").unwrap();
+    abandoned.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut rejected = Vec::new();
+    abandoned
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    abandoned.read_to_end(&mut rejected).unwrap();
+    assert!(
+        rejected.is_empty(),
+        "incomplete requests cannot verify a key"
+    );
+    for (request, expected) in [
+        (
+            "GET /v1/models HTTP/1.1\r\nAuthorization: Bearer test-key\r\n\r\n",
+            "\"object\":\"list\"",
+        ),
+        (
+            "POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer test-key\r\nContent-Length: 2\r\n\r\n{}",
+            "UX4_FIRST_SEND_OK",
+        ),
+    ] {
+        let mut socket = std::net::TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        // Exercise headers and body delivered over multiple writes.
+        for chunk in request.as_bytes().chunks(7) {
+            socket.write_all(chunk).unwrap();
+        }
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains(expected), "{response}");
+    }
+}
+
+/// Leave the peer open without sending its next bytes. EOF or a response here
+/// would mean the provider abandoned a pending request or proved a partial one.
+fn delay_provider_request(socket: &mut std::net::TcpStream) {
+    let delay = Duration::from_millis(75);
+    socket.set_read_timeout(Some(delay)).unwrap();
+    let started = Instant::now();
+    let error = socket.read(&mut [0_u8; 1]).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ));
+    assert!(
+        started.elapsed() >= delay,
+        "pending request must wait, not return immediate WouldBlock"
+    );
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+}
+
+fn assert_provider_response(socket: &mut std::net::TcpStream, expected: &str) {
+    let mut response = String::new();
+    socket.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains(expected), "{response}");
+}
+
+#[test]
+fn ux4_loopback_provider_waits_for_delayed_first_request_bytes() {
+    let provider = spawn_loopback_models_provider();
+    let mut socket = provider.connect();
+    delay_provider_request(&mut socket);
+    socket
+        .write_all(b"GET /v1/models HTTP/1.1\r\nAuthorization: Bearer test-key\r\n\r\n")
+        .unwrap();
+    assert_provider_response(&mut socket, "\"object\":\"list\"");
+}
+
+#[test]
+fn ux4_loopback_provider_waits_for_delayed_header_and_body_fragments() {
+    let provider = spawn_loopback_models_provider();
+    let mut socket = provider.connect();
+    socket
+        .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer ")
+        .unwrap();
+    delay_provider_request(&mut socket);
+    socket
+        .write_all(b"test-key\r\nContent-Length: 2\r\n\r\n{")
+        .unwrap();
+    delay_provider_request(&mut socket);
+    socket.write_all(b"}").unwrap();
+    assert_provider_response(&mut socket, "UX4_FIRST_SEND_OK");
+}
+
+#[test]
+fn ux4_loopback_provider_waits_for_elapsed_idle_and_partial_deadlines_then_recovers() {
+    let provider = spawn_loopback_models_provider();
+    for request in [
+        b"".as_slice(),
+        b"GET /v1/models HTTP/1.1\r\nAuthorization: Bearer test-key\r\n",
+        b"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer test-key\r\nContent-Length: 2\r\n\r\n{",
+    ] {
+        let mut abandoned = provider.connect();
+        let started = Instant::now();
+        abandoned.write_all(request).unwrap();
+        // Keep the write half open so EOF cannot masquerade as an idle timeout.
+        let mut rejected = Vec::new();
+        abandoned.read_to_end(&mut rejected).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            rejected.is_empty(),
+            "idle/incomplete authenticated traffic cannot verify a key"
+        );
+        assert!(
+            elapsed >= PROVIDER_IO_TIMEOUT,
+            "provider must wait for its read deadline, not immediate WouldBlock: {elapsed:?}"
+        );
+
+        let mut socket = provider.connect();
+        socket
+            .write_all(b"GET /v1/models HTTP/1.1\r\nAuthorization: Bearer test-key\r\n\r\n")
+            .unwrap();
+        assert_provider_response(&mut socket, "\"object\":\"list\"");
+    }
+}
+
+#[test]
+fn ux4_loopback_provider_rejects_incomplete_and_oversized_requests() {
+    for request in [
+        b"GET /v1/models HTTP/1.1\r\n".to_vec(),
+        b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{".to_vec(),
+    ] {
+        let error = read_provider_request(&mut request.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+    for request in [
+        vec![b'x'; 64 * 1024],
+        b"POST / HTTP/1.1\r\nContent-Length: 4194304\r\n\r\n".to_vec(),
+        b"POST / HTTP/1.1\r\nContent-Length: invalid\r\n\r\n".to_vec(),
+    ] {
+        let error = read_provider_request(&mut request.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
+#[test]
+fn ux4_loopback_provider_distinguishes_idle_from_partial_request_timeout() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    assert!(read_provider_request(&mut server).unwrap().is_none());
+    client.write_all(b"GET /v1/models HTTP/1.1\r\n").unwrap();
+    let error = read_provider_request(&mut server).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ));
 }
 
 fn click_text(session: &mut HermeticCockpit, needle: &str) {
@@ -376,8 +716,51 @@ fn assert_daemon_onboarding_complete(session: &HermeticCockpit) {
     });
 }
 
+fn saved_code_sessions(session: &HermeticCockpit) -> usize {
+    let socket = session.socket_path();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let client = cockpit_client::DaemonClient::connect(&socket)
+                .await
+                .unwrap();
+            let response = client
+                .request_ok(cockpit_proto::Request::ListSessions {
+                    project_id: None,
+                    parent_session_id: None,
+                    assistant_id: None,
+                    compaction_lineage_root_id: None,
+                    include_archived: false,
+                })
+                .await
+                .unwrap();
+            let cockpit_proto::Response::Sessions { sessions } = response else {
+                panic!("expected session list");
+            };
+            sessions
+                .into_iter()
+                .filter(|session| session.session_entry_mode == "code")
+                .count()
+        })
+}
+
 fn complete_cold_first_run(input: WalkthroughInput) {
-    let (provider_url, provider_shutdown) = spawn_loopback_models_provider();
+    let provider = spawn_loopback_models_provider();
+    // Force the connection lifecycle that used to kill the detached mock.
+    // It must still serve the subsequent authenticated onboarding and send.
+    drop(
+        std::net::TcpStream::connect(
+            provider
+                .url
+                .strip_prefix("http://")
+                .unwrap()
+                .strip_suffix("/v1")
+                .unwrap(),
+        )
+        .expect("unused provider connection"),
+    );
     let mut session = HermeticCockpit::prepare_fresh(HermeticProfile::Default);
     session.set_extra_env("COCKPIT_REDUCE_MOTION", "1");
     session.set_extra_env("COCKPIT_LOG", "warn,cockpit_core::daemon=info");
@@ -412,7 +795,7 @@ fn complete_cold_first_run(input: WalkthroughInput) {
     }
     wait_for_text(&mut session, "provider catalog", "Let's add a provider");
     session.wait_for_daemon_handshake(TRANSITION_TIMEOUT);
-    configure_custom_provider(&mut session, input, &provider_url);
+    configure_custom_provider(&mut session, input, &provider.url);
 
     complete_model(&mut session, input);
     // Complete unlocks the real workspace decision; it is deliberately not
@@ -431,6 +814,120 @@ fn complete_cold_first_run(input: WalkthroughInput) {
         "ready chat after onboarding",
         COMPOSER_PLACEHOLDER,
     );
+
+    // The required path ends in a usable first conversation, not merely a
+    // Connected model catalog. Check persistence via the real daemon RPC.
+    assert_eq!(saved_code_sessions(&session), 0);
+    let provider_path = session.home().config_dir().join("providers/localtest.json");
+    let provider: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+    assert!(
+        !serde_json::to_string(&provider)
+            .unwrap()
+            .contains("test-key"),
+        "onboarding must persist a named reference, never the key literal"
+    );
+    let reference = provider["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|header| {
+            header["name"]
+                .as_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("Authorization"))
+        })
+        .unwrap()["value"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("$secret:")
+        .unwrap()
+        .to_owned();
+    // Fault only this throwaway encrypted item. Preserve provider bytes and
+    // installed binding provenance; no plaintext or real-user store is read.
+    let vault_fixture = rusqlite::Connection::open(session.home().db_path()).unwrap();
+    vault_fixture.execute("CREATE TEMP TABLE ux4_saved_named_secret AS SELECT * FROM secret_vault_items WHERE kind = 'named_secret' AND item_id = ?1", [&reference]).unwrap();
+    assert_eq!(
+        vault_fixture
+            .execute(
+                "DELETE FROM secret_vault_items WHERE kind = 'named_secret' AND item_id = ?1",
+                [&reference]
+            )
+            .unwrap(),
+        1
+    );
+    keyboard_input(&mut session, b"Reply briefly without tools.");
+    for _ in 0..2 {
+        let failures_before = session
+            .snapshot()
+            .contents()
+            .matches("Could not create session")
+            .count();
+        keyboard_input(&mut session, b"\r");
+        session
+            .wait_until_screen(
+                "failed attach retains draft",
+                ASYNC_STAGE_TIMEOUT,
+                |screen| {
+                    let text = screen.contents();
+                    // The long opaque name wraps in a real terminal. Preserve
+                    // the exact ID assertion while ignoring layout whitespace.
+                    let latest_names =
+                        text.rsplit_once("Could not create session")
+                            .map(|(_, latest)| {
+                                latest
+                                    .chars()
+                                    .filter(|ch| !ch.is_whitespace())
+                                    .collect::<String>()
+                            });
+                    latest_names.is_some_and(|latest| latest.contains(&reference))
+                        && text.matches("Could not create session").count() > failures_before
+                },
+            )
+            .unwrap();
+        let screen = session.snapshot().contents();
+        assert!(screen.contains("Draft (unsaved)"), "{screen}");
+        assert!(screen.contains("Reply briefly without tools."), "{screen}");
+        assert_eq!(
+            saved_code_sessions(&session),
+            0,
+            "failed first send and retry must not save rows"
+        );
+        assert_eq!(
+            vault_fixture
+                .query_row(
+                    "SELECT count(*) FROM sessions WHERE session_entry_mode = 'code'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "failed preparation must be removed, including its internal parent"
+        );
+    }
+    assert_eq!(
+        vault_fixture
+            .execute(
+                "INSERT INTO secret_vault_items SELECT * FROM temp.ux4_saved_named_secret",
+                []
+            )
+            .unwrap(),
+        1
+    );
+    keyboard_input(&mut session, b"\r");
+    wait_for_text(
+        &mut session,
+        "authenticated first inference",
+        "UX4_FIRST_SEND_OK",
+    );
+    assert_eq!(saved_code_sessions(&session), 1);
+    assert!(
+        !session.snapshot().contents().contains("Draft (unsaved)"),
+        "successful first send must leave draft mode"
+    );
+    keyboard_input(&mut session, b"/new");
+    keyboard_input(&mut session, b"\r");
+    wait_for_text(&mut session, "unsaved second composer", "Draft (unsaved)");
+    assert_eq!(saved_code_sessions(&session), 1);
 
     // Advanced agent controls remain usable as an optional /setup route.
     // Keep the complete keyboard/mouse model grants, tuning, tool grants,
@@ -470,7 +967,6 @@ fn complete_cold_first_run(input: WalkthroughInput) {
     );
     assert_daemon_onboarding_complete(&session);
 
-    provider_shutdown.store(true, Ordering::Relaxed);
     session.reap();
     session.stop_child_spawned_daemon();
     session.assert_reaped();

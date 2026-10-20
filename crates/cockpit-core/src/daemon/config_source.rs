@@ -285,8 +285,24 @@ impl ConfigSource {
                 let extended = crate::config::extended::load_for_cwd_for_daemon_contract_with_workspace_layer(
                     cwd, workspace,
                 )?;
+                let mut providers = extended.providers;
+                // Use only bytes acquired through the retained global capability.
+                // IgnoreConfig project slots are already absent from this chain.
+                if let Some(global) = workspace.layers.iter().find(|layer| {
+                    matches!(layer.origin, Some(cockpit_config::dirs::ConfigDirKind::HomeXdg))
+                }) {
+                    let global_providers = crate::config::providers::ConfigDoc::providers_from_workspace_layer_snapshot(global)?;
+                    providers.global_credential_source = Some(Arc::new(
+                        cockpit_config::providers::GlobalProviderCredentialSource {
+                            owner_root: crate::secret_ownership::canonical_owner_root(
+                                &cockpit_config::dirs::global_config_dir()?.to_string_lossy(),
+                            ),
+                            providers: global_providers.providers,
+                        },
+                    ));
+                }
                 Ok(DaemonConfigLoad {
-                    providers: extended.providers,
+                    providers,
                     provider_warnings: extended.provider_warnings,
                     extended: extended.config,
                     response_metrics_tokenizer_validation: extended

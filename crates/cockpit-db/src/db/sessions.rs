@@ -389,9 +389,10 @@ pub struct SessionRow {
     /// explicit session address, but are excluded from default recall and
     /// future dream source selection.
     pub is_dream_session: bool,
-    /// `true` for a throwaway `/side` side-conversation fork (migration
-    /// 0017) and for persistent `/btw` forks. Ephemeral sessions are
-    /// excluded from every list query and never auto-titled. Legacy `/side`
+    /// `true` for tentative Code-worker preparation, throwaway `/side`
+    /// conversations and persistent `/btw` forks. These rows are excluded
+    /// from every list query and never auto-titled. Code preparation promotes
+    /// only after worker creation succeeds. Unfinished preparation and `/side`
     /// rows are swept on boot; `/btw` rows carry [`Self::btw_parent_session_id`]
     /// and are not swept.
     pub ephemeral: bool,
@@ -802,8 +803,8 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
           assistant_name, created_by_principal, shared_with_collaborators, is_dream_session,
-          is_assistant_thread, compaction_predecessor_session_id, compaction_lineage_root_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+          is_assistant_thread, compaction_predecessor_session_id, compaction_lineage_root_id, ephemeral)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -834,6 +835,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.compaction_lineage_root_id
                 .unwrap_or(row.session_id)
                 .to_string(),
+            row.ephemeral as i64,
         ],
     )?;
     Ok(())
@@ -2121,8 +2123,8 @@ impl Db {
         .await
     }
 
-    /// Insert a visible `sessions` row. `custody` must have been proven on
-    /// this same connection for `row.session_id`.
+    /// Insert a `sessions` row, preserving its ephemeral/list-visibility flag.
+    /// `custody` must have been proven on this connection for `row.session_id`.
     pub fn insert_session_row_conn(
         conn: &Connection,
         row: &SessionRow,

@@ -643,6 +643,26 @@ impl CodeRootAuthorityV1 {
         fingerprint: [u8; 32],
         result: IdempotencyResult,
     ) -> Result<()> {
+        self.record_with_commit(
+            logical_client_id,
+            client_request_id,
+            route,
+            fingerprint,
+            result,
+            || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_with_commit(
+        &mut self,
+        logical_client_id: &proto::OpaqueAsciiId128V1,
+        client_request_id: &proto::OpaqueAsciiId128V1,
+        route: &'static str,
+        fingerprint: [u8; 32],
+        result: IdempotencyResult,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let key = (
             logical_client_id.as_str().to_owned(),
             client_request_id.as_str().to_owned(),
@@ -654,6 +674,10 @@ impl CodeRootAuthorityV1 {
         if self.idempotency.len() >= MAX_IDEMPOTENCY_RECEIPTS {
             bail!("Code-root idempotency capacity exhausted");
         }
+        // Every fallible receipt check precedes promotion. The caller holds
+        // this authority lock through commit and the infallible insertion, so
+        // no replay can observe a receipt for a provisional root.
+        commit()?;
         self.idempotency.insert(
             key,
             IdempotencyReceipt {
@@ -684,6 +708,35 @@ impl CodeRootAuthorityV1 {
         Ok(())
     }
 
+    /// Remove capabilities minted during a failed fresh create. Saved-root
+    /// attach/resume never calls this provisional-only cleanup boundary.
+    pub fn forget_unpublished_root(&mut self, root_id: proto::CodeRootIdV1) {
+        self.attachments
+            .retain(|_, record| record.root_id != root_id);
+        for request in self.code_root_requests_in_flight.values_mut() {
+            if request.created_root_id == Some(root_id) {
+                request.created_root_id = None;
+            }
+        }
+    }
+
+    pub fn record_create_with_commit(
+        &mut self,
+        request: &proto::CreateCodeRootV1Request,
+        result: proto::CreateCodeRootV1Result,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.record_with_commit(
+            &request.logical_client_id,
+            &request.client_request_id,
+            "create",
+            request_fingerprint(request)?,
+            IdempotencyResult::Create(result),
+            commit,
+        )
+    }
+
+    #[cfg(test)]
     pub fn record_create(
         &mut self,
         request: &proto::CreateCodeRootV1Request,

@@ -777,6 +777,9 @@ pub struct Session {
     /// flush point — it writes the `sessions` row *before* any dependent
     /// write, so FK/ordering invariants hold.
     pending_row: Mutex<Option<SessionRow>>,
+    /// New Code worker preparation may need FK-backed profile rows before
+    /// attach succeeds. Such rows stay ephemeral until publication commits.
+    new_code_attach_pending: AtomicBool,
     /// Session-scoped gitignore read-allowlist globs added via the approval
     /// flow's "Approve for this session" choice
     /// (implementation note). Unioned with the persisted
@@ -1783,10 +1786,9 @@ impl Session {
 
     /// Owner-scoped provider resolution store. Unlike [`Self::credential_store`]
     /// (the comprehensive view used for redaction and inventory), this restricts
-    /// the resolvable `$secret:` names to those owned by (provider, this
-    /// session's project root), backfilling legacy references this provider
-    /// config actually uses. A provider request built from this store can never
-    /// resolve a secret owned by a different kind/workspace. See
+    /// the resolvable `$secret:` names to this project's provider owner, plus
+    /// references in unchanged authentication envelopes from the daemon-held
+    /// global source. No unclaimed or foreign-workspace names are adopted. See
     /// `named-secret-ownership-boundary`.
     pub(crate) fn provider_credential_store(
         &self,
@@ -1805,9 +1807,21 @@ impl Session {
             None,
             &crate::secret_ref::provider_credential_record_references(providers),
         )?;
+        if let Some(source) = &providers.global_credential_source {
+            let (names, records) =
+                crate::secret_ref::inherited_global_provider_references(providers, source);
+            let global = crate::credentials::CredentialStore::from_vault_provider_owner_scoped(
+                self.secret_vault.clone(),
+                &source.owner_root,
+                &names,
+                None,
+                &records,
+            )?;
+            store.extend_provider_references(global, &names, &records);
+        }
         // Inject resolved command outputs from the daemon cache. The store is
-        // owner-scoped, so only (provider, this-workspace)-owned command names
-        // are present and injectable — a foreign-owned command name is never
+        // owner-scoped, so only this workspace's and authorized inherited
+        // global provider command names are present and injectable — a foreign-owned command name is never
         // injected (and, resolved through this same scoped view, never execed).
         self.inject_command_outputs_if_installed(&mut store);
         Ok(store)

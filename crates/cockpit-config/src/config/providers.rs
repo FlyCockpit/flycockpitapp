@@ -333,6 +333,16 @@ pub struct ProvidersConfig {
     /// are generation-keyed without every call site inventing a generation.
     #[serde(skip)]
     pub resolution_generation: u64,
+    /// Daemon-acquired global provider authentication envelopes. Runtime-only:
+    /// a project document or wire payload cannot grant global vault authority.
+    #[serde(skip)]
+    pub global_credential_source: Option<std::sync::Arc<GlobalProviderCredentialSource>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GlobalProviderCredentialSource {
+    pub owner_root: String,
+    pub providers: BTreeMap<String, ProviderEntry>,
 }
 
 impl ProvidersConfig {

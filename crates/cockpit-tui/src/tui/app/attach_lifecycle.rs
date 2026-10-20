@@ -996,3 +996,214 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod setup_error_render_tests {
+    use super::*;
+    use crate::tui::session_setup::SessionSetupPane;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    // Core pins this fixture to the real resolver diagnostic, including the
+    // daemon/client wrappers. Exercise the final attach wrapper here too.
+    const DIAGNOSTIC: &str =
+        include_str!("../../../../cockpit-core/tests/fixtures/attach-hard-requirements.txt");
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn error_app(root: &std::path::Path, inline: bool, color: bool) -> App {
+        let mut app =
+            App::new_with_workspace_trust(Some(root), false, StartupWorkspaceTrust::Decided);
+        app.launch.banner_enabled = false;
+        app.session_setup_collapsed = false;
+        app.session_setup_inline = Some(SessionSetupPane::loading_inline(color));
+        app.overlay = Overlay::SessionSetup(SessionSetupPane::loading(color));
+        app.apply_runner_attach_neutral_pane_error(
+            DIAGNOSTIC
+                .trim_end()
+                .strip_prefix("Could not start a session — ")
+                .expect("attach wrapper"),
+        );
+        assert_eq!(
+            app.session_setup_inline
+                .as_ref()
+                .expect("inline pane")
+                .error_message(),
+            Some(DIAGNOSTIC.trim_end())
+        );
+        if inline {
+            app.overlay = Overlay::None;
+        }
+        app
+    }
+
+    fn render_setup(app: &mut App, inline: bool, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                if inline {
+                    app.render_history(frame, frame.area());
+                } else if let Overlay::SessionSetup(pane) = &mut app.overlay {
+                    pane.render(frame, frame.area());
+                } else {
+                    panic!("setup overlay must remain open");
+                }
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        // Exclude overlay borders and the permanently reserved scrollbar
+        // column. Inspect the rendered cells, not the pane's source lines.
+        let content = if inline {
+            Rect::new(0, 0, width.saturating_sub(1), height)
+        } else {
+            Rect::new(1, 1, width.saturating_sub(3), height.saturating_sub(2))
+        };
+        let mut text = String::new();
+        for y in content.y..content.bottom() {
+            for x in content.x..content.right() {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    fn compact(text: &str) -> String {
+        text.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
+
+    fn assert_guidance_visible(screens: &[String]) {
+        for clause in [
+            "Locality: unknown; requires remote",
+            "Context tokens: unknown; requires at least 32768 (minContextTokens)",
+            "Computer-use: required but no host-issued contract",
+            "Tool calling: unknown; requires Supported",
+            "OpenAI-compatible local servers (LM Studio, Ollama) often do not advertise these capabilities",
+            "/settings → Providers → this model, set Locality, Context tokens, and Tool calling only when they are true",
+            "Frontier Coding requires remote plus a computer-use contract",
+            "/settings on a local LM Studio model cannot satisfy that",
+            "/settings → Agents or /agent to a local coding agent that does not require remote or computer-use",
+            "remote tools-capable model with a host-issued computer-use contract",
+            "Then send again.",
+        ] {
+            assert!(
+                screens
+                    .iter()
+                    .any(|screen| compact(screen).contains(&compact(clause))),
+                "missing visible guidance: {clause}; screens: {screens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_pane_attach_diagnostic_visible_at_80_and_120_columns() {
+        let tmp = tempfile::tempdir().expect("workspace");
+        for width in [80, 120] {
+            for inline in [false, true] {
+                for color in [false, true] {
+                    let mut app = error_app(tmp.path(), inline, color);
+                    let text = render_setup(&mut app, inline, width, 24);
+                    assert!(
+                        compact(&text).contains(&compact(DIAGNOSTIC)),
+                        "entire diagnostic must fit at {width}, inline={inline}: {text}"
+                    );
+                    assert_guidance_visible(&[text]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn setup_pane_attach_diagnostic_scrolls_at_80_and_120_columns() {
+        let tmp = tempfile::tempdir().expect("workspace");
+        for width in [80, 120] {
+            for inline in [false, true] {
+                let mut app = error_app(tmp.path(), inline, false);
+                let first = render_setup(&mut app, inline, width, 7);
+                if inline {
+                    assert!(app.chat_total_lines > app.chat_visible_lines);
+                    // Chat starts at the tail; PageUp must reach the preamble.
+                    app.handle_key(press(KeyCode::PageUp));
+                    assert!(app.chat_scroll_offset > 0);
+                    app.scroll_chat_up(app.chat_total_lines);
+                } else {
+                    assert!(!compact(&first).contains(&compact("Then send again.")));
+                    app.handle_key(press(KeyCode::End));
+                    let tail = render_setup(&mut app, inline, width, 7);
+                    assert!(compact(&tail).contains(&compact("Then send again.")));
+                    app.handle_key(press(KeyCode::Home));
+                }
+                let mut screens = Vec::new();
+                // A one-row stride makes every clause visible in a viewport,
+                // including clauses that straddle a page boundary.
+                for _ in 0..32 {
+                    screens.push(render_setup(&mut app, inline, width, 7));
+                    if inline {
+                        app.scroll_chat_down(1);
+                    } else {
+                        app.handle_key(press(KeyCode::Down));
+                    }
+                }
+                assert!(
+                    compact(&screens[0]).contains(&compact("Could not start a session")),
+                    "preamble must be reachable at {width}, inline={inline}: {}",
+                    screens[0]
+                );
+                assert_guidance_visible(&screens);
+                if inline {
+                    assert_eq!(app.chat_scroll_offset, 0);
+                } else {
+                    app.handle_key(press(KeyCode::PageUp));
+                    let page_up = render_setup(&mut app, inline, width, 7);
+                    assert!(!compact(&page_up).contains(&compact("Then send again.")));
+                    app.handle_key(press(KeyCode::PageDown));
+                    let page_down = render_setup(&mut app, inline, width, 7);
+                    assert!(compact(&page_down).contains(&compact("Then send again.")));
+                }
+                // A wider/taller resize clamps the old scroll offset.
+                let resized = render_setup(&mut app, inline, 120, 24);
+                assert!(compact(&resized).contains(&compact(DIAGNOSTIC)));
+            }
+        }
+    }
+
+    #[test]
+    fn setup_pane_errors_wrap_without_diagnostic_matching_and_reset_on_reentry() {
+        let tmp = tempfile::tempdir().expect("workspace");
+        let message = format!(
+            "Unknown attach failure: {}\nRetry here.",
+            "界e\u{301}".repeat(45)
+        );
+        for inline in [false, true] {
+            let mut app = error_app(tmp.path(), inline, false);
+            if inline {
+                app.session_setup_inline
+                    .as_mut()
+                    .expect("inline")
+                    .set_error(&message);
+            } else if let Overlay::SessionSetup(pane) = &mut app.overlay {
+                pane.set_error(&message);
+            }
+            let narrow = render_setup(&mut app, inline, 24, 24);
+            assert!(compact(&narrow).contains(&compact(&message)), "{narrow}");
+            app.handle_key(press(KeyCode::End));
+            if inline {
+                app.session_setup_inline
+                    .as_mut()
+                    .expect("inline")
+                    .set_error("Retry now.");
+            } else if let Overlay::SessionSetup(pane) = &mut app.overlay {
+                pane.set_error("Retry now.");
+            }
+            let short = render_setup(&mut app, inline, 80, 7);
+            assert!(short.contains("Retry now."), "{short}");
+            assert!(!short.contains("Unknown attach failure"));
+            if !inline {
+                app.handle_key(press(KeyCode::Esc));
+                assert!(matches!(app.overlay, Overlay::None));
+            }
+        }
+    }
+}

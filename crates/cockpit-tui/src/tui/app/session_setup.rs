@@ -1107,7 +1107,7 @@ mod tests {
         app.apply_session_setup_add_mcp_error("lease held by another editor".to_string());
         let pane = app.session_setup_inline.as_ref().expect("inline pane");
         let lines: Vec<String> = pane
-            .inline_lines()
+            .inline_lines(80)
             .into_iter()
             .map(|line| line.to_string())
             .collect();
@@ -1131,7 +1131,7 @@ mod tests {
         app.apply_session_setup_snapshot_error("transport reset".to_string());
         let pane = app.session_setup_inline.as_ref().expect("inline pane");
         let lines: Vec<String> = pane
-            .inline_lines()
+            .inline_lines(80)
             .into_iter()
             .map(|line| line.to_string())
             .collect();

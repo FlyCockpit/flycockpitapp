@@ -2911,6 +2911,13 @@ mod tests {
             );
         }
         assert!(unknown.ends_with("Then send again."));
+        // The TUI renders this same fixture through both setup-pane surfaces.
+        assert_eq!(
+            include_str!("../../tests/fixtures/attach-hard-requirements.txt").trim_end(),
+            format!(
+                "Could not start a session — attach: daemon error: internal: preparing fresh installed-root launch: {unknown}"
+            )
+        );
 
         for (required_locality, location, context, tools, computer, expected) in [
             (

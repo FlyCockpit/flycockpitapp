@@ -386,9 +386,24 @@ impl App {
         self.current_session_persisted = false;
         self.busy = false;
         self.session_setup_inline = None;
+        self.model_settings_fix = cockpit_core::agents::model_settings_fix_target(error);
+        let action = if self.model_settings_fix.is_some() {
+            " Run /model-settings to open it"
+        } else {
+            ""
+        };
         self.history.push(HistoryEntry::CommandError {
-            line: format!("Could not create session: {error}; send to retry"),
+            line: format!("Could not create session: {error}{action}; send to retry"),
         });
+    }
+
+    /// Open Model Settings for one exact provider/model (attach-failure fix).
+    pub(super) fn open_model_settings_for(&mut self, provider: &str, model: &str) {
+        self.dialog = crate::tui::settings::Dialog::open_model_settings_for(
+            &self.launch.cwd,
+            provider,
+            model,
+        );
     }
 
     pub(super) fn restore_durable_view_after_draft_failure(&mut self, error: &str) {

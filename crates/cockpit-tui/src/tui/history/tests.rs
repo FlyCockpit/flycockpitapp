@@ -240,6 +240,53 @@ fn command_error_row_shares_transcript_indent() {
     );
 }
 
+/// LM Studio context regression: the attach failure the user saw was split
+/// mid-word ("Conte xt", "Provi ders") because the long CommandError row was
+/// left to the column-cutting visual prewrap.
+#[test]
+fn command_error_wraps_long_attach_failure_on_word_boundaries() {
+    let line = "Could not create session: attach: daemon error: internal: preparing fresh \
+        installed-root launch: slot `primary` cannot use model `lfm2.5-24b-a2b` from provider \
+        `lmstudio`: Context tokens: unknown; requires at least 1 (minContextTokens). Local \
+        OpenAI-compatible servers (LM Studio, Ollama) often do not report these values. Set \
+        only the values that are true in this model's Model Settings, then send again.; send \
+        to retry";
+    let entry = HistoryEntry::CommandError { line: line.into() };
+    for width in [40_u16, 80, 123, 160] {
+        let r = render_entry(
+            &entry,
+            width,
+            ThinkingDisplay::Condensed,
+            MarkdownOpts::default(),
+            cockpit_config::extended::DiffStyle::default(),
+            false,
+            false,
+            &no_elided(),
+            0,
+            None,
+        );
+        assert!(r.lines.len() > 1, "long error wraps at {width}");
+        assert_eq!(r.continuations.len(), r.lines.len());
+        let mut words = Vec::new();
+        for row in &r.lines {
+            assert!(line_width(row) <= usize::from(width), "row fits {width}");
+            let text = line_text(row);
+            assert!(
+                text.starts_with(&" ".repeat(AGENT_INDENT)),
+                "hanging indent"
+            );
+            words.extend(text.split_whitespace().map(str::to_owned));
+        }
+        // Every row boundary falls between words: re-joining the rows'
+        // words reproduces the message exactly.
+        assert_eq!(
+            words.join(" "),
+            line.split_whitespace().collect::<Vec<_>>().join(" "),
+            "no word split at width {width}"
+        );
+    }
+}
+
 #[test]
 fn inference_error_expanded_detail_rows_use_agent_indent() {
     let summary_tail_marker = "summary-tail-kept";

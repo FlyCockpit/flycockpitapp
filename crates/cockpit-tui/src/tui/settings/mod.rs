@@ -3709,10 +3709,18 @@ impl SettingsCx {
         let message = format!("operation was authoritatively {disposition}: {error}");
         match original {
             PendingSettingsOperation::ProviderMutation { .. } => {
-                self.completed_provider_mutation = Some(Err(message.clone()));
+                // The daemon receipt message is bounded and user-safe (a fixed
+                // typed reason or the fixed generic text). Show it directly;
+                // the settlement mechanics are not actionable for the user.
+                let user_message = if cancelled {
+                    message.clone()
+                } else {
+                    error.message.clone()
+                };
+                self.completed_provider_mutation = Some(Err(user_message.clone()));
                 self.completed_provider_mutation_navigation =
                     self.pending_provider_mutation_navigation.take();
-                self.reject_pending_provider_add(message.clone());
+                self.reject_pending_provider_add(user_message);
             }
             PendingSettingsOperation::SimpleMutation { action, .. } => match action {
                 SettingsMutationAction::McpSave { .. } => {
@@ -6491,6 +6499,20 @@ impl Dialog {
         d
     }
 
+    /// Open the settings dialog directly on one exact provider/model's Model
+    /// Settings page (the attach-failure "Open Model Settings" action).
+    pub fn open_model_settings_for(cwd: &std::path::Path, provider: &str, model: &str) -> Self {
+        let mut d = Self::open(cwd);
+        if let Dialog::PickConfig { files, .. } = &d
+            && let Some(file) = files.first()
+        {
+            let mut s = file.open(cwd.to_path_buf());
+            s.enter_model_settings_for(provider, model);
+            d = Dialog::Settings(Box::new(s));
+        }
+        d
+    }
+
     /// Open the settings dialog directly on the gitignore read-allowlist
     /// editor for the **current project** (`/gitignore-allow`,
     /// implementation note). The target config is the
@@ -8496,6 +8518,14 @@ impl SettingsDialog {
     /// (provider, model) can't be found.
     fn enter_model_settings(&mut self) {
         self.page = providers_page(providers::active_model_settings_page(&self.config));
+    }
+
+    fn enter_model_settings_for(&mut self, provider: &str, model: &str) {
+        self.page = providers_page(providers::model_settings_page_for(
+            &self.config,
+            provider,
+            model,
+        ));
     }
 
     fn save_config(&mut self) -> Result<(), String> {

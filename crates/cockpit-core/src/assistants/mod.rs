@@ -550,6 +550,7 @@ pub fn vnext_for_private_assistant(installation_id: Uuid) -> VnextAgentDef {
             ModelSlot {
                 purpose: "Primary model for this private assistant.".to_string(),
                 min_context_tokens: 1,
+                unknown_context_satisfies: false,
                 required_capabilities: vec![ModelCapability::TextGeneration],
                 locality: ModelLocality::Any,
                 allow_default_fallback: true,

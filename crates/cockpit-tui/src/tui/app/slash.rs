@@ -891,7 +891,13 @@ fn run_mcp(app: &mut App, args: &str) -> bool {
 }
 
 fn run_model_settings(app: &mut App, _: &str) -> bool {
-    app.dialog = Dialog::open_model_settings(&app.launch.cwd);
+    // After an attach failure that named a fixable model, open that exact
+    // model rather than the (possibly different) active one.
+    if let Some(target) = app.model_settings_fix.take() {
+        app.open_model_settings_for(&target.provider, &target.model);
+    } else {
+        app.dialog = Dialog::open_model_settings(&app.launch.cwd);
+    }
     false
 }
 

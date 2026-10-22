@@ -345,6 +345,9 @@ fn builtin_vnext(name: &str, _mode: AgentMode) -> VnextAgentDef {
             ModelSlot {
                 purpose: "Primary model for this built-in role.".to_string(),
                 min_context_tokens: 1,
+                // Built-in roles run on any configured model, including local
+                // OpenAI-compatible servers that never report context size.
+                unknown_context_satisfies: true,
                 required_capabilities: vec![ModelCapability::TextGeneration],
                 locality: ModelLocality::Any,
                 allow_default_fallback: true,

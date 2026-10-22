@@ -2460,6 +2460,9 @@ pub struct App {
     pub(super) session_setup_focused: bool,
     /// One-line hint shown after collapse, naming where each control lives.
     pub(super) session_setup_collapse_hint: Option<String>,
+    /// Exact Model Settings route the latest attach failure named as fixable;
+    /// `/model-settings` and the setup pane's action open it.
+    pub(super) model_settings_fix: Option<cockpit_core::agents::ModelSettingsFixTarget>,
     /// Answering dialog for a `question`-tool interrupt (GOALS §3b).
     /// Opened from `TurnEvent::InterruptRaised`, replaces the composer,
     /// and on submit/cancel sends `ResolveInterrupt` back to the daemon.
@@ -4376,6 +4379,7 @@ impl App {
             // input. Tab transfers focus to the setup controls.
             session_setup_focused: false,
             session_setup_collapse_hint: None,
+            model_settings_fix: None,
             question_dialog: None,
             question_dialog_btw: false,
             pending_btw_interrupt: None,

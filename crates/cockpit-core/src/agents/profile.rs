@@ -999,6 +999,21 @@ fn offering_is_compatible(
     hard_requirements_satisfied(slot, location, &capabilities)
 }
 
+/// The providers-config key an offering's capabilities resolve under.
+fn offering_config_key<'a>(
+    offering: &'a AgentProfileModelOffering,
+    providers: &ProvidersConfig,
+) -> &'a str {
+    if providers
+        .providers
+        .contains_key(&offering.provider_profile_handle)
+    {
+        &offering.provider_profile_handle
+    } else {
+        &offering.provider_id
+    }
+}
+
 fn offering_capabilities(
     offering: &AgentProfileModelOffering,
     providers: &ProvidersConfig,
@@ -1008,14 +1023,7 @@ fn offering_capabilities(
     // Prefer the latter when it is an installed local route; falling back to
     // the provider id keeps portable profile resolution independent of the
     // daemon's local handle spelling.
-    let capability_key = if providers
-        .providers
-        .contains_key(&offering.provider_profile_handle)
-    {
-        &offering.provider_profile_handle
-    } else {
-        &offering.provider_id
-    };
+    let capability_key = offering_config_key(offering, providers);
     let capabilities = providers.resolve_effective_model_capabilities(
         capability_key,
         &offering.model_id,
@@ -1025,6 +1033,40 @@ fn offering_capabilities(
         providers.resolve_location(capability_key, &offering.model_id),
         capabilities,
     )
+}
+
+/// Fixed closing sentence of a hard-requirement failure that the named
+/// model's Model Settings can resolve. Its presence is the contract that
+/// [`model_settings_fix_target`] parses.
+pub const MODEL_SETTINGS_FIX_SENTENCE: &str =
+    "Set only the values that are true in this model's Model Settings, then send again.";
+
+/// The provider route and model whose Model Settings can resolve an attach
+/// failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSettingsFixTarget {
+    /// Provider config key (`/settings → Providers` row).
+    pub provider: String,
+    pub model: String,
+}
+
+/// Recover the exact Model Settings target from an attach error that
+/// [`incompatible_offering_message`] produced for a fixable failure. Returns
+/// `None` for any other error, including the Frontier remote/computer-use
+/// case, which Model Settings cannot fix.
+pub fn model_settings_fix_target(message: &str) -> Option<ModelSettingsFixTarget> {
+    if !message.contains(MODEL_SETTINGS_FIX_SENTENCE) {
+        return None;
+    }
+    let (_, rest) = message.split_once("cannot use model `")?;
+    let (model, rest) = rest.split_once("` from provider `")?;
+    let (provider, _) = rest.split_once("`: ")?;
+    (!model.is_empty() && !provider.is_empty() && !provider.contains('`')).then(|| {
+        ModelSettingsFixTarget {
+            provider: provider.to_string(),
+            model: model.to_string(),
+        }
+    })
 }
 
 fn incompatible_offering_message(
@@ -1058,6 +1100,7 @@ fn incompatible_offering_message(
         failures.push(format!("Locality: {actual}; requires {required}"));
     }
     match capabilities.context_tokens {
+        None if slot.unknown_context_satisfies => {}
         None => failures.push(format!(
             "Context tokens: unknown; requires at least {} (minContextTokens)",
             slot.min_context_tokens
@@ -1095,22 +1138,39 @@ fn incompatible_offering_message(
         };
         failures.push(format!("{label}: {actual}; requires Supported"));
     }
+    let frontier = slot.locality == ModelLocality::Remote
+        && slot
+            .required_capabilities
+            .contains(&ModelCapability::ComputerUse);
+    let computer_use_failed = failures
+        .iter()
+        .any(|failure| failure.starts_with("Computer-use:"));
+    if !computer_use_failed {
+        // Every failure is a per-model value (locality, context, capability
+        // status) the user can set in that model's Model Settings. Name the
+        // exact config route so the client can open that page directly (see
+        // `model_settings_fix_target`).
+        return format!(
+            "slot `{slot_id}` cannot use model `{}` from provider `{}`: {}. \
+             Local OpenAI-compatible servers (LM Studio, Ollama) often do not report these values. \
+             {MODEL_SETTINGS_FIX_SENTENCE}",
+            offering.model_id,
+            offering_config_key(offering, providers),
+            failures.join("; ")
+        );
+    }
     let mut message = format!(
         "slot `{slot_id}` default binding cannot satisfy hard model requirements: {}. \
          OpenAI-compatible local servers (LM Studio, Ollama) often do not advertise these capabilities. \
          In /settings → Providers → this model, set Locality, Context tokens, and Tool calling only when they are true. ",
         failures.join("; ")
     );
-    if slot.locality == ModelLocality::Remote
-        && slot
-            .required_capabilities
-            .contains(&ModelCapability::ComputerUse)
-    {
+    if frontier {
         message.push_str(
-            "Frontier Coding requires remote plus a computer-use contract; \
-             /settings on a local LM Studio model cannot satisfy that. \
-             Switch in /settings → Agents or /agent to a local coding agent that does not require remote or computer-use, \
-             or pick a remote tools-capable model with a host-issued computer-use contract. ",
+        "Frontier Coding requires remote plus a computer-use contract; \
+         /settings on a local LM Studio model cannot satisfy that. \
+         Switch in /settings → Agents or /agent to a local coding agent that does not require remote or computer-use, \
+         or pick a remote tools-capable model with a host-issued computer-use contract. ",
         );
     }
     message.push_str("Then send again.");
@@ -1141,6 +1201,7 @@ pub(crate) fn prepared_route_is_compatible(
 pub(crate) fn redacted_slot_requirements(slot: &ModelSlot) -> RedactedModelSlotRequirements {
     RedactedModelSlotRequirements {
         min_context_tokens: slot.min_context_tokens,
+        unknown_context_satisfies: slot.unknown_context_satisfies,
         required_capabilities: slot
             .required_capabilities
             .iter()
@@ -1200,6 +1261,7 @@ fn model_slot_from_redacted(requirements: &RedactedModelSlotRequirements) -> Opt
     Some(ModelSlot {
         purpose: "prepared child slot".to_string(),
         min_context_tokens: requirements.min_context_tokens,
+        unknown_context_satisfies: requirements.unknown_context_satisfies,
         required_capabilities,
         locality,
         allow_default_fallback: false,
@@ -1236,15 +1298,22 @@ pub(crate) fn redacted_child_route_is_compatible(
     )
 }
 
+/// `minContextTokens` check. A known window must meet the minimum; an unknown
+/// window satisfies only a slot whose definition explicitly accepts it
+/// (built-in slots). Authored slots fail closed.
+fn context_requirement_satisfied(slot: &ModelSlot, context_tokens: Option<u32>) -> bool {
+    match context_tokens {
+        Some(actual) => actual >= slot.min_context_tokens.try_into().unwrap_or(u32::MAX),
+        None => slot.unknown_context_satisfies,
+    }
+}
+
 fn hard_requirements_satisfied(
     slot: &super::ModelSlot,
     location: Option<ModelLocation>,
     capabilities: &EffectiveModelCapabilities,
 ) -> bool {
-    if capabilities
-        .context_tokens
-        .is_none_or(|actual| actual < slot.min_context_tokens.try_into().unwrap_or(u32::MAX))
-    {
+    if !context_requirement_satisfied(slot, capabilities.context_tokens) {
         return false;
     }
     let locality_ok = match slot.locality {
@@ -2909,10 +2978,106 @@ mod tests {
     }
 
     #[test]
+    fn agent_profile_resolution_unknown_context_builtin_accepts_authored_fails_with_fix_target() {
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "lmstudio".into(),
+            ProviderEntry {
+                url: "http://127.0.0.1:1234/v1".into(),
+                template: Some("openai-compatible".into()),
+                models: vec![ModelEntry {
+                    id: "lfm2.5-24b-a2b".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let offering = AgentProfileModelOffering {
+            offering_id: "offering-0-0".into(),
+            provider_profile_handle: "lmstudio".into(),
+            provider_id: "openai-compatible".into(),
+            model_id: "lfm2.5-24b-a2b".into(),
+        };
+
+        // Built-in slot: unknown context is explicitly acceptable.
+        let builtin = crate::agents::builtin_defs::embedded_default("Build").expect("Build");
+        let builtin_slot =
+            builtin.vnext.as_ref().expect("vNext built-in").model_slots["primary"].clone();
+        assert!(builtin_slot.unknown_context_satisfies);
+        assert!(offering_is_compatible(&builtin_slot, &offering, &config));
+
+        // Authored slot (minContextTokens: 1): unknown context fails closed
+        // with an actionable message naming the exact Model Settings route.
+        let mut definition = definition("");
+        let slot = definition
+            .vnext
+            .as_mut()
+            .unwrap()
+            .model_slots
+            .get_mut("primary")
+            .unwrap();
+        slot.min_context_tokens = 1;
+        assert!(!slot.unknown_context_satisfies);
+        let slot = slot.clone();
+        assert!(!offering_is_compatible(&slot, &offering, &config));
+        let (catalog, installation_id, digest) = catalog(definition);
+        let mut bound = binding(installation_id, digest, &offering.model_id);
+        bound.provider_profile_handle = offering.provider_profile_handle.clone();
+        let error = resolve_agent_profile(AgentProfileResolutionInput {
+            installation_id,
+            catalog: &catalog,
+            bindings: vec![bound],
+            offerings: vec![offering.clone()],
+            utility_fallbacks: BTreeMap::new(),
+            providers: &config,
+            host_policy: VnextHostPolicy::default(),
+            question_override: ProfileQuestionOverride::Inherit,
+            verification_reductions: BTreeMap::new(),
+        })
+        .expect_err("authored slot must fail closed on unknown context")
+        .to_string();
+        assert!(
+            error.contains("Context tokens: unknown; requires at least 1"),
+            "{error}"
+        );
+        assert!(error.contains(MODEL_SETTINGS_FIX_SENTENCE), "{error}");
+        assert_eq!(
+            model_settings_fix_target(&format!(
+                "attach: daemon error: internal: preparing fresh installed-root launch: {error}"
+            )),
+            Some(ModelSettingsFixTarget {
+                provider: "lmstudio".into(),
+                model: "lfm2.5-24b-a2b".into(),
+            })
+        );
+
+        // Setting the context override is the fix.
+        config.providers.get_mut("lmstudio").unwrap().models[0]
+            .capability_overrides
+            .context_tokens = Some(131_072);
+        assert!(offering_is_compatible(&slot, &offering, &config));
+    }
+
+    #[test]
+    fn model_settings_fix_target_ignores_unfixable_and_unrelated_errors() {
+        assert_eq!(model_settings_fix_target("daemon unreachable"), None);
+        assert_eq!(
+            model_settings_fix_target(
+                "slot `primary` default binding cannot satisfy hard model requirements: \
+                 Computer-use: required but no host-issued contract. Then send again."
+            ),
+            None
+        );
+        // The sentence alone, without an exact route, offers nothing.
+        assert_eq!(model_settings_fix_target(MODEL_SETTINGS_FIX_SENTENCE), None);
+    }
+
+    #[test]
     fn agent_profile_resolution_hard_capability_and_locality_unknown_fail_closed() {
         let tool_slot = super::super::ModelSlot {
             purpose: "tools".into(),
             min_context_tokens: 8,
+            unknown_context_satisfies: false,
             required_capabilities: vec![ModelCapability::ToolCalling],
             locality: ModelLocality::Local,
             allow_default_fallback: false,
@@ -3065,15 +3230,37 @@ mod tests {
             let message = resolve(required_locality, location, context, tools, computer)
                 .expect_err("incompatible offering must still prevent attach")
                 .to_string();
-            assert_eq!(
-                message
-                    .split_once(". OpenAI-compatible")
-                    .expect("guidance")
-                    .0,
-                format!(
-                    "slot `primary` default binding cannot satisfy hard model requirements: {expected}"
-                )
-            );
+            if expected.contains("Computer-use") {
+                assert_eq!(
+                    message
+                        .split_once(". OpenAI-compatible")
+                        .expect("guidance")
+                        .0,
+                    format!(
+                        "slot `primary` default binding cannot satisfy hard model requirements: {expected}"
+                    )
+                );
+                assert_eq!(model_settings_fix_target(&message), None);
+            } else {
+                // Fixable in Model Settings: names the exact config route.
+                assert_eq!(
+                    message
+                        .split_once(". Local OpenAI-compatible")
+                        .expect("guidance")
+                        .0,
+                    format!(
+                        "slot `primary` cannot use model `model-a` from provider `provider`: {expected}"
+                    )
+                );
+                assert!(message.ends_with(MODEL_SETTINGS_FIX_SENTENCE), "{message}");
+                assert_eq!(
+                    model_settings_fix_target(&message),
+                    Some(ModelSettingsFixTarget {
+                        provider: "provider".into(),
+                        model: "model-a".into(),
+                    })
+                );
+            }
         }
         for (required_locality, location) in [
             (ModelLocality::Any, None),
@@ -3098,6 +3285,7 @@ mod tests {
         let computer_slot = super::super::ModelSlot {
             purpose: "computer".into(),
             min_context_tokens: 8,
+            unknown_context_satisfies: false,
             required_capabilities: vec![ModelCapability::ComputerUse],
             locality: ModelLocality::Any,
             allow_default_fallback: false,

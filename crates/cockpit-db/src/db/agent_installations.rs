@@ -323,6 +323,10 @@ pub struct RedactedBindingEvidence {
 #[serde(deny_unknown_fields)]
 pub struct RedactedModelSlotRequirements {
     pub min_context_tokens: u64,
+    /// The prepared slot accepts an unknown context window (built-in slots
+    /// only); see `ModelSlot::unknown_context_satisfies`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unknown_context_satisfies: bool,
     pub required_capabilities: Vec<String>,
     pub locality: String,
     pub allowed_models: Vec<ProviderAlias>,
@@ -5866,6 +5870,7 @@ mod tests {
             },
             slot_requirements: RedactedModelSlotRequirements {
                 min_context_tokens: 1,
+                unknown_context_satisfies: false,
                 required_capabilities: vec!["text_generation".into()],
                 locality: "any".into(),
                 allowed_models: Vec::new(),
@@ -6044,6 +6049,7 @@ mod tests {
                 },
                 slot_requirements: RedactedModelSlotRequirements {
                     min_context_tokens: 1,
+                    unknown_context_satisfies: false,
                     required_capabilities: vec!["text_generation".into()],
                     locality: "any".into(),
                     allowed_models: Vec::new(),

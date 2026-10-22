@@ -1747,6 +1747,13 @@ pub struct ModelSlot {
     pub purpose: String,
     #[serde(rename = "minContextTokens")]
     pub min_context_tokens: u64,
+    /// Whether a model whose context window is unknown satisfies
+    /// `min_context_tokens`. Only Cockpit's own built-in definitions set this
+    /// (they must run on servers such as LM Studio that never report context
+    /// size). It is not authorable: authored slots always fail closed on an
+    /// unknown context window.
+    #[serde(skip)]
+    pub unknown_context_satisfies: bool,
     #[serde(rename = "requiredCapabilities")]
     pub required_capabilities: Vec<ModelCapability>,
     pub locality: ModelLocality,
@@ -3085,6 +3092,7 @@ mod tests {
                 ModelSlot {
                     purpose: "review source".to_string(),
                     min_context_tokens: 1,
+                    unknown_context_satisfies: false,
                     required_capabilities: vec![ModelCapability::TextGeneration],
                     locality: ModelLocality::Any,
                     allow_default_fallback: false,

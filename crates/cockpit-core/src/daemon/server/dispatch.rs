@@ -23578,6 +23578,179 @@ async fn finish_local_operation(
         .map_err(internal)
 }
 
+/// Finite, user-safe reasons a durable local-operation receipt may carry in
+/// place of the fixed generic rejection text.
+///
+/// Receipts outlive the request and must never persist anyhow-, path-,
+/// provider- or secret-derived text. A rejection is classified only when its
+/// message is exactly one of the static daemon validation messages below;
+/// the receipt then stores this variant's fixed public message, never the
+/// classified input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SafeRejectionReason {
+    LayerSplit,
+    InventoryChanged,
+    ConfigChanged,
+    EditExpired,
+    EntryTooLarge,
+    DuplicateIds,
+    HeaderNotRestorable,
+}
+
+impl SafeRejectionReason {
+    /// Exact static daemon messages (and the proto inventory-patch messages
+    /// they wrap) mapped to their typed reason.
+    const CLASSIFIED: &'static [(&'static str, Self)] = &[
+        (
+            "provider batch spans multiple authority layers; reload the defining layer",
+            Self::LayerSplit,
+        ),
+        (
+            "provider model inventory changed; reload before saving",
+            Self::InventoryChanged,
+        ),
+        (
+            "provider inventory changed; reload before saving",
+            Self::InventoryChanged,
+        ),
+        (
+            "provider model patch has no existing inventory",
+            Self::InventoryChanged,
+        ),
+        (
+            "provider model authoring changed the effective inventory; no configuration was written",
+            Self::InventoryChanged,
+        ),
+        (
+            "configuration generation changed; reload before saving",
+            Self::ConfigChanged,
+        ),
+        (
+            "provider configuration changed; reload before saving",
+            Self::ConfigChanged,
+        ),
+        (
+            "provider authority layer changed; reload before saving",
+            Self::ConfigChanged,
+        ),
+        (
+            "provider authority layer changed before durable staging; reload before saving",
+            Self::ConfigChanged,
+        ),
+        (
+            "provider edit capability is absent or expired",
+            Self::EditExpired,
+        ),
+        (
+            "provider edit capability does not match the submitted base revision",
+            Self::EditExpired,
+        ),
+        ("provider entry exceeds maximum length", Self::EntryTooLarge),
+        (
+            "provider model authoring cannot preserve the effective inventory within the authored entry limit; no configuration was written",
+            Self::EntryTooLarge,
+        ),
+        (
+            "provider batch intent exceeds durable byte limit; no provider configuration was written",
+            Self::EntryTooLarge,
+        ),
+        (
+            "provider mutation contains duplicate ids",
+            Self::DuplicateIds,
+        ),
+        (
+            "provider model inventory contains duplicate ids",
+            Self::DuplicateIds,
+        ),
+        (
+            "a redacted provider header could not be restored authoritatively",
+            Self::HeaderNotRestorable,
+        ),
+    ];
+
+    pub(super) fn classify(error: &ErrorPayload) -> Option<Self> {
+        if !matches!(error.code, ErrorCode::BadRequest | ErrorCode::Conflict) {
+            return None;
+        }
+        Self::CLASSIFIED
+            .iter()
+            .find(|(message, _)| *message == error.message)
+            .map(|(_, reason)| *reason)
+    }
+
+    pub(super) fn public_message(self) -> &'static str {
+        match self {
+            Self::LayerSplit => {
+                "this provider is defined in a different config layer than the one being edited; reopen /settings and edit it from the layer that defines it"
+            }
+            Self::InventoryChanged => {
+                "the provider's model list changed while this page was open; reopen the model's settings and save again"
+            }
+            Self::ConfigChanged => {
+                "provider configuration changed while this page was open; reopen /settings and save again"
+            }
+            Self::EditExpired => {
+                "this settings page expired before saving; reopen /settings and save again"
+            }
+            Self::EntryTooLarge => {
+                "the provider entry is too large to save; remove unused models or headers and try again"
+            }
+            Self::DuplicateIds => {
+                "the provider or model list contains duplicate ids; remove the duplicate and save again"
+            }
+            Self::HeaderNotRestorable => {
+                "a saved provider header could not be kept; re-enter the header value and save again"
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod safe_rejection_reason_tests {
+    use super::{ErrorCode, ErrorPayload, SafeRejectionReason};
+
+    /// Every classified message is a live static validation message (in this
+    /// dispatcher or the proto inventory patch it wraps), so a reworded
+    /// validation cannot silently fall back to the generic receipt text.
+    #[test]
+    fn classified_messages_are_live_static_validation_messages() {
+        let dispatch = include_str!("dispatch.rs");
+        let proto = include_str!("../../../../cockpit-proto/src/provider_management.rs");
+        let compact = |text: &str| text.split_whitespace().collect::<String>();
+        let (dispatch, proto) = (compact(dispatch), compact(proto));
+        for (message, _) in SafeRejectionReason::CLASSIFIED {
+            let needle = compact(&format!("\"{message}\""));
+            assert!(
+                dispatch.matches(&needle).count() >= 2 || proto.contains(&needle),
+                "classified message is not raised anywhere: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn classification_is_exact_bounded_and_public_text_is_fixed() {
+        let split = ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "provider batch spans multiple authority layers; reload the defining layer"
+                .into(),
+        };
+        let reason = SafeRejectionReason::classify(&split).expect("classified");
+        assert_eq!(reason, SafeRejectionReason::LayerSplit);
+        assert!(reason.public_message().contains("different config layer"));
+        // Any extra text (a path, a provider body) defeats classification.
+        let tainted = ErrorPayload {
+            message: format!("{} /Users/me/.config/cockpit", split.message),
+            ..split.clone()
+        };
+        assert_eq!(SafeRejectionReason::classify(&tainted), None);
+        let internal = ErrorPayload {
+            code: ErrorCode::Internal,
+            ..split
+        };
+        assert_eq!(SafeRejectionReason::classify(&internal), None);
+    }
+}
+
 async fn finish_local_operation_error(
     ctx: &DaemonContext,
     owner: String,
@@ -23638,6 +23811,10 @@ async fn finish_local_operation_error(
         code: error.code.clone(),
         message: if error.code == ErrorCode::Shutdown {
             "the daemon stopped before the local operation completed"
+        } else if let Some(reason) = SafeRejectionReason::classify(error) {
+            // A bounded, typed reason whose public text is a fixed constant;
+            // the classified daemon message itself is never persisted.
+            reason.public_message()
         } else {
             "the local operation was rejected; inspect daemon diagnostics for details"
         }

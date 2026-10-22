@@ -52,6 +52,12 @@ pub(crate) enum SessionSetupOutcome {
         /// The app uses this to apply the same cache-break handling as `/tools`.
         cache_break: bool,
     },
+    /// Open `/settings → Providers → provider → model → Model Settings` for
+    /// the exact route an attach failure named as fixable there.
+    OpenModelSettings {
+        provider: String,
+        model: String,
+    },
     /// Add an MCP server at an explicit scope.
     AddMcp {
         scope: SessionSetupMcpScope,
@@ -338,6 +344,14 @@ impl SessionSetupPane {
         self.notice.as_deref()
     }
 
+    /// The exact provider/model whose Model Settings resolve the current
+    /// attach error, when the daemon marked it fixable there.
+    pub(crate) fn model_settings_fix_target(
+        &self,
+    ) -> Option<cockpit_core::agents::ModelSettingsFixTarget> {
+        cockpit_core::agents::model_settings_fix_target(self.error_message()?)
+    }
+
     pub(crate) fn error_message(&self) -> Option<&str> {
         match &self.status {
             Status::Error(message) => Some(message.as_str()),
@@ -581,6 +595,14 @@ impl SessionSetupPane {
         if matches!(self.status, Status::Error(_)) {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => return SessionSetupOutcome::Close,
+                KeyCode::Enter | KeyCode::Char('m') => {
+                    if let Some(target) = self.model_settings_fix_target() {
+                        return SessionSetupOutcome::OpenModelSettings {
+                            provider: target.provider,
+                            model: target.model,
+                        };
+                    }
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.error_scroll = self.error_scroll.saturating_sub(1);
                 }
@@ -1105,6 +1127,9 @@ impl SessionSetupPane {
 
     fn error_lines(&self, width: u16) -> Vec<Line<'static>> {
         let message = self.error_message().unwrap_or_default();
+        let action = self
+            .model_settings_fix_target()
+            .map(|target| model_settings_action_label(&target.provider, &target.model));
         let lines = self
             .notice
             .iter()
@@ -1118,6 +1143,10 @@ impl SessionSetupPane {
                     self.color,
                 ))
             })
+            .chain(
+                action
+                    .map(|label| Line::from(styled(label, RowKind::CandidateSelected, self.color))),
+            )
             .collect();
         crate::tui::message_block::wrap_lines_to_width(lines, usize::from(width).max(1)).0
     }
@@ -1192,6 +1221,11 @@ impl Pane for SessionSetupPane {
 
 /// Fixed, human-readable scope label. Same `source_agent_id` in two scopes
 /// stays distinct because the scope word is always present.
+/// Button row offered under an attach error that Model Settings can fix.
+pub(crate) fn model_settings_action_label(provider: &str, model: &str) -> String {
+    format!("[ Open Model Settings ] {provider}/{model} · Enter or m")
+}
+
 fn scope_label(scope: AgentInstallationScopeWire) -> &'static str {
     match scope {
         AgentInstallationScopeWire::Global => "global",
@@ -2063,6 +2097,61 @@ mod tests {
                 assert_eq!(render_overlay_rows(&mut pane, width, 24), stopped);
             }
         }
+    }
+
+    /// An attach failure the named model's Model Settings can fix offers a
+    /// direct action to that exact page; other failures offer nothing.
+    #[test]
+    fn attach_error_fixable_in_model_settings_offers_open_model_settings_action() {
+        let fixable = format!(
+            "Could not start a session — attach: daemon error: internal: preparing fresh \
+             installed-root launch: slot `primary` cannot use model `lfm2.5-24b-a2b` from \
+             provider `lmstudio`: Context tokens: unknown; requires at least 1 \
+             (minContextTokens). Local OpenAI-compatible servers (LM Studio, Ollama) often do \
+             not report these values. {}",
+            cockpit_core::agents::MODEL_SETTINGS_FIX_SENTENCE
+        );
+        for inline in [false, true] {
+            for key in [KeyCode::Enter, KeyCode::Char('m')] {
+                let mut pane = if inline {
+                    SessionSetupPane::loading_inline(false)
+                } else {
+                    SessionSetupPane::loading(false)
+                };
+                pane.set_error(fixable.clone());
+                let text = pane
+                    .inline_lines(80)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    text.contains("[ Open Model Settings ] lmstudio/lfm2.5-24b-a2b"),
+                    "{text}"
+                );
+                assert!(matches!(
+                    pane.handle_key(press(key)),
+                    SessionSetupOutcome::OpenModelSettings { provider, model }
+                        if provider == "lmstudio" && model == "lfm2.5-24b-a2b"
+                ));
+            }
+        }
+        let mut unfixable = SessionSetupPane::loading(false);
+        unfixable.set_error(
+            "slot `primary` default binding cannot satisfy hard model requirements: \
+             Computer-use: required but no host-issued contract. Then send again.",
+        );
+        let text = unfixable
+            .inline_lines(80)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("Open Model Settings"), "{text}");
+        assert!(matches!(
+            unfixable.handle_key(press(KeyCode::Enter)),
+            SessionSetupOutcome::Stay
+        ));
     }
 
     #[test]

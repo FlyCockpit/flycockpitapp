@@ -132,6 +132,13 @@ impl App {
                 }
                 self.submit_session_setup_tool_surface(override_json, cache_break);
             }
+            SessionSetupOutcome::OpenModelSettings { provider, model } => {
+                if !as_overlay {
+                    self.session_setup_focused = false;
+                    self.session_setup_inline = Some(pane);
+                }
+                self.open_model_settings_for(&provider, &model);
+            }
             SessionSetupOutcome::AddMcp {
                 scope,
                 name,

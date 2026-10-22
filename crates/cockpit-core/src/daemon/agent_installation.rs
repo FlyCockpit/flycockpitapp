@@ -8749,6 +8749,7 @@ mod tests {
         ModelSlot {
             purpose: "fixture slot".into(),
             min_context_tokens: 8,
+            unknown_context_satisfies: false,
             required_capabilities: required,
             locality: ModelLocality::Any,
             allow_default_fallback: false,

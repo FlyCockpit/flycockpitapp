@@ -54,8 +54,9 @@ pub use invariants::validate_invariants;
 pub use profile::{
     AgentProfileDefinition, AgentProfileFallbackRoute, AgentProfileInstallationCatalog,
     AgentProfileInstallationSource, AgentProfileModelOffering, AgentProfilePrepareRequest,
-    AgentProfileResolutionInput, ProfileQuestionOverride, ProfileVerificationReduction,
-    ReloadedAgentProfile, ResolvedAgentProfile, ResolvedModelSlot, ResolvedModelSlotChoice,
+    AgentProfileResolutionInput, MODEL_SETTINGS_FIX_SENTENCE, ModelSettingsFixTarget,
+    ProfileQuestionOverride, ProfileVerificationReduction, ReloadedAgentProfile,
+    ResolvedAgentProfile, ResolvedModelSlot, ResolvedModelSlotChoice, model_settings_fix_target,
     ranked_compatible_offerings, resolve_agent_profile,
 };
 pub(crate) use profile::{

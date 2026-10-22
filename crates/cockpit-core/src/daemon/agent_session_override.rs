@@ -1256,6 +1256,7 @@ mod tests {
             binding: binding_evidence(provider_handle, provider_id, model_id),
             slot_requirements: crate::db::agent_installations::RedactedModelSlotRequirements {
                 min_context_tokens: 1,
+                unknown_context_satisfies: false,
                 required_capabilities: vec!["text_generation".to_string()],
                 locality: "any".to_string(),
                 allowed_models: vec![crate::db::agent_installations::ProviderAlias {

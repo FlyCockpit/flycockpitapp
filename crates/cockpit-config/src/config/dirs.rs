@@ -499,8 +499,18 @@ pub fn config_write_target_for_provider(
     // precedence actually reads. Prefer an existing definition, else fall
     // back to the nearest writable layer, else the always-writable global
     // home (independent of `is_dir()` discovery).
+    //
+    // A provider that no layer defines yet (a new provider, or the `default`
+    // anchor the daemon uses for its provider edit authority) goes to the
+    // nearest layer that already holds provider definitions. A bare project
+    // `.cockpit/` or machine-local directory that holds no provider files must
+    // not become the provider authority layer: the edit capability is anchored
+    // here while existing providers resolve to their defining layer, and a
+    // split would reject every edit of an existing provider as spanning
+    // multiple authority layers.
     let mut target = None;
     let mut defining = None;
+    let mut provider_home = None;
     for dir in config_dirs_most_specific_first(cwd) {
         let path = crate::config::providers::provider_file_path_for_dir(&dir.path, provider_id)
             .map_err(|_| ConfigWriteTargetError::InvalidProviderId(provider_id.to_string()))?;
@@ -508,10 +518,14 @@ pub fn config_write_target_for_provider(
             target = Some(path.clone());
         }
         if defining.is_none() && path.exists() {
-            defining = Some(path);
+            defining = Some(path.clone());
+        }
+        if provider_home.is_none() && layer_defines_any_provider(&dir.path) {
+            provider_home = Some(path);
         }
     }
     let path = defining
+        .or(provider_home)
         .or(target)
         .or_else(|| global_provider_write_target(provider_id))
         .ok_or_else(|| {
@@ -519,6 +533,24 @@ pub fn config_write_target_for_provider(
         })?;
     authorize_config_layer_write(&path)?;
     Ok(path)
+}
+
+/// Whether `config_dir/providers/` holds at least one provider definition file.
+fn layer_defines_any_provider(config_dir: &Path) -> bool {
+    let Some(providers_dir) =
+        crate::config::providers::provider_file_path_for_dir(config_dir, "probe")
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+    else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(providers_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_file())
+            && crate::config::providers::provider_id_from_file_name(&entry.path()).is_some()
+    })
 }
 
 /// Most-specific *discovered* runtime `config.json` write target.
@@ -1178,6 +1210,62 @@ mod tests {
             config_write_target_for_provider(&app, "default").ok(),
             Some(inner),
             "nearest layer now defines it, so the mutation must target it"
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// LM Studio context regression: a provider defined only in the global
+    /// layer and the provider-authority anchor (`default`) must resolve to the
+    /// same layer even when a bare, more-specific workspace layer directory
+    /// exists (the first attach leaves one holding only a lock leaf).
+    /// Otherwise every edit of the global provider is rejected as spanning
+    /// multiple authority layers. Fails against the pre-fix fallback to the
+    /// most-specific discovered layer.
+    #[test]
+    fn provider_authority_anchor_follows_existing_provider_layer_not_bare_workspace_dir() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".cockpit")).unwrap();
+        std::fs::write(
+            repo.join(".cockpit/.cockpit-effective-default-lock-0.lock"),
+            "",
+        )
+        .unwrap();
+        let global = global_config_dir().unwrap();
+        let global_provider =
+            crate::config::providers::provider_file_path_for_dir(&global, "lmstudio").unwrap();
+        std::fs::create_dir_all(global_provider.parent().unwrap()).unwrap();
+        std::fs::write(&global_provider, "{}").unwrap();
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(&repo).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+        );
+
+        let provider = config_write_target_for_provider(&repo, "lmstudio").unwrap();
+        let anchor = config_write_target_for_provider(&repo, "default").unwrap();
+        assert_eq!(provider, global_provider);
+        assert_eq!(
+            anchor.parent(),
+            provider.parent(),
+            "anchor and existing provider must share one authority layer"
+        );
+
+        // Once the workspace layer itself holds a provider, it is the nearest
+        // provider layer and becomes the anchor again.
+        let local_provider =
+            crate::config::providers::provider_file_path_for_dir(&repo.join(".cockpit"), "other")
+                .unwrap();
+        std::fs::create_dir_all(local_provider.parent().unwrap()).unwrap();
+        std::fs::write(&local_provider, "{}").unwrap();
+        assert_eq!(
+            config_write_target_for_provider(&repo, "default")
+                .unwrap()
+                .parent(),
+            local_provider.parent()
         );
         crate::config::trust::clear_runtime_policy_for_tests();
     }

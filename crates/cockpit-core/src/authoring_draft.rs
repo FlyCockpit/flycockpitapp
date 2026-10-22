@@ -665,6 +665,7 @@ fn build_frontmatter(
             ModelSlot {
                 purpose: "Primary model".into(),
                 min_context_tokens: 1_u64,
+                unknown_context_satisfies: false,
                 required_capabilities: vec![ModelCapability::TextGeneration],
                 locality: ModelLocality::Any,
                 allow_default_fallback: false,
@@ -928,6 +929,7 @@ fn build_child_markdown(
             ModelSlot {
                 purpose: "Primary model".into(),
                 min_context_tokens: 1_u64,
+                unknown_context_satisfies: false,
                 required_capabilities: vec![ModelCapability::TextGeneration],
                 locality: ModelLocality::Any,
                 allow_default_fallback: false,

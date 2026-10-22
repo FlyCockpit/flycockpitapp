@@ -5840,42 +5840,49 @@ pub(super) fn active_model_settings_page(
     let Some(active) = config.active_model.as_ref() else {
         return no_model("no model selected — pick one with `/model` first");
     };
-    let Some(entry) = config.providers.get(&active.provider) else {
-        return no_model(&format!(
-            "active provider `{}` not found in config",
-            active.provider
-        ));
+    model_settings_page_for(config, &active.provider, &active.model)
+}
+
+/// Model Settings for one exact provider route and model — the page an
+/// attach failure's "Open Model Settings" action targets. Falls back to the
+/// providers list with an inline status when the route is not configured.
+pub(super) fn model_settings_page_for(
+    config: &cockpit_config::providers::ProvidersConfig,
+    provider: &str,
+    model: &str,
+) -> ProvidersPage {
+    let no_model = |msg: &str| ProvidersPage::List {
+        cursor: initial_list_cursor(config),
+        status: Some(msg.to_string()),
+        delete_pending: false,
     };
-    if !entry.models.iter().any(|m| m.id == active.model) {
-        return no_model(&format!(
-            "active model `{}/{}` not found in config",
-            active.provider, active.model
-        ));
+    let Some(entry) = config.providers.get(provider) else {
+        return no_model(&format!("provider `{provider}` not found in config"));
+    };
+    if !entry.models.iter().any(|m| m.id == model) {
+        return no_model(&format!("model `{provider}/{model}` not found in config"));
     }
     let retention_status = config
-        .resolve_effective_model_capabilities(
-            &active.provider,
-            &active.model,
-            config.resolution_generation,
-        )
+        .resolve_effective_model_capabilities(provider, model, config.resolution_generation)
         .prompt_cache_retention;
+    let active_retention = config
+        .active_model
+        .as_ref()
+        .filter(|active| active.provider == provider && active.model == model)
+        .and_then(|active| active.prompt_cache_retention)
+        .unwrap_or_default();
     let settings = SettingsEditor::for_model_with_generation(
-        &active.provider,
+        provider,
         entry,
-        &active.model,
+        model,
         config.resolution_generation.max(1),
     )
-    .with_active_prompt_cache_retention(
-        active.prompt_cache_retention.unwrap_or_default(),
-        retention_status,
-    );
+    .with_active_prompt_cache_retention(active_retention, retention_status);
     let models = Box::new(ModelEditor::new(
-        entry
-            .effective_template(&active.provider)
-            .map(str::to_owned),
+        entry.effective_template(provider).map(str::to_owned),
         entry.models.clone(),
     ));
-    let parent = EditState::new(active.provider.clone(), entry.clone());
+    let parent = EditState::new(provider.to_string(), entry.clone());
     ProvidersPage::ModelSettings {
         editor: settings,
         models,

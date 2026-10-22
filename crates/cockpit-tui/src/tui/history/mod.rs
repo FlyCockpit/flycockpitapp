@@ -807,6 +807,20 @@ fn interrupted_marker_line() -> Line<'static> {
     ])
 }
 
+fn command_error_rendered(lines: Vec<Line<'static>>, continuations: Vec<bool>) -> Rendered {
+    Rendered {
+        lines,
+        chip_row: None,
+        continuations,
+        tool_call_rows: Vec::new(),
+        tool_result_scroll_regions: Vec::new(),
+        reasoning_scroll_region: None,
+        copy_body_start: None,
+        pin_region: None,
+        metric_region: None,
+    }
+}
+
 fn render_plain(line: &str) -> Rendered {
     let lines = if let Some((from, body)) = line
         .strip_prefix("steer from ")
@@ -924,20 +938,37 @@ pub fn render_entry(
             }
         }
         HistoryEntry::Plain { line } => render_plain(line),
-        HistoryEntry::CommandError { line } => Rendered {
-            lines: vec![Line::from(vec![
-                Span::styled(" ".repeat(AGENT_INDENT), Style::default().fg(ERROR_TEXT)),
-                Span::styled(line.clone(), Style::default().fg(ERROR_TEXT)),
-            ])],
-            chip_row: None,
-            continuations: vec![false],
-            tool_call_rows: Vec::new(),
-            tool_result_scroll_regions: Vec::new(),
-            reasoning_scroll_region: None,
-            copy_body_start: None,
-            pin_region: None,
-            metric_region: None,
-        },
+        HistoryEntry::CommandError { line } => {
+            // Word-wrap here with a hanging indent. Left as one long row, the
+            // generic visual-row prewrap cuts at the column boundary and
+            // splits words mid-token ("Conte xt", "Provi ders").
+            let style = Style::default().fg(ERROR_TEXT);
+            let body_width = usize::from(width).saturating_sub(AGENT_INDENT);
+            let lines = if body_width == 0 {
+                vec![Line::from(vec![
+                    Span::styled(" ".repeat(AGENT_INDENT), style),
+                    Span::styled(line.clone(), style),
+                ])]
+            } else {
+                let (wrapped, _) = wrap_lines_to_width(
+                    vec![Line::from(Span::styled(line.clone(), style))],
+                    body_width,
+                );
+                wrapped
+                    .into_iter()
+                    .map(|row| {
+                        let mut spans = vec![Span::styled(" ".repeat(AGENT_INDENT), style)];
+                        spans.extend(row.spans);
+                        Line::from(spans)
+                    })
+                    .collect()
+            };
+            let mut continuations = vec![true; lines.len()];
+            if let Some(first) = continuations.first_mut() {
+                *first = false;
+            }
+            command_error_rendered(lines, continuations)
+        }
         HistoryEntry::Maintenance { line } => Rendered {
             lines: vec![centered_note(line)],
             chip_row: None,

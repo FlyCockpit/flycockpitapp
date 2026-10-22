@@ -12621,6 +12621,7 @@ fn minimum_context_slot() -> cockpit_core::agents::ModelSlot {
     cockpit_core::agents::ModelSlot {
         purpose: "Primary".into(),
         min_context_tokens: 1,
+        unknown_context_satisfies: false,
         required_capabilities: vec![cockpit_core::agents::ModelCapability::TextGeneration],
         locality: cockpit_core::agents::ModelLocality::Any,
         allow_default_fallback: false,
@@ -13014,6 +13015,161 @@ fn capability_token_limits_save_at_u32_max() {
 #[test]
 fn capability_token_overflow_rejects_without_mutation_or_override_loss() {
     check_capability_token_boundary(true);
+}
+
+/// Regression (LM Studio context): onboarding writes the provider to the
+/// global layer, and the first attach leaves more-specific workspace layer
+/// directories behind. Saving that model's Context tokens must still reach the
+/// daemon's global provider file, and the next attach-time check must see it.
+/// `project_provider` additionally defines an unrelated provider in the
+/// workspace layer, which keeps the edit split across layers and must surface
+/// an actionable, bounded reason instead of the generic receipt text.
+fn global_provider_model_settings_save(project_provider: bool) -> (String, Option<u32>) {
+    use cockpit_core::agents::{AgentProfileModelOffering, ranked_compatible_offerings};
+
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        ConfigDoc::load(&global)
+            .unwrap()
+            .write(&lmstudio_settings_config())
+            .unwrap();
+
+        // The workspace as the first attach leaves it: a project `.cockpit/`
+        // holding only a config mutation lock leaf, no config or providers.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_layer = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&project_layer).unwrap();
+        std::fs::write(
+            project_layer.join(".cockpit-effective-default-lock-0000.lock"),
+            "",
+        )
+        .unwrap();
+        let trust_root = cockpit_config::config::trust::resolve_trust_root(tmp.path())
+            .expect("provider fixture trust root");
+        cockpit_config::config::trust::set_runtime_policy(
+            trust_root.clone(),
+            cockpit_config::WorkspaceTrustMode::Trust,
+        );
+        trust_provider_project(&trust_root.root);
+        if project_provider {
+            let path = project_layer.join("config.json");
+            std::fs::write(&path, "{}").unwrap();
+            let mut other = ProvidersConfig::default();
+            other.providers.insert(
+                "other".into(),
+                ProviderEntry {
+                    url: "http://127.0.0.1:1235/v1".into(),
+                    auth: Some(AuthKind::None),
+                    models: vec![model("other-model", false)],
+                    ..Default::default()
+                },
+            );
+            with_trusted_fixture_root(tmp.path(), || ConfigDoc::load(&path).unwrap().write(&other))
+                .unwrap();
+        }
+
+        let mut dialog = super::super::tests::open_fixture_dialog(&global);
+        dialog.active_project_root = Some(tmp.path().to_path_buf());
+        dialog.credential_store_path = Some(tmp.path().join("credentials.json"));
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        let offering = AgentProfileModelOffering {
+            offering_id: "offering-0-0".into(),
+            provider_profile_handle: "lmstudio".into(),
+            provider_id: "lmstudio".into(),
+            model_id: "lfm2.5-24b-a2b".into(),
+        };
+        let slot = minimum_context_slot();
+        assert!(
+            ranked_compatible_offerings(&slot, std::slice::from_ref(&offering), &dialog.config)
+                .is_empty(),
+            "unset context must fail closed for an authored slot"
+        );
+
+        open_lmstudio_model_settings(&mut dialog);
+        edit_model_setting(&mut dialog, ProviderSettingId::CapabilityContextTokens);
+        for ch in "131072".chars() {
+            dialog.handle_key(press(KeyCode::Char(ch)));
+        }
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Char('s')));
+        dialog.settle_test_effects();
+        assert!(
+            dialog.cx.last_provider_mutation_operation_id.is_some(),
+            "save must cross ApplyProviderMutation"
+        );
+        let screen = render_provider_rows(&dialog, 200, 40).join("\n");
+
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let effective = super::super::providers_config_from_view(&current.config);
+        let context = effective
+            .resolve_effective_model_capabilities(
+                "lmstudio",
+                "lfm2.5-24b-a2b",
+                current.authority.config_generation,
+            )
+            .context_tokens;
+        if context.is_some() {
+            // The attach-time capability check reads the saved override.
+            assert_eq!(
+                ranked_compatible_offerings(&slot, std::slice::from_ref(&offering), &effective),
+                vec![offering]
+            );
+            let global_provider = load_provider(&global, "lmstudio");
+            assert_eq!(
+                global_provider.models[0]
+                    .capability_overrides
+                    .context_tokens,
+                Some(131_072),
+                "override lands in the provider's defining (global) layer"
+            );
+            assert!(
+                !project_layer.join("providers").exists(),
+                "no shadow provider copy in the workspace layer"
+            );
+        }
+        (screen, context)
+    })
+}
+
+#[test]
+fn global_provider_model_settings_save_persists_despite_bare_workspace_layer() {
+    let (screen, context) = global_provider_model_settings_save(false);
+    assert_eq!(context, Some(131_072), "{screen}");
+    assert!(screen.contains("saved"), "{screen}");
+    assert!(!screen.contains("save failed"), "{screen}");
+}
+
+#[test]
+fn split_layer_provider_save_rejection_shows_bounded_actionable_reason() {
+    let (screen, context) = global_provider_model_settings_save(true);
+    assert_eq!(context, None, "a rejected save persists nothing: {screen}");
+    let compact = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        compact.contains("defined in a different config layer"),
+        "{compact}"
+    );
+    assert!(
+        !compact.contains("inspect daemon diagnostics"),
+        "generic receipt text must be replaced by the typed reason: {compact}"
+    );
+    assert!(!compact.contains("authoritatively"), "{compact}");
 }
 
 /// Shared fixture for App input/effect-drain coverage. Only initialization uses

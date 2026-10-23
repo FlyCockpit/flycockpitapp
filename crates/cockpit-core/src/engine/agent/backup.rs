@@ -1712,6 +1712,58 @@ mod backup_fallback_tests {
             serde_json::to_vec(&requests[1].body["messages"]).unwrap(),
             "the two dispatched turns carry distinct volatile history"
         );
+        for request in &requests {
+            let messages = request.body["messages"].as_array().unwrap();
+            let system_positions: Vec<usize> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| {
+                    matches!(message["role"].as_str(), Some("system" | "developer"))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(
+                system_positions,
+                vec![0],
+                "exactly one leading system message: {messages:#?}"
+            );
+        }
+        let notices: Vec<String> = requests[1].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| {
+                message["content"].as_str().map(str::to_string).or_else(|| {
+                    message["content"].as_array().map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| part["text"].as_str())
+                            .collect::<String>()
+                    })
+                })
+            })
+            .filter(|text| text.contains("Tool availability changed."))
+            .collect();
+        assert_eq!(notices.len(), 1, "{:#?}", requests[1].body["messages"]);
+        assert!(
+            notices[0].contains("<system-reminder>\nTool availability changed."),
+            "{}",
+            notices[0]
+        );
+        assert!(
+            notices[0].contains(
+                "Now unavailable (calls will fail until restored): `capability_flipping_tool`."
+            ),
+            "{}",
+            notices[0]
+        );
+        assert!(
+            !serde_json::to_string(&requests[0].body["messages"])
+                .unwrap()
+                .contains("Tool availability changed."),
+            "an unchanged first turn carries no availability notice"
+        );
     }
 
     /// Drain currently-buffered events into a vec (the turn is over by now).

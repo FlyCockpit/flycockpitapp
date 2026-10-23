@@ -126,6 +126,42 @@ impl Session {
         })
     }
 
+    /// Model-visible notice for a mid-session change in which tools are
+    /// callable. The provider `tools[]` array is a session-stable advertised
+    /// schema (cache boundary), so live availability changes — capability
+    /// probes, dormant media authority, toolbox rebuilds after an MCP/config
+    /// change — are announced positionally instead of by rewriting the cached
+    /// system prompt. The first observation for an agent is compared against
+    /// the advertised schema, so a tool that is advertised but not callable is
+    /// disclosed once at the start. `escalate` keeps its dedicated
+    /// [`Self::sandbox_escalation_turn_notice`].
+    pub(crate) fn tool_availability_turn_notice(
+        &self,
+        agent: &str,
+        advertised: &[String],
+        callable: &[&str],
+    ) -> Option<String> {
+        const EXCLUDED: &[&str] = &["escalate"];
+        let callable: BTreeSet<String> = callable
+            .iter()
+            .filter(|name| !EXCLUDED.contains(name))
+            .map(|name| (*name).to_string())
+            .collect();
+        let mut state = self
+            .tool_availability_notice_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = state.insert(agent.to_string(), callable.clone());
+        let previous = previous.unwrap_or_else(|| {
+            advertised
+                .iter()
+                .filter(|name| !EXCLUDED.contains(&name.as_str()))
+                .cloned()
+                .collect()
+        });
+        tool_availability_notice_text(&previous, &callable)
+    }
+
     pub(crate) fn safety_gate_degrade_notice_needed(
         &self,
         reason: &str,
@@ -541,6 +577,37 @@ impl Session {
     }
 }
 
+/// Render the availability diff `previous -> current`, or `None` when nothing
+/// changed.
+pub(crate) fn tool_availability_notice_text(
+    previous: &BTreeSet<String>,
+    current: &BTreeSet<String>,
+) -> Option<String> {
+    let render = |names: Vec<&String>| {
+        names
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let added: Vec<&String> = current.difference(previous).collect();
+    let removed: Vec<&String> = previous.difference(current).collect();
+    if added.is_empty() && removed.is_empty() {
+        return None;
+    }
+    let mut lines = vec!["Tool availability changed.".to_string()];
+    if !added.is_empty() {
+        lines.push(format!("Now available: {}.", render(added)));
+    }
+    if !removed.is_empty() {
+        lines.push(format!(
+            "Now unavailable (calls will fail until restored): {}.",
+            render(removed)
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -672,5 +739,59 @@ mod tests {
         assert!(row.model.is_none());
         assert!(row.model_selection_json.is_none());
         assert_eq!(row.active_model_revision, revision + 1);
+    }
+
+    #[test]
+    fn tool_availability_notice_tracks_callable_changes_per_agent() {
+        let session = Session::create_for_test(
+            crate::db::Db::open_in_memory().unwrap(),
+            PathBuf::from("/tool-availability-notice"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let advertised = vec![
+            "read".to_string(),
+            "read_image".to_string(),
+            "escalate".to_string(),
+        ];
+        // First observation: compared with the advertised schema, so a dormant
+        // advertised tool is disclosed once; `escalate` has its own notice.
+        let first = session
+            .tool_availability_turn_notice("Build", &advertised, &["read"])
+            .expect("dormant advertised tool is disclosed");
+        assert_eq!(
+            first,
+            "Tool availability changed.\nNow unavailable (calls will fail until restored): `read_image`."
+        );
+        assert!(
+            session
+                .tool_availability_turn_notice("Build", &advertised, &["read"])
+                .is_none(),
+            "an unchanged set emits nothing"
+        );
+        let second = session
+            .tool_availability_turn_notice("Build", &advertised, &["read_image", "grep"])
+            .expect("change is announced");
+        assert_eq!(
+            second,
+            "Tool availability changed.\nNow available: `grep`, `read_image`.\nNow unavailable (calls will fail until restored): `read`."
+        );
+        assert!(
+            session
+                .tool_availability_turn_notice(
+                    "Build",
+                    &advertised,
+                    &["read_image", "grep", "escalate"]
+                )
+                .is_none(),
+            "escalate is announced by its dedicated notice"
+        );
+        assert!(
+            session
+                .tool_availability_turn_notice("Plan", &["read".to_string()], &["read"])
+                .is_none(),
+            "state is per agent"
+        );
     }
 }

@@ -3979,6 +3979,21 @@ async fn inject_volatile_context(
             redact.as_ref(),
         );
     }
+    // Live tool-availability change: announce it positionally (it becomes a
+    // `<system-reminder>` user message on the wire) rather than rewriting the
+    // cached system prompt or the session-stable `tools[]` schema. Computed
+    // after every fallible await so a failed injection cannot consume the
+    // change without delivering it.
+    let advertised: Vec<String> = active_tools
+        .advertised_definitions(agent.tool_steering)
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    if let Some(notice) =
+        session.tool_availability_turn_notice(&agent.name, &advertised, &active_tool_names)
+    {
+        candidate.push(Message::System { content: notice });
+    }
     candidate.extend(trailing_tool_group);
     *history = candidate;
     Ok(())

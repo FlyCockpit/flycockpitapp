@@ -1,4 +1,5 @@
 mod custody_boundary;
+mod system_roles;
 
 use super::*;
 use crate::config::providers::{ModelEntry, ProviderEntry, TimeoutConfig, WireApi};

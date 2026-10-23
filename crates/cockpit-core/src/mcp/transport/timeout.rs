@@ -24,7 +24,7 @@ impl McpTimeouts {
 pub fn client(timeouts: McpTimeouts, endpoint: &str) -> Result<reqwest::Client> {
     let endpoint = validate_remote_endpoint(endpoint)?;
     let redirect_origin = endpoint.clone();
-    reqwest::Client::builder()
+    crate::tls_trust::reqwest_client_builder()
         .connect_timeout(timeouts.connect)
         .timeout(timeouts.request)
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {

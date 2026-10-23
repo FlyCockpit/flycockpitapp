@@ -330,13 +330,37 @@ impl VettedHttpsHop {
     }
 
     fn bound_client_builder(&self, limits: &HttpsFetchLimits) -> reqwest::ClientBuilder {
-        reqwest::Client::builder()
+        Self::bound_policy(crate::tls_trust::reqwest_client_builder(), limits)
+    }
+
+    fn bound_policy(
+        builder: reqwest::ClientBuilder,
+        limits: &HttpsFetchLimits,
+    ) -> reqwest::ClientBuilder {
+        builder
             // An environment/system proxy would bypass the vetted peer set
             // and could also receive URL or credential material.
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .referer(false)
             .timeout(limits.timeout)
+    }
+
+    /// [`Self::bound_client_builder`] with test trust anchors augmenting the
+    /// OS store (reqwest's own `add_root_certificate` is ignored under the
+    /// preconfigured `tls_trust` backend).
+    #[cfg(test)]
+    fn bound_client_builder_with_roots(
+        &self,
+        limits: &HttpsFetchLimits,
+        roots: &[u8],
+    ) -> reqwest::ClientBuilder {
+        Self::bound_policy(
+            crate::tls_trust::reqwest_client_builder_with_extra_roots(vec![
+                rustls::pki_types::CertificateDer::from(roots.to_vec()),
+            ]),
+            limits,
+        )
     }
 
     #[cfg(test)]
@@ -346,8 +370,7 @@ impl VettedHttpsHop {
         certificate_der: &[u8],
     ) -> Result<reqwest::Client> {
         let host = self.url.host_str().context("vetted HTTPS hop lost host")?;
-        self.bound_client_builder(limits)
-            .add_root_certificate(reqwest::Certificate::from_der(certificate_der)?)
+        self.bound_client_builder_with_roots(limits, certificate_der)
             .resolve_to_addrs(host, &self.socket_addrs)
             .build()
             .context("build connection-bound HTTPS media client")
@@ -892,8 +915,7 @@ mod tests {
                 peer: SocketAddr,
             ) -> Result<reqwest::Client> {
                 let host = hop.url.host_str().unwrap();
-                hop.bound_client_builder(limits)
-                    .add_root_certificate(reqwest::Certificate::from_der(&self.roots)?)
+                hop.bound_client_builder_with_roots(limits, &self.roots)
                     .resolve_to_addrs(host, &[peer])
                     .build()
                     .map_err(Into::into)

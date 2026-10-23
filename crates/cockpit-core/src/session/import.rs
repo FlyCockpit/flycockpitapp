@@ -250,7 +250,12 @@ fn read_archive_bytes_with_caps(
     let mut archive_paths = BTreeSet::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        let name = entry.name().to_string();
+        // zip 9 decodes the stored name fallibly; an undecodable name is a
+        // malformed archive, not something to repair.
+        let name = entry
+            .name()
+            .context("import archive contains an undecodable entry name")?
+            .into_owned();
         if name.starts_with('/') || name.split('/').any(|part| part == "..") {
             bail!("import archive contains unsafe path `{name}`");
         }

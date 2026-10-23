@@ -203,7 +203,7 @@ fn read_zip_entry(bytes: &[u8], name: &str) -> Option<String> {
 fn entry_names(bytes: &[u8]) -> Vec<String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes.to_vec())).unwrap();
     (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
         .collect()
 }
 

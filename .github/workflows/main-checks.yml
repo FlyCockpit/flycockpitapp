@@ -46,7 +46,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 24
+          node-version: 24.22.1
           cache: pnpm
 
       - name: Install dependencies
@@ -81,7 +81,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Restore workspace
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -113,7 +113,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Restore workspace
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -145,7 +145,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Restore workspace
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -196,7 +196,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Restore workspace
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -375,7 +375,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Restore workspace
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -412,7 +412,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Restore workspace
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
@@ -444,7 +444,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       # pnpm audit reads pnpm-lock.yaml directly — no install needed.
       #

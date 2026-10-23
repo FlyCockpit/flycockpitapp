@@ -1,4 +1,9 @@
-FROM node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d AS base
+# Base image: official node:24.22.1-trixie-slim (multi-arch index digest,
+# built 2026-10-21). Node >= 24.22.1 ships the bundled CA store fix for the
+# eMudhra intermediate compromise (CVE-2026-111943); the previous pin was
+# Node 24.19.0. Bump the digest only to an image carrying an equal or newer
+# Node 24 release.
+FROM node:24-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS base
 
 # Runtime base:
 #   - openssl: required by Prisma query engine
@@ -8,9 +13,14 @@ FROM node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b2
 # already in the pinned Node Trixie image (glibc, libcap2, systemd libs, etc.) — the base image
 # lags the Debian point release, so Trivy fails on fixable HIGH CVEs without it.
 RUN apt-get update -y && apt-get upgrade -y && apt-get install -y \
+  ca-certificates \
   openssl \
   postgresql-client \
   && rm -rf /var/lib/apt/lists/*
+# CVE-2026-111943 (eMudhra): ca-certificates 20250419+deb13u1 removes the
+# distrusted emSign ECC Root CA - G3. Fail the build if apt resolved anything
+# older (e.g. a stale mirror), instead of shipping the vulnerable bundle.
+RUN dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1
 
 # --- Build-time base ---
 # Adds git + pnpm. Not inherited by the final runtime image.

@@ -112,6 +112,7 @@ pub mod test_env;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod tls_crypto_provider;
+pub mod tls_trust;
 pub mod tokens;
 pub mod tool_media_authority;
 pub mod tools;

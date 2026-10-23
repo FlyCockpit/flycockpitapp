@@ -300,7 +300,7 @@ impl ReqwestHttpsTransport {
     /// daemon's environment would route the outbound connection to a host outside
     /// the snapshot's origin allowlist.
     pub fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::tls_trust::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .build()

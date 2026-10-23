@@ -191,7 +191,7 @@ impl VettedHttpClient {
             return Err(ProviderTransportError::Tls);
         }
 
-        let client = reqwest::Client::builder()
+        let client = crate::tls_trust::reqwest_client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .referer(false)

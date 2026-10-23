@@ -520,7 +520,10 @@ fn extract_zip_executable(staged: &Path) -> Result<tempfile::NamedTempFile, Upda
         let mut member = archive.by_index(index).map_err(|error| {
             UpdaterError::InvalidArchive(format!("reading zip member: {error}"))
         })?;
-        if member.name() == "cockpit.exe" && member.is_file() {
+        let is_cockpit_exe = member.name().map_err(|error| {
+            UpdaterError::InvalidArchive(format!("decoding zip member name: {error}"))
+        })? == "cockpit.exe";
+        if is_cockpit_exe && member.is_file() {
             if executable.is_some() {
                 return Err(UpdaterError::InvalidArchive(
                     "zip archive contains more than one cockpit.exe member".into(),

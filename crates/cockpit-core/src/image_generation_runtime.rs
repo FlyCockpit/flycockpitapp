@@ -512,7 +512,7 @@ impl ReqwestPinnedConnector {
                 RuntimeErrorCode::ConnectTimeout,
                 "The provider connection did not complete in time.",
             ))?;
-        let client = reqwest::Client::builder()
+        let client = crate::tls_trust::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .connect_timeout(connect_timeout)

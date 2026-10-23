@@ -17,6 +17,7 @@
   "dependencies": {
     "@better-auth/expo": "catalog:",
     "@config-plugins/react-native-webrtc": "15.0.1",
+    "@expo/dom-webview": "catalog:",
     "@expo/metro-runtime": "catalog:",
     "@expo/vector-icons": "catalog:",
     "@gorhom/bottom-sheet": "catalog:",

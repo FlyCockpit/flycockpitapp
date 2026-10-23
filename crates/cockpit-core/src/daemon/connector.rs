@@ -7,10 +7,10 @@ use futures::{SinkExt, StreamExt, future::join_all};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 
 use crate::auth::flycockpit::{
     FlycockpitClient, RelayCandidate, RelayChoice, StoredFlycockpitCredential,
@@ -503,7 +503,9 @@ async fn select_relay_from_candidates_with_timeout(
         tokio::time::sleep(jitter.duration_up_to(COLD_PROBE_JITTER_MAX)).await;
     }
 
-    let http = reqwest::Client::new();
+    let http = crate::tls_trust::reqwest_client_builder()
+        .build()
+        .context("building relay probe HTTP client")?;
     let probes = join_all(
         candidates
             .iter()
@@ -617,7 +619,10 @@ async fn connect_relay_socket(
         .parse()
         .context("building relay authorization header")?;
     request.headers_mut().insert(AUTHORIZATION, header_value);
-    let (ws, _) = connect_async(request)
+    // OS trust store + explicit key distrust (`crate::tls_trust`), not the
+    // bundled webpki-roots tokio-tungstenite would otherwise use.
+    let tls = crate::tls_trust::default_client_config().context("building relay TLS config")?;
+    let (ws, _) = connect_async_tls_with_config(request, None, false, Some(Connector::Rustls(tls)))
         .await
         .with_context(|| format!("connecting relay WebSocket {ws_url}"))?;
     Ok(ws)

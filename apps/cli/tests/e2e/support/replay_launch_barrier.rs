@@ -74,7 +74,9 @@ impl ReplayLaunchBarrier {
                     .expect("keep sandbox launch-barrier reader live"),
             );
             self.reader = Some(
-                tokio::io::unix::AsyncFd::new(reader)
+                // SAFETY: `reader` is an owned `File` moved into the
+                // `AsyncFd`; its descriptor stays open and stable until drop.
+                unsafe { tokio::io::unix::AsyncFd::register(reader) }
                     .expect("register sandbox launch-barrier reader"),
             );
             let reader = self.reader.as_ref().expect("launch reader");

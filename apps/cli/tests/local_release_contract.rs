@@ -368,7 +368,10 @@ fn local_release_outbound_network_inventory_is_fail_closed() {
     let daemon = source("crates/cockpit-core/src/daemon/mod.rs");
     assert!(daemon.contains("#[cfg(feature = \"remote\")]\npub mod connector;"));
     let connector = source("crates/cockpit-core/src/daemon/connector.rs");
-    assert!(connector.contains("connect_async(request)"));
+    assert!(connector.contains(
+        "connect_async_tls_with_config(request, None, false, Some(Connector::Rustls(tls)))"
+    ));
+    assert!(connector.contains("crate::tls_trust::default_client_config()"));
 }
 
 #[test]

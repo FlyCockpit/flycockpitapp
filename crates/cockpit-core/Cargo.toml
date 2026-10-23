@@ -73,7 +73,6 @@ remote = [
     "dep:str0m-rust-crypto",
     "dep:turn-client-proto",
     "dep:turn-client-rustls",
-    "dep:rustls-native-certs",
 ]
 # Compiles the real Linux/WSL PKCS#11 daemon custody adapter (cryptoki). OFF by
 # default so the serialized local gate stays green and lock-stable without a
@@ -123,7 +122,9 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 image = { workspace = true }
-reqwest = { workspace = true, features = ["form", "json", "rustls", "stream"] }
+# `http2` is explicit because `tls_trust` hands reqwest a preconfigured rustls
+# config that offers the `h2` ALPN.
+reqwest = { workspace = true, features = ["form", "http2", "json", "rustls", "stream"] }
 url.workspace = true
 # Workspace: `rig-core` aliased as `rig` — portable contracts + transport only.
 rig = { workspace = true }
@@ -262,15 +263,18 @@ str0m-rust-crypto = { version = "=0.5.0", default-features = false, optional = t
 # before any TLS client config is built.
 turn-client-proto = { version = "=0.7.1", default-features = false, features = ["std"], optional = true }
 turn-client-rustls = { version = "=0.1.0", default-features = false, features = ["std"], optional = true }
-# System roots for TLS-to-TURN-server verification (rustls-native-certs). Exact
-# pin (no caret) matching the audited lock version.
-rustls-native-certs = { version = "=0.8.4", default-features = false, optional = true }
+# OS trust store for every Cockpit-owned TLS client (`crate::tls_trust`): all
+# reqwest clients, the daemon websocket connector and TURN-over-TLS. Exact pin
+# matching the audited lock version; already in the graph via reqwest 0.13.
+# On macOS/Windows it delegates to the OS verifier (OS revocation applies); on
+# Linux it verifies with rustls-webpki against the system CA bundle.
+rustls-platform-verifier = { version = "=0.7.1", default-features = false }
 # Process-global rustls provider install (`aws_lc_rs`) shared by TURN TLS and
 # media HTTPS. Default features keep the `aws_lc_rs` provider available; `ring`
 # is never installed as the process default. Already resolved in Cargo.lock at
-# 0.23.45 (previously a dev-dependency), so promoting it to a normal dependency
+# 0.23.46 (previously a dev-dependency), so promoting it to a normal dependency
 # adds no new lock entry.
-rustls = "=0.23.45"
+rustls = "=0.23.46"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
@@ -281,7 +285,7 @@ zbus-secret-service-keyring-store = { version = "=1.0.0", default-features = fal
 # gated by the `daemon-custody-pkcs11` feature (SoftHSM CI enables it). NOTE:
 # cryptoki is NOT yet in Cargo.lock — the gate must refresh the lock (cargo
 # fetch / cargo build) before running with `--locked`.
-cryptoki = { version = "=0.12.0", default-features = false, optional = true }
+cryptoki = { version = "=0.12.1", default-features = false, optional = true }
 # Computer target identity (X11 RandR + optional AT-SPI). Exact audited pins.
 x11rb = { version = "=0.13.2", default-features = false, features = ["randr"] }
 atspi = { version = "=0.30.0", default-features = false, features = ["connection", "proxies", "tokio"] }

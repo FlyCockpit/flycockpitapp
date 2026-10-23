@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 /// Base builder for credentialed provider HTTP: no ambient proxy trust and no
 /// redirects. Credential headers must not leave the validated endpoint origin.
 pub(crate) fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    crate::tls_trust::reqwest_client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
 }
@@ -601,9 +601,15 @@ mod tests {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
+            if rel.starts_with("tls_trust/") {
+                continue;
+            }
             let source = strip_test_modules(&std::fs::read_to_string(&path).unwrap());
+            // A bare `tls_trust` builder carries the trust policy but not the
+            // provider proxy/redirect policy, so it is "naked" here too.
             let has_naked = source.contains("reqwest::Client::new()")
-                || source.contains("reqwest::Client::builder()");
+                || source.contains("reqwest::Client::builder()")
+                || source.contains("tls_trust::reqwest_client_builder()");
             if !has_naked {
                 continue;
             }
@@ -616,6 +622,53 @@ mod tests {
             violations.is_empty(),
             "credentialed provider HTTP must use provider_http::client_builder(); \
              add provider_http or document an allow-list exemption:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// CVE-2026-111943 (eMudhra): every reqwest client must start from
+    /// `crate::tls_trust` so it trusts the OS store behind the explicit key
+    /// distrust list. reqwest's own TLS knobs are silently ignored under the
+    /// preconfigured backend, so they are banned outside `tls_trust` as well.
+    #[test]
+    fn every_reqwest_client_uses_the_tls_trust_policy() {
+        const FORBIDDEN: &[&str] = &[
+            "reqwest::Client::new()",
+            "reqwest::Client::builder()",
+            "reqwest::ClientBuilder::new()",
+            "reqwest::Client::default()",
+            ".add_root_certificate(",
+            ".tls_backend_preconfigured(",
+            ".use_preconfigured_tls(",
+            ".tls_certs_only(",
+            ".tls_certs_merge(",
+            ".tls_danger_accept_invalid_certs(",
+            ".tls_danger_accept_invalid_hostnames(",
+            "connect_async(",
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&root, &mut files);
+        let mut violations = Vec::new();
+        for path in files {
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.starts_with("tls_trust/") || rel == "providers/provider_http.rs" {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            for needle in FORBIDDEN {
+                if source.contains(needle) {
+                    violations.push(format!("{rel}: {needle}"));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "TLS clients must be built through crate::tls_trust:\n{}",
             violations.join("\n")
         );
     }

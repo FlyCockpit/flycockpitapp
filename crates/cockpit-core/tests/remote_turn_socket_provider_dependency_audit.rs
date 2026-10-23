@@ -4,7 +4,8 @@
 //! literals recorded here; the test reads the real `Cargo.lock` and
 //! `cargo metadata --locked --offline` and fails on any drift. It proves exact
 //! pins + checksums for `turn-client-proto` / `turn-client-rustls` /
-//! `rustls-native-certs`, MIT-OR-Apache licensing, registry provenance, the
+//! `rustls-platform-verifier` (the TURN TLS trust store, via
+//! `cockpit_core::tls_trust`), MIT-OR-Apache licensing, registry provenance, the
 //! `default-features = false` + `["std"]`-only manifest (so the optional
 //! `openssl` feature stays off), and that no alternate TURN/WebRTC/TLS stack is
 //! pulled as a direct dependency.
@@ -29,20 +30,20 @@ const EXPECTED: &[(&str, &str, &str)] = &[
         "9759ad9615c5738e7e1a314204b5722ff9a545d23e09f0f2ff0c5c6f38c47da8",
     ),
     (
-        "rustls-native-certs",
-        "0.8.4",
-        "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d",
+        "rustls-platform-verifier",
+        "0.7.1",
+        "1167586491e2b18b8bfbb293e8180ec17c201c4f076d7cb3070ca964e7598f98",
     ),
     // Transitive support crates pinned through the client crates.
     (
         "turn-types",
-        "0.7.2",
-        "b219ecb1e95783c98ff2819d51e95ef54dad78ae438be7ffa490d6480a3df0de",
+        "0.7.3",
+        "1c2a60694c39c98c5ddf7a894dfbe464531376ac664d4b6e26494caa26c955bc",
     ),
     (
         "stun-proto",
-        "2.0.2",
-        "d93b223082474c3952d14cbea5b2d5356e913f6253e6b0e0659199149c483058",
+        "2.0.4",
+        "ea57539b68056cbbc51197de7284fbf57315957448bf80283ba8e1e5b55167ee",
     ),
 ];
 
@@ -112,9 +113,10 @@ fn remote_turn_socket_provider_dependency_audit() {
         "turn-client-rustls must be pinned =0.1.0 with default-features off + std only"
     );
     assert!(
-        manifest
-            .contains("rustls-native-certs = { version = \"=0.8.4\", default-features = false }"),
-        "rustls-native-certs must be an exact =0.8.4 pin (no caret)"
+        manifest.contains(
+            "rustls-platform-verifier = { version = \"=0.7.1\", default-features = false }"
+        ),
+        "rustls-platform-verifier must be an exact =0.7.1 pin (no caret)"
     );
     // No openssl / native-tls / alternate TURN or WebRTC stack as a direct dep.
     for forbidden in [

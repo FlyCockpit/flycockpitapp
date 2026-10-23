@@ -33,7 +33,7 @@ pub enum RepoResolution {
 /// repository field (caller must refuse to clone, not guess). Network
 /// or parse failures bubble up as `Err`.
 pub async fn resolve_repo_url(eco: Ecosystem, name: &str) -> Result<RepoResolution> {
-    let client = reqwest::Client::builder()
+    let client = crate::tls_trust::reqwest_client_builder()
         .timeout(LOOKUP_TIMEOUT)
         .user_agent(crate::user_agent::user_agent())
         .build()

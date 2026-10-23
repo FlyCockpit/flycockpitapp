@@ -523,7 +523,7 @@ async fn fetch_catalog_at_revision_with_client(
 }
 
 fn catalog_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::tls_trust::reqwest_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(CATALOG_FETCH_TIMEOUT)
         .user_agent("flycockpit-agent-catalog")

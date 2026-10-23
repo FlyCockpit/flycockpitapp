@@ -1067,7 +1067,7 @@ fn native_http_client(
     provider: WebProviderRuntime,
     with_api_key: bool,
 ) -> std::result::Result<reqwest::Client, WebToolError> {
-    reqwest::Client::builder()
+    crate::tls_trust::reqwest_client_builder()
         .timeout(NATIVE_TIMEOUT)
         .build()
         .map_err(|e| WebToolError::general(provider, with_api_key, e.to_string()))

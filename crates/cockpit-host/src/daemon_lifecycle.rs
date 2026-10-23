@@ -446,7 +446,10 @@ impl VerifiedDaemonProcess {
     /// not reaped the resulting zombie. Unlike numeric-PID probing, this
     /// completion signal cannot be confused by either a zombie or PID reuse.
     async fn wait_for_exit_linux(self) -> std::io::Result<()> {
-        let pidfd = tokio::io::unix::AsyncFd::new(self.pidfd)?;
+        // SAFETY: `pidfd` is an `OwnedFd` moved into the `AsyncFd`, so the
+        // descriptor stays open and `as_raw_fd()` returns the same value
+        // until the `AsyncFd` is dropped.
+        let pidfd = unsafe { tokio::io::unix::AsyncFd::register(self.pidfd)? };
         loop {
             let mut ready = pidfd.readable().await?;
             let mut poll_fd = libc::pollfd {
@@ -680,9 +683,16 @@ async fn wait_for_verified_process_exit(
     let pid = process.receipt.pid;
     // Tokio's macOS/FreeBSD reactor is itself a kqueue; nesting a kqueue in it
     // is only valid for read interest (EVFILT_WRITE on a kqueue is EINVAL), so
-    // the default read+write interest of `AsyncFd::new` must not be used.
-    let kqueue =
-        tokio::io::unix::AsyncFd::with_interest(process.kqueue, tokio::io::Interest::READABLE)?;
+    // the default read+write interest of `AsyncFd::register` must not be used.
+    // SAFETY: `process.kqueue` is an `OwnedFd` moved into the `AsyncFd`, so
+    // the descriptor stays open and `as_raw_fd()` returns the same value until
+    // the `AsyncFd` is dropped.
+    let kqueue = unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(
+            process.kqueue,
+            tokio::io::Interest::READABLE,
+        )?
+    };
     let ready = async {
         loop {
             let mut readiness = kqueue.readable().await?;

@@ -301,7 +301,7 @@ pub async fn dispatch(host: &HostContext, request: GovernedRequest) -> Result<Va
         );
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::tls_trust::reqwest_client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))

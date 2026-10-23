@@ -16,7 +16,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::Instant as TokioInstant;
@@ -210,34 +209,23 @@ async fn drive_tls(
     credentials: &TurnCredentials,
     deadline_at: TokioInstant,
 ) -> Result<EstablishedRelay, ConnectError> {
-    // aws_lc_rs must be installed before we build any rustls client config.
-    crate::tls_crypto_provider::install_process_default()
-        .map_err(|_| ConnectError::TlsValidationFailed)?;
-    let mut roots = RootCertStore::empty();
-    // System roots are best-effort per repo policy: individually malformed OS
-    // roots are skipped, but an empty resulting store fails closed below.
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        let _ = roots.add(cert);
-    }
-    // Enterprise roots AUGMENT (never replace) system roots, and only when the
-    // signed entry allowed it (the plan carries the DERs only in that case). A
-    // caller-supplied signed root that will not parse/add is a HARD failure —
-    // never silently skipped — so a malformed enterprise root can't be ignored.
-    if plan.allow_enterprise_roots {
-        for der in &plan.enterprise_root_ders {
-            roots
-                .add(CertificateDer::from(der.as_slice()))
-                .map_err(|_| ConnectError::TlsValidationFailed)?;
-        }
-    }
-    if roots.is_empty() {
-        return Err(ConnectError::TlsValidationFailed);
-    }
+    // OS trust store (platform verifier) behind Cockpit's explicit key
+    // distrust list; see `crate::tls_trust`. Enterprise roots AUGMENT (never
+    // replace) the OS store, and only when the signed entry allowed it (the
+    // plan carries the DERs only in that case). A caller-supplied signed root
+    // that will not parse is a HARD failure (`TlsTrustError::InvalidExtraRoot`)
+    // — never silently skipped. `client_config` also installs aws_lc_rs first.
+    let enterprise_roots = if plan.allow_enterprise_roots {
+        plan.enterprise_root_ders
+            .iter()
+            .map(|der| CertificateDer::from(der.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let tls_config = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
+        crate::tls_trust::client_config(enterprise_roots)
+            .map_err(|_| ConnectError::TlsValidationFailed)?,
     );
 
     // SNI: preserved hostname for DNS names; IP-SAN against the literal address

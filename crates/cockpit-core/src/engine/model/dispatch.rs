@@ -1570,7 +1570,7 @@ impl Model {
             .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
         // One leading system message on every provider/wire: positional
         // history `System` entries replay as `<system-reminder>` user turns.
-        normalize_system_roles_for_wire(&mut history, &mut prompt);
+        normalize_system_roles_for_wire(&system, &mut history, &mut prompt);
         let identity_records =
             if self.needs_responses_tool_identity_normalization(endpoint_recovery_enabled) {
                 match normalize_responses_tool_call_identity(&mut history, &mut prompt) {
@@ -1685,6 +1685,9 @@ impl Model {
             .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
         let mut prompt = scrub_message(redact, prompt)
             .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
+        // Same wire shape as `prepare_completion_request`, so the pending
+        // record matches the request that is actually dispatched.
+        normalize_system_roles_for_wire(&system, &mut history, &mut prompt);
         let identity_metadata = if self.needs_responses_tool_identity_normalization(false) {
             match normalize_responses_tool_call_identity(&mut history, &mut prompt) {
                 Ok(records) if !records.is_empty() => Some((
@@ -1807,7 +1810,7 @@ impl Model {
                 };
             }
         };
-        normalize_system_roles_for_wire(&mut stripped, &mut prompt_scrubbed);
+        normalize_system_roles_for_wire(system, &mut stripped, &mut prompt_scrubbed);
         let prompt = &prompt_scrubbed;
         let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
         let request = assembled_request(

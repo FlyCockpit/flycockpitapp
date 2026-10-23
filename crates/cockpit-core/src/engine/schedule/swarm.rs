@@ -890,6 +890,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         assistant_identity_prefix: ctx.agent.assistant_identity_prefix.clone(),
         model_system_prompt_snapshot: ctx.session.model_system_prompt_snapshot(),
         knowledge_base_system_prefix: ctx.session.knowledge_base_system_prompt(),
+        system_reminder_id: ctx.session.system_reminder_id().to_string(),
         // A background swarm child is noninteractive (no human attached).
         interactive: false,
         mcp_parent_reachable: Some(ctx.agent.mcp_resolver.catalog().admitted_entries()),

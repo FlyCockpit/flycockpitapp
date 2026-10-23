@@ -541,38 +541,85 @@ async fn run_approve_class_grants() {
 }
 
 /// Indices of `system`/`developer` messages in a chat-completions body.
-fn system_message_positions(body: &serde_json::Value) -> Vec<usize> {
+fn system_message_positions(roles: &[String]) -> Vec<usize> {
+    roles
+        .iter()
+        .enumerate()
+        .filter(|(_, role)| matches!(role.as_str(), "system" | "developer"))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Roles of a chat-completions body, in order.
+fn message_roles(body: &serde_json::Value) -> Vec<String> {
     body["messages"]
         .as_array()
         .map(|messages| {
             messages
                 .iter()
-                .enumerate()
-                .filter(|(_, message)| {
-                    matches!(message["role"].as_str(), Some("system" | "developer"))
-                })
-                .map(|(index, _)| index)
+                .map(|message| message["role"].as_str().unwrap_or("").to_string())
                 .collect()
         })
         .unwrap_or_default()
 }
 
-/// Strict local chat templates (LM Studio / llama.cpp serving Qwen-, Llama-
-/// or Mistral-family models) reject any request whose system message is not
-/// the single `messages[0]`. A first turn plus a tool-using second turn must
-/// keep that shape end to end. `COCKPIT_STRICT_TEMPLATE_URL` points the run at
-/// an external strict server (the lane's python fake that answers HTTP 500
-/// on a violation); otherwise the scripted provider captures the bodies and
-/// the same rule is asserted here.
+/// The strict-template rule: one system message, first; no adjacent
+/// `user,user` or `assistant,assistant`.
+fn assert_strict_template_roles(roles: &[String]) {
+    assert_eq!(system_message_positions(roles), vec![0], "{roles:?}");
+    assert!(
+        roles
+            .windows(2)
+            .all(|pair| !(pair[0] == pair[1] && matches!(pair[0].as_str(), "user" | "assistant"))),
+        "roles must alternate: {roles:?}"
+    );
+}
+
+/// Strict local chat templates (LM Studio / llama.cpp serving Qwen-, Llama-,
+/// Mistral- or Gemma-family models) reject any request whose system message
+/// is not the single `messages[0]`, or whose user/assistant turns do not
+/// alternate. A first turn plus a tool-using second turn must keep that shape
+/// end to end. `COCKPIT_STRICT_TEMPLATE_URL` points the run at an external
+/// strict server (the lane's python fake, which answers HTTP 500 on a
+/// violation and logs one JSON line per request to
+/// `COCKPIT_STRICT_TEMPLATE_LOG`); otherwise the scripted provider captures
+/// the bodies and the same rule is asserted here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strict_template_provider_accepts_first_and_tool_using_turns() {
     let external = std::env::var("COCKPIT_STRICT_TEMPLATE_URL").ok();
+    let external_log = external.as_ref().map(|_| {
+        std::env::var("COCKPIT_STRICT_TEMPLATE_LOG")
+            .expect("COCKPIT_STRICT_TEMPLATE_LOG names the strict server's request log")
+    });
+    // Only entries written by this run count.
+    let log_offset = external_log
+        .as_ref()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        })
+        .unwrap_or(0);
+    // Scripted turns are consumed in arrival order and background metadata
+    // requests share the provider, so several distinct tool calls are queued
+    // to guarantee the foreground turn receives one and replays its result.
     let provider = ScriptedProvider::builder()
         .turn(text_turn("hello back"))
         .turn(Turn::ToolCall {
-            id: "strict-read-call".into(),
+            id: "strict-read-call-1".into(),
             name: "read".into(),
             arguments: serde_json::json!({ "path": "README.md" }),
+        })
+        .turn(Turn::ToolCall {
+            id: "strict-read-call-2".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": "NOTES.md" }),
+        })
+        .turn(Turn::ToolCall {
+            id: "strict-read-call-3".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": "CHANGES.md" }),
         })
         .turn(text_turn("done after tool"))
         .repeat_last()
@@ -581,11 +628,10 @@ async fn strict_template_provider_accepts_first_and_tool_using_turns() {
     let base_url = external.clone().unwrap_or_else(|| provider.base_url());
     let home = IsolatedHome::new();
     home.write_local_provider_config(&base_url);
-    std::fs::write(
-        home.project_path().join("README.md"),
-        "# strict template demo\n",
-    )
-    .expect("write project readme");
+    for name in ["README.md", "NOTES.md", "CHANGES.md"] {
+        std::fs::write(home.project_path().join(name), "# strict template demo\n")
+            .expect("write project file");
+    }
     let daemon = SpawnedDaemon::start_with_home(home).await;
     let home = daemon.home();
     home.trust_project();
@@ -607,48 +653,41 @@ async fn strict_template_provider_accepts_first_and_tool_using_turns() {
     let second = spawn_run(second);
     assert!(second.status.success(), "{}", output_text(&second));
 
-    if external.is_some() {
-        // The external server logs one JSON line per POST with its verdict;
-        // require that the turns actually reached it and were all accepted.
-        let log_path = std::env::var("COCKPIT_STRICT_TEMPLATE_LOG")
-            .expect("COCKPIT_STRICT_TEMPLATE_LOG names the strict server's request log");
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        let entries: Vec<serde_json::Value> = log
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("strict server log line is JSON"))
-            .collect();
-        assert!(
-            entries.len() >= 3,
-            "strict server saw {} requests: {log}",
-            entries.len()
-        );
-        for entry in &entries {
-            assert!(entry["violation"].is_null(), "{entry:#}");
-        }
-        assert!(
+    let request_roles: Vec<Vec<String>> = match external_log {
+        Some(path) => {
+            let log = std::fs::read_to_string(&path).unwrap_or_default();
+            let entries: Vec<serde_json::Value> = log
+                .lines()
+                .skip(log_offset)
+                .map(|line| serde_json::from_str(line).expect("strict server log line is JSON"))
+                .collect();
+            for entry in &entries {
+                assert!(entry["violation"].is_null(), "{entry:#}");
+            }
             entries
                 .iter()
-                .any(|entry| entry["roles"].to_string().contains("\"tool\"")),
-            "the tool-using turn replays its tool result: {log}"
-        );
-    }
-    if external.is_none() {
-        let requests: Vec<_> = provider
+                .map(|entry| message_roles(&entry["body"]))
+                .collect()
+        }
+        None => provider
             .captured()
             .into_iter()
             .filter(|request| request.request_line.starts_with("POST "))
-            .collect();
-        // Scripted turns are consumed in arrival order, so which request
-        // carries the tool round-trip is not pinned here; the external
-        // strict-server mode asserts the replayed tool result.
-        assert!(requests.len() >= 3, "{requests:#?}");
-        for request in &requests {
-            assert_eq!(
-                system_message_positions(&request.body),
-                vec![0],
-                "{:#?}",
-                request.body["messages"]
-            );
-        }
+            .map(|request| message_roles(&request.body))
+            .collect(),
+    };
+    assert!(
+        request_roles.len() >= 3,
+        "this run sent {} provider requests: {request_roles:?}",
+        request_roles.len()
+    );
+    for roles in &request_roles {
+        assert_strict_template_roles(roles);
     }
+    assert!(
+        request_roles
+            .iter()
+            .any(|roles| roles.iter().any(|role| role == "tool")),
+        "the tool-using turn replays its tool result: {request_roles:?}"
+    );
 }

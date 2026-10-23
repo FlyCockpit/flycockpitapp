@@ -16916,6 +16916,7 @@ impl Driver {
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             knowledge_base_system_prefix: self.session.knowledge_base_system_prompt(),
+            system_reminder_id: self.session.system_reminder_id().to_string(),
             interactive,
             mcp_parent_reachable: None,
             mcp_root_catalog: self.stack[0].agent.mcp_resolver.root_catalog(),

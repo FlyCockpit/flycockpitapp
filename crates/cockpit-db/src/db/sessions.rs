@@ -433,6 +433,9 @@ pub struct SessionRow {
     /// `false` distinguishes interrupted first-worker startup from a
     /// successfully captured empty snapshot.
     pub knowledge_base_prompt_snapshot_captured: bool,
+    /// Per-session random tag for host-authored system reminders; see the
+    /// `system_reminder_id` column.
+    pub system_reminder_id: String,
     pub created_by_principal: Option<String>,
     pub shared_with_collaborators: bool,
     /// Session lifecycle barrier. `active` accepts work; `deleting` rejects new
@@ -547,6 +550,7 @@ impl SessionRow {
             knowledge_base_prompt_snapshot_captured: row
                 .get::<_, i64>("knowledge_base_prompt_snapshot_captured")?
                 != 0,
+            system_reminder_id: row.get("system_reminder_id")?,
             created_by_principal: row.get("created_by_principal")?,
             shared_with_collaborators: row.get::<_, i64>("shared_with_collaborators")? != 0,
             lifecycle: row
@@ -803,8 +807,9 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
           knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
           assistant_name, created_by_principal, shared_with_collaborators, is_dream_session,
-          is_assistant_thread, compaction_predecessor_session_id, compaction_lineage_root_id, ephemeral)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+          is_assistant_thread, compaction_predecessor_session_id, compaction_lineage_root_id, ephemeral,
+          system_reminder_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -836,6 +841,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
                 .unwrap_or(row.session_id)
                 .to_string(),
             row.ephemeral as i64,
+            row.system_reminder_id,
         ],
     )?;
     Ok(())
@@ -879,8 +885,8 @@ fn execute_fork_insert(
           model_system_prompt_snapshot_json, knowledge_base_prompt_snapshot_json,
           knowledge_base_prompt_snapshot_captured,
           assistant_name, active_model_revision, is_dream_session,
-          compaction_predecessor_session_id, compaction_lineage_root_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
+          compaction_predecessor_session_id, compaction_lineage_root_id, system_reminder_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -919,6 +925,7 @@ fn execute_fork_insert(
             row.compaction_lineage_root_id
                 .unwrap_or(row.session_id)
                 .to_string(),
+            row.system_reminder_id,
         ],
     )?;
     Ok(())
@@ -997,6 +1004,12 @@ pub(crate) fn insert_session_with_unique_short_id(
     Err(short_id_exhausted())
 }
 
+/// A fresh 64-bit random hex tag for `SessionRow::system_reminder_id`.
+pub fn new_system_reminder_id() -> String {
+    let bytes: [u8; 8] = rand::random();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn build_session_row(
     project_id: &str,
     project_root: &str,
@@ -1051,6 +1064,7 @@ fn build_session_row(
         model_system_prompt_snapshot_json: "{}".to_string(),
         knowledge_base_prompt_snapshot_json: "{}".to_string(),
         knowledge_base_prompt_snapshot_captured: false,
+        system_reminder_id: new_system_reminder_id(),
         created_by_principal: None,
         shared_with_collaborators: false,
         lifecycle: "active".to_string(),
@@ -2386,6 +2400,7 @@ impl Db {
             model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_json: parent.knowledge_base_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_captured: parent.knowledge_base_prompt_snapshot_captured,
+            system_reminder_id: parent.system_reminder_id,
             created_by_principal: parent.created_by_principal,
             shared_with_collaborators: false,
             lifecycle: "active".to_string(),
@@ -2606,6 +2621,7 @@ impl Db {
             model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_json: parent.knowledge_base_prompt_snapshot_json,
             knowledge_base_prompt_snapshot_captured: parent.knowledge_base_prompt_snapshot_captured,
+            system_reminder_id: parent.system_reminder_id,
             created_by_principal: parent.created_by_principal,
             shared_with_collaborators: false,
             lifecycle: "active".to_string(),
@@ -2798,6 +2814,7 @@ impl Db {
                 .clone(),
             knowledge_base_prompt_snapshot_captured: predecessor
                 .knowledge_base_prompt_snapshot_captured,
+            system_reminder_id: predecessor.system_reminder_id.clone(),
             created_by_principal: predecessor.created_by_principal.clone(),
             shared_with_collaborators: predecessor.shared_with_collaborators,
             lifecycle: "active".to_string(),

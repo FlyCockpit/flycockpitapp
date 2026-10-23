@@ -1495,6 +1495,7 @@ impl Session {
             allow_unjournaled_inference: std::sync::atomic::AtomicBool::new(false),
             unjournaled_inference_reason: Mutex::new(None),
             short_id: Mutex::new(short_id),
+            system_reminder_id: row.system_reminder_id.clone(),
             parent_session_id: row.parent_session_id,
             fork_point_turn_id: row.fork_point_turn_id,
             btw_parent_session_id: row.btw_parent_session_id,

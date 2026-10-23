@@ -1727,6 +1727,16 @@ mod backup_fallback_tests {
                 vec![0],
                 "exactly one leading system message: {messages:#?}"
             );
+            let roles: Vec<&str> = messages
+                .iter()
+                .map(|message| message["role"].as_str().unwrap_or(""))
+                .collect();
+            assert!(
+                roles
+                    .windows(2)
+                    .all(|pair| !(pair[0] == pair[1] && matches!(pair[0], "user" | "assistant"))),
+                "strict user/assistant alternation: {roles:?}"
+            );
         }
         let notices: Vec<String> = requests[1].body["messages"]
             .as_array()
@@ -1747,7 +1757,7 @@ mod backup_fallback_tests {
             .collect();
         assert_eq!(notices.len(), 1, "{:#?}", requests[1].body["messages"]);
         assert!(
-            notices[0].contains("<system-reminder>\nTool availability changed."),
+            notices[0].contains("Tool availability changed."),
             "{}",
             notices[0]
         );

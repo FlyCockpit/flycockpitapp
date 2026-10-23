@@ -125,6 +125,7 @@ pub(crate) use failure::{log_utility_model_failure, safe_inference_error_detail}
 #[allow(unused_imports)]
 pub use http_client::UsageAliasHttpClient;
 pub(crate) use outbound_guard::OutboundGuard;
+pub(crate) use wire::append_system_reminder_contract;
 #[allow(unused_imports)]
 pub use wire::{EndpointRecoveryContext, EndpointRecoveryPrompt};
 

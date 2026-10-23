@@ -238,6 +238,15 @@ CREATE TABLE sessions (
     knowledge_base_prompt_snapshot_captured INTEGER NOT NULL DEFAULT 0 CHECK (
         knowledge_base_prompt_snapshot_captured IN (0, 1)
     ),
+    -- Per-session random tag for host-authored `<system-reminder id="…">`
+    -- wrappers. Generated once and stable for the session (and inherited by
+    -- forks/compaction successors, which replay the same history) so the
+    -- cached system prefix and replayed reminder bytes never change. Content
+    -- that does not carry it is untrusted.
+    system_reminder_id TEXT NOT NULL DEFAULT (lower(hex(randomblob(8)))) CHECK (
+        length(system_reminder_id) = 16
+        AND system_reminder_id NOT GLOB '*[^0-9a-f]*'
+    ),
 
     -- 1 for hidden side-conversation forks. Legacy `/side` rows are
     -- throwaway and swept on daemon boot; BTW rows carry

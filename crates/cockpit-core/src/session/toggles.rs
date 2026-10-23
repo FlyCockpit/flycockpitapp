@@ -794,4 +794,42 @@ mod tests {
             "state is per agent"
         );
     }
+
+    #[tokio::test]
+    async fn system_reminder_id_is_random_persisted_and_stable() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/system-reminder-id"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session.persist_if_needed().unwrap();
+        let id = session.system_reminder_id().to_string();
+        assert_eq!(id.len(), 16);
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        let row = db
+            .get_session(session.id)
+            .await
+            .unwrap()
+            .expect("persisted row");
+        assert_eq!(
+            row.system_reminder_id, id,
+            "the id is persisted with the session"
+        );
+        let again = db.get_session(session.id).await.unwrap().unwrap();
+        assert_eq!(again.system_reminder_id, id, "stable across reads");
+        let other = Session::create_for_test(
+            db,
+            PathBuf::from("/system-reminder-id-other"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        assert_ne!(other.system_reminder_id(), id, "generated per session");
+    }
 }

@@ -2589,6 +2589,69 @@ mod history_rewrite_tests {
     }
 }
 
+/// Host-context history built with the production injectors (skills
+/// catalog, project-guidance user message, tool-availability notice) around
+/// one completed exchange, for wire-shape regressions in `engine::model`.
+#[cfg(test)]
+pub(crate) fn host_context_fixture_for_wire_tests() -> Vec<Message> {
+    use crate::db::workspace_trust::WorkspaceTrustMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let _trust = crate::config::trust::enter_workspace_trust_policy(
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: WorkspaceTrustMode::Trust,
+        },
+    );
+    let scan = tmp.path().join("scan");
+    let skill = scan.join("deploy");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: deploy\ndescription: Deploy safely\n---\nBody",
+    )
+    .unwrap();
+    let cfg = crate::config::extended::SkillsConfig {
+        scan_dirs: vec![scan.to_string_lossy().into_owned()],
+        external_dirs: Vec::new(),
+        auto_bang_commands: false,
+        ancestor_walk: false,
+        write_approval: false,
+        prune_builtins: false,
+        consolidate: false,
+    };
+    let mut history = Vec::new();
+    inject_available_skills_catalog_for_config_at_generation(
+        &mut history,
+        tmp.path(),
+        &cfg,
+        &["skill"],
+        1,
+    );
+    assert_eq!(history.len(), 1, "the real skills catalog was injected");
+    history.push(guidance_user_message(
+        "Prefer small commits.",
+        Some("Project guidance from `AGENTS.md`"),
+    ));
+    let advertised: std::collections::BTreeSet<String> =
+        ["read".to_string(), "read_image".to_string()].into();
+    let callable: std::collections::BTreeSet<String> = ["read".to_string()].into();
+    history.push(Message::System {
+        content: crate::session::tool_availability_notice_text(&advertised, &callable)
+            .expect("availability changed"),
+    });
+    history.push(Message::user("first prompt"));
+    history.push(Message::assistant("first answer"));
+    history.push(guidance_user_message(
+        "Updated: prefer tiny commits.",
+        Some("Project guidance from `AGENTS.md`"),
+    ));
+    history.push(Message::System {
+        content: crate::session::tool_availability_notice_text(&callable, &advertised)
+            .expect("availability changed"),
+    });
+    history
+}
+
 #[cfg(test)]
 mod project_guidance_injection_tests {
     use super::*;

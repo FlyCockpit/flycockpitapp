@@ -179,6 +179,7 @@ pub(crate) fn run_parent_acquisition_tool<'a>(
             assistant_identity_prefix: env.agent.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: env.ctx.session.model_system_prompt_snapshot(),
             knowledge_base_system_prefix: env.ctx.session.knowledge_base_system_prompt(),
+            system_reminder_id: env.ctx.session.system_reminder_id().to_string(),
             interactive: false,
             mcp_parent_reachable: Some(env.agent.mcp_resolver.catalog().admitted_entries()),
             mcp_root_catalog: env.agent.mcp_resolver.root_catalog(),

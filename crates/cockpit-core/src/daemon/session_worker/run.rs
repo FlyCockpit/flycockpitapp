@@ -6515,6 +6515,7 @@ pub(super) async fn run_worker(
         assistant_identity_prefix,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
+        system_reminder_id: session.system_reminder_id().to_string(),
         // The daemon root is always the user-facing interactive agent —
         // it gets the cross-session recall tools.
         interactive: true,

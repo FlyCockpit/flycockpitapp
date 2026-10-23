@@ -139,6 +139,11 @@ pub struct SpawnArgs {
     /// Frozen KB identity/freshness block for this session. It is appended to
     /// the cached system prompt and never replaced by live dream status.
     pub knowledge_base_system_prefix: String,
+    /// The session's stable `<system-reminder id="…">` tag. When non-empty,
+    /// the composed system prompt ends with the reminder contract line that
+    /// names it (see `engine::model::system_reminder_contract_line`); empty
+    /// for synthetic/test spawns, which then use untagged reminders.
+    pub system_reminder_id: String,
     /// Whether this agent is being spawned into a user-facing
     /// interactive session (the daemon root, or an interactive handoff
     /// such as `builder`) versus a one-shot leaf delegation
@@ -1517,6 +1522,9 @@ pub(crate) fn compose_system_prompt_for_model(
         out
     };
     append_untrusted_leak_report_steering(&mut out, model.is_trusted());
+    // Last, so no untrusted prompt material can follow (and shadow) it: the
+    // wire layer reads the tag from the final contract line.
+    crate::engine::model::append_system_reminder_contract(&mut out, &args.system_reminder_id);
     out
 }
 
@@ -2659,6 +2667,8 @@ fn compose_reposture_system(
         None => role_system,
     };
     append_untrusted_leak_report_steering(&mut out, model.is_trusted());
+    // Must match `compose_system_prompt_for_model` byte for byte.
+    crate::engine::model::append_system_reminder_contract(&mut out, session.system_reminder_id());
     out
 }
 
@@ -4871,6 +4881,7 @@ pub(crate) mod tests {
             assistant_identity_prefix: None,
             model_system_prompt_snapshot: Arc::new(ModelSystemPromptSnapshot::empty()),
             knowledge_base_system_prefix: String::new(),
+            system_reminder_id: String::new(),
             interactive: true,
             mcp_parent_reachable: None,
             mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd)

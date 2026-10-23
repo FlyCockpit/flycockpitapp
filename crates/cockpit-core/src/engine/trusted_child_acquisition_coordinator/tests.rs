@@ -72,6 +72,7 @@ fn acquisition_spawn_args(
         assistant_identity_prefix: None,
         model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
         knowledge_base_system_prefix: session.knowledge_base_system_prompt(),
+        system_reminder_id: session.system_reminder_id().to_string(),
         interactive: false,
         mcp_parent_reachable: None,
         mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::empty().root_catalog(),

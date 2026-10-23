@@ -4813,6 +4813,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
             crate::model_system_prompt::ModelSystemPromptSnapshot::empty(),
         ),
         knowledge_base_system_prefix: String::new(),
+        system_reminder_id: String::new(),
         interactive: true,
         mcp_parent_reachable: None,
         mcp_root_catalog: crate::mcp::resolver::EffectiveCatalogResolver::for_cwd(cwd).catalog(),

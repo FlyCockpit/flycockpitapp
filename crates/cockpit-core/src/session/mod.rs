@@ -76,6 +76,8 @@ pub use recording::{
 };
 mod title;
 mod toggles;
+#[cfg(test)]
+pub(crate) use toggles::tool_availability_notice_text;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEventLineage {
@@ -613,6 +615,9 @@ pub struct Session {
     /// (GOALS §17b). Populated at create-time. Insert collision retry can
     /// replace the in-memory value — read through [`Self::short_id`].
     short_id: Mutex<String>,
+    /// Per-session random tag for host-authored `<system-reminder id="…">`
+    /// wrappers, persisted on the session row (see `system_reminder_id`).
+    system_reminder_id: String,
     /// Parent session in the fork tree (GOALS §17e). `None` = root.
     // Fork-tree lineage (GOALS §17e); not yet read by any consumer.
     #[allow(dead_code)]
@@ -1276,6 +1281,13 @@ impl Session {
 
     /// Durable 6-char display id. Collision retry at persist can replace the
     /// value assigned at `create_deferred`.
+    /// The session's stable system-reminder tag. Only host-authored reminder
+    /// wrappers and the agent contract carry it; it is never placed inside
+    /// untrusted content.
+    pub fn system_reminder_id(&self) -> &str {
+        &self.system_reminder_id
+    }
+
     pub fn short_id(&self) -> String {
         self.short_id
             .lock()

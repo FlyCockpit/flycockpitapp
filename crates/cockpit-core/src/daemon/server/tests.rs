@@ -8649,6 +8649,7 @@ async fn mint_mcp_edit_authority(
         Request::GetProviderCatalogSnapshot {
             project_root: root.to_string(),
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: snapshot_session_id.to_string(),
         },
         state,
@@ -12025,6 +12026,7 @@ async fn provider_catalog_snapshot_survives_missing_provider_layer() {
         Request::GetProviderCatalogSnapshot {
             project_root: root,
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: "fresh-install-snapshot".into(),
         },
         &mut state,
@@ -12084,6 +12086,7 @@ async fn take_onboarding_catalog(
         Request::GetProviderCatalogSnapshot {
             project_root: workspace.to_string_lossy().into_owned(),
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: snapshot_session_id.to_string(),
         },
         state,
@@ -23104,11 +23107,13 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "get_provider_catalog_snapshot" => Request::GetProviderCatalogSnapshot {
             project_root: root.clone(),
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: "fixture-snapshot".into(),
         },
         "get_provider_catalog_page" => Request::GetProviderCatalogPage {
             project_root: root.clone(),
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: "fixture-snapshot".into(),
             offset: 0,
         },
@@ -31731,8 +31736,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::BeginMcpOAuth { client_operation_id: "begin-mcp".into(), project_root: "/tmp/project".into(), server: "example".into(), profile: String::new(), agent: None }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::CompleteMcpOAuth { client_operation_id: "complete-mcp".into(), flow_id: "flow".into(), input: None }, kind: "complete_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::CancelMcpOAuth { client_operation_id: "cancel-mcp".into(), begin_client_operation_id: "begin-mcp".into(), flow_id: Some("flow".into()) }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None, snapshot_session_id: "fixture-snapshot".into() }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
-        CommandMetadataCase { request: Request::GetProviderCatalogPage { project_root: "/tmp/project".into(), provider_id: None, snapshot_session_id: "fixture-snapshot".into(), offset: 0 }, kind: "get_provider_catalog_page", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None, config_layer: None, snapshot_session_id: "fixture-snapshot".into() }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::GetProviderCatalogPage { project_root: "/tmp/project".into(), provider_id: None, config_layer: None, snapshot_session_id: "fixture-snapshot".into(), offset: 0 }, kind: "get_provider_catalog_page", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ApplyProviderMutation { snapshot_session_id: "fixture-snapshot".into(), layer_id: "fixture-layer".into(), expected_revision: "fixture-revision".into(), client_operation_id: "fixture-operation".into(), mutation_intent_hash: "00".repeat(32), mutation: cockpit_proto::ProviderMutationBatch { upserts: vec![cockpit_proto::ProviderMutationUpsert { model_patch: None, provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }], deletes: Vec::new(), metadata: None } }, kind: "apply_provider_mutation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetLocalOperationSettlement { client_operation_id: "fixture-operation".into() }, kind: "get_local_operation_settlement", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::FetchProviderModels { project_root: "/tmp/project".into(), provider_id: None, model_id: None, deep: false, on_unlisted: None, allow_fallback: false }, kind: "fetch_provider_models", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
@@ -33102,6 +33107,7 @@ async fn provider_models_fetch_summary_fits_for_5000_model_catalog() {
         Request::GetProviderCatalogSnapshot {
             project_root: workspace.to_string_lossy().into_owned(),
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: "trimmed-catalog-snapshot".into(),
         },
         &mut state,
@@ -33224,6 +33230,7 @@ async fn openrouter_scale_catalog_persists_a_snapshot_that_fits() {
         Request::GetProviderCatalogSnapshot {
             project_root: workspace.to_string_lossy().into_owned(),
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: "large-catalog-snapshot".into(),
         },
         &mut state,
@@ -46594,6 +46601,7 @@ async fn catalog_writes_check_complete_read_contract() {
             Request::GetProviderCatalogSnapshot {
                 project_root: root.clone(),
                 provider_id: None,
+                config_layer: None,
                 snapshot_session_id: "\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES),
             },
             &mut state,
@@ -46839,6 +46847,7 @@ async fn catalog_snapshot_via_client(
         .request_ok(Request::GetProviderCatalogSnapshot {
             project_root: root,
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: snapshot_id.into(),
         })
         .await
@@ -46896,6 +46905,7 @@ async fn catalog_r4_layered_refresh_must_budget_the_reloaded_catalog() {
         Request::GetProviderCatalogSnapshot {
             project_root: root.clone(),
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: "layered-before".into(),
         },
         &mut state,
@@ -46943,6 +46953,7 @@ async fn catalog_r4_layered_refresh_must_budget_the_reloaded_catalog() {
         Request::GetProviderCatalogSnapshot {
             project_root: root.clone(),
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: "layered-after".into(),
         },
         &mut state,
@@ -47009,6 +47020,7 @@ async fn catalog_r4_global_refresh_must_preserve_other_root_readability() {
         Request::GetProviderCatalogSnapshot {
             project_root: root.clone(),
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: "other-root-before".into(),
         },
         &mut state,
@@ -47039,6 +47051,7 @@ async fn catalog_r4_global_refresh_must_preserve_other_root_readability() {
         Request::GetProviderCatalogSnapshot {
             project_root: global_root,
             provider_id: None,
+            config_layer: None,
             snapshot_session_id: "own-root-after".into(),
         },
         &mut state,

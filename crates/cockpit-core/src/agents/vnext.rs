@@ -1748,11 +1748,16 @@ pub struct ModelSlot {
     #[serde(rename = "minContextTokens")]
     pub min_context_tokens: u64,
     /// Whether a model whose context window is unknown satisfies
-    /// `min_context_tokens`. Only Cockpit's own built-in definitions set this
-    /// (they must run on servers such as LM Studio that never report context
-    /// size). It is not authorable: authored slots always fail closed on an
-    /// unknown context window.
-    #[serde(skip)]
+    /// `min_context_tokens`. Cockpit sets this on its built-in slots and on
+    /// the primary slot it generates for an onboarding agent, which must run
+    /// on servers such as LM Studio that never report context size. Absent
+    /// (the default for every user-written definition), an unknown context
+    /// window fails closed.
+    #[serde(
+        rename = "unknownContextSatisfies",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub unknown_context_satisfies: bool,
     #[serde(rename = "requiredCapabilities")]
     pub required_capabilities: Vec<ModelCapability>,

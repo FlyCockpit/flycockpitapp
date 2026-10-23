@@ -2443,6 +2443,7 @@ impl App {
                     .request(Request::GetProviderCatalogSnapshot {
                         project_root: project_root.clone(),
                         provider_id: None,
+                        config_layer: None,
                         snapshot_session_id: snapshot_session_id.clone(),
                     })
                     .await

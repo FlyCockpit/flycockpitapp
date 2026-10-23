@@ -465,7 +465,10 @@ pub fn draft_from_selection(
         .or_insert_with(|| crate::agents::ModelSlot {
             purpose: "Primary model".into(),
             min_context_tokens: 1,
-            unknown_context_satisfies: false,
+            // Cockpit generates this slot for the model the user just chose
+            // in onboarding; like a built-in slot, it must not reject a local
+            // server (LM Studio, Ollama) that does not report context size.
+            unknown_context_satisfies: true,
             required_capabilities: vec![crate::agents::ModelCapability::TextGeneration],
             locality: crate::agents::ModelLocality::Any,
             allow_default_fallback: false,

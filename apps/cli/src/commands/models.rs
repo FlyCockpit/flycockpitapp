@@ -21,6 +21,7 @@ async fn daemon_catalog(
         .request(Request::GetProviderCatalogSnapshot {
             project_root: cwd.display().to_string(),
             provider_id,
+            config_layer: None,
             snapshot_session_id: uuid::Uuid::new_v4().to_string(),
         })
         .await

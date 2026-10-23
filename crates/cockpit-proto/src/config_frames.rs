@@ -227,6 +227,7 @@ mod tests {
                         snapshot_session_id: "snapshot".into(),
                         layer_id: "layer".into(),
                         owner_root: "/project".into(),
+                        config_layer: None,
                         mutation_intent_hash: "digest".into(),
                         upserted_provider_ids: vec!["p".into()],
                         consumed_revision: "before".into(),

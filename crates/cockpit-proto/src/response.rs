@@ -703,6 +703,10 @@ pub enum Response {
         layer_id: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         owner_root: String,
+        /// The `/settings`-picked layer the consumed capability was bound to;
+        /// a required catalog read-back must request the same layer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_layer: Option<String>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         mutation_intent_hash: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

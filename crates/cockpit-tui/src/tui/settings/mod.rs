@@ -4255,6 +4255,8 @@ impl SettingsCx {
             Request::GetProviderCatalogSnapshot {
                 project_root: project_root.clone(),
                 provider_id: None,
+                // Bind the edit capability to the layer picked in `/settings`.
+                config_layer: Some(self.config_path.display().to_string()),
                 snapshot_session_id: snapshot_session_id.clone(),
             },
         );
@@ -4531,6 +4533,7 @@ impl SettingsCx {
                         snapshot_session_id: returned_session_id,
                         layer_id: returned_layer_id,
                         owner_root: returned_owner_root,
+                        config_layer: _,
                         mutation_intent_hash: returned_intent_hash,
                         upserted_provider_ids: _,
                         consumed_revision,
@@ -10591,6 +10594,7 @@ fn daemon_provider_view_snapshot_inner(
     match settings_daemon_request(Request::GetProviderCatalogSnapshot {
         project_root,
         provider_id,
+        config_layer: None,
         snapshot_session_id: uuid::Uuid::new_v4().to_string(),
     }) {
         Ok(Response::ProviderCatalogSnapshot { config, .. }) => Some(config),

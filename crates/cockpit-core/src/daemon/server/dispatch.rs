@@ -692,6 +692,8 @@ struct ProviderEditCapability {
     owner: String,
     project_root: String,
     target_path: std::path::PathBuf,
+    /// `config.json` the user picked in `/settings` (None: nearest layer).
+    layer_config: Option<std::path::PathBuf>,
     layer_id: String,
     revision: String,
     config_generation: u64,
@@ -18216,6 +18218,7 @@ async fn handle_serialized_request_inner(
         Request::GetProviderCatalogPage {
             project_root,
             provider_id,
+            config_layer,
             snapshot_session_id,
             offset,
         } => {
@@ -18223,6 +18226,7 @@ async fn handle_serialized_request_inner(
                 ctx,
                 &project_root,
                 provider_id.as_deref(),
+                config_layer.as_deref(),
                 &snapshot_session_id,
                 settings_capability_owner(state),
                 offset,
@@ -18232,12 +18236,14 @@ async fn handle_serialized_request_inner(
         Request::GetProviderCatalogSnapshot {
             project_root,
             provider_id,
+            config_layer,
             snapshot_session_id,
         } => {
             provider_catalog_snapshot(
                 ctx,
                 &project_root,
                 provider_id.as_deref(),
+                config_layer.as_deref(),
                 &snapshot_session_id,
                 settings_capability_owner(state),
             )
@@ -21468,6 +21474,7 @@ async fn handle_concurrent_request_impl(
         Request::GetProviderCatalogPage {
             project_root,
             provider_id,
+            config_layer,
             snapshot_session_id,
             offset,
         } => {
@@ -21475,6 +21482,7 @@ async fn handle_concurrent_request_impl(
                 &ctx,
                 &project_root,
                 provider_id.as_deref(),
+                config_layer.as_deref(),
                 &snapshot_session_id,
                 shared.capability_owner.clone(),
                 offset,
@@ -21484,12 +21492,14 @@ async fn handle_concurrent_request_impl(
         Request::GetProviderCatalogSnapshot {
             project_root,
             provider_id,
+            config_layer,
             snapshot_session_id,
         } => {
             provider_catalog_snapshot(
                 &ctx,
                 &project_root,
                 provider_id.as_deref(),
+                config_layer.as_deref(),
                 &snapshot_session_id,
                 shared.capability_owner.clone(),
             )
@@ -22072,6 +22082,7 @@ async fn provider_catalog_snapshot(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: Option<&str>,
+    config_layer: Option<&str>,
     snapshot_session_id: &str,
     capability_owner: String,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -22083,6 +22094,7 @@ async fn provider_catalog_snapshot(
         ctx,
         project_root,
         provider_id,
+        config_layer.map(std::path::Path::new),
         snapshot_session_id,
         capability_owner,
         cwd,
@@ -22135,6 +22147,7 @@ async fn provider_catalog_snapshot_page(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: Option<&str>,
+    config_layer: Option<&str>,
     snapshot_session_id: &str,
     capability_owner: String,
     offset: u64,
@@ -22149,6 +22162,7 @@ async fn provider_catalog_snapshot_page(
         ctx,
         project_root,
         provider_id,
+        config_layer.map(std::path::Path::new),
         snapshot_session_id,
         capability_owner,
         cwd,
@@ -22170,6 +22184,7 @@ async fn provider_catalog_candidate_snapshot(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: Option<&str>,
+    config_layer: Option<&std::path::Path>,
     snapshot_session_id: &str,
     capability_owner: String,
     cwd: std::path::PathBuf,
@@ -22198,13 +22213,24 @@ async fn provider_catalog_candidate_snapshot(
     // this read mints an edit capability instead of returning a silent
     // read-only snapshot. Stub config sources that intentionally have no
     // write target still omit the capability.
+    // The capability binds to the layer the user picked in `/settings`; with
+    // no pick, the nearest layer. A picked path that is not a selectable
+    // layer for this workspace is refused rather than silently rebound.
     let target_path =
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             ctx.config_source()
-                .config_write_target_for_provider(&cwd, "default")
-        })
+                .provider_layer_write_target(&cwd, config_layer)
+        });
+    let target_path = match (target_path, config_layer) {
+        (Ok(path), _) => Some(path),
+        (Err(_), Some(_)) => {
+            return Err(bad_request(
+                "the selected config layer is not editable for this workspace",
+            ));
+        }
         // No selectable (or allowed) layer mints no edit capability.
-        .ok();
+        (Err(_), None) => None,
+    };
     let layer_id = target_path
         .as_ref()
         .map(|target_path| {
@@ -22294,6 +22320,7 @@ async fn provider_catalog_candidate_snapshot(
                     owner: capability_owner,
                     project_root: canonical_root.clone(),
                     target_path,
+                    layer_config: config_layer.map(std::path::Path::to_path_buf),
                     layer_id: layer_id.clone(),
                     revision: revision.clone(),
                     config_generation,
@@ -22753,6 +22780,7 @@ async fn ensure_catalog_candidate_readable(
         ctx,
         project_root,
         None,
+        None,
         &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES),
         String::new(),
         cwd.to_path_buf(),
@@ -22915,6 +22943,7 @@ async fn apply_provider_mutation(
             ctx,
             &capability.project_root,
             &capability.target_path,
+            capability.layer_config.as_deref(),
             mutation,
             &capability_owner,
             &client_operation_id,
@@ -22938,6 +22967,7 @@ async fn apply_provider_mutation(
                     owner: capability.owner,
                     project_root: capability.project_root,
                     target_path: capability.target_path,
+                    layer_config: capability.layer_config,
                     layer_id: layer_id.clone(),
                     revision: commit.result_revision.clone(),
                     config_generation: commit.config_generation,
@@ -23052,6 +23082,7 @@ pub(super) fn register_mcp_edit_capability_for_test(
             owner: owner.to_string(),
             project_root: project_root.to_string(),
             target_path: std::path::PathBuf::new(),
+            layer_config: None,
             layer_id: String::new(),
             revision: String::new(),
             config_generation: 0,
@@ -24238,6 +24269,7 @@ async fn stage_and_recover_provider_batch(
     ctx: &DaemonContext,
     project_root: &str,
     capability_target: &std::path::Path,
+    capability_layer: Option<&std::path::Path>,
     mutation: cockpit_proto::ProviderMutationBatch,
     owner_digest: &str,
     client_operation_id: &str,
@@ -24252,9 +24284,11 @@ async fn stage_and_recover_provider_batch(
 ) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
+    // Re-resolve the capability's own layer (the `/settings` pick) under the
+    // current trust policy; a revoked or moved layer is a reload conflict.
     let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
         ctx.config_source()
-            .config_write_target_for_provider(&cwd, "default")
+            .provider_layer_write_target(&cwd, capability_layer)
     })
     .map_err(config_write_target_error)?;
     let target = prepare_user_level_write_target(ctx, &target)?;
@@ -24282,7 +24316,10 @@ async fn stage_and_recover_provider_batch(
             })
             .map_err(config_write_target_error)?;
         let provider_target = prepare_user_level_write_target(ctx, &provider_target)?;
-        if provider_target.parent() != target.parent() {
+        // A provider already defined in another (more specific) layer would
+        // be shadowed by, or shadow, this edit. A provider no layer defines
+        // yet is written into the selected layer.
+        if provider_target.exists() && provider_target.parent() != target.parent() {
             return Err(bad_request(
                 "provider batch spans multiple authority layers; reload the defining layer",
             ));
@@ -24510,6 +24547,7 @@ async fn stage_and_recover_provider_batch(
         snapshot_session_id: snapshot_session_id.to_owned(),
         layer_id: layer_id.to_owned(),
         owner_root: project_root.to_owned(),
+        config_layer: capability_layer.map(|path| path.display().to_string()),
         mutation_intent_hash: mutation_intent_hash.to_owned(),
         upserted_provider_ids,
         consumed_revision: consumed_revision.to_owned(),
@@ -25347,6 +25385,7 @@ pub(super) async fn provider_models_fetch(
             ctx,
             project_root,
             None,
+            None,
             &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES),
             String::new(),
             cwd.clone(),
@@ -25373,7 +25412,7 @@ pub(super) async fn provider_models_fetch(
         }
         ensure_catalog_entries_editable(&config)?;
         bounded_provider_response(provider_catalog_candidate_snapshot(
-            ctx, project_root, None, &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES), String::new(),
+            ctx, project_root, None, None, &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES), String::new(),
             cwd.clone(), trust_policy.clone(), config.clone(), warnings, u64::MAX, false,
         ).await?).map_err(|_| bad_request("protected models or auxiliary configuration exceed the readable snapshot limit; no catalog was written"))?;
         for result in &mut results {
@@ -26255,6 +26294,7 @@ mod provider_atomic_authority_tests {
             owner: "owner".into(),
             project_root: "/project".into(),
             target_path: "/project/.cockpit/config.json".into(),
+            layer_config: None,
             layer_id: "layer".into(),
             revision: "revision".into(),
             config_generation: 7,
@@ -27235,13 +27275,14 @@ async fn recover_provider_journal_file_bounded(
                     .as_deref()
                     .ok_or_else(|| bad_request("provider batch journal is missing target"))?,
             );
-            let expected_path =
+            // The journal records the capability's selected layer anchor.
+            // Replay only into a layer that is still selectable here.
+            let selectable =
                 crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
                     ctx.config_source()
-                        .config_write_target_for_provider(cwd, "default")
-                })
-                .map_err(config_write_target_error)?;
-            if path != canonical_mcp_target_path(&expected_path)? {
+                        .is_selectable_provider_anchor(cwd, &path)
+                });
+            if !selectable {
                 return Err(bad_request(
                     "provider batch journal target no longer matches its authority layer",
                 ));

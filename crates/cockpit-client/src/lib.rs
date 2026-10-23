@@ -1389,10 +1389,12 @@ impl DaemonClient {
             Request::GetProviderCatalogSnapshot {
                 project_root,
                 provider_id,
+                config_layer,
                 snapshot_session_id,
             } => Some((
                 project_root.clone(),
                 provider_id.clone(),
+                config_layer.clone(),
                 snapshot_session_id.clone(),
             )),
             _ => None,
@@ -1404,7 +1406,8 @@ impl DaemonClient {
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await?;
-        let Some((project_root, provider_id, snapshot_session_id)) = catalog_request else {
+        let Some((project_root, provider_id, config_layer, snapshot_session_id)) = catalog_request
+        else {
             return self
                 .resolve_provider_catalog_readback(response, deadline)
                 .await;
@@ -1463,6 +1466,7 @@ impl DaemonClient {
                             Request::GetProviderCatalogPage {
                                 project_root: project_root.clone(),
                                 provider_id: provider_id.clone(),
+                                config_layer: config_layer.clone(),
                                 snapshot_session_id: snapshot_session_id.clone(),
                                 offset: assembled.len().try_into()?,
                             },
@@ -1504,6 +1508,7 @@ impl DaemonClient {
         let Ok(Response::ProviderMutationCommitted {
             catalog_readback,
             owner_root,
+            config_layer: receipt_config_layer,
             snapshot_session_id: receipt_snapshot_session_id,
             layer_id,
             result_revision,
@@ -1528,6 +1533,8 @@ impl DaemonClient {
                 Request::GetProviderCatalogSnapshot {
                     project_root: owner_root.clone(),
                     provider_id: None,
+                    // Read back the exact layer the consumed capability bound.
+                    config_layer: receipt_config_layer.clone(),
                     snapshot_session_id: nonce.clone(),
                 },
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
@@ -4160,6 +4167,7 @@ mod catalog_page_tests {
                 .request_ok(Request::GetProviderCatalogSnapshot {
                     project_root: "/project".into(),
                     provider_id: None,
+                    config_layer: None,
                     snapshot_session_id: "paged-test".into(),
                 })
                 .await;
@@ -4241,6 +4249,7 @@ mod provider_mutation_readback_tests {
                                     snapshot_session_id: "original".into(),
                                     layer_id: "layer".into(),
                                     owner_root: "/project".into(),
+                                    config_layer: None,
                                     mutation_intent_hash: "1".repeat(64),
                                     upserted_provider_ids: vec!["p".into()],
                                     consumed_revision: "0".repeat(64),

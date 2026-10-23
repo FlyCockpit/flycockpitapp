@@ -1562,12 +1562,16 @@ fn daemon_visibility_guidance(referenced: &[String], error: &str) -> Option<Stri
 impl SettingsCx {
     /// All provider side effects use the project selected for this dialog;
     /// config editing must never silently retarget to the process cwd.
-    fn provider_fetch_root(&self) -> String {
-        self.provider_project_context()
-            .or_else(|| self.config_path.parent())
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .display()
-            .to_string()
+    fn provider_fetch_root(&self) -> super::auth::ProviderReadRoot {
+        super::auth::ProviderReadRoot {
+            project_root: self
+                .provider_project_context()
+                .or_else(|| self.config_path.parent())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .display()
+                .to_string(),
+            config_layer: Some(self.config_path.display().to_string()),
+        }
     }
 
     fn handle_provider_list_key(

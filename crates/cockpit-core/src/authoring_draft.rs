@@ -665,7 +665,10 @@ fn build_frontmatter(
             ModelSlot {
                 purpose: "Primary model".into(),
                 min_context_tokens: 1_u64,
-                unknown_context_satisfies: false,
+                // Onboarding generates this slot for the model the user just
+                // picked; like a built-in, it accepts a local server that does
+                // not report its context size.
+                unknown_context_satisfies: true,
                 required_capabilities: vec![ModelCapability::TextGeneration],
                 locality: ModelLocality::Any,
                 allow_default_fallback: false,
@@ -929,7 +932,10 @@ fn build_child_markdown(
             ModelSlot {
                 purpose: "Primary model".into(),
                 min_context_tokens: 1_u64,
-                unknown_context_satisfies: false,
+                // Onboarding generates this slot for the model the user just
+                // picked; like a built-in, it accepts a local server that does
+                // not report its context size.
+                unknown_context_satisfies: true,
                 required_capabilities: vec![ModelCapability::TextGeneration],
                 locality: ModelLocality::Any,
                 allow_default_fallback: false,
@@ -1097,6 +1103,42 @@ mod tests {
             default_route: Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 0 }),
             review_trust_disclosure: "shared trust".into(),
         }
+    }
+
+    /// LM Studio context decision: the onboarding-generated agent accepts a
+    /// model that does not report its context size, durably (the flag is in
+    /// the persisted markdown and survives a parse), while a user-written
+    /// slot without the flag stays strict.
+    #[test]
+    fn onboarding_generated_slots_accept_unknown_context_and_persist_the_policy() {
+        let projection = sample_projection();
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
+        draft.source_selection = SourceSelection::Authored;
+        draft.name = "Pilot".into();
+        draft.trust_confirmations[0] = true;
+        let mut child = default_child_draft(&projection);
+        child.name = "Helper".into();
+        child.trust_confirmations[0] = true;
+        draft.children.push(child);
+        let package = build_package_draft(&projection, &draft).unwrap();
+        for markdown in [&package.markdown, &package.children[0].markdown] {
+            assert!(
+                markdown.contains("unknownContextSatisfies: true"),
+                "{markdown}"
+            );
+            let (frontmatter, _) = markdown
+                .trim_start_matches("---\n")
+                .split_once("\n---\n")
+                .unwrap();
+            let parsed: crate::agents::AgentDefinitionFrontmatter =
+                serde_yaml::from_str(frontmatter).unwrap();
+            assert!(parsed.model_slots["primary"].unknown_context_satisfies);
+        }
+        let strict: crate::agents::ModelSlot = serde_yaml::from_str(
+            "purpose: Primary model\nminContextTokens: 1\nrequiredCapabilities: [text_generation]\nlocality: any\nallowDefaultFallback: false\n",
+        )
+        .unwrap();
+        assert!(!strict.unknown_context_satisfies);
     }
 
     #[test]

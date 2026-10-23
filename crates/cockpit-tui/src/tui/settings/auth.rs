@@ -154,27 +154,28 @@ impl FetchHandle {
         lifecycle: cockpit_client::LifecycleClient,
         provider_id: String,
         entry: ProviderEntry,
-        project_root: String,
+        project_root: impl Into<ProviderReadRoot>,
     ) -> Self {
-        Self::spawn_with_fallback(lifecycle, provider_id, entry, project_root, false)
+        Self::spawn_with_fallback(lifecycle, provider_id, entry, project_root.into(), false)
     }
 
     pub fn spawn_allowing_fallback(
         lifecycle: cockpit_client::LifecycleClient,
         provider_id: String,
         entry: ProviderEntry,
-        project_root: String,
+        project_root: impl Into<ProviderReadRoot>,
     ) -> Self {
-        Self::spawn_with_fallback(lifecycle, provider_id, entry, project_root, true)
+        Self::spawn_with_fallback(lifecycle, provider_id, entry, project_root.into(), true)
     }
 
     fn spawn_with_fallback(
         lifecycle: cockpit_client::LifecycleClient,
         provider_id: String,
         _entry: ProviderEntry,
-        project_root: String,
+        root: ProviderReadRoot,
         allow_fallback: bool,
     ) -> Self {
+        let project_root = root.project_root.clone();
         let state = Arc::new(Mutex::new(FetchState::Running));
         let state_w = Arc::clone(&state);
         let pid = provider_id.clone();
@@ -203,7 +204,7 @@ impl FetchHandle {
                         .and_then(|result| result.map_err(|error| error.to_string()));
                     // A lost reply can follow a commit. Always read back, even
                     // when the very first request returned a transport error.
-                    let snapshot = provider_snapshot(&client, &project_root).await;
+                    let snapshot = provider_snapshot_in(&client, &root).await;
                     let response = response.and_then(|response| {
                         let Response::ProviderModelsFetched { mut results, .. } = response else {
                             return Err(
@@ -253,11 +254,38 @@ pub(super) async fn provider_snapshot(
     client: &cockpit_client::DaemonClient,
     project_root: &str,
 ) -> Result<ProviderSnapshot, String> {
+    provider_snapshot_in(client, &ProviderReadRoot::from(project_root.to_string())).await
+}
+
+/// Workspace plus the `/settings`-picked layer a provider read binds its
+/// edit capability to. Background fetch/deep-fetch read-backs carry it so an
+/// adopted snapshot never rebinds the dialog to a different layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderReadRoot {
+    pub project_root: String,
+    pub config_layer: Option<String>,
+}
+
+impl From<String> for ProviderReadRoot {
+    fn from(project_root: String) -> Self {
+        Self {
+            project_root,
+            config_layer: None,
+        }
+    }
+}
+
+pub(super) async fn provider_snapshot_in(
+    client: &cockpit_client::DaemonClient,
+    root: &ProviderReadRoot,
+) -> Result<ProviderSnapshot, String> {
+    let project_root = root.project_root.as_str();
     let requested_id = uuid::Uuid::new_v4().to_string();
     let response = client
         .request(Request::GetProviderCatalogSnapshot {
             project_root: project_root.to_string(),
             provider_id: None,
+            config_layer: root.config_layer.clone(),
             snapshot_session_id: requested_id.clone(),
         })
         .await

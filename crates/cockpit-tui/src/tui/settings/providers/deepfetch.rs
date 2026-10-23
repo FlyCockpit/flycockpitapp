@@ -93,6 +93,7 @@ impl DeepFetchState {
         &mut self,
         lifecycle: cockpit_client::LifecycleClient,
         project_root: std::path::PathBuf,
+        config_layer: Option<String>,
     ) {
         debug_assert_eq!(self.phase, DeepFetchPhase::Confirm);
         self.phase = DeepFetchPhase::Running;
@@ -105,6 +106,7 @@ impl DeepFetchState {
             let result = run_deep_fetch(
                 lifecycle,
                 project_root.display().to_string(),
+                config_layer,
                 provider_id,
                 targets,
                 &progress,
@@ -165,6 +167,7 @@ impl DeepFetchState {
 async fn run_deep_fetch(
     lifecycle: cockpit_client::LifecycleClient,
     project_root: String,
+    config_layer: Option<String>,
     provider_id: String,
     targets: Vec<DeepfetchTarget>,
     progress: &Arc<Mutex<DeepFetchProgress>>,
@@ -188,6 +191,7 @@ async fn run_deep_fetch(
                 .map_err(|error| error.to_string())
         },
         &project_root,
+        config_layer.as_deref(),
         &provider_id,
         &targets,
         progress,
@@ -209,6 +213,7 @@ async fn run_deep_fetch(
 pub(super) async fn deep_fetch_with<F, Fut>(
     request: F,
     project_root: &str,
+    config_layer: Option<&str>,
     provider_id: &str,
     targets: &[DeepfetchTarget],
     progress: &Arc<Mutex<DeepFetchProgress>>,
@@ -240,6 +245,7 @@ where
         let refreshed = request(cockpit_proto::Request::GetProviderCatalogSnapshot {
             project_root: project_root.to_string(),
             provider_id: None,
+            config_layer: config_layer.map(str::to_string),
             snapshot_session_id: snapshot_id.clone(),
         })
         .await;
@@ -507,7 +513,11 @@ impl SettingsCx {
                             Some("deep fetch requires the active settings workspace".into());
                         return Nav::Stay;
                     };
-                    state.start(self.lifecycle.clone(), project_root);
+                    state.start(
+                        self.lifecycle.clone(),
+                        project_root,
+                        Some(self.config_path.display().to_string()),
+                    );
                 }
                 KeyCode::Enter => return deep_fetch_back(parent, "deep fetch cancelled".into()),
                 _ => {}
@@ -797,6 +807,7 @@ mod read_back_tests {
                 }
             },
             "/project",
+            None,
             "p",
             &targets,
             &progress,
@@ -861,6 +872,7 @@ mod read_back_tests {
                 }
             },
             "/project",
+            None,
             "p",
             &[target("a"), target("b")],
             &progress,
@@ -925,6 +937,7 @@ mod read_back_tests {
                     }
                 },
                 "/tmp/project",
+                None,
                 "p",
                 &[target("a"), target("b")],
                 &progress,

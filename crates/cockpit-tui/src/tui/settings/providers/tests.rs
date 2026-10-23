@@ -8591,7 +8591,7 @@ fn pending_daemon_deep_success_after_escape_adopts_current_snapshot() {
                 calls.lock().unwrap().push(request.wire_tag().to_string());
                 let client = &client;
                 async move {client.request_ok(request).await.map_err(|error| error.to_string())}
-            }, &root, "p", &targets, &progress, &cancel);
+            }, &root, None, "p", &targets, &progress, &cancel);
             tokio::pin!(work);
             tokio::select! {
                 _ = waiting => {},
@@ -8752,7 +8752,7 @@ fn pending_daemon_deep_lost_reply_after_escape_reads_committed_snapshot() {
                         client.request_ok(request).await.map_err(|error| error.to_string())
                     }
                 }
-            }, &root, "p", &targets, &progress, &cancel);
+            }, &root, None, "p", &targets, &progress, &cancel);
             tokio::pin!(work);
             tokio::select! {
                 _ = waiting => {},
@@ -13018,13 +13018,14 @@ fn capability_token_overflow_rejects_without_mutation_or_override_loss() {
 }
 
 /// Regression (LM Studio context): onboarding writes the provider to the
-/// global layer, and the first attach leaves more-specific workspace layer
-/// directories behind. Saving that model's Context tokens must still reach the
-/// daemon's global provider file, and the next attach-time check must see it.
-/// `project_provider` additionally defines an unrelated provider in the
-/// workspace layer, which keeps the edit split across layers and must surface
-/// an actionable, bounded reason instead of the generic receipt text.
-fn global_provider_model_settings_save(project_provider: bool) -> (String, Option<u32>) {
+/// global layer, and the first attach leaves a more-specific workspace layer
+/// directory behind. With `/settings` on the global layer, saving that model's
+/// Context tokens must reach the daemon's global provider file through a
+/// capability bound to the picked layer, and the next attach-time check must
+/// see it. `pick_project_layer` instead opens `/settings` on the workspace
+/// layer, where the global provider cannot be edited: the save must be
+/// rejected with an actionable, bounded reason instead of the generic text.
+fn global_provider_model_settings_save(pick_project_layer: bool) -> (String, Option<u32>) {
     use cockpit_core::agents::{AgentProfileModelOffering, ranked_compatible_offerings};
 
     let (_fixture, runtime) = provider_daemon_runtime();
@@ -13055,24 +13056,15 @@ fn global_provider_model_settings_save(project_provider: bool) -> (String, Optio
             cockpit_config::WorkspaceTrustMode::Trust,
         );
         trust_provider_project(&trust_root.root);
-        if project_provider {
+        let picked = if pick_project_layer {
             let path = project_layer.join("config.json");
             std::fs::write(&path, "{}").unwrap();
-            let mut other = ProvidersConfig::default();
-            other.providers.insert(
-                "other".into(),
-                ProviderEntry {
-                    url: "http://127.0.0.1:1235/v1".into(),
-                    auth: Some(AuthKind::None),
-                    models: vec![model("other-model", false)],
-                    ..Default::default()
-                },
-            );
-            with_trusted_fixture_root(tmp.path(), || ConfigDoc::load(&path).unwrap().write(&other))
-                .unwrap();
-        }
+            path
+        } else {
+            global.clone()
+        };
 
-        let mut dialog = super::super::tests::open_fixture_dialog(&global);
+        let mut dialog = super::super::tests::open_fixture_dialog(&picked);
         dialog.active_project_root = Some(tmp.path().to_path_buf());
         dialog.credential_store_path = Some(tmp.path().join("credentials.json"));
         let root = tmp.path().display().to_string();
@@ -13081,8 +13073,15 @@ fn global_provider_model_settings_save(project_provider: bool) -> (String, Optio
                 &crate::tui::settings::test_lifecycle_client(),
             ))
             .unwrap();
+        // The dialog's own layer-bound catalog read (what production issues).
         let initial = runtime
-            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .block_on(super::super::auth::provider_snapshot_in(
+                &client,
+                &super::super::auth::ProviderReadRoot {
+                    project_root: root.clone(),
+                    config_layer: Some(picked.display().to_string()),
+                },
+            ))
             .unwrap();
         dialog
             .adopt_refreshed_provider_snapshot(Ok(initial))
@@ -13108,11 +13107,14 @@ fn global_provider_model_settings_save(project_provider: bool) -> (String, Optio
         dialog.handle_key(press(KeyCode::Enter));
         dialog.handle_key(press(KeyCode::Char('s')));
         dialog.settle_test_effects();
+        let screen = render_provider_rows(&dialog, 200, 40).join("\n");
         assert!(
             dialog.cx.last_provider_mutation_operation_id.is_some(),
-            "save must cross ApplyProviderMutation"
+            "save must cross ApplyProviderMutation; authority={} reload_required={} warnings={:?}\n{screen}",
+            dialog.provider_edit_authority.is_some(),
+            dialog.provider_catalog_reload_required,
+            dialog.extended_warnings,
         );
-        let screen = render_provider_rows(&dialog, 200, 40).join("\n");
 
         let current = runtime
             .block_on(super::super::auth::provider_snapshot(&client, &root))

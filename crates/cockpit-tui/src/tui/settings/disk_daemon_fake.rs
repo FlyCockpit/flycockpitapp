@@ -123,6 +123,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
             Request::GetProviderCatalogSnapshot {
                 project_root,
                 provider_id,
+                config_layer: _,
                 snapshot_session_id,
             } => provider_catalog_snapshot(
                 Path::new(&project_root),
@@ -1318,6 +1319,7 @@ fn apply_provider_mutation(
         snapshot_session_id,
         layer_id,
         owner_root: capability.owner_root,
+        config_layer: None,
         mutation_intent_hash,
         upserted_provider_ids,
         consumed_revision: expected_revision,

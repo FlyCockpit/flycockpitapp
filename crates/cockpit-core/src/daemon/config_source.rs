@@ -37,6 +37,11 @@ type WriteTargetFn = dyn Fn(&Path, &str) -> std::result::Result<PathBuf, crate::
     + Send
     + Sync;
 type WatchPathsFn = dyn Fn(&Path) -> ConfigWatchPaths + Send + Sync;
+/// `(config.json, providers/default.json)` provider-edit layers selectable
+/// for a workspace.
+type ProviderLayersFn = dyn Fn(&Path) -> Vec<(PathBuf, PathBuf)> + Send + Sync;
+/// Injected (test/advisory) provider write-target resolver.
+type InjectedWriteTargetFn = dyn Fn(&Path, &str) -> Option<PathBuf> + Send + Sync;
 type PrepareGlobalLayersFn = dyn Fn(&Path, &WorkspaceTrustPolicy) -> Result<()> + Send + Sync;
 
 /// Files whose parent directories should be watched for live config refresh.
@@ -109,6 +114,7 @@ pub struct ConfigSource {
     daemon_load: Arc<DaemonLoadFn>,
     workspace_daemon_load: Arc<WorkspaceDaemonLoadFn>,
     write_target: Arc<WriteTargetFn>,
+    provider_layers: Arc<ProviderLayersFn>,
     watch_paths: Arc<WatchPathsFn>,
     /// Production-only credential preparation performed before a worker
     /// captures its retained source capabilities. Injected sources must stay
@@ -138,6 +144,21 @@ fn installed_store(
     }
 }
 
+/// Injected sources expose exactly their nearest provider layer.
+fn injected_provider_layers(write_target: Arc<InjectedWriteTargetFn>) -> Arc<ProviderLayersFn> {
+    Arc::new(move |cwd: &Path| {
+        write_target(cwd, "default")
+            .and_then(|anchor| {
+                let config = anchor
+                    .parent()?
+                    .parent()?
+                    .join(crate::config::dirs::CONFIG_FILE);
+                Some(vec![(config, anchor)])
+            })
+            .unwrap_or_default()
+    })
+}
+
 impl ConfigSource {
     /// Construct an advisory injected source. This is suitable only when the
     /// supplied typed config is already known valid. Raw-layer tests and any
@@ -147,6 +168,7 @@ impl ConfigSource {
         write_target: impl Fn(&Path, &str) -> Option<PathBuf> + Send + Sync + 'static,
         watch_paths: impl Fn(&Path) -> ConfigWatchPaths + Send + Sync + 'static,
     ) -> Self {
+        let write_target: Arc<InjectedWriteTargetFn> = Arc::new(write_target);
         let load = Arc::new(load) as Arc<LoadFn>;
         let daemon_source = load.clone();
         let workspace_daemon_source = load.clone();
@@ -184,6 +206,7 @@ impl ConfigSource {
                 })
             }),
             load,
+            provider_layers: injected_provider_layers(write_target.clone()),
             write_target: Arc::new(move |cwd: &Path, provider_id: &str| {
                 write_target(cwd, provider_id).ok_or_else(|| {
                     crate::config::dirs::ConfigWriteTargetError::Unresolved(
@@ -206,6 +229,7 @@ impl ConfigSource {
         write_target: impl Fn(&Path, &str) -> Option<PathBuf> + Send + Sync + 'static,
         watch_paths: impl Fn(&Path) -> ConfigWatchPaths + Send + Sync + 'static,
     ) -> Self {
+        let write_target: Arc<InjectedWriteTargetFn> = Arc::new(write_target);
         let daemon_load = Arc::new(daemon_load) as Arc<DaemonLoadFn>;
         let workspace_daemon_load_source = daemon_load.clone();
         Self {
@@ -226,6 +250,7 @@ impl ConfigSource {
             workspace_daemon_load: Arc::new(move |cwd, _workspace| {
                 workspace_daemon_load_source(cwd)
             }),
+            provider_layers: injected_provider_layers(write_target.clone()),
             write_target: Arc::new(move |cwd: &Path, provider_id: &str| {
                 write_target(cwd, provider_id).ok_or_else(|| {
                     crate::config::dirs::ConfigWriteTargetError::Unresolved(
@@ -337,6 +362,7 @@ impl ConfigSource {
             }),
             daemon_load,
             workspace_daemon_load,
+            provider_layers: Arc::new(crate::config::dirs::selectable_provider_layers),
             write_target: Arc::new(|cwd, provider_id| {
                 crate::config::dirs::config_write_target_for_provider(cwd, provider_id)
             }),
@@ -528,6 +554,36 @@ impl ConfigSource {
                 .map_err(anyhow::Error::new)?;
             Ok((load.providers, load.extended))
         })
+    }
+
+    /// Provider-edit authority anchor for the layer the user picked in
+    /// `/settings` (`config_path`), or the nearest layer when none was picked.
+    /// A picked path that is not a selectable layer for `cwd` is refused.
+    pub fn provider_layer_write_target(
+        &self,
+        cwd: &Path,
+        config_path: Option<&Path>,
+    ) -> std::result::Result<PathBuf, crate::config::dirs::ConfigWriteTargetError> {
+        let Some(config_path) = config_path else {
+            return self.config_write_target_for_provider(cwd, "default");
+        };
+        (self.provider_layers)(cwd)
+            .into_iter()
+            .find(|(config, _)| crate::config::dirs::same_config_path(config, config_path))
+            .map(|(_, anchor)| anchor)
+            .ok_or_else(|| {
+                crate::config::dirs::ConfigWriteTargetError::Unresolved(
+                    "the selected config layer is not editable for this workspace".into(),
+                )
+            })
+    }
+
+    /// Whether `anchor` is the provider-edit anchor of a layer selectable for
+    /// `cwd` (journal replay re-validates its recorded target with this).
+    pub fn is_selectable_provider_anchor(&self, cwd: &Path, anchor: &Path) -> bool {
+        (self.provider_layers)(cwd)
+            .iter()
+            .any(|(_, candidate)| crate::config::dirs::same_config_path(candidate, anchor))
     }
 
     /// Resolve the config-file write target for `provider_id`.

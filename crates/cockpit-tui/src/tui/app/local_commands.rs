@@ -1148,6 +1148,7 @@ impl App {
             cockpit_proto::Request::GetProviderCatalogSnapshot {
                 project_root: pending.project_root,
                 provider_id: None,
+                config_layer: None,
                 snapshot_session_id,
             },
         );
@@ -1199,6 +1200,7 @@ impl App {
             cockpit_proto::Request::GetProviderCatalogSnapshot {
                 project_root,
                 provider_id: None,
+                config_layer: None,
                 snapshot_session_id,
             },
         );
@@ -1474,6 +1476,7 @@ impl App {
                     cockpit_proto::Request::GetProviderCatalogSnapshot {
                         project_root: pending.project_root,
                         provider_id: None,
+                        config_layer: None,
                         snapshot_session_id,
                     },
                 );
@@ -1578,6 +1581,7 @@ impl App {
                     cockpit_proto::Request::GetProviderCatalogSnapshot {
                         project_root: pending.project_root,
                         provider_id: None,
+                        config_layer: None,
                         snapshot_session_id,
                     },
                 );

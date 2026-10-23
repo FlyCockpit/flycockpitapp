@@ -26,8 +26,9 @@ impl FetchAllState {
     pub(in crate::tui::settings) fn spawn(
         lifecycle: cockpit_client::LifecycleClient,
         providers: &cockpit_config::providers::ProvidersConfig,
-        project_root: String,
+        project_root: impl Into<super::super::auth::ProviderReadRoot>,
     ) -> Self {
+        let project_root = project_root.into();
         let mut ids: Vec<String> = providers.providers.keys().cloned().collect();
         ids.sort();
         let mut in_flight = Vec::new();

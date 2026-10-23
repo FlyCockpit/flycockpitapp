@@ -669,6 +669,7 @@ async fn apply_model_wizard_via_daemon(
                 .display()
                 .to_string(),
             provider_id: Some(provider_id.clone()),
+            config_layer: None,
             snapshot_session_id: snapshot_session_id.clone(),
         })
         .await?
@@ -1046,6 +1047,7 @@ impl ProviderSetupActions {
                 // full layer snapshot still issues the exact CAS capability
                 // needed for an add or replacement.
                 provider_id: None,
+                config_layer: None,
                 snapshot_session_id: snapshot_session_id.clone(),
             })
             .await?

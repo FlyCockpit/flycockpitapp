@@ -1626,3 +1626,189 @@ fn walk_skipping_comments(root: &std::path::Path, needles: &[String], hits: &mut
         }
     }
 }
+
+/// A keyring-placement KEK store that records the order of its native
+/// operations and, like the macOS Keychain, only consults the user (here:
+/// optionally denies) when an existing item is read.
+struct ConsentKekStore {
+    inner: MemoryKekStore,
+    ops: std::sync::Mutex<Vec<&'static str>>,
+    deny_existing_reads: bool,
+    authority_committed_at_read: std::sync::Mutex<Vec<bool>>,
+    db: Db,
+}
+
+impl ConsentKekStore {
+    fn new(db: &Db, deny_existing_reads: bool) -> Self {
+        Self {
+            inner: MemoryKekStore::new(SecretStorePlacement::Keyring),
+            ops: std::sync::Mutex::new(Vec::new()),
+            deny_existing_reads,
+            authority_committed_at_read: std::sync::Mutex::new(Vec::new()),
+            db: db.clone(),
+        }
+    }
+
+    fn ops(&self) -> Vec<&'static str> {
+        self.ops.lock().unwrap().clone()
+    }
+}
+
+impl KekStore for ConsentKekStore {
+    fn placement(&self) -> SecretStorePlacement {
+        SecretStorePlacement::Keyring
+    }
+
+    fn write_kek(&self, version: i64, bytes: &[u8]) -> Result<(), SecureKeyError> {
+        self.ops.lock().unwrap().push("write");
+        self.inner.write_kek(version, bytes)
+    }
+
+    fn read_kek(&self, version: i64) -> Result<super::key_material::TempSecret, SecureKeyError> {
+        let existing = self.inner.read_kek(version);
+        if existing.is_err() {
+            self.ops.lock().unwrap().push("lookup-missing");
+            return existing;
+        }
+        self.ops.lock().unwrap().push("read-existing");
+        let committed = self
+            .db
+            .blocking_write_for_sync_maintenance(load_authority_conn)
+            .unwrap()
+            .is_some();
+        self.authority_committed_at_read
+            .lock()
+            .unwrap()
+            .push(committed);
+        if self.deny_existing_reads {
+            return Err(SecureKeyError::Denied(
+                "user denied the Keychain prompt".into(),
+            ));
+        }
+        existing
+    }
+
+    fn delete_kek(&self, version: i64) -> Result<(), SecureKeyError> {
+        self.ops.lock().unwrap().push("delete");
+        self.inner.delete_kek(version)
+    }
+}
+
+/// Regression (keychain-onboarding): first-run keyring materialization must
+/// read the newly written KEK back through the native store *before* the
+/// vault authority commits. Creating a Keychain item never prompts on macOS;
+/// the first read does, so without this read-back the consent prompt
+/// appeared only at the next daemon start instead of during onboarding.
+#[test]
+fn first_run_keyring_reads_the_kek_back_before_committing() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let keyring = Arc::new(ConsentKekStore::new(&db, false));
+    let effective = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &tmp.path().join("secret-vault"),
+        SecretStoreInjected {
+            file_kek: None,
+            keyring_kek: Some(keyring.clone()),
+        },
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::Automatic,
+            passphrase: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        effective.snapshot.effective_placement,
+        SecretStorePlacement::Keyring
+    );
+    assert_eq!(
+        keyring.ops(),
+        vec!["lookup-missing", "write", "read-existing"],
+        "first run must write the keychain item and then read it back"
+    );
+    assert_eq!(
+        *keyring.authority_committed_at_read.lock().unwrap(),
+        vec![false],
+        "the read-back (and its OS prompt) must precede the vault commit"
+    );
+    assert!(
+        db.blocking_write_for_sync_maintenance(load_authority_conn)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Regression (keychain-onboarding): a denied Keychain prompt during the
+/// secure-store step fails the choice with the typed `KeyringAccessDenied`
+/// reason, commits no vault, and leaves no orphan keychain item, so the user
+/// can retry the keyring or choose a file vault in the same onboarding run.
+#[test]
+fn first_run_keyring_denial_commits_nothing_and_allows_another_choice() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let denied = Arc::new(ConsentKekStore::new(&db, true));
+    let error = match ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &tmp.path().join("secret-vault"),
+        SecretStoreInjected {
+            file_kek: None,
+            keyring_kek: Some(denied.clone()),
+        },
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::Keyring,
+            passphrase: None,
+        },
+    ) {
+        Ok(_) => panic!("a denied Keychain read-back must fail first-run"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.cause,
+        crate::secure_key::KekFailureCause::KeyringDenied
+    );
+    assert_eq!(
+        crate::onboarding::classify_secure_intent_error(&anyhow::Error::new(error.into_error())),
+        cockpit_proto::SensitiveOnboardingIntentError::PlacementUnavailable(
+            cockpit_proto::SecurePlacementFailureReason::KeyringAccessDenied,
+        )
+    );
+    assert_eq!(
+        denied.ops(),
+        vec!["lookup-missing", "write", "read-existing", "delete"]
+    );
+    assert_eq!(
+        denied.inner.len(),
+        0,
+        "denial must not leave a keychain item"
+    );
+    assert!(
+        db.blocking_write_for_sync_maintenance(load_authority_conn)
+            .unwrap()
+            .is_none(),
+        "denial must not commit a vault"
+    );
+
+    // The same run can now choose the machine-bound file vault.
+    let file_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
+    let effective = ensure_secret_vault_with_options(
+        &db,
+        &available_probe(),
+        &tmp.path().join("secret-vault"),
+        SecretStoreInjected {
+            file_kek: Some(file_kek.clone()),
+            keyring_kek: None,
+        },
+        SecretVaultOpenOptions {
+            first_run_intent: FirstRunSecretStoreIntent::FileMachineBound,
+            passphrase: None,
+        },
+    )
+    .unwrap_or_else(|error| panic!("file vault after denial: {}", error.reason));
+    assert_eq!(
+        effective.snapshot.effective_placement,
+        SecretStorePlacement::Database
+    );
+    assert_eq!(file_kek.len(), 1);
+}

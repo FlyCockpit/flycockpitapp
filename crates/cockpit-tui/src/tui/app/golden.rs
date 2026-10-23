@@ -864,7 +864,9 @@ pub fn onboarding_secure_store_shell() -> OnboardingShell {
         },
         last_receipt: None,
     };
-    OnboardingShell::new(&snapshot, false)
+    let mut shell = OnboardingShell::new(&snapshot, false);
+    shell.set_keychain_prompt_notice_for_golden(false);
+    shell
 }
 
 pub fn render_onboarding_secure_store(width: u16, height: u16) -> Buffer {
@@ -902,6 +904,20 @@ pub fn assert_onboarding_secure_store() {
         preview.contains("[ Continue ]") && preview.contains("Secure your secrets"),
         "secure-store dump must include chrome"
     );
+    // The macOS Keychain notice fits the smallest supported frame.
+    let mut shell = onboarding_secure_store_shell();
+    shell.set_keychain_prompt_notice_for_golden(true);
+    let engine = Dialog::None;
+    let mut links = crate::tui::links::LinkRegistry::default();
+    let notice = buffer_text(&render_frame(80, 24, |frame| {
+        shell.render(frame, frame.area(), &engine, &mut links);
+    }));
+    for needle in ["macOS may ask", "Always Allow", "Deny"] {
+        assert!(
+            notice.contains(needle),
+            "secure-store Keychain notice clipped ({needle}):\n{notice}"
+        );
+    }
 }
 
 fn onboarding_shell_at(stage: OnboardingStage) -> OnboardingShell {

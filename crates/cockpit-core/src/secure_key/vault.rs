@@ -272,6 +272,21 @@ impl SecretVault {
         let db_for_cleanup = db.clone();
         let ours = fingerprint_key(&kek);
         let built = (|| -> Result<Self, SecureKeyError> {
+            // Read the KEK back through its store before the vault commits,
+            // so the item is proven readable by this process and any OS
+            // consent for reading it (a Keychain access prompt for a binary
+            // the item's ACL does not trust, or a Secret Service unlock
+            // prompt) is asked during first-run, where a refusal can still
+            // be reported and another placement chosen — never first at the
+            // next daemon start. A refusal or mismatch leaves no vault and no
+            // orphan KEK.
+            let read_back = kek_store.read_kek(kek_version)?.into_key_bytes()?;
+            if fingerprint_key(&read_back) != ours {
+                return Err(SecureKeyError::Corrupt(
+                    "the KEK read back from its store does not match the KEK just written".into(),
+                ));
+            }
+            drop(read_back);
             let dek = generate_key_bytes();
             let wrap_nonce = random_nonce();
             let wrap_aad = wrap_aad(

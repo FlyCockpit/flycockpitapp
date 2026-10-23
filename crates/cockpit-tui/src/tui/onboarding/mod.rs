@@ -1324,6 +1324,15 @@ impl OnboardingShell {
         self.frame = frame;
     }
 
+    /// Pin the platform Keychain prompt notice so secure-store dumps are
+    /// identical on every host OS.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_keychain_prompt_notice_for_golden(&mut self, enabled: bool) {
+        if let OnboardingScreen::SecureStore(screen) = &mut self.screen {
+            screen.set_keychain_prompt_notice(enabled);
+        }
+    }
+
     /// Select a password-entry sub-step for deterministic secure-store dumps.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_secure_store_password_phase_for_golden(&mut self, confirmation: bool) {

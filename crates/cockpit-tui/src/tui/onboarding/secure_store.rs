@@ -20,6 +20,22 @@ use crate::tui::theme::{BAD, BRASS, DISABLED, FOG, INK, NIGHT, PLACEHOLDER};
 /// ingress instead of after unbounded allocation and comparison.
 const MAX_PASSPHRASE_BYTES: usize = cockpit_proto::MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES;
 
+/// Shown on the platform-keyring row on macOS: Cockpit stores and reads back
+/// its vault key in the login keychain during this step, so any Keychain
+/// access prompt appears now, and this says what each answer means. (A
+/// binary whose code identity matches the item's creator is not prompted;
+/// a rebuilt or replaced unsigned binary is.)
+pub(crate) const KEYCHAIN_PROMPT_NOTICE: [&str; 4] = [
+    "macOS may ask to let cockpit use your login keychain when you choose this.",
+    "Always Allow: this cockpit binary can unlock its key at every start without asking.",
+    "Allow: this one time only; macOS will ask again whenever cockpit starts.",
+    "Deny: nothing is kept in the Keychain; retry, or pick a file vault instead.",
+];
+
+/// Shown while the keyring choice is in flight.
+pub(crate) const KEYCHAIN_PROMPT_WAITING: &str =
+    "If a macOS Keychain prompt appears, answer it to continue (it may be behind this window).";
+
 pub struct SecureStoreSubmission {
     pub placement: cockpit_proto::OnboardingSecurePlacement,
     pub passphrase: Option<cockpit_proto::SensitiveOnboardingPassphrase>,
@@ -44,6 +60,9 @@ pub(crate) struct SecureStoreScreen {
     /// frame). A validation `status` takes precedence over it.
     pub(crate) progress: Option<String>,
     revealed: bool,
+    /// Whether choosing the platform keyring triggers an OS consent prompt
+    /// the user must be told about (the macOS Keychain access dialog).
+    keychain_prompt_notice: bool,
     password_rect: Rect,
     confirmation_rect: Rect,
 }
@@ -60,6 +79,7 @@ impl SecureStoreScreen {
             status: None,
             progress: None,
             revealed: false,
+            keychain_prompt_notice: cfg!(target_os = "macos"),
             password_rect: Rect::default(),
             confirmation_rect: Rect::default(),
         };
@@ -82,6 +102,21 @@ impl SecureStoreScreen {
     /// checked rather than unavailable, and none can be chosen yet.
     pub(crate) fn probing(&self) -> bool {
         self.capabilities.generation == 0 && self.capabilities.features.is_empty()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_keychain_prompt_notice(&mut self, enabled: bool) {
+        self.keychain_prompt_notice = enabled;
+    }
+
+    /// The keyring row is focused on a host whose keyring may show an OS
+    /// consent prompt: the daemon writes and then reads back the vault key
+    /// in the Keychain during this step, so any prompt appears now.
+    fn keychain_prompt_applies(&self) -> bool {
+        self.keychain_prompt_notice
+            && self.phase == SecureStoreInputPhase::Choice
+            && self.cursor == 0
+            && self.row_enabled(0)
     }
 
     pub(crate) fn take_submission(&mut self) -> Option<SecureStoreSubmission> {
@@ -324,6 +359,23 @@ impl SecureStoreScreen {
                 Style::new().fg(FOG).add_modifier(Modifier::ITALIC),
             )));
             return lines;
+        }
+        if self.keychain_prompt_applies() {
+            lines.push(Line::default());
+            if self.progress.is_some() && self.status.is_none() {
+                lines.push(Line::from(Span::styled(
+                    KEYCHAIN_PROMPT_WAITING,
+                    Style::new().fg(BRASS).add_modifier(Modifier::BOLD),
+                )));
+            }
+            for (index, text) in KEYCHAIN_PROMPT_NOTICE.iter().enumerate() {
+                let style = if index == 0 {
+                    Style::new().fg(INK)
+                } else {
+                    Style::new().fg(FOG)
+                };
+                lines.push(Line::from(Span::styled(*text, style)));
+            }
         }
         if !self.row_enabled(self.cursor) {
             let id = if self.cursor == 0 {
@@ -667,6 +719,31 @@ mod tests {
             Some(OnboardingSecurePlacement::PassphraseFile)
         );
         assert!(line_text(&screen.lines()).contains("unavailable"));
+    }
+
+    /// macOS: the keyring row explains the Keychain prompt that choosing it
+    /// triggers, and the in-flight progress tells the user to answer it. The
+    /// file rows (no prompt) carry no notice.
+    #[test]
+    fn keyring_row_explains_the_keychain_prompt_and_always_allow() {
+        let mut screen = SecureStoreScreen::new(capabilities(FeatureCapabilityState::Available));
+        screen.set_keychain_prompt_notice(true);
+        let detail = line_text(&screen.detail_lines());
+        assert!(detail.contains("macOS may ask"), "{detail}");
+        assert!(detail.contains("Always Allow"), "{detail}");
+        assert!(detail.contains("Deny"), "{detail}");
+
+        screen.progress = Some("Securing your secrets…".into());
+        assert!(line_text(&screen.detail_lines()).contains(KEYCHAIN_PROMPT_WAITING));
+
+        screen.handle_key(key(KeyCode::Down));
+        assert!(!line_text(&screen.detail_lines()).contains("Always Allow"));
+        assert!(!line_text(&screen.detail_lines()).contains(KEYCHAIN_PROMPT_WAITING));
+
+        let mut other_platform =
+            SecureStoreScreen::new(capabilities(FeatureCapabilityState::Available));
+        other_platform.set_keychain_prompt_notice(false);
+        assert!(!line_text(&other_platform.detail_lines()).contains("Always Allow"));
     }
 
     #[test]

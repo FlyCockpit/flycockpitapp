@@ -241,18 +241,10 @@ pub fn map_keyring_error(err: keyring_core::Error) -> SecureKeyError {
     use keyring_core::Error as Ke;
     match err {
         Ke::NoEntry => SecureKeyError::NotFound("native item missing".into()),
-        Ke::NoStorageAccess(e) => {
-            let msg = e.to_string();
-            let lower = msg.to_ascii_lowercase();
-            if lower.contains("lock") {
-                SecureKeyError::Locked(msg)
-            } else if lower.contains("denied") || lower.contains("permission") {
-                SecureKeyError::Denied(msg)
-            } else {
-                SecureKeyError::Unavailable(msg)
+        Ke::NoStorageAccess(e) | Ke::PlatformFailure(e) => {
+            if let Some(classified) = classify_platform_status(e.as_ref()) {
+                return classified;
             }
-        }
-        Ke::PlatformFailure(e) => {
             let msg = e.to_string();
             let lower = msg.to_ascii_lowercase();
             if lower.contains("lock") {
@@ -274,5 +266,67 @@ pub fn map_keyring_error(err: keyring_core::Error) -> SecureKeyError {
         }
         Ke::Invalid(name, reason) => SecureKeyError::Invalid(format!("invalid {name}: {reason}")),
         other => SecureKeyError::Unavailable(other.to_string()),
+    }
+}
+
+/// Classify a native store failure by its typed platform status code when the
+/// platform exposes one. macOS reports a refused Keychain prompt as
+/// `errSecUserCanceled` (the user chose "Deny") or `errSecAuthFailed`, whose
+/// messages mention neither "denied" nor "permission"; without this they
+/// would be misreported as an unreachable keyring.
+fn classify_platform_status(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<SecureKeyError> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = error.downcast_ref::<security_framework::base::Error>()?;
+        let msg = status.to_string();
+        return match status.code() {
+            // errSecUserCanceled, errSecAuthFailed
+            -128 | -25293 => Some(SecureKeyError::Denied(msg)),
+            // errSecInteractionNotAllowed: no UI may be shown (locked
+            // keychain in a non-interactive session).
+            -25308 => Some(SecureKeyError::Locked(msg)),
+            _ => None,
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = error;
+        None
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_status_tests {
+    use super::*;
+
+    fn platform_failure(code: i32) -> keyring_core::Error {
+        keyring_core::Error::PlatformFailure(Box::new(security_framework::base::Error::from_code(
+            code,
+        )))
+    }
+
+    /// A "Deny" on the macOS Keychain prompt surfaces as a typed denial (so
+    /// onboarding reports `KeyringAccessDenied`), not as an unreachable
+    /// keyring.
+    #[test]
+    fn keychain_prompt_refusal_is_classified_as_denied() {
+        for code in [-128, -25293] {
+            let mapped = map_keyring_error(platform_failure(code));
+            assert!(
+                matches!(mapped, SecureKeyError::Denied(_)),
+                "status {code}: {mapped:?}"
+            );
+            assert_eq!(KekFailureCause::of(&mapped), KekFailureCause::KeyringDenied);
+        }
+        assert!(matches!(
+            map_keyring_error(platform_failure(-25308)),
+            SecureKeyError::Locked(_)
+        ));
+        assert!(matches!(
+            map_keyring_error(platform_failure(-25300)),
+            SecureKeyError::Unavailable(_)
+        ));
     }
 }

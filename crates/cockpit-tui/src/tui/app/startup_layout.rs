@@ -140,6 +140,9 @@ pub(super) enum FirstScreenOutcome {
 pub(super) const ONBOARDING_HANDOFF_DEADLINE: std::time::Duration =
     cockpit_client::READY_SERVICES_WAIT;
 const ONBOARDING_HANDOFF_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+/// A secure-store submission whose response was lost and whose durable
+/// receipt shows it was not committed (rejected, or never recorded).
+pub(super) const SECURE_INTENT_NOT_APPLIED: &str = "the secure-store choice was not applied; if a Keychain or keyring prompt appeared and was denied, choose again and allow it, or pick a file vault";
 
 fn handoff_deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + ONBOARDING_HANDOFF_DEADLINE
@@ -806,7 +809,15 @@ async fn onboarding_snapshot_after_secure_intent(
             .await?
             {
                 Some(receipt) => Some(receipt),
-                None => return Err(error_chain(&error)),
+                // The daemon settled the choice without committing it — for
+                // the platform keyring typically because the OS access prompt
+                // (which can outlast the request timeout) was denied.
+                None => {
+                    return Err(format!(
+                        "{SECURE_INTENT_NOT_APPLIED} ({})",
+                        error_chain(&error)
+                    ));
+                }
             }
         }
     };

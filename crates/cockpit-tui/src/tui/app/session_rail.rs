@@ -679,11 +679,10 @@ mod tests {
     }
 
     fn popover_chat_body(app: &App, width: u16, height: u16) -> ratatui::layout::Rect {
-        let rects = app
-            .geometry()
-            .layout(ratatui::layout::Rect::new(0, 0, width, height));
-        let (_rail, chat_body) = app.session_rail.split_body(rects.body, width);
-        chat_body
+        let (_rail, chat_column) = app
+            .session_rail
+            .split_body(ratatui::layout::Rect::new(0, 0, width, height), width);
+        app.geometry().layout(chat_column).body
     }
 
     fn chat_column_text(buf: &ratatui::buffer::Buffer, rail_right: u16, width: u16) -> String {
@@ -1512,5 +1511,133 @@ mod tests {
                 "no saved row may be highlighted: {draft}"
             );
         }
+    }
+
+    fn render_with_cursor(
+        app: &mut App,
+        width: u16,
+        height: u16,
+    ) -> (ratatui::buffer::Buffer, ratatui::layout::Position) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        (terminal.backend().buffer().clone(), cursor)
+    }
+
+    fn contains(rect: ratatui::layout::Rect, inner: ratatui::layout::Rect) -> bool {
+        inner.x >= rect.x
+            && inner.y >= rect.y
+            && inner.right() <= rect.right()
+            && inner.bottom() <= rect.bottom()
+    }
+
+    #[test]
+    fn open_rail_runs_full_height_and_composer_takes_chat_column_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _env) = configured_app(&tmp);
+        let (width, height) = (120, 40);
+        render_buffer(&mut app, width, height);
+        let rail = app.session_rail.rail_area().expect("persistent rail");
+        assert_eq!((rail.x, rail.y), (0, 0));
+        assert_eq!(rail.height, height, "rail spans the whole frame height");
+        let input = app.input_area.expect("composer painted");
+        assert_eq!(input.x, rail.right(), "composer starts beside the rail");
+        assert_eq!(input.right(), width);
+        assert_eq!(input.bottom(), height);
+        let chat = app.chat_area.expect("chat area");
+        assert!(chat.x >= rail.right());
+        // The click on the rail's bottom-left cell, beside the composer row,
+        // belongs to the rail, not the composer.
+        assert!(!input.contains(ratatui::layout::Position::new(rail.x, height - 1)));
+    }
+
+    #[test]
+    fn closed_rail_keeps_full_width_composer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _env) = configured_app(&tmp);
+        app.session_rail.set_visible(false);
+        render_buffer(&mut app, 120, 40);
+        assert!(app.session_rail.rail_area().is_none());
+        let input = app.input_area.expect("composer painted");
+        assert_eq!((input.x, input.width), (0, 120));
+        assert_eq!(input.bottom(), 40);
+    }
+
+    #[test]
+    fn compact_affordance_runs_full_height_beside_composer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _env) = configured_app(&tmp);
+        render_buffer(&mut app, 70, 24);
+        let affordance = app
+            .session_rail
+            .compact_area()
+            .or(app.session_rail.rail_area())
+            .expect("compact affordance");
+        assert_eq!(affordance.width, COMPACT_AFFORDANCE_WIDTH);
+        assert_eq!(affordance.height, 24);
+        let input = app.input_area.expect("composer painted");
+        assert_eq!(input.x, COMPACT_AFFORDANCE_WIDTH);
+        assert_eq!(input.right(), 70);
+        // Below the compact breakpoint the unfocused rail stays hidden and
+        // the composer keeps the full width.
+        render_buffer(&mut app, 55, 24);
+        assert_eq!(app.input_area.map(|r| (r.x, r.width)), Some((0, 55)));
+    }
+
+    #[test]
+    fn composer_wraps_grows_and_parks_cursor_inside_chat_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _env) = configured_app(&tmp);
+        // Long enough to wrap at the chat column (rail 30 of 120) onto more
+        // rows than it would need at the full terminal width.
+        let text = "word ".repeat(36);
+        app.composer.set(text.trim_end());
+        let (buf, cursor) = render_with_cursor(&mut app, 120, 40);
+        let rail = app.session_rail.rail_area().expect("persistent rail");
+        let input = app.input_area.expect("composer painted");
+        assert_eq!(input.x, rail.right());
+        // 179 columns fit two rows at the full 118-column inner width but
+        // need three at the chat column's 88: the box grows to the column.
+        assert_eq!(rail.width, 30);
+        assert_eq!(input.height - 2, 3, "input height follows the chat column");
+        let shown: usize = (input.y..input.bottom())
+            .map(|y| {
+                row_text(&buf, y, input.x, input.right())
+                    .matches("word")
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            shown, 36,
+            "every wrapped word stays visible in the composer"
+        );
+        assert!(
+            input.contains(cursor),
+            "cursor {cursor:?} must sit in the composer {input:?}"
+        );
+        assert_eq!(rail.height, 40);
+    }
+
+    #[test]
+    fn slash_menu_stays_inside_chat_column_beside_full_height_rail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _env) = configured_app(&tmp);
+        app.composer.set("/");
+        app.reset_slash_window();
+        let buf = render_buffer(&mut app, 120, 40);
+        let rail = app.session_rail.rail_area().expect("persistent rail");
+        assert_eq!(rail.height, 40);
+        let menu = app.suggestion_box_area.expect("slash menu painted");
+        let chat_column = ratatui::layout::Rect::new(rail.right(), 0, 120 - rail.right(), 40);
+        assert!(
+            contains(chat_column, menu),
+            "menu {menu:?} left the chat column"
+        );
+        let input = app.input_area.expect("composer painted");
+        assert!(contains(chat_column, input));
+        // The rail keeps its bottom row beside the composer: nothing of the
+        // composer box bleeds into it.
+        assert!(!row_text(&buf, 39, rail.x, rail.right()).contains('╰'));
     }
 }

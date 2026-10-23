@@ -1069,9 +1069,18 @@ impl App {
     }
 
     pub(super) fn input_height(&self) -> u16 {
-        let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
-        // Inner content width = terminal width - 2 side rails.
-        let wrap_width = (term_w as usize).saturating_sub(2).max(1);
+        // The composer lives in the chat column beside the full-height
+        // session rail, so it wraps at the chat column's width. Prefer the
+        // last painted frame (what the pointer and the next render see) and
+        // fall back to the terminal size before the first frame.
+        let term_w = if self.last_frame_area.width > 0 {
+            self.last_frame_area.width
+        } else {
+            crossterm::terminal::size().map_or(80, |(w, _)| w)
+        };
+        let chat_w = term_w.saturating_sub(self.session_rail.persistent_columns(term_w, term_w));
+        // Inner content width = chat column width - 2 side borders.
+        let wrap_width = (chat_w as usize).saturating_sub(2).max(1);
         let prefix = input_prefix_width();
         // Ghost text (implementation note): when a multi-line
         // `long` prediction has been expanded, the box grows to fit the
@@ -1230,6 +1239,9 @@ impl App {
         // the last input end the captures of the old owner.
         self.sync_pointer_owner();
         self.distribute_pointer_ownership();
+        // Record the frame first: the composer sizes itself to the chat
+        // column of this frame, not of the previous one.
+        self.last_frame_area = frame.area();
         let geom = self.geometry();
         // The chat header records its layout when it renders this frame;
         // reset first so pill activation cannot target a stale frame.
@@ -1256,7 +1268,6 @@ impl App {
         self.suggestion_row_hits.clear();
         // The paint record is rebuilt as this frame paints its covering parts.
         self.paint_record.clear();
-        self.last_frame_area = frame.area();
         // Pane geometry is this frame's too: a mode that does not paint the
         // panes (a popover, the question dialog) leaves none to hit-test.
         self.pane_rect = None;
@@ -1267,13 +1278,18 @@ impl App {
             .set_attachment(self.local_session_draft, self.launch.session_id);
         self.session_rail.set_pointer_capture(self.mouse_capture);
         self.session_rail.begin_frame();
-        let rects = geom.layout(frame.area());
         let frame_width = frame.area().width;
         // Stable rail seam for every chat-owned surface: carve the persistent
-        // column before choosing a dialog/overlay, so those surfaces can float
-        // in the remaining body without erasing navigation. #449/#450 build
-        // on this ordering; keep the split independent of overlay variants.
-        let (persistent_rail, chat_body) = self.session_rail.split_body(rects.body, frame_width);
+        // rail out of the whole frame first, so it runs full height and every
+        // chat-column surface (history, queue/suggestion strip, composer, the
+        // compact question dialog, toasts) is laid out in the column beside
+        // it. Dialogs/overlays then float in the remaining body without
+        // erasing navigation. #449/#450 build on this ordering; keep the
+        // split independent of overlay variants.
+        let (persistent_rail, chat_column) =
+            self.session_rail.split_body(frame.area(), frame_width);
+        let rects = geom.layout(chat_column);
+        let chat_body = rects.body;
         let overlay_rail = self.session_rail.overlay_rail_rect(chat_body, frame_width);
         let render_session_rail = self.onboarding_shell.is_none();
         let popover_max_height = chat_body.height.saturating_sub(2).max(1);
@@ -1511,8 +1527,9 @@ impl App {
         // The collapsed-pill `more` popover floats over the transcript.
         self.paint_chat_header_more_popover(frame);
 
-        // Transient notices float over the body's final row now that the
-        // shell has no footer/status row.
+        // Transient notices float over the chat column's final body row now
+        // that the shell has no footer/status row; they stay clear of the
+        // full-height session rail.
         if let Some(toast) = self.toast.clone() {
             let toast_row = Rect::new(
                 rects.body.x,

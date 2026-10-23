@@ -20,12 +20,21 @@ use crate::tui::theme::{
 use cockpit_proto::SessionSummary;
 
 impl SessionRail {
-    /// Split the chat body into `(persistent_rail, remaining_chat)`. The
-    /// overlay-sized focused rail is drawn later over `remaining_chat`.
+    /// Columns the persistent rail takes out of a `width`-wide area at the
+    /// given frame width; zero when the rail is closed, overlay-only, or
+    /// would leave no chat column.
+    pub fn persistent_columns(&self, width: u16, frame_width: u16) -> u16 {
+        let persistent = self.layout_mode(frame_width).persistent_width(self.focused);
+        if persistent >= width { 0 } else { persistent }
+    }
+
+    /// Split an area into `(persistent_rail, remaining_chat)`. The app
+    /// splits the whole frame, so the persistent rail runs full height and
+    /// the composer lives in `remaining_chat`. The overlay-sized focused rail
+    /// is drawn later over the chat body.
     pub fn split_body(&self, body: Rect, frame_width: u16) -> (Option<Rect>, Rect) {
-        let mode = self.layout_mode(frame_width);
-        let persistent = mode.persistent_width(self.focused);
-        if persistent == 0 || persistent >= body.width {
+        let persistent = self.persistent_columns(body.width, frame_width);
+        if persistent == 0 {
             return (None, body);
         }
         let rail = Rect {

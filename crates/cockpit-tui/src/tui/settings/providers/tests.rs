@@ -13108,9 +13108,12 @@ fn global_provider_model_settings_save(pick_project_layer: bool) -> (String, Opt
         dialog.handle_key(press(KeyCode::Char('s')));
         dialog.settle_test_effects();
         let screen = render_provider_rows(&dialog, 200, 40).join("\n");
-        assert!(
+        // Only a committed save records its operation id; a rejected one is
+        // asserted through the rendered reason by the caller.
+        assert_eq!(
             dialog.cx.last_provider_mutation_operation_id.is_some(),
-            "save must cross ApplyProviderMutation; authority={} reload_required={} warnings={:?}\n{screen}",
+            !pick_project_layer,
+            "authority={} reload_required={} warnings={:?}\n{screen}",
             dialog.provider_edit_authority.is_some(),
             dialog.provider_catalog_reload_required,
             dialog.extended_warnings,

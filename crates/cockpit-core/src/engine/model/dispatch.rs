@@ -1568,6 +1568,9 @@ impl Model {
             .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
         prompt = scrub_message(redact, &prompt)
             .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
+        // One leading system message on every provider/wire: positional
+        // history `System` entries replay as `<system-reminder>` user turns.
+        normalize_system_roles_for_wire(&mut history, &mut prompt);
         let identity_records =
             if self.needs_responses_tool_identity_normalization(endpoint_recovery_enabled) {
                 match normalize_responses_tool_call_identity(&mut history, &mut prompt) {
@@ -1789,7 +1792,7 @@ impl Model {
                 let prompt = scrub_message(redact, prompt)?;
                 Ok((history, prompt))
             })();
-        let (stripped, prompt_scrubbed) = match scrub_result {
+        let (mut stripped, mut prompt_scrubbed) = match scrub_result {
             Ok(pair) => pair,
             Err(field) => {
                 return TandemOutcome {
@@ -1804,6 +1807,7 @@ impl Model {
                 };
             }
         };
+        normalize_system_roles_for_wire(&mut stripped, &mut prompt_scrubbed);
         let prompt = &prompt_scrubbed;
         let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
         let request = assembled_request(

@@ -1550,6 +1550,7 @@ impl Session {
             monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
             sandbox_escalation_enabled: AtomicBool::new(true),
             sandbox_escalation_notice_state: AtomicBool::new(true),
+            tool_availability_notice_state: Mutex::new(std::collections::HashMap::new()),
             safety_gate_degrade_notice_key: Mutex::new(None),
             mcp_reserved_cockpit_notice_sent: AtomicBool::new(false),
             agent_compact_requested: AtomicBool::new(false),

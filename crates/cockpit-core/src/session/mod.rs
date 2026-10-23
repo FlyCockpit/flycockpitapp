@@ -563,6 +563,10 @@ pub struct Session {
     /// any allowed escalation.
     sandbox_escalation_enabled: AtomicBool,
     sandbox_escalation_notice_state: AtomicBool,
+    /// Last callable tool-name set the model was told about, per agent name.
+    /// Seeded from the advertised `tools[]` schema on an agent's first turn;
+    /// see [`Session::tool_availability_turn_notice`].
+    tool_availability_notice_state: Mutex<std::collections::HashMap<String, BTreeSet<String>>>,
     safety_gate_degrade_notice_key: Mutex<Option<(String, Option<String>)>>,
     mcp_reserved_cockpit_notice_sent: AtomicBool,
     agent_compact_requested: AtomicBool,

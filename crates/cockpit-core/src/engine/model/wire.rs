@@ -484,3 +484,100 @@ fn responses_identity_error(
         call_id,
     })
 }
+
+/// Opening delimiter for host-authored, positional system content replayed on
+/// the wire as a user message.
+pub(crate) const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
+/// Closing delimiter matching [`SYSTEM_REMINDER_OPEN`].
+pub(crate) const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+
+/// Wrap host-authored positional system content for the wire.
+pub(crate) fn system_reminder_text(content: &str) -> String {
+    format!("{SYSTEM_REMINDER_OPEN}\n{content}\n{SYSTEM_REMINDER_CLOSE}")
+}
+
+/// Canonical role shape for every provider request, applied once to the
+/// cockpit history before it is handed to rig so every wire (Chat
+/// Completions, Responses, ChatGPT/Codex Responses, Anthropic Messages) gets
+/// the same shape: the agent's stable system contract is the only
+/// system-role content (rig sends it as the single leading system message /
+/// `instructions` / top-level `system`), and every `Message::System` carried
+/// in history is host-authored positional context (turn-start notices,
+/// nudges, tool-availability changes, conversation rules, time prelude).
+/// Those are replayed in place as `<system-reminder>` user text.
+///
+/// Why: chat templates served by LM Studio / llama.cpp / vLLM / Ollama
+/// (Qwen, Llama, Mistral families) raise "System message must be at the
+/// beginning" for any system message after index 0; rig's Anthropic and
+/// Codex Responses conversions otherwise hoist mid-conversation system text
+/// into the cached top-level system prefix, invalidating the prompt cache
+/// whenever a notice appears and losing its position. Keeping positional
+/// content in place leaves the leading system block byte-stable across turns.
+///
+/// Alternation: a run of reminders is merged into the following plain user
+/// turn as leading text blocks; when the following message is an assistant
+/// turn or a tool-result turn, it is appended as trailing text blocks to the
+/// preceding user turn instead (after any tool results, which keeps
+/// tool-result adjacency valid on every wire); only between two assistant
+/// turns (or at the very start before an assistant) does it stand alone as
+/// its own user message. The merge depends only on a reminder's immediate
+/// neighbours, which never change once both are in history, so the replayed
+/// shape is identical on every later turn. Idempotent.
+pub(crate) fn normalize_system_roles_for_wire(history: &mut Vec<Message>, prompt: &mut Message) {
+    fn is_plain_user(message: &Message) -> bool {
+        matches!(message, Message::User { content }
+            if !content.iter().any(|part| matches!(part, UserContent::ToolResult(_))))
+    }
+    fn reminder_part(content: &str) -> UserContent {
+        UserContent::text(system_reminder_text(content))
+    }
+    fn flush(out: &mut Vec<Message>, pending: &mut Vec<UserContent>, next: Option<&mut Message>) {
+        if pending.is_empty() {
+            return;
+        }
+        if let Some(next) = next
+            && is_plain_user(next)
+            && let Message::User { content } = next
+        {
+            let mut merged = std::mem::take(pending);
+            merged.append(content);
+            *content = merged;
+            return;
+        }
+        if let Some(Message::User { content }) = out.last_mut() {
+            content.append(pending);
+            return;
+        }
+        out.push(Message::User {
+            content: std::mem::take(pending),
+        });
+    }
+
+    if !history.iter().any(|m| matches!(m, Message::System { .. }))
+        && !matches!(prompt, Message::System { .. })
+    {
+        return;
+    }
+    let mut out: Vec<Message> = Vec::with_capacity(history.len());
+    let mut pending: Vec<UserContent> = Vec::new();
+    for mut message in std::mem::take(history) {
+        if let Message::System { content } = &message {
+            pending.push(reminder_part(content));
+            continue;
+        }
+        flush(&mut out, &mut pending, Some(&mut message));
+        out.push(message);
+    }
+    if let Message::System { content } = prompt {
+        // The prompt must remain its own (final) message; a reminder prompt
+        // simply becomes a user reminder turn after any pending reminders.
+        let part = reminder_part(content);
+        flush(&mut out, &mut pending, None);
+        *prompt = Message::User {
+            content: vec![part],
+        };
+    } else {
+        flush(&mut out, &mut pending, Some(prompt));
+    }
+    *history = out;
+}
